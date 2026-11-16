@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
@@ -40,17 +41,22 @@ fn config(dir: &Path, web: bool) -> jarvis_hub::config::Config {
 /// A connector starting a fake agent that answers each prompt with two text chunks; it keeps
 /// the last spec it was given.
 fn fake_connector() -> (Connector, Arc<Mutex<Option<AgentSpec>>>) {
+    fake_connector_with(FakeScript {
+        updates: vec![text_chunk("Bonjour "), text_chunk("Alix !")],
+        ..FakeScript::default()
+    })
+}
+
+/// A connector starting a fake agent that plays `script`; it keeps the last spec it was given.
+fn fake_connector_with(script: FakeScript) -> (Connector, Arc<Mutex<Option<AgentSpec>>>) {
     let seen = Arc::new(Mutex::new(None));
     let connector: Connector = Arc::new({
         let seen = seen.clone();
         move |spec: &AgentSpec, resume, events| {
             *seen.lock().unwrap() = Some(spec.clone());
-            let spec = spec.clone();
+            let (spec, script) = (spec.clone(), script.clone());
             Box::pin(async move {
-                let (transport, _handle) = fake_agent(FakeScript {
-                    updates: vec![text_chunk("Bonjour "), text_chunk("Alix !")],
-                    ..FakeScript::default()
-                });
+                let (transport, _handle) = fake_agent(script);
                 AgentClient::connect(transport, &spec, resume, events).await
             })
         }
@@ -615,6 +621,98 @@ async fn hello_names_the_log_before_the_replay() {
     for entry in &turn {
         assert_eq!(&next_entry(&mut other).await, entry);
     }
+}
+
+#[tokio::test]
+async fn reconnect_in_the_middle_of_an_answer_gets_the_rest_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Notify::new());
+    let (connector, _) = fake_connector_with(FakeScript {
+        updates: vec![
+            text_chunk("Un, "),
+            text_chunk("deux, "),
+            text_chunk("trois."),
+        ],
+        pause: Some((1, gate.clone())),
+        ..FakeScript::default()
+    });
+    let (addr, _server) = timeout(
+        WAIT,
+        jarvis::start_with(config(dir.path(), true), connector),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let cookie = sign_in(addr).await;
+
+    let mut first = open_chat(addr, &cookie).await;
+    let (log_id, _) = hello(&mut first, 0, None).await;
+    say(
+        &mut first,
+        ClientMsg::Send {
+            text: "Compte".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        next_entry(&mut first).await.event,
+        Event::User {
+            text: "Compte".into()
+        }
+    );
+    let seen = next_entry(&mut first).await;
+    assert_eq!(
+        seen.event,
+        Event::Assistant {
+            text: "Un, ".into()
+        }
+    );
+    // The phone sleeps: the socket drops in the middle of the answer.
+    drop(first);
+
+    // It comes back with the last entry it saw, while the agent goes on.
+    let mut second = open_chat(addr, &cookie).await;
+    say(
+        &mut second,
+        ClientMsg::Hello {
+            last_seq: seen.seq,
+            log_id: Some(log_id),
+        },
+    )
+    .await;
+    gate.notify_one();
+    let rest = until_turn_ended(&mut second).await;
+
+    let rest: Vec<(u64, Event)> = rest.into_iter().map(|e| (e.seq, e.event)).collect();
+    assert_eq!(
+        rest,
+        [
+            (
+                3,
+                Event::Assistant {
+                    text: "deux, ".into()
+                }
+            ),
+            (
+                4,
+                Event::Assistant {
+                    text: "trois.".into()
+                }
+            ),
+            (
+                5,
+                Event::TurnEnded {
+                    outcome: TurnOutcome::Done
+                }
+            ),
+        ]
+    );
+    // Nothing comes twice.
+    assert!(
+        timeout(Duration::from_millis(200), second.next())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

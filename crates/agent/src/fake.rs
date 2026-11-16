@@ -39,6 +39,8 @@ pub struct FakeScript {
     pub signed_out: bool,
     /// Never answer a prompt, even once it is cancelled, after the updates: a wedged agent.
     pub ignore_cancel: bool,
+    /// After this many updates of each prompt, wait for the notify before sending the rest.
+    pub pause: Option<(usize, Arc<Notify>)>,
 }
 
 impl Default for FakeScript {
@@ -54,6 +56,7 @@ impl Default for FakeScript {
             fail_prompt: false,
             signed_out: false,
             ignore_cancel: false,
+            pause: None,
         }
     }
 }
@@ -184,7 +187,12 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
                     // dispatch loop that delivers it.
                     cx.clone().spawn(async move {
                         let session = request.session_id;
-                        for update in &script.updates {
+                        for (index, update) in script.updates.iter().enumerate() {
+                            if let Some((after, gate)) = &script.pause
+                                && index == *after
+                            {
+                                gate.notified().await;
+                            }
                             cx.send_notification(SessionNotification::new(
                                 session.clone(),
                                 update.clone(),
