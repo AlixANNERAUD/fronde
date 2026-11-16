@@ -37,6 +37,7 @@ run = [
   "cargo clippy --package fronde-web --target wasm32-unknown-unknown -- -D warnings",
   "cargo fmt --manifest-path components/Cargo.toml --all --check",
   "cargo clippy --manifest-path components/Cargo.toml --target wasm32-wasip2 -- -D warnings",
+  "cargo clippy --manifest-path components/Cargo.toml --package fronde-calendar --all-targets -- -D warnings",
 ]
 
 [tasks.test]
@@ -45,6 +46,8 @@ depends = ["web-css", "components"]
 run = [
   "cargo nextest run $FRONDE_SERVER_PACKAGES --no-tests=pass",
   "cargo nextest run --package fronde-web",
+  # The components' logic is tested on the host; their WIT glue only builds for wasm32.
+  "cargo nextest run --manifest-path components/Cargo.toml --package fronde-calendar",
 ]
 
 # The web crate embeds its stylesheet at compile time, so Cargo needs the file. It is built with
