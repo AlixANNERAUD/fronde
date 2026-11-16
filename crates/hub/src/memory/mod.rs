@@ -69,8 +69,13 @@ pub struct MemoryStore {
     lock: Mutex<()>,
 }
 
-fn read(path: &Path) -> String {
-    std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+/// File content; a missing file is empty, any other error is reported (never treated as empty).
+fn read(path: &Path) -> std::io::Result<String> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
 }
 
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
@@ -116,12 +121,15 @@ impl MemoryStore {
 
     /// Read the core without waiting for writers (files are replaced atomically).
     pub fn core_now(&self) -> Core {
-        Core { user: read(&self.dir.join("USER.md")), memory: read(&self.dir.join("MEMORY.md")) }
+        Core {
+            user: read(&self.dir.join("USER.md")).unwrap_or_default(),
+            memory: read(&self.dir.join("MEMORY.md")).unwrap_or_default(),
+        }
     }
 
     pub async fn core(&self) -> Core {
         let _g = self.lock.lock().await;
-        Core { user: read(&self.dir.join("USER.md")), memory: read(&self.dir.join("MEMORY.md")) }
+        self.core_now()
     }
 
     pub async fn add(&self, file: MemoryFile, text: &str, now: DateTime<Utc>) -> Result<PathBuf, MemoryError> {
@@ -132,7 +140,7 @@ impl MemoryStore {
         let _g = self.lock.lock().await;
         match self.capped(file) {
             Some((path, name, limit)) => {
-                let mut content = read(&path);
+                let mut content = read(&path)?;
                 if !content.is_empty() && !content.ends_with('\n') {
                     content.push('\n');
                 }
@@ -147,7 +155,7 @@ impl MemoryStore {
             None => {
                 let local = now.with_timezone(&self.tz);
                 let path = self.dir.join("journal").join(format!("{}.md", local.format("%Y-%m-%d")));
-                let mut content = read(&path);
+                let mut content = read(&path)?;
                 if !content.is_empty() && !content.ends_with('\n') {
                     content.push('\n');
                 }
@@ -164,7 +172,7 @@ impl MemoryStore {
             return Err(MemoryError::Empty);
         }
         let _g = self.lock.lock().await;
-        let content = read(&path);
+        let content = read(&path)?;
         let count = content.matches(old).count();
         let start = match count {
             0 => return Err(MemoryError::NotFound),
@@ -180,7 +188,8 @@ impl MemoryStore {
             content.replacen(old, new, 1)
         };
         let would_be = updated.chars().count();
-        if would_be > limit {
+        // A file already over its cap (edited by hand) may always shrink.
+        if would_be > limit && would_be > content.chars().count() {
             return Err(MemoryError::Full { file: name, would_be, limit });
         }
         write_atomic(&path, &updated)?;
@@ -259,6 +268,34 @@ mod tests {
         assert_eq!(s.core().await.memory, "- likes green tea\n- likes coffee\n");
         let e = s.replace(MemoryFile::Journal, "a", "b").await.unwrap_err().to_string();
         assert!(e.contains("append-only"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn over_cap_file_can_be_pruned() {
+        let (dir, s) = store(50);
+        std::fs::write(dir.path().join("MEMORY.md"), format!("- {}\n- {}\n", "x".repeat(80), "w".repeat(80))).unwrap();
+        s.replace(MemoryFile::Memory, &"x".repeat(80), "").await.unwrap();
+        assert_eq!(s.core().await.memory, format!("- {}\n", "w".repeat(80)), "shrinking is allowed even above the cap");
+        std::fs::write(dir.path().join("MEMORY.md"), format!("- {}\n", "y".repeat(80))).unwrap();
+        s.replace(MemoryFile::Memory, &"y".repeat(80), "short").await.unwrap();
+        assert!(s.replace(MemoryFile::Memory, "short", &"z".repeat(80)).await.is_err(), "growing past the cap is still refused");
+    }
+
+    #[tokio::test]
+    async fn unreadable_file_is_not_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, s) = store(1000);
+        let path = dir.path().join("MEMORY.md");
+        std::fs::write(&path, "- precious\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            eprintln!("running as root: skipped");
+            return;
+        }
+        let r = s.add(MemoryFile::Memory, "new", now()).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(r, Err(MemoryError::Io(_))), "{r:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "- precious\n");
     }
 
     #[tokio::test]

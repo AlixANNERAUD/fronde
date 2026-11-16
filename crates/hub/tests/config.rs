@@ -73,3 +73,11 @@ fn missing_secret_explains() {
     let e = Secret::Env { env: "ABSENT_X".into() }.resolve().unwrap_err().to_string();
     assert!(e.contains("ABSENT_X") && e.contains("set"), "{e}");
 }
+
+#[test]
+fn rejects_reserved_and_duplicate_upstream_names() {
+    let s = format!("{MIN}\n[[mcp]]\nname = \"hub\"\nurl = \"http://x/mcp\"\n");
+    assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("reserved"));
+    let s = format!("{MIN}\n[[mcp]]\nname = \"a\"\nurl = \"http://x/mcp\"\n[[mcp]]\nname = \"a\"\nurl = \"http://y/mcp\"\n");
+    assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("twice"));
+}

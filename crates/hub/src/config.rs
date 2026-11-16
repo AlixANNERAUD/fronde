@@ -110,7 +110,14 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         .with_context(|| format!("cannot read config {}", path.display()))?;
     let config: Config =
         toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
+    let mut seen = std::collections::HashSet::new();
     for m in &config.mcp {
+        if m.name == "hub" {
+            bail!("mcp name \"hub\" is reserved for the hub's own tools; pick another name");
+        }
+        if !seen.insert(&m.name) {
+            bail!("mcp name {:?} is used twice; names must be unique", m.name);
+        }
         if !is_valid_name(&m.name) {
             bail!("mcp name {:?} must match ^[a-z][a-z0-9_]{{0,63}}$", m.name);
         }

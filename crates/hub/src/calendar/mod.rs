@@ -41,7 +41,10 @@ impl CalendarBackend for CalDavBackend {
     async fn list_events(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> anyhow::Result<Vec<Event>> {
         let mut out = Vec::new();
         for res in self.events.query(Kind::Event, Some((from, to))).await? {
-            out.extend(ics::parse_events(&res.ics, self.tz)?);
+            match ics::parse_events(&res.ics, self.tz) {
+                Ok(events) => out.extend(events),
+                Err(e) => tracing::warn!("skipping unreadable event {}: {e:#}", res.href),
+            }
         }
         Ok(out)
     }
@@ -77,7 +80,10 @@ impl CalendarBackend for CalDavBackend {
     async fn list_reminders(&self) -> anyhow::Result<Vec<Reminder>> {
         let mut out = Vec::new();
         for res in self.reminders.query(Kind::Todo, None).await? {
-            out.extend(ics::parse_reminders(&res.ics, self.tz)?);
+            match ics::parse_reminders(&res.ics, self.tz) {
+                Ok(rs) => out.extend(rs),
+                Err(e) => tracing::warn!("skipping unreadable task {}: {e:#}", res.href),
+            }
         }
         Ok(out)
     }
@@ -188,6 +194,26 @@ END:VCALENDAR
         let put = server.received_requests().await.unwrap().into_iter().find(|r| r.method.as_str() == "PUT").unwrap();
         let body = String::from_utf8(put.body).unwrap();
         assert!(body.contains("DUE;VALUE=DATE:20261118") && body.contains("PRIORITY:1") && body.contains("STATUS:COMPLETED"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn one_broken_item_does_not_break_the_list() {
+        let server = MockServer::start().await;
+        let body = r#"<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+<response><href>/c/bad.ics</href><propstat><prop><getetag>"1"</getetag><C:calendar-data>this is not iCalendar</C:calendar-data></prop></propstat></response>
+<response><href>/c/ok.ics</href><propstat><prop><getetag>"2"</getetag><C:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:ok
+SUMMARY:Fine
+DTSTART:20261116T180000Z
+END:VEVENT
+END:VCALENDAR
+</C:calendar-data></prop></propstat></response></multistatus>"#;
+        Mock::given(method("REPORT")).respond_with(ResponseTemplate::new(207).set_body_string(body)).mount(&server).await;
+        let b = backend_with(&server).await;
+        let now = Utc::now();
+        let events = b.list_events(now, now).await.unwrap();
+        assert_eq!(events.iter().map(|e| e.uid.as_str()).collect::<Vec<_>>(), vec!["ok"]);
     }
 
     /// Live round trip against a real server: JARVIS_TEST_CALDAV_URL (+ _USER, _PASSWORD).
