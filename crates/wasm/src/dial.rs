@@ -60,6 +60,18 @@ pub(crate) fn is_local(ip: IpAddr) -> bool {
     }
 }
 
+/// Addresses no origin may reach, not even one allowed as local: link-local (169.254.0.0/16,
+/// fe80::/10) and cloud metadata. No CalDAV server lives there.
+pub(crate) fn is_never_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || METADATA.contains(&ip),
+        IpAddr::V6(v6) => match embedded_ipv4(v6) {
+            Some(v4) => is_never_allowed(IpAddr::V4(v4)),
+            None => v6.is_unicast_link_local() || METADATA.contains(&ip),
+        },
+    }
+}
+
 /// The IPv4 address an IPv6 one stands for: mapped (`::ffff:a.b.c.d`), compatible
 /// (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`).
 fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -88,6 +100,7 @@ pub(crate) async fn send(
     mut request: Request<WasiBody>,
     connect_timeout: Duration,
     local: bool,
+    component: &str,
 ) -> Result<Sent, Error> {
     let deadline = Instant::now() + connect_timeout;
     let uri = request.uri();
@@ -99,6 +112,8 @@ pub(crate) async fn send(
         .trim_end_matches(']')
         .to_string();
     let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+    // Only the origin is logged: never a path or query, which may carry secrets.
+    let origin = format!("{}://{host}:{port}", if https { "https" } else { "http" });
 
     let addresses: Vec<SocketAddr> =
         timeout_at(deadline, tokio::net::lookup_host((host.as_str(), port)))
@@ -110,7 +125,18 @@ pub(crate) async fn send(
         return Err(Error::DestinationNotFound);
     }
     // One local address is enough to refuse: a name that also resolves elsewhere is no safer.
+    if addresses.iter().any(|a| is_never_allowed(a.ip())) {
+        tracing::warn!(
+            "{component}: {origin} resolves to a link-local or metadata address, which is \
+             refused even for an origin allowed as local"
+        );
+        return Err(Error::DestinationIpProhibited);
+    }
     if !local && addresses.iter().any(|a| is_local(a.ip())) {
+        tracing::warn!(
+            "{component}: {origin} resolves to a local address; allow it as \
+             {{ origin = \"{origin}\", local = true }}"
+        );
         return Err(Error::DestinationIpProhibited);
     }
     let tcp = timeout_at(deadline, TcpStream::connect(&addresses[..]))
@@ -194,7 +220,7 @@ fn tls() -> Result<&'static TlsConnector, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -244,5 +270,102 @@ mod tests {
         ] {
             assert!(!is_local(remote.parse().unwrap()), "{remote}");
         }
+    }
+
+    #[test]
+    fn never_allowed_addresses() {
+        for ip in [
+            "169.254.0.1",
+            "169.254.169.254",
+            "fe80::1",
+            "::ffff:169.254.169.254",
+            "100.100.100.200",
+            "168.63.129.16",
+            "fd00:ec2::254",
+        ] {
+            assert!(is_never_allowed(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "192.168.1.10",
+            "10.0.0.2",
+            "::1",
+            "fd12::1",
+            "8.8.8.8",
+        ] {
+            assert!(!is_never_allowed(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    /// Runs `f` and returns what it logged.
+    pub(crate) fn logged(f: impl FnOnce()) -> String {
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let out = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || out.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn refusal(uri: &str, local: bool) -> (bool, String) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut refused = false;
+        let log = logged(|| {
+            let request = Request::builder()
+                .uri(uri)
+                .body(
+                    http_body_util::Empty::new()
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                )
+                .unwrap();
+            refused = matches!(
+                runtime.block_on(send(request, Duration::from_secs(2), local, "calendar")),
+                Err(Error::DestinationIpProhibited)
+            );
+        });
+        (refused, log)
+    }
+
+    #[test]
+    fn local_refusal_names_the_fix() {
+        let (refused, log) = refusal("http://127.0.0.1:5232/dav?secret=1", false);
+        assert!(refused);
+        assert!(log.contains("WARN"), "{log}");
+        assert!(
+            log.contains(
+                "calendar: http://127.0.0.1:5232 resolves to a local address; allow it as \
+                 { origin = \"http://127.0.0.1:5232\", local = true }"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("secret"), "{log}");
+    }
+
+    #[test]
+    fn link_local_is_refused_even_as_local() {
+        let (refused, log) = refusal("http://169.254.169.254/latest", true);
+        assert!(refused);
+        assert!(log.contains("calendar: http://169.254.169.254:80"), "{log}");
+        assert!(log.contains("link-local or metadata"), "{log}");
+        assert!(!log.contains("/latest"), "{log}");
     }
 }

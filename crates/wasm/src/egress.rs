@@ -188,6 +188,8 @@ impl Grants {
 /// The store's HTTP hooks: one per call.
 pub(crate) struct Egress {
     pub(crate) grants: Grants,
+    /// The component's name, for the log.
+    pub(crate) component: Arc<str>,
     /// For each request, from sending it to the end of the response body.
     pub(crate) request_timeout: Duration,
 }
@@ -213,6 +215,7 @@ impl WasiHttpHooks for Egress {
             > + Send,
     > {
         let Some(grant) = self.grants.find(request.uri()) else {
+            warn_unlisted(&self.component, request.uri());
             // Read and discard the guest's body before refusing: dropping it would fail the
             // guest's write first, and the guest would report a reset connection, not the denial.
             return Box::new(async move {
@@ -228,8 +231,9 @@ impl WasiHttpHooks for Egress {
         // a new request, checked again here.
         let deadline = Instant::now() + self.request_timeout;
         let local = grant.local;
+        let component = self.component.clone();
         Box::new(async move {
-            let send = dial::send(request, CONNECT_TIMEOUT, local);
+            let send = dial::send(request, CONNECT_TIMEOUT, local, &component);
             let (response, io) = tokio::time::timeout_at(deadline, send)
                 .await
                 .map_err(|_| Error::HttpResponseTimeout)??;
@@ -250,6 +254,19 @@ impl WasiHttpHooks for Egress {
             ))
         })
     }
+}
+
+/// Tell the owner a request went to an origin the component may not reach. Only the origin is
+/// logged, never the path or query.
+fn warn_unlisted(component: &str, uri: &http::Uri) {
+    let origin = match Origin::of(uri) {
+        Some(origin) => origin.to_string(),
+        None => uri.scheme_str().zip(uri.host()).map_or_else(
+            || "an invalid URL".to_string(),
+            |(scheme, host)| format!("{scheme}://{host}"),
+        ),
+    };
+    tracing::warn!("{component}: {origin} is not in its allow list; add it to the source's allow");
 }
 
 /// A response body that fails once the request's deadline has passed, however slowly it drips.
@@ -305,6 +322,24 @@ mod tests {
 
     fn allowed(g: &Grants, uri: &str) -> bool {
         g.find(&uri.parse().unwrap()).is_some()
+    }
+
+    #[test]
+    fn unlisted_origin_is_logged_without_path_or_query() {
+        let log = crate::dial::tests::logged(|| {
+            warn_unlisted(
+                "calendar",
+                &"https://x.example/dav?token=s3cret".parse().unwrap(),
+            );
+        });
+        assert!(
+            log.contains(
+                "calendar: https://x.example:443 is not in its allow list; add it to the \
+                 source's allow"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("s3cret") && !log.contains("/dav"), "{log}");
     }
 
     #[test]

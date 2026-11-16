@@ -7,7 +7,7 @@ use crate::v0_1;
 use anyhow::{Context, bail, ensure};
 use async_trait::async_trait;
 use fronde_hub::source::Tool;
-use fronde_hub::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
+use fronde_hub::tools::{ToolDef, ToolHandler, ToolOutput};
 use serde_json::Value;
 use std::sync::Arc;
 use wasmtime::Store;
@@ -164,14 +164,6 @@ impl LoadedComponent {
                 (def.clone(), handler)
             })
             .collect()
-    }
-
-    /// Add the component's tools to the registry.
-    pub fn register(&self, registry: &Registry) -> anyhow::Result<()> {
-        for (def, handler) in self.tools() {
-            registry.register(def, handler)?;
-        }
-        Ok(())
     }
 }
 

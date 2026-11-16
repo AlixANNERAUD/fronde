@@ -166,6 +166,19 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
             "allow has {origin}, which the manifest does not ask for (it asks for {})",
             asked(&manifest.network, &settings)
         );
+        if !a.local
+            && origin
+                .host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(crate::dial::is_local)
+        {
+            bail!(
+                "allow has {origin}, a local address, which is refused unless allowed as local: \
+                 write it as {{ origin = \"{origin}\", local = true }}"
+            );
+        }
         allow.push(Allowed {
             origin,
             local: a.local,

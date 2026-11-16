@@ -362,6 +362,29 @@ fn check_refuses_what_the_sandbox_would() {
 }
 
 #[test]
+fn local_ip_literal_needs_local_true() {
+    let dir = calendar();
+    let lan = SETTINGS
+        .replace("https://cloud.example", "http://192.168.1.10:5232")
+        .replace("https://tasks.example:8443", "http://192.168.1.10:5232");
+    let config = entry(
+        dir.path(),
+        &format!("allow = [\"http://192.168.1.10:5232\"]\n{lan}"),
+    );
+    let e = refused(&config);
+    assert!(
+        e.contains("{ origin = \"http://192.168.1.10:5232\", local = true }"),
+        "{e}"
+    );
+    // With the flag it passes.
+    let config = entry(
+        dir.path(),
+        &format!("allow = [{{ origin = \"http://192.168.1.10:5232\", local = true }}]\n{lan}"),
+    );
+    assert!(prepare(&config, &checks("Europe/Paris")).is_ok());
+}
+
+#[test]
 fn url_settings_hold_no_credentials() {
     let dir = calendar();
     let config = entry(

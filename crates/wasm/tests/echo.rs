@@ -1,7 +1,7 @@
 //! Runs the `echo` test component (components/echo), built into components/dist by
 //! `mise run components`.
 
-use fronde_hub::tools::{Registry, register_meta_tools};
+use fronde_hub::tools::{Registry, meta_tools};
 use fronde_wasm::{
     Allowed, ComponentHost, ComponentSpec, Credential, Limits, LoadedComponent, Origin,
 };
@@ -471,8 +471,8 @@ async fn rejects_unsupported_api_version() {
 #[tokio::test]
 async fn tools_register_in_the_hub_registry() {
     let registry = Arc::new(Registry::new());
-    register_meta_tools(&registry).unwrap();
-    load(spec()).await.register(&registry).unwrap();
+    registry.replace_source("hub", meta_tools(&registry));
+    registry.replace_source("echo", load(spec()).await.tools());
 
     let visible: Vec<String> = registry.visible().into_iter().map(|d| d.name).collect();
     assert!(visible.contains(&"echo_text".to_string()), "{visible:?}");

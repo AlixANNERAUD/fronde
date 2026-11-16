@@ -104,7 +104,7 @@ origins granted here. Its manifest says what it asks for (see
 | `manifest` | path | The manifest. Default: the `.toml` file beside `path` with the same name (`calendar.wasm`, `calendar.toml`). |
 | `sha256` | hex string | SHA-256 of the `.wasm` file. Set it with `manifest_sha256`, or neither for a component shipped with Fronde. |
 | `manifest_sha256` | hex string | SHA-256 of the manifest. |
-| `allow` | array | Origins the component may reach: `"https://cloud.example"`, or `{ origin = "http://192.168.1.10:5232", local = true }` for a server on this machine or the local network. Each must be one the manifest asks for, and listed once. |
+| `allow` | array | Origins the component may reach: `"https://cloud.example"`, or `{ origin = "http://192.168.1.10:5232", local = true }` for a server on this machine or the local network. Each must be one the manifest asks for, and listed once. An IP address on a local network needs `local = true` (`fronde check` says so); link-local (169.254.0.0/16, fe80::/10) and cloud metadata addresses are refused even then. A request the sandbox refuses is logged as a warning naming the component, the origin and the fix. |
 | `settings` | table of strings | What the component reads, checked against the manifest's settings: unknown keys and missing required ones are errors. Never a secret: a URL setting with a user name or password in it is refused (put them in `credentials`). Fronde adds `timezone` from `[data]` when the manifest declares it and the table does not set it. |
 | `credentials` | array of tables | Secrets Fronde adds to the component's requests, one per origin; see below. |
 

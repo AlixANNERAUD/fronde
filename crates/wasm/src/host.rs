@@ -212,6 +212,7 @@ impl Sandbox {
                 table,
                 egress: Egress {
                     grants: self.grants.clone(),
+                    component: self.name.as_str().into(),
                     request_timeout: limits.request_timeout,
                 },
                 settings: self.settings.clone(),
