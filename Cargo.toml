@@ -27,7 +27,6 @@ chrono-tz = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 icalendar = "0.17"
 leptos = { version = "0.8.23", features = ["islands"] }
-leptos_axum = "0.8.10"
 leptos_meta = "0.8.7"
 leptos_router = "0.8.17"
 reqwest = "0.13"

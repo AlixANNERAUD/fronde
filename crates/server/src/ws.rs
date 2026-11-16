@@ -1,6 +1,6 @@
 //! The chat WebSocket: the conversation log streamed to the page, its messages passed to Jarvis.
 
-use crate::web::{Web, is_signed_in};
+use crate::web::{Web, is_signed_in, renew};
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -30,6 +30,7 @@ pub async fn upgrade(
             let _ = socket.send(Message::Close(Some(close))).await;
         });
     }
+    renew(&session);
     let jarvis = web.jarvis.clone();
     upgrade.on_upgrade(move |socket| chat(socket, jarvis))
 }

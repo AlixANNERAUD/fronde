@@ -20,7 +20,8 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 server-side Cargo commands leave out `jarvis-frontend` and `jarvis-web`
 (`$JARVIS_SERVER_PACKAGES`). UI classes come from Rust/UI
 (`crates/app/src/components/LICENSE-rust-ui`); styles are Tailwind in `style/main.css`. The
-server reads the built site from `JARVIS_SITE_ROOT` (default `target/site`).
+server reads the built interface from `JARVIS_SITE_ROOT` (default
+`target/dx/jarvis-web/release/web/public`, written by `mise run web-build`).
 
 Lint and tests run `jarvis-web` on its own, natively and for wasm32. It embeds
 `crates/web/assets/tailwind.css` at compile time: the hidden `web-css` task generates it from

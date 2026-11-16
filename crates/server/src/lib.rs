@@ -18,7 +18,7 @@ use jarvis_hub::mcp::HubServer;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -108,21 +108,26 @@ fn system_prompt(user: &str) -> String {
     )
 }
 
-/// Where the chat's browser bundle and stylesheet are: `JARVIS_SITE_ROOT`, else `target/site`,
-/// where `cargo leptos build` writes them.
+/// Where the web interface's files are: `JARVIS_SITE_ROOT`, else where `mise run web-build`
+/// writes them.
 fn site_root() -> PathBuf {
-    std::env::var_os("JARVIS_SITE_ROOT").map_or_else(|| PathBuf::from("target/site"), PathBuf::from)
+    std::env::var_os("JARVIS_SITE_ROOT").map_or_else(
+        || PathBuf::from("target/dx/jarvis-web/release/web/public"),
+        PathBuf::from,
+    )
 }
 
 /// Resolve secrets, start the hub and serve HTTP in the background.
 pub async fn start(config: Config) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    start_with(config, process_connector()).await
+    start_with(config, process_connector(), &site_root()).await
 }
 
-/// [`start`], with Jarvis reaching its agent through `connector`.
+/// [`start`], with Jarvis reaching its agent through `connector` and the web interface's files in
+/// `site_root`.
 pub async fn start_with(
     config: Config,
     connector: Connector,
+    site_root: &Path,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let token = config.server.token.resolve().context("server.token")?;
     check_token(&token)?;
@@ -164,7 +169,7 @@ pub async fn start_with(
                 throttle: Default::default(),
             },
             secure_cookie,
-            &site_root(),
+            site_root,
         ));
     }
     let handle = tokio::spawn(async move {

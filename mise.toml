@@ -61,11 +61,11 @@ description = "Everything CI checks, except the release build"
 depends = ["lint", "test", "deny"]
 
 # The first run writes a development configuration under target/dev: a random token, the
-# password `jarvis` and a data directory of its own. cargo-leptos 0.3.11 reads the binary's
-# arguments from its command line only, hence `-- serve`; `listen` must match `site-addr` in
-# Cargo.toml.
+# password `jarvis` and a data directory of its own. `listen` is where `web-dev` sends /ws and
+# sign-in (crates/web/Dioxus.toml); delete target/dev/jarvis.toml to rewrite a configuration made
+# before that.
 [tasks.dev]
-description = "Run the server with live reload on http://127.0.0.1:3000 (password: jarvis)"
+description = "Run the server on http://127.0.0.1:8484 for `mise run web-dev` (password: jarvis)"
 run = '''
 set -eu
 dev=target/dev
@@ -75,7 +75,7 @@ if [ ! -f "$dev/jarvis.toml" ]; then
   printf jarvis > "$dev/password"
   cat > "$dev/jarvis.toml" <<EOF
 [server]
-listen = "127.0.0.1:3000"
+listen = "127.0.0.1:8484"
 token = { file = "$PWD/$dev/token" }
 
 [data]
@@ -89,11 +89,8 @@ git = false
 password = { file = "$PWD/$dev/password" }
 EOF
 fi
-cargo leptos watch -- serve --config "$dev/jarvis.toml"
+cargo run --package jarvis -- serve --config "$dev/jarvis.toml"
 '''
-
-[tasks.dev.env]
-JARVIS_SITE_ROOT = "target/site"
 
 [tasks.build]
 description = "Build the release binary and the site into target/site"

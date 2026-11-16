@@ -54,7 +54,8 @@ target/release/jarvis serve --config jarvis.toml
 ```
 
 Open http://127.0.0.1:8484 and sign in with the chat password. The server reads the chat's files
-from `target/site`; run it from the checkout, or set `JARVIS_SITE_ROOT`.
+from `target/dx/jarvis-web/release/web/public` (`mise run web-build`); run it from the checkout, or
+set `JARVIS_SITE_ROOT`.
 
 ### Docker
 

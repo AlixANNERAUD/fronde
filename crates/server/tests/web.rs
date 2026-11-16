@@ -3,9 +3,11 @@ use jarvis_agent::acp::{AgentClient, AgentSpec};
 use jarvis_agent::fake::{FakeScript, fake_agent, text_chunk};
 use jarvis_agent::jarvis::Connector;
 use jarvis_protocol::{ClientMsg, Entry, Event, ServerMsg, TurnOutcome};
-use reqwest::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
+use reqwest::header::{
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE,
+};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -18,6 +20,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PASSWORD: &str = "correct horse battery staple";
 const WAIT: Duration = Duration::from_secs(10);
+const INDEX: &str =
+    "<!doctype html><title>Jarvis</title><script src=\"/assets/app-1a2b.js\"></script>";
+const CSS: &str = "body{color:red}";
+/// A well-formed session id the server never issued.
+const FORGED: &str = "jarvis_session=AAAAAAAAAAAAAAAAAAAAAA";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -64,13 +71,36 @@ fn fake_connector_with(script: FakeScript) -> (Connector, Arc<Mutex<Option<Agent
     (connector, seen)
 }
 
+/// A built interface as dx writes it: the page, hashed assets with their `.br` copies, and a
+/// file at the root.
+fn site(dir: &Path) -> PathBuf {
+    let site = dir.join("site");
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("index.html"), INDEX).unwrap();
+    std::fs::write(site.join("assets/app-1a2b.css"), CSS).unwrap();
+    std::fs::write(site.join("assets/app-1a2b.css.br"), "brotli bytes").unwrap();
+    std::fs::write(site.join("favicon.ico"), "icon").unwrap();
+    site
+}
+
 async fn start(dir: &Path) -> (SocketAddr, Arc<Mutex<Option<AgentSpec>>>) {
     let (connector, seen) = fake_connector();
-    let (addr, _server) = timeout(WAIT, jarvis::start_with(config(dir, true), connector))
+    (
+        start_with(config(dir, true), connector, &site(dir)).await,
+        seen,
+    )
+}
+
+async fn start_with(
+    config: jarvis_hub::config::Config,
+    connector: Connector,
+    site_root: &Path,
+) -> SocketAddr {
+    let (addr, _server) = timeout(WAIT, jarvis::start_with(config, connector, site_root))
         .await
         .unwrap()
         .unwrap();
-    (addr, seen)
+    addr
 }
 
 fn client() -> reqwest::Client {
@@ -277,6 +307,23 @@ async fn session_is_renewed_by_use() {
         renewed.contains(&format!("Max-Age={}", 30 * 24 * 3600)),
         "{renewed}"
     );
+
+    // The chat page stays open on its socket: opening it renews the session too.
+    let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+    let headers = request.headers_mut();
+    headers.insert("cookie", cookie.parse().unwrap());
+    headers.insert("origin", format!("http://{addr}").parse().unwrap());
+    let (_socket, response) = timeout(WAIT, tokio_tungstenite::connect_async(request))
+        .await
+        .unwrap()
+        .unwrap();
+    let renewed = response
+        .headers()
+        .get(SET_COOKIE)
+        .expect("the socket does not renew the session")
+        .to_str()
+        .unwrap();
+    assert!(renewed.starts_with(&format!("{cookie};")), "{renewed}");
 }
 
 #[tokio::test]
@@ -444,10 +491,7 @@ async fn hub_url_follows_the_listen_address() {
     let mut config = config(dir.path(), true);
     config.server.listen = "127.0.0.2:0".parse().unwrap();
     let (connector, seen) = fake_connector();
-    let (addr, _server) = timeout(WAIT, jarvis::start_with(config, connector))
-        .await
-        .unwrap()
-        .unwrap();
+    let addr = start_with(config, connector, &site(dir.path())).await;
     let cookie = sign_in(addr).await;
     let mut socket = open_chat(addr, &cookie).await;
     say(
@@ -474,10 +518,7 @@ async fn secure_cookie_marks_the_session_cookie_secure() {
     let mut config = config(dir.path(), true);
     config.web.as_mut().unwrap().secure_cookie = true;
     let (connector, _) = fake_connector();
-    let (addr, _server) = timeout(WAIT, jarvis::start_with(config, connector))
-        .await
-        .unwrap()
-        .unwrap();
+    let addr = start_with(config, connector, &site(dir.path())).await;
     let response = post_password(addr, PASSWORD).await;
     let set_cookie = response.headers()[SET_COOKIE].to_str().unwrap();
     assert!(set_cookie.contains("Secure"), "{set_cookie}");
@@ -487,13 +528,7 @@ async fn secure_cookie_marks_the_session_cookie_secure() {
 async fn without_web_section_no_chat_routes() {
     let dir = tempfile::tempdir().unwrap();
     let (connector, seen) = fake_connector();
-    let (addr, _server) = timeout(
-        WAIT,
-        jarvis::start_with(config(dir.path(), false), connector),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let addr = start_with(config(dir.path(), false), connector, &site(dir.path())).await;
     assert_eq!(get(addr, "/sign-in", None).await.status(), 404);
     assert_eq!(get(addr, "/health", None).await.status(), 200);
     assert!(seen.lock().unwrap().is_none());
@@ -524,74 +559,170 @@ fn check_requires_web_password_secret() {
     assert!(stderr.contains("web.password"), "{stderr}");
 }
 
-#[tokio::test]
-async fn sign_in_page_renders() {
-    let dir = tempfile::tempdir().unwrap();
-    let (addr, _) = start(dir.path()).await;
-
-    let page = get(addr, "/sign-in", None).await;
-    assert_eq!(page.status(), 200);
-    let html = page.text().await.unwrap();
-    assert!(html.contains("<title>Connexion · Jarvis</title>"), "{html}");
-    assert!(html.contains("href=\"/pkg/jarvis.css\""), "{html}");
-    assert!(html.contains("action=\"/sign-in\""), "{html}");
-    assert!(html.contains("type=\"password\""), "{html}");
-    assert!(html.contains("Mot de passe"), "{html}");
-    assert!(html.contains("Se connecter"), "{html}");
-    assert!(!html.contains("role=\"alert\""), "{html}");
+fn assert_security_headers(response: &reqwest::Response) {
     for (name, value) in [
         ("x-content-type-options", "nosniff"),
         ("content-security-policy", "frame-ancestors 'none'"),
         ("referrer-policy", "same-origin"),
     ] {
-        assert_eq!(get(addr, "/sign-in", None).await.headers()[name], value);
+        assert_eq!(response.headers()[name], value, "{name}");
     }
+}
 
-    let wrong = get(addr, "/sign-in?error=1", None)
-        .await
-        .text()
-        .await
-        .unwrap();
-    assert!(wrong.contains("Mot de passe incorrect."), "{wrong}");
-    let locked = get(addr, "/sign-in?error=2", None)
-        .await
-        .text()
-        .await
-        .unwrap();
+/// Checks that `response` is the interface's page, which browsers must check again each time.
+async fn assert_index(response: reqwest::Response) {
+    assert_eq!(response.status(), 200);
+    assert_security_headers(&response);
+    assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
     assert!(
-        locked.contains("Trop d'essais, réessaie dans une minute."),
-        "{locked}"
+        response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"),
     );
+    assert_eq!(response.text().await.unwrap(), INDEX);
 }
 
 #[tokio::test]
-async fn chat_page_redirects_without_session() {
+async fn sign_in_serves_index() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, _) = start(dir.path()).await;
 
-    for cookie in [None, Some("jarvis_session=forged")] {
-        let page = get(addr, "/", cookie).await;
-        assert_eq!(page.status(), 303);
-        assert_eq!(page.headers()[LOCATION], "/sign-in");
+    // The page reads its error from the query.
+    for path in ["/sign-in", "/sign-in?error=1"] {
+        let page = get(addr, path, None).await;
+        assert!(page.headers().get(SET_COOKIE).is_none());
+        assert_index(page).await;
     }
 }
 
 #[tokio::test]
-async fn chat_page_renders_island_when_signed_in() {
+async fn root_redirects_without_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+
+    for cookie in [None, Some("jarvis_session=forged"), Some(FORGED)] {
+        let page = get(addr, "/", cookie).await;
+        assert_eq!(page.status(), 303);
+        assert_eq!(page.headers()[LOCATION], "/sign-in");
+        assert_security_headers(&page);
+    }
+}
+
+#[tokio::test]
+async fn root_serves_index_when_signed_in() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, _) = start(dir.path()).await;
     let cookie = sign_in(addr).await;
 
-    let page = get(addr, "/", Some(&cookie)).await;
-    assert_eq!(page.status(), 200);
-    let html = page.text().await.unwrap();
-    assert!(html.contains("<title>Jarvis</title>"), "{html}");
-    assert!(html.contains("<leptos-island"), "{html}");
-    assert!(html.contains("ChatPanel"), "{html}");
-    assert!(html.contains("/pkg/jarvis.js"), "{html}");
-    assert!(html.contains("action=\"/sign-out\""), "{html}");
-    assert!(html.contains("Se déconnecter"), "{html}");
-    assert!(html.contains("<textarea"), "{html}");
+    assert_index(get(addr, "/", Some(&cookie)).await).await;
+}
+
+#[tokio::test]
+async fn assets_are_cached_long() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+
+    // Asset names change with their content, so browsers may keep them for good, without a session.
+    let css = get(addr, "/assets/app-1a2b.css", None).await;
+    assert_eq!(css.status(), 200);
+    assert_security_headers(&css);
+    assert_eq!(
+        css.headers()[CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+    assert!(
+        css.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    assert_eq!(css.text().await.unwrap(), CSS);
+
+    // The compressed copy dx wrote, for browsers that take it.
+    let brotli = timeout(
+        WAIT,
+        client()
+            .get(format!("http://{addr}/assets/app-1a2b.css"))
+            .header(ACCEPT_ENCODING, "br")
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(brotli.status(), 200);
+    assert_eq!(brotli.headers()[CONTENT_ENCODING], "br");
+    assert_eq!(brotli.text().await.unwrap(), "brotli bytes");
+
+    // A missing asset is not cached for a year.
+    let missing = get(addr, "/assets/gone-9z9z.js", None).await;
+    assert_eq!(missing.status(), 404);
+    assert!(missing.headers().get(CACHE_CONTROL).is_none());
+
+    // Other files at the site root are served as they are.
+    let icon = get(addr, "/favicon.ico", None).await;
+    assert_eq!(icon.status(), 200);
+    assert_eq!(icon.text().await.unwrap(), "icon");
+}
+
+#[tokio::test]
+async fn unknown_path_is_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+
+    for cookie in [None, Some(cookie.as_str())] {
+        let page = get(addr, "/nope", cookie).await;
+        assert_eq!(page.status(), 404);
+        assert_security_headers(&page);
+    }
+}
+
+#[tokio::test]
+async fn forged_cookie_creates_no_session() {
+    // Only signed-in sessions are saved again; an unknown id must not become a session.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+
+    for path in [
+        "/assets/app-1a2b.css",
+        "/assets/x",
+        "/nope",
+        "/sign-in",
+        "/health",
+    ] {
+        let response = get(addr, path, Some(FORGED)).await;
+        assert!(
+            response.headers().get(SET_COOKIE).is_none(),
+            "{path}: {:?}",
+            response.headers().get(SET_COOKIE)
+        );
+    }
+    let mut socket = connect(addr, Some(FORGED), Some(&format!("http://{addr}")))
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut socket).await, 4401);
+}
+
+#[tokio::test]
+async fn missing_build_answers_503() {
+    // The hub works before the interface is built; the pages say how to build it.
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let addr = start_with(config(dir.path(), true), connector, &empty).await;
+    let cookie = sign_in(addr).await;
+
+    for (path, cookie) in [("/sign-in", None), ("/", Some(cookie.as_str()))] {
+        let page = get(addr, path, cookie).await;
+        assert_eq!(page.status(), 503, "{path}");
+        assert_eq!(
+            page.text().await.unwrap(),
+            "Interface non construite : lance `mise run web-build`."
+        );
+    }
+    assert_eq!(get(addr, "/health", None).await.status(), 200);
 }
 
 #[tokio::test]
@@ -636,13 +767,7 @@ async fn reconnect_in_the_middle_of_an_answer_gets_the_rest_once() {
         pause: Some((1, gate.clone())),
         ..FakeScript::default()
     });
-    let (addr, _server) = timeout(
-        WAIT,
-        jarvis::start_with(config(dir.path(), true), connector),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let addr = start_with(config(dir.path(), true), connector, &site(dir.path())).await;
     let cookie = sign_in(addr).await;
 
     let mut first = open_chat(addr, &cookie).await;
