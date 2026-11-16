@@ -49,8 +49,9 @@ pub enum Item {
     },
 }
 
-/// An item with the seq of its first entry and a version that changes each time the item does,
-/// so the page re-renders only changed rows.
+/// An item with the seq of its first entry and a version that changes each time the item does.
+/// The page keys rows by [`Row::key`], which ignores the version, so a changed row re-renders
+/// in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     /// Which log the row comes from: seqs start again after a reset.
@@ -61,9 +62,10 @@ pub struct Row {
 }
 
 impl Row {
-    /// Identifies the row as drawn: a new key means a new element.
-    pub fn key(&self) -> (u32, u64, u32) {
-        (self.generation, self.seq, self.version)
+    /// Identifies the row's element: it survives the row's changes (`version`) and differs after a
+    /// log reset, where seqs start again.
+    pub fn key(&self) -> (u32, u64) {
+        (self.generation, self.seq)
     }
 }
 
@@ -287,6 +289,7 @@ mod tests {
             ],
         );
         let version = chat.rows()[1].version;
+        let key = chat.rows()[1].key();
         assert_eq!(
             items(&chat),
             [
@@ -317,6 +320,8 @@ mod tests {
             ],
         );
         assert_ne!(chat.rows()[1].version, version);
+        // The key stays, so the page keeps the bubble's element while the reply streams.
+        assert_eq!(chat.rows()[1].key(), key);
         assert_eq!(
             items(&chat)[1..],
             [

@@ -56,7 +56,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
                     aria_label: "Conversation",
                     class: "mx-auto flex w-full max-w-3xl flex-col gap-3 px-4 py-4",
                     for row in chat.rows() {
-                        li { key: "{row.generation}-{row.seq}-{row.version}", class: "flex flex-col",
+                        li { key: "{row.generation}-{row.seq}", class: "flex flex-col",
                             RowView { item: row.item.clone(), open, on_send }
                         }
                     }
