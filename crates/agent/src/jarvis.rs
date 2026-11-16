@@ -25,6 +25,8 @@ const FAILED: &str = "L'agent a rencontré une erreur.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
 /// How long the agent gets to start and open its session.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the agent gets to end a cancelled turn before it is stopped.
+const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 /// Opens an agent session: `AgentClient::spawn` in production, a fake agent in tests.
 pub type Connector = Arc<
@@ -188,6 +190,7 @@ impl Jarvis {
         };
         let prompt = session.client.prompt(text);
         tokio::pin!(prompt);
+        let mut wedged = false;
         let end = tokio::select! {
             // The prompt is polled first so the cancel always reaches the agent after it.
             biased;
@@ -196,12 +199,22 @@ impl Jarvis {
                 if let Err(error) = session.client.cancel() {
                     tracing::warn!("cannot cancel the turn: {error:#}");
                 }
-                prompt.await
+                match tokio::time::timeout(CANCEL_GRACE, &mut prompt).await {
+                    Ok(end) => end,
+                    Err(_) => {
+                        tracing::warn!(
+                            "the agent did not end the cancelled turn within {CANCEL_GRACE:?}; stopping it"
+                        );
+                        wedged = true;
+                        Ok(TurnEnd::Cancelled)
+                    }
+                }
             }
         };
         session.flush().await;
-        if end.is_err() {
-            // A failed turn may leave the connection broken: the next message reconnects.
+        if end.is_err() || wedged {
+            // A failed turn may leave the connection broken, and a wedged agent is stopped by
+            // dropping its client: the next message reconnects.
             *self.session_slot() = None;
         }
         Ok(match end? {

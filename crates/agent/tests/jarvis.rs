@@ -432,6 +432,49 @@ async fn cancel_ends_the_turn() {
     assert_eq!(fakes.handles()[0].record().cancels, 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn stop_frees_a_turn_the_agent_never_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = FakeScript {
+        updates: vec![text_chunk("Je cherche")],
+        ignore_cancel: true,
+        ..FakeScript::default()
+    };
+    let (jarvis, fakes) = open(dir.path(), script);
+    let searching = Event::Assistant {
+        text: "Je cherche".into(),
+    };
+
+    jarvis.send("Salut".into()).await;
+    wait_until(&jarvis, |events| events.contains(&searching)).await;
+    jarvis.cancel();
+    // The agent gets a grace period to end the turn itself.
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    assert_eq!(events(&jarvis), vec![user("Salut"), searching.clone()]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        events(&jarvis),
+        vec![user("Salut"), searching, ended(TurnOutcome::Cancelled)]
+    );
+    let record = fakes.handles()[0].record();
+    assert_eq!(record.cancels, 1);
+    // The wedged agent was let go.
+    assert!(record.closed);
+
+    // The next message is accepted, on a new connection.
+    jarvis.send("Encore".into()).await;
+    let events = wait_until(&jarvis, |events| events.contains(&user("Encore"))).await;
+    assert!(!events.contains(&notice(BUSY)), "{events:?}");
+    timeout(WAIT, async {
+        while fakes.handles().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no new connection");
+}
+
 #[tokio::test]
 async fn cancel_while_connecting_skips_the_prompt() {
     let dir = tempfile::tempdir().unwrap();

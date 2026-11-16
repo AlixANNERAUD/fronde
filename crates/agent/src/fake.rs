@@ -37,6 +37,8 @@ pub struct FakeScript {
     pub fail_prompt: bool,
     /// Answer each prompt with ACP's `auth_required` error, as a signed-out Claude does.
     pub signed_out: bool,
+    /// Never answer a prompt, even once it is cancelled, after the updates: a wedged agent.
+    pub ignore_cancel: bool,
 }
 
 impl Default for FakeScript {
@@ -51,6 +53,7 @@ impl Default for FakeScript {
             leave_permission_pending: false,
             fail_prompt: false,
             signed_out: false,
+            ignore_cancel: false,
         }
     }
 }
@@ -70,6 +73,8 @@ pub struct FakeRecord {
     pub modes: Vec<String>,
     pub permission_outcomes: Vec<RequestPermissionOutcome>,
     pub cancels: usize,
+    /// The client closed the connection.
+    pub closed: bool,
 }
 
 /// Reads what the fake agent recorded.
@@ -191,6 +196,9 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
                         if script.signed_out {
                             return responder.respond_with_error(Error::auth_required());
                         }
+                        if script.ignore_cancel {
+                            std::future::pending::<()>().await;
+                        }
                         let mut stop = script.stop;
                         if script.ask_permission {
                             if script.wait_for_cancel {
@@ -218,7 +226,10 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
             agent_client_protocol::on_receive_request!(),
         );
 
-    tokio::spawn(agent.connect_to(agent_end));
+    tokio::spawn(async move {
+        let _ = agent.connect_to(agent_end).await;
+        lock(&record).closed = true;
+    });
     (client_end, handle)
 }
 
