@@ -293,7 +293,7 @@ impl Assistant {
     /// Written aside then renamed, so a crash never leaves half an id behind.
     fn save_session_id(&self, id: &str) -> anyhow::Result<()> {
         let temporary = self.session_file.with_extension("session.tmp");
-        std::fs::write(&temporary, id)
+        crate::log::write_private(&temporary, id.as_bytes())
             .with_context(|| format!("writing {}", temporary.display()))?;
         std::fs::rename(&temporary, &self.session_file)
             .with_context(|| format!("replacing {}", self.session_file.display()))

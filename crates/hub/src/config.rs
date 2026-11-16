@@ -121,6 +121,7 @@ impl Secret {
     pub fn resolve(&self) -> anyhow::Result<String> {
         match self {
             Secret::File { file } => {
+                crate::private::check_secret_file(file)?;
                 let s = std::fs::read_to_string(file)
                     .with_context(|| format!("cannot read secret file {}", file.display()))?;
                 Ok(s.trim_end_matches(['\n', '\r']).to_string())

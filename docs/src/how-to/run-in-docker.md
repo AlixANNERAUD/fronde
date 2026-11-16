@@ -39,6 +39,11 @@ Create the secrets. Fronde runs as uid 65532, which must be able to read them:
 sudo chown 65532 fronde_token fronde_password
 ```
 
+If you use Docker's own `secrets:` (Compose or Swarm) instead of bind-mounted files, the runtime
+mounts them with mode 0444 and root as owner, which Fronde refuses by default. Set
+`FRONDE_ALLOW_SHARED_SECRET_FILES=1` in the container's environment to accept them. Bind-mounted
+files kept at mode 0600 and owned by uid 65532, as above, need no override.
+
 ## 3. Run it
 
 ```sh

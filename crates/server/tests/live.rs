@@ -27,8 +27,8 @@ const TURN: Duration = Duration::from_secs(180);
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn config(dir: &Path, agent: &str) -> fronde_hub::config::Config {
-    std::fs::write(dir.join("token"), TOKEN).unwrap();
-    std::fs::write(dir.join("password"), PASSWORD).unwrap();
+    fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(dir.join("password"), PASSWORD).unwrap();
     let env = match std::env::var("FRONDE_LIVE_CLAUDE") {
         Ok(claude) => format!("{{ CLAUDE_CODE_EXECUTABLE = {claude:?} }}"),
         Err(_) => "{}".to_owned(),

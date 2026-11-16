@@ -85,6 +85,23 @@ mod tests {
     use rmcp::ServiceExt;
     use rmcp::model::CallToolRequestParams;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_creates_private_data_dir_and_tightens_existing() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        start_hub(&data).await;
+        for p in ["", "memory", "memory/journal"] {
+            assert_eq!(mode(&data.join(p)), 0o700, "{p}");
+        }
+        assert_eq!(mode(&data.join("index.sqlite")), 0o600);
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        start_hub(&data).await;
+        assert_eq!(mode(&data), 0o700);
+    }
+
     async fn start_hub(dir: &std::path::Path) -> Arc<Hub> {
         let toml = format!(
             "[server]\ntoken = {{ env = \"UNUSED\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"alix\"\n[memory]\ngit = false\n",

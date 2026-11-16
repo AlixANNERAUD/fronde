@@ -6,7 +6,7 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 fn config(dir: &std::path::Path, token: &str) -> fronde_hub::config::Config {
     let token_file = dir.join("token");
-    std::fs::write(&token_file, token).unwrap();
+    fronde_hub::private::write(&token_file, token).unwrap();
     let toml = format!(
         "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n",
         token_file.display().to_string(),
@@ -109,7 +109,7 @@ fn check_reports_unknown_key() {
 #[test]
 fn check_accepts_valid_config() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
     let path = dir.path().join("fronde.toml");
     std::fs::write(&path, format!("[server]\ntoken = {{ file = {:?} }}\n[data]\ndir = \"/tmp/x\"\ntimezone = \"Europe/Paris\"\n", dir.path().join("token").display().to_string())).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
@@ -124,6 +124,34 @@ fn check_accepts_valid_config() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("config OK"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_refuses_shared_secret_file_unless_allowed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(&path, format!("[server]\ntoken = {{ file = {:?} }}\n[data]\ndir = \"/tmp/x\"\ntimezone = \"Europe/Paris\"\n", token.display().to_string())).unwrap();
+    let run = |allow: bool| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"));
+        cmd.args(["check", "--config"]).arg(&path);
+        if allow {
+            cmd.env("FRONDE_ALLOW_SHARED_SECRET_FILES", "1");
+        }
+        cmd.output().unwrap()
+    };
+    let out = run(false);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("readable by other users; run chmod 600"),
+        "{stderr}"
+    );
+    assert_eq!(run(true).status.code(), Some(0));
 }
 
 #[tokio::test]

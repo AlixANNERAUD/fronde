@@ -29,8 +29,8 @@ const FORGED: &str = "fronde_session=AAAAAAAAAAAAAAAAAAAAAA";
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn config(dir: &Path, web: bool) -> fronde_hub::config::Config {
-    std::fs::write(dir.join("token"), TOKEN).unwrap();
-    std::fs::write(dir.join("password"), format!("{PASSWORD}\n")).unwrap();
+    fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(dir.join("password"), format!("{PASSWORD}\n")).unwrap();
     let mut toml = format!(
         "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n[memory]\ngit = false\n[agent]\nenv = {{ FRONDE_TEST = \"1\" }}\nbuiltin_tools = [\"WebFetch\"]\n",
         dir.join("token").display().to_string(),
@@ -539,7 +539,7 @@ async fn without_web_section_no_chat_routes() {
 #[test]
 fn check_requires_web_password_secret() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
     let path = dir.path().join("fronde.toml");
     std::fs::write(
         &path,

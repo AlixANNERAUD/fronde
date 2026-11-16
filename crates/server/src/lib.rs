@@ -151,7 +151,7 @@ pub async fn start_with(
     let mut app = router(hub, token.clone());
     if let Some((password, secure_cookie)) = password {
         let cwd = data_dir.join("agent");
-        std::fs::create_dir_all(&cwd)
+        fronde_hub::private::create_dir_all(&cwd)
             .with_context(|| format!("cannot create the agent dir {}", cwd.display()))?;
         let spec = AgentSpec {
             command: agent.command,

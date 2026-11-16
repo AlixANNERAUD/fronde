@@ -10,6 +10,18 @@ where each one is: `{ file = "…" }` or `{ env = "…" }`. The configuration ca
 shared or mounted read-only. `[agent] env` is written in plain text, so it is for settings only;
 the Claude token reaches the agent through Fronde's own environment.
 
+A secret file must be mode 0600 and owned by the user running Fronde; otherwise Fronde refuses to
+read it. Setting `FRONDE_ALLOW_SHARED_SECRET_FILES=1` lifts the check for setups like Docker
+secrets, where the runtime sets the file's mode and owner.
+
+## Personal data on disk
+
+Fronde creates its data directory and every directory inside it with mode 0700, and every file it
+writes (memory, conversation log, session id, search index, temporary files) with mode 0600,
+whatever the umask. At start, a data directory that group or others could enter is tightened to
+0700 and a warning is logged. Other users on the same machine cannot read your memory or
+conversation. This does not encrypt anything: see below.
+
 ## Two doors
 
 - **`/mcp`** needs the bearer token, compared in constant time. It is at least 32 characters, so
@@ -57,5 +69,5 @@ see [Component interface](../reference/wit-interface.md).
 ## What is out of scope
 
 - Several users: there is one password and one conversation.
-- Encryption at rest: protect the data directory with the machine's own means.
+- Encryption at rest: file modes keep other users out, but not someone with the disk. Protect the data directory with the machine's own means.
 - TLS: put Fronde behind a reverse proxy for https. Built-in TLS is **planned** with federation.

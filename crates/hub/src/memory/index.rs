@@ -28,6 +28,9 @@ fn relative(root: &Path, file: &Path) -> String {
 
 impl MemoryIndex {
     pub fn open(db: &Path) -> anyhow::Result<Self> {
+        // Create the file 0600 first: SQLite would use the umask, and its -wal and -shm
+        // files copy the main file's mode.
+        crate::private::write_if_missing(db)?;
         let conn = Connection::open(db)?;
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS m USING fts5(file UNINDEXED, line UNINDEXED, text, \

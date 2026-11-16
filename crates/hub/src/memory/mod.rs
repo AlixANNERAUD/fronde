@@ -94,17 +94,17 @@ fn read(path: &Path) -> std::io::Result<String> {
 
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(tmp, path)
+    crate::private::write_atomic(path, &tmp, content)
 }
 
 impl MemoryStore {
     pub fn open(dir: &Path, cfg: &MemoryConfig, tz: Tz) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(dir.join("journal"))?;
+        crate::private::create_dir_all(&dir.join("journal"))?;
+        crate::private::tighten_dir(dir)?;
         for f in ["USER.md", "MEMORY.md"] {
             let p = dir.join(f);
             if !p.exists() {
-                std::fs::write(p, "")?;
+                crate::private::write(&p, "")?;
             }
         }
         Ok(Self {
@@ -254,6 +254,20 @@ mod tests {
         };
         let s = MemoryStore::open(dir.path(), &cfg, chrono_tz::Europe::Paris).unwrap();
         (dir, s)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_dirs_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _s) = store(100);
+        let mode =
+            |p: std::path::PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.path().join("journal")), 0o700);
+        assert_eq!(mode(dir.path().to_path_buf()), 0o700);
+        assert_eq!(mode(dir.path().join("MEMORY.md")), 0o600);
+        write_atomic(&dir.path().join("MEMORY.md"), "x").unwrap();
+        assert_eq!(mode(dir.path().join("MEMORY.md")), 0o600);
     }
 
     fn now() -> DateTime<Utc> {

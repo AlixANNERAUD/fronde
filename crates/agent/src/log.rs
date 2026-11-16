@@ -69,12 +69,13 @@ impl ConversationLog {
             Some(id) => id,
             None => write_header(path)?,
         };
-        let mut file = OpenOptions::new()
+        let mut file = private_options()
             .create(true)
             .read(true)
             .append(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
+        restrict(path).with_context(|| format!("restricting {}", path.display()))?;
         let length = file.metadata()?.len();
         let torn = length > 0 && {
             let mut last = [0u8; 1];
@@ -176,10 +177,39 @@ fn write_header(path: &Path) -> anyhow::Result<String> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = std::path::PathBuf::from(temporary);
-    std::fs::write(&temporary, bytes)
+    write_private(&temporary, &bytes)
         .with_context(|| format!("writing {}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(log_id)
+}
+
+/// Options for a file only its owner can read, whatever the umask says.
+pub(crate) fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
+/// Make an existing file 0600 (one from an older version may be open to others).
+pub(crate) fn restrict(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Write a file that is 0600 from its creation.
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = private_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    restrict(path)?;
+    file.write_all(bytes)
 }
 
 #[cfg(test)]
@@ -188,6 +218,26 @@ mod tests {
 
     fn user(text: &str) -> Event {
         Event::User { text: text.into() }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let log = ConversationLog::open(&path).unwrap();
+        log.append(user("a")).unwrap();
+        let fresh = dir.path().join("new.jsonl");
+        ConversationLog::open(&fresh).unwrap();
+        for p in [&path, &fresh] {
+            assert_eq!(
+                std::fs::metadata(p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

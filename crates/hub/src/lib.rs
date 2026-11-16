@@ -5,6 +5,7 @@ pub mod config;
 pub mod guide;
 pub mod mcp;
 pub mod memory;
+pub mod private;
 pub mod search;
 pub mod tools;
 pub mod upstream;
@@ -29,8 +30,10 @@ impl Hub {
     /// Open memory, register native tools and start upstream connections (in the background).
     pub async fn start(config: Config) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
-        std::fs::create_dir_all(dir)
+        private::create_dir_all(dir)
             .with_context(|| format!("cannot create data dir {}", dir.display()))?;
+        private::tighten_dir(dir)
+            .with_context(|| format!("cannot restrict data dir {}", dir.display()))?;
         let memory = Arc::new(MemoryStore::open(
             &dir.join("memory"),
             &config.memory,

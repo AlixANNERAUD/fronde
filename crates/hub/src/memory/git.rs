@@ -45,7 +45,7 @@ pub fn commit_all(dir: &Path, message: &str) {
         if !git(dir, &["init", "-q"]) {
             return;
         }
-        let _ = std::fs::write(dir.join(".gitignore"), "*.sqlite*\n*.tmp\n");
+        let _ = crate::private::write(dir.join(".gitignore"), "*.sqlite*\n*.tmp\n");
     }
     if git(dir, &["add", "-A"]) {
         git(

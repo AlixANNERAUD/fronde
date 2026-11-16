@@ -17,6 +17,12 @@ A secret is never written in the file. It is one of:
 
 The settings below marked *secret* take one of these forms.
 
+A secret file must be private. On Unix, Fronde refuses a file that group or others can read or
+write, or that another user owns, and says so: `secret file <path> is readable by other users; run
+chmod 600 <path>`. `fronde check` reports it too. For Docker secrets, which are usually mode 0444
+and owned by root, set the environment variable `FRONDE_ALLOW_SHARED_SECRET_FILES=1` to skip
+this check. It is off by default and applies to every secret file.
+
 ## `[server]`
 
 Required.
