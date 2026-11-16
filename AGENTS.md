@@ -38,6 +38,10 @@ through mr-boxington.
 
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 
+`crates/server/tests/live.rs` chats with the real Claude adapter on the owner's subscription. It
+is ignored and runs only by hand, with `JARVIS_LIVE_AGENT` set to the adapter's path:
+`mise exec -- cargo nextest run -p jarvis --test live --run-ignored only --no-capture`.
+
 ## Rules
 
 - Keep it as simple as possible: add a mechanism only when its absence hurts.
