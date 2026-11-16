@@ -1,6 +1,5 @@
-//! Hub: tools, memory, calendar and MCP server.
+//! Hub: tools, memory, tool sources and the MCP server.
 
-pub mod calendar;
 pub mod config;
 pub mod guide;
 pub mod mcp;
