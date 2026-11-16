@@ -167,6 +167,18 @@ async fn until_turn_ended(socket: &mut Socket) -> Vec<Entry> {
     }
 }
 
+/// The code of the close frame the server sends next.
+async fn close_code(socket: &mut Socket) -> u16 {
+    loop {
+        match timeout(WAIT, socket.next()).await.unwrap() {
+            Some(Ok(Message::Close(Some(frame)))) => return frame.code.into(),
+            Some(Ok(Message::Close(None))) | None => panic!("closed without a code"),
+            Some(Ok(_)) => {}
+            Some(Err(error)) => panic!("socket error: {error}"),
+        }
+    }
+}
+
 fn status_of(error: tungstenite::Error) -> u16 {
     match error {
         tungstenite::Error::Http(response) => response.status().as_u16(),
@@ -225,12 +237,12 @@ async fn ws_requires_session_and_same_origin() {
     let (addr, _) = start(dir.path()).await;
     let origin = format!("http://{addr}");
 
-    let anonymous = connect(addr, None, Some(&origin)).await.unwrap_err();
-    assert_eq!(status_of(anonymous), 401);
-    let forged = connect(addr, Some("jarvis_session=forged"), Some(&origin))
-        .await
-        .unwrap_err();
-    assert_eq!(status_of(forged), 401);
+    // Without a session the socket opens and closes at once with 4401, which a page can read
+    // (a refused upgrade only shows as 1006) to go and sign in.
+    for cookie in [None, Some("jarvis_session=forged")] {
+        let mut socket = connect(addr, cookie, Some(&origin)).await.unwrap();
+        assert_eq!(close_code(&mut socket).await, 4401);
+    }
 
     let cookie = sign_in(addr).await;
     let cross_site = connect(addr, Some(&cookie), Some("https://evil.example"))
@@ -427,6 +439,13 @@ async fn sign_in_page_renders() {
     assert!(html.contains("Mot de passe"), "{html}");
     assert!(html.contains("Se connecter"), "{html}");
     assert!(!html.contains("role=\"alert\""), "{html}");
+    for (name, value) in [
+        ("x-content-type-options", "nosniff"),
+        ("content-security-policy", "frame-ancestors 'none'"),
+        ("referrer-policy", "same-origin"),
+    ] {
+        assert_eq!(get(addr, "/sign-in", None).await.headers()[name], value);
+    }
 
     let wrong = get(addr, "/sign-in?error=1", None)
         .await

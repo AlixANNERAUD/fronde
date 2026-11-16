@@ -63,6 +63,10 @@ pub struct Entry {
     pub event: Event,
 }
 
+/// The close code of a chat WebSocket opened without a session: the page must sign in again.
+/// Browsers show a refused upgrade only as 1006, like a network failure.
+pub const CLOSE_SIGNED_OUT: u16 = 4401;
+
 /// What the chat page sends over the WebSocket.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]

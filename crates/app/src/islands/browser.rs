@@ -14,7 +14,7 @@ mod imp {
         socket: web_sys::WebSocket,
         _on_open: Closure<dyn FnMut()>,
         _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
-        _on_close: Closure<dyn FnMut()>,
+        _on_close: Closure<dyn FnMut(web_sys::CloseEvent)>,
     }
 
     impl Socket {
@@ -22,7 +22,7 @@ mod imp {
             path: &str,
             on_open: impl FnMut() + 'static,
             mut on_message: impl FnMut(String) + 'static,
-            on_close: impl FnMut() + 'static,
+            mut on_close: impl FnMut(u16) + 'static,
         ) -> Option<Self> {
             let location = window().location();
             let scheme = if location.protocol().ok()? == "https:" {
@@ -42,7 +42,11 @@ mod imp {
                 },
             );
             // A failed connection is closed too, so `onerror` adds nothing.
-            let on_close = Closure::<dyn FnMut()>::new(on_close);
+            let on_close = Closure::<dyn FnMut(web_sys::CloseEvent)>::new(
+                move |event: web_sys::CloseEvent| {
+                    on_close(event.code());
+                },
+            );
             socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
             socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
             socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -67,6 +71,10 @@ mod imp {
             self.socket.set_onclose(None);
             let _ = self.socket.close();
         }
+    }
+
+    pub fn go_to(path: &str) {
+        let _ = window().location().assign(path);
     }
 
     pub fn on_visible(callback: impl Fn() + 'static) {
@@ -116,12 +124,12 @@ pub struct Socket;
 #[cfg(not(feature = "hydrate"))]
 impl Socket {
     /// Opens a WebSocket to `path` on this site (`wss` on https); `None` when the browser
-    /// refuses. `on_close` runs when it closes or fails to connect.
+    /// refuses. `on_close` runs with the close code when it closes or fails to connect.
     pub fn open(
         path: &str,
         on_open: impl FnMut() + 'static,
         on_message: impl FnMut(String) + 'static,
-        on_close: impl FnMut() + 'static,
+        on_close: impl FnMut(u16) + 'static,
     ) -> Option<Self> {
         let _ = (path, on_open, on_message, on_close);
         None
@@ -140,6 +148,14 @@ pub fn after(delay: Duration, callback: impl FnOnce() + 'static) {
     leptos::prelude::set_timeout(callback, delay);
     #[cfg(not(feature = "hydrate"))]
     let _ = (delay, callback);
+}
+
+/// Leaves for another page of this site.
+pub fn go_to(path: &str) {
+    #[cfg(feature = "hydrate")]
+    imp::go_to(path);
+    #[cfg(not(feature = "hydrate"))]
+    let _ = path;
 }
 
 /// Runs `callback` each time the page becomes visible again.

@@ -49,13 +49,22 @@ pub enum Item {
     },
 }
 
-/// An item with the seq of its first entry, which identifies it, and a version that changes
-/// each time the item does, so the page re-renders only changed rows.
+/// An item with the seq of its first entry and a version that changes each time the item does,
+/// so the page re-renders only changed rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
+    /// Which log the row comes from: seqs start again after a reset.
+    pub generation: u32,
     pub seq: u64,
     pub version: u32,
     pub item: Item,
+}
+
+impl Row {
+    /// Identifies the row as drawn: a new key means a new element.
+    pub fn key(&self) -> (u32, u64, u32) {
+        (self.generation, self.seq, self.version)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -66,6 +75,8 @@ pub struct Chat {
     running: bool,
     /// The next entry is the first the server sends after a hello.
     replaying: bool,
+    /// Counts log resets.
+    generation: u32,
 }
 
 impl Chat {
@@ -92,7 +103,10 @@ impl Chat {
         // After a hello the server only sends newer entries, unless its log restarted from 1
         // (it was deleted): then what the page shows is gone too.
         if std::mem::take(&mut self.replaying) && entry.seq <= self.last_seq {
-            *self = Self::default();
+            *self = Self {
+                generation: self.generation + 1,
+                ..Self::default()
+            };
         }
         if entry.seq <= self.last_seq {
             return;
@@ -174,6 +188,7 @@ impl Chat {
 
     fn push(&mut self, seq: u64, item: Item) {
         self.rows.push(Row {
+            generation: self.generation,
             seq,
             version: 0,
             item,
@@ -491,6 +506,13 @@ mod tests {
                 Item::Assistant { text: "B".into() },
             ]
         );
+
+        // The new rows get keys of their own: the page drops the old rows instead of keeping
+        // them under a reused seq.
+        let mut before = Chat::default();
+        apply_all(&mut before, [user(1, "Un")]);
+        assert_ne!(before.rows()[0].key(), chat.rows()[0].key());
+        assert_eq!(chat.rows()[0].seq, before.rows()[0].seq);
 
         // Without a reset, the first entry after hello is a new one.
         assert_eq!(chat.hello(), 2);

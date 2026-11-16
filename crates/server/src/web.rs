@@ -2,7 +2,7 @@
 
 use crate::ws;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -97,6 +97,25 @@ pub fn router(web: Web, secure_cookie: bool, site_root: &Path) -> Router {
         .with_state(Arc::new(web))
         .merge(pages(site_root))
         .layer(sessions)
+        .layer(middleware::map_response(security_headers))
+}
+
+/// No page may be framed by another site, sniffed into another type, or leak its address.
+async fn security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
+    );
+    response
 }
 
 /// The Leptos pages, and the site root's files for any other path.

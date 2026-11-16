@@ -2,11 +2,11 @@
 
 use crate::web::{Web, is_signed_in};
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use jarvis_agent::jarvis::Jarvis;
-use jarvis_protocol::{ClientMsg, Entry, ServerMsg};
+use jarvis_protocol::{CLOSE_SIGNED_OUT, ClientMsg, Entry, ServerMsg};
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tower_sessions::Session;
@@ -22,7 +22,13 @@ pub async fn upgrade(
         return StatusCode::FORBIDDEN.into_response();
     }
     if !is_signed_in(&session).await {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return upgrade.on_upgrade(|mut socket| async move {
+            let close = CloseFrame {
+                code: CLOSE_SIGNED_OUT,
+                reason: "".into(),
+            };
+            let _ = socket.send(Message::Close(Some(close))).await;
+        });
     }
     let jarvis = web.jarvis.clone();
     upgrade.on_upgrade(move |socket| chat(socket, jarvis))

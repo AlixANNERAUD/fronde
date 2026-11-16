@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use jarvis_protocol::{ClientMsg, ServerMsg};
+use jarvis_protocol::{CLOSE_SIGNED_OUT, ClientMsg, ServerMsg};
 use leptos::{ev, prelude::*};
 
 use super::browser::{self, Socket};
@@ -70,8 +70,14 @@ impl Connection {
                     }
                 }
             },
-            move || {
-                if current() {
+            move |code| {
+                if !current() {
+                    return;
+                }
+                if code == CLOSE_SIGNED_OUT {
+                    // The session expired, or the server restarted and forgot it.
+                    browser::go_to("/sign-in");
+                } else {
                     self.retry_later(attempt);
                 }
             },
@@ -150,22 +156,27 @@ fn PermissionCard(
     status: PermissionStatus,
     connection: Connection,
 ) -> impl IntoView {
+    // Answered once: the card changes when the server logs the answer.
+    let sent = RwSignal::new(false);
     let answer = move |allow: bool| {
         // The server numbers its requests; anything else cannot be answered.
         let id = id.parse::<u64>().ok();
         move |_: ev::MouseEvent| {
-            if let Some(id) = id {
-                connection.send(&ClientMsg::Answer { id, allow });
+            if let Some(id) = id
+                && connection.send(&ClientMsg::Answer { id, allow })
+            {
+                sent.set(true);
             }
         }
     };
+    let disabled = move || sent.get() || !connection.is_open();
     let footer = match status {
         PermissionStatus::Open => view! {
             <div class="flex gap-2">
                 <button
                     type="button"
                     class=button_class(ButtonVariant::Default, ButtonSize::Small)
-                    disabled=move || !connection.is_open()
+                    disabled=disabled
                     on:click=answer(true)
                 >
                     "Autoriser"
@@ -173,7 +184,7 @@ fn PermissionCard(
                 <button
                     type="button"
                     class=button_class(ButtonVariant::Outline, ButtonSize::Small)
-                    disabled=move || !connection.is_open()
+                    disabled=disabled
                     on:click=answer(false)
                 >
                     "Refuser"
@@ -231,6 +242,10 @@ pub fn ChatPanel() -> impl IntoView {
         browser::on_visible(move || connection.wake());
     });
     let submit = move || {
+        // The server refuses a message while a turn runs: the draft stays for later.
+        if chat.with_untracked(Chat::running) {
+            return;
+        }
         let text = draft.with_untracked(|draft| draft.trim().to_owned());
         if !text.is_empty() && connection.send(&ClientMsg::Send { text }) {
             draft.set(String::new());
@@ -290,7 +305,7 @@ pub fn ChatPanel() -> impl IntoView {
             <ol aria-label="Conversation" class="flex flex-1 flex-col gap-3 px-4 py-4">
                 <For
                     each=move || chat.with(|chat| chat.rows().to_vec())
-                    key=|row| (row.seq, row.version)
+                    key=Row::key
                     children=move |row| view! { <li class="flex flex-col">{row_view(row, connection)}</li> }
                 />
             </ol>
