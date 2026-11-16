@@ -16,10 +16,14 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | `crates/server` | The `jarvis` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the chat pages and `/ws` |
 
 `jarvis-app` builds with `ssr` for the server and with `hydrate` for the browser, never both:
-server-side Cargo commands leave out `jarvis-frontend` (`$JARVIS_SERVER_PACKAGES`). UI classes
-come from Rust/UI (`crates/app/src/components/LICENSE-rust-ui`); styles are Tailwind in
-`style/main.css`. The server reads the built site from `JARVIS_SITE_ROOT` (default
-`target/site`).
+server-side Cargo commands leave out `jarvis-frontend` and `jarvis-web`
+(`$JARVIS_SERVER_PACKAGES`). UI classes come from Rust/UI
+(`crates/app/src/components/LICENSE-rust-ui`); styles are Tailwind in `style/main.css`. The
+server reads the built site from `JARVIS_SITE_ROOT` (default `target/site`).
+
+Lint and tests run `jarvis-web` on its own, natively and for wasm32. It embeds
+`crates/web/assets/tailwind.css` at compile time: dx generates it from `crates/web/tailwind.css`
+before its builds, and `lint` and `test` run the hidden `web-css` task first.
 
 ## Commands
 
@@ -36,6 +40,8 @@ through mr-boxington.
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
 | `mise run dev` | The server with live reload on http://127.0.0.1:3000 (password `jarvis`; config in `target/dev`) |
 | `mise run build` | Release build: `target/release/jarvis` and the site in `target/site` |
+| `mise run web-build` | Release build of the Dioxus interface into `target/dx/jarvis-web/release/web/public` |
+| `mise run web-dev` | The Dioxus interface with hot reload (dx serve); `/ws`, `/sign-in` and `/sign-out` go to a jarvis server on 127.0.0.1:8484 |
 
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 

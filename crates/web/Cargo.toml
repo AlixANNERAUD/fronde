@@ -1,0 +1,37 @@
+[package]
+name = "jarvis-web"
+description = "Web interface of jarvis, built with Dioxus."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+dioxus.workspace = true
+icons.workspace = true
+jarvis-client = { path = "../client" }
+jarvis-protocol = { path = "../protocol" }
+serde_json.workspace = true
+strum.workspace = true
+tw_merge.workspace = true
+
+# The WebSocket, its retry timer and the page's visibility exist only in the browser; natively
+# the page compiles without them so its components are tested with dioxus-ssr.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures.workspace = true
+gloo-net.workspace = true
+gloo-timers.workspace = true
+wasm-bindgen.workspace = true
+web-sys = { workspace = true, features = ["Document", "Location", "VisibilityState", "Window"] }
+
+[dev-dependencies]
+dioxus-ssr.workspace = true
+
+[features]
+default = []
+# dx enables it for `--platform web`.
+web = ["dioxus/web"]
+
+[lints]
+workspace = true

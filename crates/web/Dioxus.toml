@@ -1,0 +1,19 @@
+[application]
+name = "jarvis-web"
+
+[web]
+# Writes .br copies of the release files next to them, for the server to send.
+pre_compress = true
+
+[web.app]
+title = "Jarvis"
+
+# `dx serve` serves the interface; a jarvis server on 127.0.0.1:8484 answers the rest.
+[[web.proxy]]
+backend = "http://127.0.0.1:8484/ws"
+
+[[web.proxy]]
+backend = "http://127.0.0.1:8484/sign-in"
+
+[[web.proxy]]
+backend = "http://127.0.0.1:8484/sign-out"

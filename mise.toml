@@ -11,11 +11,15 @@ mr-boxington = "latest"
 # versions are cargo-leptos 0.3.11's defaults.
 "github:WebAssembly/binaryen" = { version = "123", version_prefix = "version_" }
 "aqua:tailwindlabs/tailwindcss" = "4.2.1"
+# The Dioxus CLI builds the web interface. It downloads the tools it needs itself (wasm-bindgen
+# matching Cargo.lock, wasm-opt, esbuild, Tailwind) into ~/.local/share/.dx.
+"github:DioxusLabs/dioxus" = "0.7.10"
 
 [env]
 # The browser bundle is built separately for wasm32, so server-side commands leave it out to
 # avoid unifying the `ssr` and `hydrate` features of the app crate.
-JARVIS_SERVER_PACKAGES = "--workspace --exclude jarvis-frontend"
+JARVIS_SERVER_PACKAGES = "--workspace --exclude jarvis-frontend --exclude jarvis-web"
+DX_TELEMETRY_ENABLED = "false"
 
 [tasks.format]
 description = "Format the code"
@@ -23,15 +27,29 @@ run = "cargo fmt --all"
 
 [tasks.lint]
 description = "Check formatting and run clippy on the server and browser code"
+depends = ["web-css"]
 run = [
   "cargo fmt --all --check",
   "cargo clippy $JARVIS_SERVER_PACKAGES --all-targets -- -D warnings",
   "cargo clippy --package jarvis-frontend --target wasm32-unknown-unknown -- -D warnings",
+  "cargo clippy --package jarvis-web --all-targets -- -D warnings",
+  "cargo clippy --package jarvis-web --target wasm32-unknown-unknown -- -D warnings",
 ]
 
 [tasks.test]
 description = "Run the test suite"
-run = "cargo nextest run $JARVIS_SERVER_PACKAGES --no-tests=pass"
+depends = ["web-css"]
+run = [
+  "cargo nextest run $JARVIS_SERVER_PACKAGES --no-tests=pass",
+  "cargo nextest run --package jarvis-web",
+]
+
+# The web crate embeds its stylesheet at compile time, so Cargo needs the file; dx writes it again
+# with its own Tailwind before each of its builds.
+[tasks.web-css]
+description = "Generate the web interface's stylesheet"
+hide = true
+run = "tailwindcss --input crates/web/tailwind.css --output crates/web/assets/tailwind.css"
 
 [tasks.deny]
 description = "Check advisories, licences, bans and sources"
@@ -79,3 +97,11 @@ JARVIS_SITE_ROOT = "target/site"
 [tasks.build]
 description = "Build the release binary and the site into target/site"
 run = "cargo leptos build --release"
+
+[tasks.web-build]
+description = "Build the web interface into target/dx/jarvis-web/release/web/public"
+run = "dx build --package jarvis-web --platform web --release"
+
+[tasks.web-dev]
+description = "Serve the web interface with hot reload; a jarvis server on 127.0.0.1:8484 answers /ws and sign-in"
+run = "dx serve --package jarvis-web --platform web"
