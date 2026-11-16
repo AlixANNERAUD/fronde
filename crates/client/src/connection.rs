@@ -88,6 +88,8 @@ impl Connection {
     pub fn on_visible(&mut self) -> Option<Action> {
         if matches!(self.state, State::Retrying { .. }) {
             self.state = State::Connecting;
+            // The phone just woke: the old failures say nothing about the network now.
+            self.failures = 0;
             Some(Action::RetryNow)
         } else {
             None
@@ -169,6 +171,18 @@ mod tests {
         // The pending timer finding the connection already retried does nothing.
         assert!(!connection.on_retry());
         assert_eq!(connection.state(), State::Connecting);
+    }
+
+    #[test]
+    fn visible_restarts_the_backoff() {
+        let mut connection = Connection::default();
+        for _ in 0..8 {
+            connection.on_close(1006);
+            connection.on_retry();
+        }
+        connection.on_close(1006);
+        assert_eq!(connection.on_visible(), Some(Action::RetryNow));
+        assert_eq!(connection.on_close(1006), Action::Retry(1_000));
     }
 
     #[test]
