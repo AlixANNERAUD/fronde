@@ -1346,6 +1346,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "chrono",
+ "futures",
  "jarvis-agent",
  "jarvis-protocol",
  "serde",
