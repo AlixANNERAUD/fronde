@@ -52,20 +52,18 @@ run = "cargo deny check"
 description = "Everything CI checks, except the release build"
 depends = ["lint", "test", "deny"]
 
-# The first run writes a development configuration under target/dev: a random token, the
-# password `jarvis` and a data directory of its own. `listen` is where `web-dev` sends /ws and
-# sign-in (crates/web/Dioxus.toml); delete target/dev/jarvis.toml to rewrite a configuration made
-# before that.
+# Writes a development configuration under target/dev at each run, so it follows this file: a
+# random token and the password `jarvis`, both made once, and a data directory of its own.
+# `listen` is where `web-dev` sends /ws and the sign-in forms (crates/web/Dioxus.toml).
 [tasks.dev]
 description = "Run the server on http://127.0.0.1:8484 for `mise run web-dev` (password: jarvis)"
 run = '''
 set -eu
 dev=target/dev
-if [ ! -f "$dev/jarvis.toml" ]; then
-  mkdir -p "$dev/data"
-  head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$dev/token"
-  printf jarvis > "$dev/password"
-  cat > "$dev/jarvis.toml" <<EOF
+mkdir -p "$dev/data"
+[ -f "$dev/token" ] || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$dev/token"
+[ -f "$dev/password" ] || printf jarvis > "$dev/password"
+cat > "$dev/jarvis.toml" <<EOF
 [server]
 listen = "127.0.0.1:8484"
 token = { file = "$PWD/$dev/token" }
@@ -80,7 +78,6 @@ git = false
 [web]
 password = { file = "$PWD/$dev/password" }
 EOF
-fi
 cargo run --package jarvis -- serve --config "$dev/jarvis.toml"
 '''
 
@@ -96,7 +93,7 @@ run = "dx build --package jarvis-web --platform web --release"
 
 # Tailwind rebuilds the stylesheet as classes change; dx reloads it in the page.
 [tasks.web-dev]
-description = "Serve the web interface with hot reload; a jarvis server on 127.0.0.1:8484 answers /ws and sign-in"
+description = "Serve the web interface with hot reload; `mise run dev` answers /ws and the sign-in forms"
 depends = ["web-css"]
 run = '''
 tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css --watch=always &

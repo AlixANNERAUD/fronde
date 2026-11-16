@@ -38,7 +38,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
             header { class: "shrink-0 border-b pt-[env(safe-area-inset-top)]",
                 div { class: "mx-auto flex h-12 max-w-3xl items-center gap-3 px-4",
                     span { class: "font-semibold", "Jarvis" }
-                    form { method: "post", action: "/sign-out", class: "ml-auto",
+                    form { method: "post", action: "/auth/sign-out", class: "ml-auto",
                         Button {
                             variant: ButtonVariant::Ghost,
                             size: ButtonSize::Sm,

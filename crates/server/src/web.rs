@@ -113,8 +113,11 @@ pub fn router(web: Web, secure_cookie: bool, site_root: &Path) -> Router {
             "/",
             get(page.clone()).route_layer(middleware::from_fn(require_session)),
         )
-        .route("/sign-in", get(page).post(sign_in))
-        .route("/sign-out", post(sign_out))
+        .route("/sign-in", get(page))
+        // The forms post under `/auth`, apart from the pages, so that in development dx serves the
+        // pages and passes only these to the server (crates/web/Dioxus.toml).
+        .route("/auth/sign-in", post(sign_in))
+        .route("/auth/sign-out", post(sign_out))
         .route("/ws", get(ws::upgrade))
         .with_state(Arc::new(web))
         .merge(assets)

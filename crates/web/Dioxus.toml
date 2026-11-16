@@ -8,12 +8,11 @@ pre_compress = true
 [web.app]
 title = "Jarvis"
 
-# `dx serve` serves the interface; a jarvis server on 127.0.0.1:8484 answers the rest.
+# `dx serve` serves the interface, the sign-in page included; a jarvis server on 127.0.0.1:8484
+# answers the chat's socket and the sign-in and sign-out forms. A proxy takes every method of a
+# path, hence forms posted under `/auth` rather than to the pages' own paths.
 [[web.proxy]]
 backend = "http://127.0.0.1:8484/ws"
 
 [[web.proxy]]
-backend = "http://127.0.0.1:8484/sign-in"
-
-[[web.proxy]]
-backend = "http://127.0.0.1:8484/sign-out"
+backend = "http://127.0.0.1:8484/auth"

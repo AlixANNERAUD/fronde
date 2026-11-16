@@ -47,7 +47,7 @@ async fn sign_in(addr: SocketAddr) -> String {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
-        .post(format!("http://{addr}/sign-in"))
+        .post(format!("http://{addr}/auth/sign-in"))
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(format!("password={PASSWORD}"))
         .send()

@@ -115,7 +115,7 @@ async fn post_password(addr: SocketAddr, password: &str) -> reqwest::Response {
     timeout(
         WAIT,
         client()
-            .post(format!("http://{addr}/sign-in"))
+            .post(format!("http://{addr}/auth/sign-in"))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body)
             .send(),
@@ -273,7 +273,7 @@ async fn sign_in_sets_session_and_wrong_password_refused() {
     let out = timeout(
         WAIT,
         client()
-            .post(format!("http://{addr}/sign-out"))
+            .post(format!("http://{addr}/auth/sign-out"))
             .header(COOKIE, cookie)
             .send(),
     )

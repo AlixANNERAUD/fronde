@@ -30,7 +30,7 @@ pub fn SignInPage(error: String) -> Element {
                     CardTitle { "Connexion" }
                 }
                 CardContent {
-                    form { method: "post", action: "/sign-in", class: "grid gap-4",
+                    form { method: "post", action: "/auth/sign-in", class: "grid gap-4",
                         if let Some(message) = refusal(&error) {
                             Alert { variant: AlertVariant::Destructive, "{message}" }
                         }
@@ -69,7 +69,7 @@ mod tests {
     fn sign_in_shows_error_texts() {
         let page = render("");
         assert!(page.contains(r#"method="post""#), "{page}");
-        assert!(page.contains(r#"action="/sign-in""#), "{page}");
+        assert!(page.contains(r#"action="/auth/sign-in""#), "{page}");
         assert!(page.contains(r#"name="password""#), "{page}");
         assert!(
             page.contains(r#"autocomplete="current-password""#),
