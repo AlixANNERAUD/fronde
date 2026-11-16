@@ -121,7 +121,7 @@ async fn wait_for_permission(jarvis: &Jarvis) -> u64 {
     events
         .iter()
         .find_map(|event| match event {
-            Event::Permission { id, .. } => Some(id.parse().expect("numeric id")),
+            Event::Permission { id, .. } => Some(*id),
             _ => None,
         })
         .unwrap()
@@ -139,18 +139,15 @@ fn ended(outcome: TurnOutcome) -> Event {
     Event::TurnEnded { outcome }
 }
 
-fn permission(id: &str) -> Event {
+fn permission(id: u64) -> Event {
     Event::Permission {
-        id: id.into(),
+        id,
         title: "Lire l'agenda".into(),
     }
 }
 
-fn answered(id: &str, allowed: bool) -> Event {
-    Event::PermissionAnswered {
-        id: id.into(),
-        allowed,
-    }
+fn answered(id: u64, allowed: bool) -> Event {
+    Event::PermissionAnswered { id, allowed }
 }
 
 fn asking() -> FakeScript {
@@ -278,7 +275,6 @@ async fn send_right_after_turn_ended_is_accepted() {
 
 /// Waits for a permission request other than `previous`.
 async fn wait_for_permission_after(jarvis: &Jarvis, previous: u64) -> u64 {
-    let previous = previous.to_string();
     let events = wait_until(jarvis, |events| {
         events
             .iter()
@@ -288,7 +284,7 @@ async fn wait_for_permission_after(jarvis: &Jarvis, previous: u64) -> u64 {
     events
         .iter()
         .find_map(|event| match event {
-            Event::Permission { id, .. } if *id != previous => Some(id.parse().unwrap()),
+            Event::Permission { id, .. } if *id != previous => Some(*id),
             _ => None,
         })
         .unwrap()
@@ -435,8 +431,8 @@ async fn permission_answer_is_logged() {
         events(&jarvis),
         vec![
             user("Mon agenda ?"),
-            permission("1"),
-            answered("1", true),
+            permission(2),
+            answered(2, true),
             ended(TurnOutcome::Done),
             notice(GONE),
         ]
@@ -445,6 +441,35 @@ async fn permission_answer_is_logged() {
         fakes.handles()[0].record().permission_outcomes,
         vec![RequestPermissionOutcome::Selected(
             SelectedPermissionOutcome::new("allow-once")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn permission_ids_stay_unique_across_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let (jarvis, _fakes) = open(dir.path(), asking());
+    jarvis.send("Mon agenda ?".into()).await;
+    let first = wait_for_permission(&jarvis).await;
+    jarvis.answer(first, true);
+    wait_for_turns(&jarvis, 1).await;
+    drop(jarvis);
+
+    // After a restart the agent numbers its requests from 1 again; the log's ids go on.
+    let (jarvis, fakes) = open(dir.path(), asking());
+    jarvis.send("Et demain ?".into()).await;
+    let second = wait_for_permission_after(&jarvis, first).await;
+    assert!(second > first, "{second} after {first}");
+    jarvis.answer(first, true);
+    jarvis.answer(second, false);
+    let events = wait_for_turns(&jarvis, 2).await;
+
+    assert_eq!(events.iter().filter(|e| **e == notice(GONE)).count(), 1);
+    assert!(events.contains(&answered(second, false)), "{events:?}");
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new("reject")
         )]
     );
 }
@@ -465,8 +490,8 @@ async fn cancel_ends_the_turn() {
         events(&jarvis),
         vec![
             user("Mon agenda ?"),
-            permission("1"),
-            answered("1", false),
+            permission(2),
+            answered(2, false),
             ended(TurnOutcome::Cancelled),
         ]
     );
@@ -548,14 +573,14 @@ async fn stale_permission_is_closed_in_the_log() {
 
     jarvis.send("Mon agenda ?".into()).await;
     wait_for_turns(&jarvis, 1).await;
-    jarvis.answer(1, true);
+    jarvis.answer(2, true);
 
     assert_eq!(
         events(&jarvis),
         vec![
             user("Mon agenda ?"),
-            permission("1"),
-            answered("1", false),
+            permission(2),
+            answered(2, false),
             ended(TurnOutcome::Done),
             notice(GONE),
         ]

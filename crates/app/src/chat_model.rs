@@ -40,7 +40,7 @@ pub enum Item {
         status: ToolStatus,
     },
     Permission {
-        id: String,
+        id: u64,
         title: String,
         status: PermissionStatus,
     },
@@ -157,7 +157,6 @@ impl Chat {
                 self.push(seq, Item::Permission { id, title, status });
             }
             Event::PermissionAnswered { id, allowed } => {
-                // Ids start again with each agent connection: the open request is the one.
                 let request = self.current_turn().find(|row| {
                     matches!(&row.item, Item::Permission { id: request, status: PermissionStatus::Open, .. } if *request == id)
                 });
@@ -426,11 +425,11 @@ mod tests {
     #[test]
     fn permission_is_open_only_while_its_turn_runs() {
         let mut chat = Chat::default();
-        let asked = |seq, id: &str| {
+        let asked = |seq, id: u64| {
             entry(
                 seq,
                 Event::Permission {
-                    id: id.into(),
+                    id,
                     title: "Écrire dans la mémoire".into(),
                 },
             )
@@ -439,12 +438,12 @@ mod tests {
             Item::Permission { status, .. } => *status,
             other => panic!("not a permission: {other:?}"),
         };
-        apply_all(&mut chat, [user(1, "Go"), asked(2, "1"), asked(3, "2")]);
+        apply_all(&mut chat, [user(1, "Go"), asked(2, 1), asked(3, 2)]);
         assert_eq!(status(&chat, 1), PermissionStatus::Open);
         chat.apply(entry(
             4,
             Event::PermissionAnswered {
-                id: "1".into(),
+                id: 1,
                 allowed: true,
             },
         ));
@@ -461,11 +460,11 @@ mod tests {
             &mut chat,
             [
                 user(6, "Encore"),
-                asked(7, "1"),
+                asked(7, 1),
                 entry(
                     8,
                     Event::PermissionAnswered {
-                        id: "1".into(),
+                        id: 1,
                         allowed: false,
                     },
                 ),

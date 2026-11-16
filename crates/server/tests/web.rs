@@ -140,7 +140,7 @@ async fn say(socket: &mut Socket, message: ClientMsg) {
         .unwrap();
 }
 
-async fn next_entry(socket: &mut Socket) -> Entry {
+async fn next_message(socket: &mut Socket) -> ServerMsg {
     loop {
         let message = timeout(WAIT, socket.next())
             .await
@@ -148,9 +148,27 @@ async fn next_entry(socket: &mut Socket) -> Entry {
             .unwrap()
             .unwrap();
         if let Message::Text(text) = message {
-            let ServerMsg::Entry(entry) = serde_json::from_str(&text).unwrap();
+            return serde_json::from_str(&text).unwrap();
+        }
+    }
+}
+
+/// The next entry, past the server's hello.
+async fn next_entry(socket: &mut Socket) -> Entry {
+    loop {
+        if let ServerMsg::Entry(entry) = next_message(socket).await {
             return entry;
         }
+    }
+}
+
+/// Says hello and returns the server's answer, which comes before any entry.
+async fn hello(socket: &mut Socket, last_seq: u64, log_id: Option<&str>) -> (String, u64) {
+    let log_id = log_id.map(str::to_owned);
+    say(socket, ClientMsg::Hello { last_seq, log_id }).await;
+    match next_message(socket).await {
+        ServerMsg::Hello { log_id, last_seq } => (log_id, last_seq),
+        other => panic!("expected the server's hello, got {other:?}"),
     }
 }
 
@@ -267,7 +285,14 @@ async fn ws_send_runs_a_turn() {
         .await
         .unwrap()
         .unwrap();
-    say(&mut socket, ClientMsg::Hello { last_seq: 0 }).await;
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+    )
+    .await;
     say(
         &mut socket,
         ClientMsg::Send {
@@ -336,7 +361,14 @@ async fn ws_hello_replays_then_streams() {
     let cookie = sign_in(addr).await;
 
     let mut first = open_chat(addr, &cookie).await;
-    say(&mut first, ClientMsg::Hello { last_seq: 0 }).await;
+    say(
+        &mut first,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+    )
+    .await;
     say(&mut first, ClientMsg::Send { text: "Un".into() }).await;
     let turn = until_turn_ended(&mut first).await;
     let seqs: Vec<u64> = turn.iter().map(|entry| entry.seq).collect();
@@ -344,7 +376,14 @@ async fn ws_hello_replays_then_streams() {
 
     // A client that saw entry 2 gets the rest replayed, then the live entries, each once.
     let mut second = open_chat(addr, &cookie).await;
-    say(&mut second, ClientMsg::Hello { last_seq: 2 }).await;
+    say(
+        &mut second,
+        ClientMsg::Hello {
+            last_seq: 2,
+            log_id: None,
+        },
+    )
+    .await;
     assert_eq!(next_entry(&mut second).await, turn[2]);
     assert_eq!(next_entry(&mut second).await, turn[3]);
     say(
@@ -381,7 +420,14 @@ async fn hub_url_follows_the_listen_address() {
         .unwrap();
     let cookie = sign_in(addr).await;
     let mut socket = open_chat(addr, &cookie).await;
-    say(&mut socket, ClientMsg::Hello { last_seq: 0 }).await;
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+    )
+    .await;
     say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
     until_turn_ended(&mut socket).await;
 
@@ -519,6 +565,35 @@ async fn chat_page_renders_island_when_signed_in() {
 }
 
 #[tokio::test]
+async fn hello_names_the_log_before_the_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+
+    let mut socket = open_chat(addr, &cookie).await;
+    let (log_id, last_seq) = hello(&mut socket, 0, None).await;
+    assert!(!log_id.is_empty());
+    assert_eq!(last_seq, 0);
+    say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
+    let turn = until_turn_ended(&mut socket).await;
+
+    // The same log, the next time: only the newer entries.
+    let mut again = open_chat(addr, &cookie).await;
+    assert_eq!(
+        hello(&mut again, 2, Some(&log_id)).await,
+        (log_id.clone(), 4)
+    );
+    assert_eq!(next_entry(&mut again).await, turn[2]);
+
+    // A page that saw another log gets this one from the start, even though its seq is in range.
+    let mut other = open_chat(addr, &cookie).await;
+    assert_eq!(hello(&mut other, 2, Some("another-log")).await, (log_id, 4));
+    for entry in &turn {
+        assert_eq!(&next_entry(&mut other).await, entry);
+    }
+}
+
+#[tokio::test]
 async fn hello_after_a_log_reset_replays_everything() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, _) = start(dir.path()).await;
@@ -526,11 +601,25 @@ async fn hello_after_a_log_reset_replays_everything() {
     let mut socket = open_chat(addr, &cookie).await;
 
     // A page that saw entries the log no longer has (it was deleted) gets the whole log again.
-    say(&mut socket, ClientMsg::Hello { last_seq: 0 }).await;
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+    )
+    .await;
     say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
     let turn = until_turn_ended(&mut socket).await;
     let mut stale = open_chat(addr, &cookie).await;
-    say(&mut stale, ClientMsg::Hello { last_seq: 100 }).await;
+    say(
+        &mut stale,
+        ClientMsg::Hello {
+            last_seq: 100,
+            log_id: None,
+        },
+    )
+    .await;
     for entry in &turn {
         assert_eq!(&next_entry(&mut stale).await, entry);
     }

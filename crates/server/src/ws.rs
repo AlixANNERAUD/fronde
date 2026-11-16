@@ -57,13 +57,22 @@ async fn chat(mut socket: WebSocket, jarvis: Arc<Jarvis>) {
                     Some(Ok(_)) => continue,
                 };
                 match serde_json::from_str::<ClientMsg>(&text) {
-                    Ok(ClientMsg::Hello { last_seq }) => {
+                    Ok(ClientMsg::Hello { last_seq, log_id }) => {
                         // Subscribed first, so nothing falls between the replay and the stream.
                         live = Some(jarvis.log().subscribe());
-                        // A page ahead of the log saw a log since deleted: it gets the whole new
-                        // one, whose first entry tells it to start over.
-                        last_sent = if last_seq > jarvis.log().last_seq() { 0 } else { last_seq };
-                        if replay(&mut socket, &jarvis, &mut last_sent).await.is_err() {
+                        let log = jarvis.log();
+                        let newest = log.last_seq();
+                        // A page that saw another log, or one ahead of this log, saw a log since
+                        // deleted: it gets the whole new one.
+                        let other_log = log_id.is_some_and(|id| id != log.log_id());
+                        last_sent = if other_log || last_seq > newest { 0 } else { last_seq };
+                        let hello = ServerMsg::Hello {
+                            log_id: log.log_id().to_owned(),
+                            last_seq: newest,
+                        };
+                        if send(&mut socket, &hello).await.is_err()
+                            || replay(&mut socket, &jarvis, &mut last_sent).await.is_err()
+                        {
                             return;
                         }
                     }
@@ -77,7 +86,7 @@ async fn chat(mut socket: WebSocket, jarvis: Arc<Jarvis>) {
                 let sent = match entry {
                     Ok(entry) if entry.seq > last_sent => {
                         last_sent = entry.seq;
-                        send(&mut socket, entry).await
+                        send(&mut socket, &ServerMsg::Entry(entry)).await
                     }
                     Ok(_) => Ok(()),
                     Err(RecvError::Lagged(_)) => replay(&mut socket, &jarvis, &mut last_sent).await,
@@ -103,16 +112,16 @@ async fn next_live(live: &mut Option<broadcast::Receiver<Entry>>) -> Result<Entr
 async fn replay(socket: &mut WebSocket, jarvis: &Jarvis, last_sent: &mut u64) -> Result<(), ()> {
     for entry in jarvis.log().since(*last_sent) {
         *last_sent = entry.seq;
-        send(socket, entry).await?;
+        send(socket, &ServerMsg::Entry(entry)).await?;
     }
     Ok(())
 }
 
-async fn send(socket: &mut WebSocket, entry: Entry) -> Result<(), ()> {
-    let json = match serde_json::to_string(&ServerMsg::Entry(entry)) {
+async fn send(socket: &mut WebSocket, message: &ServerMsg) -> Result<(), ()> {
+    let json = match serde_json::to_string(message) {
         Ok(json) => json,
         Err(error) => {
-            tracing::error!("cannot encode a log entry: {error}");
+            tracing::error!("cannot encode a chat message: {error}");
             return Ok(());
         }
     };

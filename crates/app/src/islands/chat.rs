@@ -55,7 +55,10 @@ impl Connection {
                     self.phase.set(Phase::Open);
                     self.retry.set_value(FIRST_RETRY);
                     let last_seq = self.chat.try_update_untracked(Chat::hello).unwrap_or(0);
-                    self.send(&ClientMsg::Hello { last_seq });
+                    self.send(&ClientMsg::Hello {
+                        last_seq,
+                        log_id: None,
+                    });
                 }
             },
             move |text| {
@@ -151,7 +154,7 @@ fn ToolLine(title: String, status: ToolStatus) -> impl IntoView {
 
 #[component]
 fn PermissionCard(
-    id: String,
+    id: u64,
     title: String,
     status: PermissionStatus,
     connection: Connection,
@@ -159,12 +162,8 @@ fn PermissionCard(
     // Answered once: the card changes when the server logs the answer.
     let sent = RwSignal::new(false);
     let answer = move |allow: bool| {
-        // The server numbers its requests; anything else cannot be answered.
-        let id = id.parse::<u64>().ok();
         move |_: ev::MouseEvent| {
-            if let Some(id) = id
-                && connection.send(&ClientMsg::Answer { id, allow })
-            {
+            if connection.send(&ClientMsg::Answer { id, allow }) {
                 sent.set(true);
             }
         }

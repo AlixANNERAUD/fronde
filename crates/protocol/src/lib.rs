@@ -39,12 +39,14 @@ pub enum Event {
         title: String,
         state: ToolState,
     },
+    /// `id` is the seq of this entry: unique for the life of the log, whatever the agent's own
+    /// numbering. The page answers with it.
     Permission {
-        id: String,
+        id: u64,
         title: String,
     },
     PermissionAnswered {
-        id: String,
+        id: u64,
         allowed: bool,
     },
     TurnEnded {
@@ -71,9 +73,13 @@ pub const CLOSE_SIGNED_OUT: u16 = 4401;
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// Start streaming: the entries after `last_seq`, then the live ones.
+    /// Start streaming: the entries after `last_seq`, then the live ones. A page that names
+    /// another log than the server's (`log_id` of its last [`ServerMsg::Hello`]) gets the whole
+    /// log.
     Hello {
         last_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        log_id: Option<String>,
     },
     Send {
         text: String,
@@ -89,6 +95,13 @@ pub enum ClientMsg {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// The answer to [`ClientMsg::Hello`], before any entry. `log_id` changes when the log is
+    /// started over, so a page can tell that what it shows is gone even when seqs overlap;
+    /// `last_seq` is the newest entry at that moment.
+    Hello {
+        log_id: String,
+        last_seq: u64,
+    },
     Entry(Entry),
 }
 
@@ -117,7 +130,10 @@ mod tests {
         let cases = [
             (
                 r#"{"type":"hello","last_seq":3}"#,
-                ClientMsg::Hello { last_seq: 3 },
+                ClientMsg::Hello {
+                    last_seq: 3,
+                    log_id: None,
+                },
             ),
             (
                 r#"{"type":"send","text":"salut"}"#,
@@ -159,14 +175,56 @@ mod tests {
     }
 
     #[test]
+    fn permission_ids_are_numbers_both_ways() {
+        let asked = Event::Permission {
+            id: 7,
+            title: "Lire l'agenda".into(),
+        };
+        let json = serde_json::to_string(&asked).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"permission","id":7,"title":"Lire l'agenda"}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), asked);
+        // The page answers with the id it was shown.
+        let Event::Permission { id, .. } = asked else {
+            unreachable!()
+        };
+        let answer = ClientMsg::Answer { id, allow: true };
+        assert_eq!(
+            serde_json::to_string(&answer).unwrap(),
+            r#"{"type":"answer","id":7,"allow":true}"#
+        );
+    }
+
+    #[test]
+    fn hello_messages_json_shape() {
+        let hello = ServerMsg::Hello {
+            log_id: "0f3c".into(),
+            last_seq: 12,
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(json, r#"{"type":"hello","log_id":"0f3c","last_seq":12}"#);
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), hello);
+
+        let hello = ClientMsg::Hello {
+            last_seq: 12,
+            log_id: Some("0f3c".into()),
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(json, r#"{"type":"hello","last_seq":12,"log_id":"0f3c"}"#);
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), hello);
+    }
+
+    #[test]
     fn enums_are_snake_case() {
         let event = Event::PermissionAnswered {
-            id: "p".into(),
+            id: 3,
             allowed: true,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
-            r#"{"type":"permission_answered","id":"p","allowed":true}"#
+            r#"{"type":"permission_answered","id":3,"allowed":true}"#
         );
         let ended = Event::TurnEnded {
             outcome: TurnOutcome::Cancelled,

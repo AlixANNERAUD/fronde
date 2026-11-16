@@ -7,11 +7,18 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::Context;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 pub use jarvis_protocol::{Entry, Event, ToolState, TurnOutcome};
 
 const BROADCAST_CAPACITY: usize = 1024;
+
+/// The log file's first line.
+#[derive(Serialize, Deserialize)]
+struct Header {
+    log_id: String,
+}
 
 struct State {
     entries: Vec<Entry>,
@@ -21,19 +28,28 @@ struct State {
 }
 
 pub struct ConversationLog {
+    log_id: String,
     state: Mutex<State>,
     live: broadcast::Sender<Entry>,
 }
 
 impl ConversationLog {
     /// Reads the JSONL file (creating it if missing); unreadable lines are skipped and logged.
+    /// The first line names the log with a random id, written when the file is created.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let mut entries = Vec::new();
+        let mut log_id = None;
         match File::open(path) {
             Ok(file) => {
                 for (index, line) in BufReader::new(file).lines().enumerate() {
                     let line = line.with_context(|| format!("reading {}", path.display()))?;
                     if line.trim().is_empty() {
+                        continue;
+                    }
+                    if index == 0
+                        && let Ok(header) = serde_json::from_str::<Header>(&line)
+                    {
+                        log_id = Some(header.log_id);
                         continue;
                     }
                     match serde_json::from_str::<Entry>(&line) {
@@ -49,6 +65,10 @@ impl ConversationLog {
                 return Err(error).with_context(|| format!("opening {}", path.display()));
             }
         }
+        let log_id = match log_id {
+            Some(id) => id,
+            None => write_header(path)?,
+        };
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -64,6 +84,7 @@ impl ConversationLog {
         };
         let (live, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
+            log_id,
             state: Mutex::new(State {
                 entries,
                 file,
@@ -73,15 +94,26 @@ impl ConversationLog {
         })
     }
 
+    /// The random id of this log, new each time the log file is created.
+    pub fn log_id(&self) -> &str {
+        &self.log_id
+    }
+
     /// Numbers the event, appends it as one line, then broadcasts it.
     pub fn append(&self, event: Event) -> anyhow::Result<Entry> {
+        self.append_with(|_| event)
+    }
+
+    /// [`append`](Self::append) for an event made from its seq, such as an id that must be
+    /// unique for the life of the log. `event` runs under the log's lock.
+    pub fn append_with(&self, event: impl FnOnce(u64) -> Event) -> anyhow::Result<Entry> {
         // The lock is held throughout so seqs are unique and file order matches seq order.
         let mut state = self.lock();
         let seq = state.entries.last().map_or(0, |entry| entry.seq) + 1;
         let entry = Entry {
             seq,
             at: Utc::now(),
-            event,
+            event: event(seq),
         };
         let mut line = String::new();
         if state.torn {
@@ -120,6 +152,34 @@ impl ConversationLog {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Names the log at `path` with a new random id, written as its first line, and returns the id.
+/// Entries already there (a log from before ids) are kept; the file is replaced in one rename.
+fn write_header(path: &Path) -> anyhow::Result<String> {
+    let log_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut text = serde_json::to_string(&Header {
+        log_id: log_id.clone(),
+    })?;
+    text.push('\n');
+    let mut old = Vec::new();
+    match File::open(path) {
+        Ok(mut file) => {
+            file.read_to_end(&mut old)
+                .with_context(|| format!("reading {}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
+    }
+    let mut bytes = text.into_bytes();
+    bytes.extend(old);
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = std::path::PathBuf::from(temporary);
+    std::fs::write(&temporary, bytes)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(log_id)
 }
 
 #[cfg(test)]
@@ -208,6 +268,67 @@ mod tests {
             .map(|e| e.seq)
             .collect();
         assert_eq!(seqs, [1, 2]);
+    }
+
+    #[test]
+    fn log_id_is_kept_until_the_log_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let log = ConversationLog::open(&path).unwrap();
+        let id = log.log_id().to_owned();
+        assert!(id.len() >= 16, "{id}");
+        log.append(user("a")).unwrap();
+        drop(log);
+
+        let log = ConversationLog::open(&path).unwrap();
+        assert_eq!(log.log_id(), id);
+        assert_eq!(log.since(0).len(), 1);
+        drop(log);
+
+        std::fs::remove_file(&path).unwrap();
+        let log = ConversationLog::open(&path).unwrap();
+        assert_ne!(log.log_id(), id);
+        assert_eq!(log.last_seq(), 0);
+    }
+
+    #[test]
+    fn log_without_an_id_gets_one_and_keeps_its_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let entry = r#"{"seq":1,"at":"2026-11-16T10:00:00Z","event":{"type":"user","text":"a"}}"#;
+        std::fs::write(&path, format!("{entry}\n")).unwrap();
+
+        let log = ConversationLog::open(&path).unwrap();
+        let id = log.log_id().to_owned();
+        assert_eq!(log.since(0).len(), 1);
+        assert_eq!(log.append(user("b")).unwrap().seq, 2);
+        drop(log);
+
+        let log = ConversationLog::open(&path).unwrap();
+        assert_eq!(log.log_id(), id);
+        let seqs: Vec<u64> = log.since(0).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [1, 2]);
+    }
+
+    #[test]
+    fn append_with_gives_the_event_its_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ConversationLog::open(&dir.path().join("log.jsonl")).unwrap();
+        log.append(user("a")).unwrap();
+        let entry = log
+            .append_with(|seq| Event::Permission {
+                id: seq,
+                title: "t".into(),
+            })
+            .unwrap();
+        assert_eq!(entry.seq, 2);
+        assert_eq!(
+            entry.event,
+            Event::Permission {
+                id: 2,
+                title: "t".into()
+            }
+        );
     }
 
     #[tokio::test]

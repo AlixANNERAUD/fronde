@@ -63,7 +63,14 @@ async fn open_chat(addr: SocketAddr, cookie: &str) -> Socket {
     headers.insert("cookie", cookie.parse().unwrap());
     headers.insert("origin", format!("http://{addr}").parse().unwrap());
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-    say(&mut socket, ClientMsg::Hello { last_seq: 0 }).await;
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+    )
+    .await;
     socket
 }
 
@@ -82,7 +89,9 @@ async fn turn(socket: &mut Socket, text: &str) -> Vec<Event> {
             let Message::Text(json) = message.unwrap() else {
                 continue;
             };
-            let ServerMsg::Entry(Entry { event, .. }) = serde_json::from_str(&json).unwrap();
+            let ServerMsg::Entry(Entry { event, .. }) = serde_json::from_str(&json).unwrap() else {
+                continue;
+            };
             eprintln!("{}", serde_json::to_string(&event).unwrap());
             if let Event::Permission { title, .. } = &event {
                 panic!("the agent asked for a permission: {title}");

@@ -4,7 +4,7 @@ use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use anyhow::{Context, anyhow};
 use futures::future::BoxFuture;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -53,8 +53,9 @@ pub struct Jarvis {
     log: ConversationLog,
     session_file: PathBuf,
     session: Mutex<Option<Session>>,
-    /// Permission requests shown in the log and not answered yet.
-    pending: Mutex<HashSet<u64>>,
+    /// Permission requests shown in the log and not answered yet, by their id in the log: the
+    /// client that asked and its own id for the request.
+    pending: Mutex<HashMap<u64, (Weak<AgentClient>, u64)>>,
     /// Cancels the running turn; `None` when idle.
     turn: Mutex<Option<CancellationToken>>,
 }
@@ -160,20 +161,18 @@ impl Jarvis {
 
     /// Answers the permission request `id` shown in the log.
     pub fn answer(&self, id: u64, allow: bool) {
-        let session = self.session_slot().clone();
-        let active = lock(&self.pending).remove(&id);
-        let Some(session) = session.filter(|_| active) else {
+        let asked = lock(&self.pending).remove(&id);
+        let Some((client, request)) =
+            asked.and_then(|(client, request)| Some((client.upgrade()?, request)))
+        else {
             self.append(Event::Notice {
                 text: NOT_ACTIVE.into(),
             });
             return;
         };
         // Logged first so the answer precedes whatever the agent does next.
-        self.append(Event::PermissionAnswered {
-            id: id.to_string(),
-            allowed: allow,
-        });
-        if let Err(error) = session.client.answer_permission(id, allow) {
+        self.append(Event::PermissionAnswered { id, allowed: allow });
+        if let Err(error) = client.answer_permission(request, allow) {
             tracing::warn!("the answer came too late: {error:#}");
         }
     }
@@ -247,16 +246,15 @@ impl Jarvis {
                 tracing::warn!("cannot save the agent session id: {error:#}");
             }
         }
+        let client = Arc::new(client);
         let (flushes, flush_requests) = mpsc::unbounded_channel();
         tokio::spawn(record_events(
             Arc::downgrade(self),
+            Recorder::new(Arc::downgrade(&client)),
             agent_events,
             flush_requests,
         ));
-        let session = Session {
-            client: Arc::new(client),
-            flushes,
-        };
+        let session = Session { client, flushes };
         *self.session_slot() = Some(session.clone());
         Ok(session)
     }
@@ -284,11 +282,11 @@ impl Jarvis {
             .with_context(|| format!("replacing {}", self.session_file.display()))
     }
 
-    fn record(&self, event: AgentEvent, tool_titles: &mut HashMap<String, String>) {
+    fn record(&self, event: AgentEvent, recorder: &mut Recorder) {
         let event = match event {
             AgentEvent::Text(text) => Event::Assistant { text },
             AgentEvent::ToolStarted { id, title } => {
-                tool_titles.insert(id.clone(), title.clone());
+                recorder.tool_titles.insert(id.clone(), title.clone());
                 Event::Tool {
                     id,
                     title,
@@ -296,7 +294,7 @@ impl Jarvis {
                 }
             }
             AgentEvent::ToolFinished { id, ok } => Event::Tool {
-                title: tool_titles.remove(&id).unwrap_or_default(),
+                title: recorder.tool_titles.remove(&id).unwrap_or_default(),
                 id,
                 state: if ok {
                     ToolState::Done
@@ -304,22 +302,34 @@ impl Jarvis {
                     ToolState::Failed
                 },
             },
-            AgentEvent::PermissionAsked { id, title } => {
-                lock(&self.pending).insert(id);
-                Event::Permission {
-                    id: id.to_string(),
-                    title,
+            AgentEvent::PermissionAsked { id: request, title } => {
+                // The agent numbers its requests from 1 on each connection: the log's id is the
+                // entry's seq. It is pending before the entry is broadcast, so an answer to it
+                // finds it. Lock order: log, then pending.
+                let client = recorder.client.clone();
+                let asked = self.log.append_with(|id| {
+                    lock(&self.pending).insert(id, (client, request));
+                    Event::Permission { id, title }
+                });
+                match asked {
+                    Ok(entry) => {
+                        recorder.permissions.insert(request, entry.seq);
+                    }
+                    Err(error) => {
+                        tracing::error!("cannot write the conversation log: {error:#}");
+                    }
                 }
+                return;
             }
-            AgentEvent::PermissionClosed { id } => {
+            AgentEvent::PermissionClosed { id: request } => {
+                let Some(id) = recorder.permissions.remove(&request) else {
+                    return;
+                };
                 // Already logged as answered when the answer raced the end of the turn.
-                if !lock(&self.pending).remove(&id) {
+                if lock(&self.pending).remove(&id).is_none() {
                     return;
                 }
-                Event::PermissionAnswered {
-                    id: id.to_string(),
-                    allowed: false,
-                }
+                Event::PermissionAnswered { id, allowed: false }
             }
         };
         self.append(event);
@@ -336,13 +346,31 @@ impl Jarvis {
     }
 }
 
+/// What recording one connection's events remembers.
+struct Recorder {
+    client: Weak<AgentClient>,
+    tool_titles: HashMap<String, String>,
+    /// The log's id of each permission request, by the agent's id.
+    permissions: HashMap<u64, u64>,
+}
+
+impl Recorder {
+    fn new(client: Weak<AgentClient>) -> Self {
+        Self {
+            client,
+            tool_titles: HashMap::new(),
+            permissions: HashMap::new(),
+        }
+    }
+}
+
 /// Logs the agent's events for the lifetime of its client and answers flush requests.
 async fn record_events(
     jarvis: Weak<Jarvis>,
+    mut recorder: Recorder,
     mut events: UnboundedReceiver<AgentEvent>,
     mut flush_requests: UnboundedReceiver<oneshot::Sender<()>>,
 ) {
-    let mut tool_titles = HashMap::new();
     loop {
         tokio::select! {
             // Events first: a flush is acknowledged only once those sent before it are logged.
@@ -351,7 +379,7 @@ async fn record_events(
                 let (Some(event), Some(owner)) = (event, jarvis.upgrade()) else {
                     break;
                 };
-                owner.record(event, &mut tool_titles);
+                owner.record(event, &mut recorder);
             }
             Some(done) = flush_requests.recv() => {
                 let _ = done.send(());
