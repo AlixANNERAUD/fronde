@@ -87,6 +87,17 @@ fn refuse_series(res: &Resource, uid: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Deleting removes the whole resource: refuse when it holds any other event or task.
+fn refuse_shared(res: &Resource, uid: &str) -> anyhow::Result<()> {
+    if ics::has_other_items(&res.ics, uid)? {
+        anyhow::bail!(
+            "the stored item with uid {uid:?} shares its resource with other events or tasks; \
+             delete it in your calendar app"
+        );
+    }
+    Ok(())
+}
+
 /// The stored resource has the UID but no item this tool can read: writing a new one over it
 /// would lose it.
 fn unreadable(uid: &str) -> anyhow::Error {
@@ -140,6 +151,7 @@ impl<T: Transport> CalendarBackend for CalDavBackend<T> {
             return Ok(false);
         };
         refuse_series(&res, uid)?;
+        refuse_shared(&res, uid)?;
         self.events.delete(&res).await.map(|_| true)
     }
 
@@ -184,6 +196,7 @@ impl<T: Transport> CalendarBackend for CalDavBackend<T> {
             return Ok(false);
         };
         refuse_series(&res, uid)?;
+        refuse_shared(&res, uid)?;
         self.reminders.delete(&res).await.map(|_| true)
     }
 }
@@ -315,6 +328,20 @@ END:VCALENDAR
         let err = block_on(b.delete_event("rd")).unwrap_err().to_string();
         assert!(err.contains("recurring"), "{err}");
         assert!(server.requests("PUT").is_empty());
+        assert!(server.requests("DELETE").is_empty());
+    }
+
+    #[test]
+    fn delete_refuses_a_resource_holding_other_items() {
+        let server = FakeServer::default();
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nSUMMARY:A\r\n\
+                   DTSTART:20261116T180000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:b\r\n\
+                   SUMMARY:B\r\nDTSTART:20261117T180000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        server.respond("REPORT", 207, multistatus(ics));
+        server.respond("DELETE", 204, "");
+        let b = backend_with(&server);
+        let err = block_on(b.delete_event("a")).unwrap_err().to_string();
+        assert!(err.contains("other events or tasks"), "{err}");
         assert!(server.requests("DELETE").is_empty());
     }
 

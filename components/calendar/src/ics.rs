@@ -240,6 +240,13 @@ pub fn is_recurring(ics: &str, uid: &str) -> anyhow::Result<bool> {
     }))
 }
 
+/// True when a top-level VEVENT or VTODO has a UID other than `uid` (or none): the resource then
+/// holds more than the one item, and removing it would remove the others.
+pub fn has_other_items(ics: &str, uid: &str) -> anyhow::Result<bool> {
+    let cal = parse(ics)?;
+    Ok(top_level(&cal).any(|(_, c)| is_item(c) && c.uid() != Some(uid)))
+}
+
 /// The one top-level component of this type and UID that is not an occurrence override.
 fn master<'a>(
     cal: &'a mut ICalendar,
@@ -1187,6 +1194,69 @@ END:VCALENDAR\r\n";
             line.contains(";ENCODING=BASE64") && line.ends_with(":iVBORw0KGgo="),
             "{line}"
         );
+    }
+
+    #[test]
+    fn edit_refuses_base64_without_value_binary() {
+        let attach = "ATTACH;ENCODING=BASE64;FMTTYPE=text/plain:SGVsbG8=";
+        let original = fixture("rich.ics").replace(
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            &format!("{attach}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
+        );
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Autre".into(),
+            ..old.clone()
+        };
+        let e = update_event_ics(&original, &old, &new)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("ATTACH holds inline data Fronde cannot keep exactly")
+                && e.contains("calendar app"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn edit_refuses_data_uri_naming_the_property() {
+        let original = fixture("rich.ics").replace(
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            "IMAGE:data:text/plain,Hello%2C%20world\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+        );
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Autre".into(),
+            ..old.clone()
+        };
+        let e = update_event_ics(&original, &old, &new)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("IMAGE holds inline data Fronde cannot keep exactly"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn edit_survives_deeply_nested_components() {
+        let depth = 5000;
+        let nested = "BEGIN:VALARM\r\n".repeat(depth) + &"END:VALARM\r\n".repeat(depth);
+        let original = fixture("rich.ics").replace(
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            &format!("{nested}X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
+        );
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Autre".into(),
+            ..old.clone()
+        };
+        // Either refused or written back whole; never a stack overflow.
+        if let Ok(out) = update_event_ics(&original, &old, &new) {
+            for tag in ["BEGIN:VALARM", "END:VALARM"] {
+                assert_eq!(out.matches(tag).count(), original.matches(tag).count());
+            }
+        }
     }
 
     #[test]

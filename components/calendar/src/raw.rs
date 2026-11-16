@@ -6,7 +6,6 @@
 //! Every other line is calcard's own output. Only the lines whose values are all URIs are written
 //! here, from calcard's rendering of their name and parameters.
 
-use anyhow::bail;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use calcard::icalendar::{
@@ -34,11 +33,67 @@ pub(crate) fn write(mut cal: ICalendar, original: &str) -> anyhow::Result<String
     Ok(out)
 }
 
-const CANNOT_KEEP: &str = "it has an inline attachment in a form this tool cannot keep exactly; \
-                           change it in your calendar app";
+/// The refusal for a property whose value cannot be written back as it was read.
+fn cannot_keep(property: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot edit the stored item: {property} holds inline data Fronde cannot keep exactly; \
+         change it in your calendar app"
+    )
+}
+
+/// The property name and parameters (name, upper-cased) of a content line, split outside quotes.
+fn line_params(line: &str) -> Option<(&str, Vec<(String, String)>)> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    let mut end = None;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                parts.push(&line[start..i]);
+                start = i + 1;
+            }
+            ':' if !quoted => {
+                end = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&line[start..end?]);
+    let name = parts.remove(0);
+    let params = parts
+        .into_iter()
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (
+                k.to_ascii_uppercase(),
+                v.trim_matches('"').to_ascii_uppercase(),
+            ),
+            None => (p.to_ascii_uppercase(), String::new()),
+        })
+        .collect();
+    Some((name, params))
+}
+
+/// calcard decodes any value with an ENCODING (or bare BASE64) parameter and drops the
+/// parameter. Only `VALUE=BINARY` ones are restored (below), so any other is refused.
+fn refuse_unrestorable_encodings(unfolded: &str) -> anyhow::Result<()> {
+    for line in unfolded.lines() {
+        let Some((name, params)) = line_params(line) else {
+            continue;
+        };
+        let encoded = params.iter().any(|(k, _)| k == "ENCODING" || k == "BASE64");
+        let binary = params.iter().any(|(k, v)| k == "VALUE" && v == "BINARY");
+        if encoded && !binary {
+            return Err(cannot_keep(&name.to_ascii_uppercase()));
+        }
+    }
+    Ok(())
+}
 
 fn restore(cal: &mut ICalendar, original: &str) -> anyhow::Result<()> {
     let unfolded = unfold(original);
+    refuse_unrestorable_encodings(&unfolded)?;
     for entry in cal.components.iter_mut().flat_map(|c| c.entries.iter_mut()) {
         let binary = entry.params.iter().any(|p| {
             p.name == ICalendarParameterName::Value
@@ -51,7 +106,7 @@ fn restore(cal: &mut ICalendar, original: &str) -> anyhow::Result<()> {
                 ICalendarValue::Text(text) if binary => {
                     let bytes = std::mem::take(text).into_bytes();
                     if !bytes.is_empty() && !unfolded.contains(&BASE64.encode(&bytes)) {
-                        bail!("cannot edit the stored item: {CANNOT_KEEP}");
+                        return Err(cannot_keep(entry.name.as_str()));
                     }
                     *value = ICalendarValue::Binary(bytes);
                 }
@@ -64,7 +119,7 @@ fn restore(cal: &mut ICalendar, original: &str) -> anyhow::Result<()> {
                     let uri = format!("data:{media_type};base64,{payload}");
                     let escaped = format!("data:{media_type};base64\\,{payload}");
                     if !unfolded.contains(&uri) && !unfolded.contains(&escaped) {
-                        bail!("cannot edit the stored item: {CANNOT_KEEP}");
+                        return Err(cannot_keep(entry.name.as_str()));
                     }
                     *value = ICalendarValue::Uri(Uri::Location(uri));
                 }
@@ -75,19 +130,37 @@ fn restore(cal: &mut ICalendar, original: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Walks the tree with an explicit stack, so that a deeply nested resource cannot overflow the
+/// stack. A component's entries come before its children, which keep their `component_ids` order.
 fn write_component(out: &mut String, cal: &ICalendar, id: usize) {
-    let Some(component) = cal.components.get(id) else {
-        return;
-    };
-    let name = component.component_type.as_str();
-    push_folded(out, &format!("BEGIN:{name}"));
-    for entry in &component.entries {
-        write_entry(out, entry);
+    enum Step {
+        Open(usize),
+        Close(String),
     }
-    for child in &component.component_ids {
-        write_component(out, cal, *child as usize);
+    let mut stack = vec![Step::Open(id)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Close(name) => push_folded(out, &format!("END:{name}")),
+            Step::Open(id) => {
+                let Some(component) = cal.components.get(id) else {
+                    continue;
+                };
+                let name = component.component_type.as_str();
+                push_folded(out, &format!("BEGIN:{name}"));
+                for entry in &component.entries {
+                    write_entry(out, entry);
+                }
+                stack.push(Step::Close(name.to_string()));
+                stack.extend(
+                    component
+                        .component_ids
+                        .iter()
+                        .rev()
+                        .map(|child| Step::Open(*child as usize)),
+                );
+            }
+        }
     }
-    push_folded(out, &format!("END:{name}"));
 }
 
 fn write_entry(out: &mut String, entry: &ICalendarEntry) {
