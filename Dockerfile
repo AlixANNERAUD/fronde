@@ -60,9 +60,11 @@ LABEL org.opencontainers.image.title="jarvis" \
       org.opencontainers.image.description="A personal agent: a web chat with Claude, and memory, calendar and tools over MCP." \
       org.opencontainers.image.source="https://github.com/AlixANNERAUD/jarvis"
 
-# git versions the memory; the agent reaches Claude over https.
+# git versions the memory; the agent reaches Claude over https. tini runs as PID 1: it passes
+# docker stop's SIGTERM on to Jarvis, which a PID 1 without a handler ignores, and reaps the
+# agent's processes left behind when an agent is stopped.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates git tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=agent /usr/local/bin/node /usr/local/bin/node
@@ -86,5 +88,5 @@ EXPOSE 8484
 HEALTHCHECK --interval=30s --timeout=6s --start-period=20s --retries=3 \
     CMD ["/app/jarvis", "healthcheck", "--config", "/config/jarvis.toml"]
 
-ENTRYPOINT ["/app/jarvis"]
+ENTRYPOINT ["tini", "--", "/app/jarvis"]
 CMD ["serve", "--config", "/config/jarvis.toml"]
