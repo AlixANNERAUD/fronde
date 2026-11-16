@@ -1,0 +1,213 @@
+//! In-process fake ACP agent for tests: it replays a script and records what the client sent.
+
+use agent_client_protocol::v1::schema::{
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
+    SessionNotification, SessionResumeCapabilities, SessionSystemPromptCapabilities, SessionUpdate,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallUpdate,
+    ToolCallUpdateFields,
+};
+use agent_client_protocol::{Agent, Channel, Client, ConnectTo, Error};
+use std::sync::{Arc, Mutex};
+
+/// The session id the fake agent gives to new sessions.
+pub const FAKE_SESSION_ID: &str = "fake-session-1";
+
+/// What the fake agent does on each prompt, and which capabilities it advertises.
+#[derive(Clone, Debug)]
+pub struct FakeScript {
+    /// Updates streamed during each prompt, before any permission request.
+    pub updates: Vec<SessionUpdate>,
+    /// Ask one permission (options `allow-once`, `allow-with-updates`, `reject`) during each prompt.
+    pub ask_permission: bool,
+    /// Stop reason of each prompt, unless the permission request was cancelled.
+    pub stop: StopReason,
+    /// Advertise `session/resume`.
+    pub resume: bool,
+    /// Answer `session/resume` with an error.
+    pub refuse_resume: bool,
+}
+
+impl Default for FakeScript {
+    fn default() -> Self {
+        Self {
+            updates: Vec::new(),
+            ask_permission: false,
+            stop: StopReason::EndTurn,
+            resume: false,
+            refuse_resume: false,
+        }
+    }
+}
+
+/// An agent message chunk carrying `text`.
+pub fn text_chunk(text: &str) -> SessionUpdate {
+    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+        text,
+    ))))
+}
+
+/// Everything the client sent to the fake agent.
+#[derive(Clone, Debug, Default)]
+pub struct FakeRecord {
+    pub new_sessions: Vec<NewSessionRequest>,
+    pub resumes: Vec<ResumeSessionRequest>,
+    pub modes: Vec<String>,
+    pub permission_outcomes: Vec<RequestPermissionOutcome>,
+    pub cancels: usize,
+}
+
+/// Reads what the fake agent recorded.
+#[derive(Clone, Debug)]
+pub struct FakeHandle {
+    record: Arc<Mutex<FakeRecord>>,
+}
+
+impl FakeHandle {
+    pub fn record(&self) -> FakeRecord {
+        lock(&self.record).clone()
+    }
+}
+
+fn lock(record: &Mutex<FakeRecord>) -> std::sync::MutexGuard<'_, FakeRecord> {
+    record
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Start a fake agent on the current tokio runtime; connect a client to the returned transport.
+pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
+    let (client_end, agent_end) = Channel::duplex();
+    let record = Arc::new(Mutex::new(FakeRecord::default()));
+    let handle = FakeHandle {
+        record: record.clone(),
+    };
+    let script = Arc::new(script);
+
+    let agent = Agent
+        .v1()
+        .on_receive_request(
+            {
+                let script = script.clone();
+                async move |request: InitializeRequest, responder, _cx| {
+                    let mut sessions = SessionCapabilities::new()
+                        .system_prompt(SessionSystemPromptCapabilities::new());
+                    if script.resume {
+                        sessions = sessions.resume(SessionResumeCapabilities::new());
+                    }
+                    responder.respond(
+                        InitializeResponse::new(request.protocol_version).agent_capabilities(
+                            AgentCapabilities::new().session_capabilities(sessions),
+                        ),
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let record = record.clone();
+                async move |request: NewSessionRequest, responder, _cx| {
+                    lock(&record).new_sessions.push(request);
+                    responder.respond(NewSessionResponse::new(FAKE_SESSION_ID))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let record = record.clone();
+                let script = script.clone();
+                async move |request: ResumeSessionRequest, responder, _cx| {
+                    lock(&record).resumes.push(request);
+                    if script.refuse_resume {
+                        responder.respond_with_error(Error::invalid_params())
+                    } else {
+                        responder.respond(ResumeSessionResponse::new())
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let record = record.clone();
+                async move |request: SetSessionModeRequest, responder, _cx| {
+                    lock(&record).modes.push(request.mode_id.0.to_string());
+                    responder.respond(SetSessionModeResponse::new())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let record = record.clone();
+                async move |_notification: CancelNotification, _cx| {
+                    lock(&record).cancels += 1;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            {
+                let record = record.clone();
+                let script = script.clone();
+                async move |request: PromptRequest, responder, cx| {
+                    let record = record.clone();
+                    let script = script.clone();
+                    // Waiting for the permission answer inside the handler would block the
+                    // dispatch loop that delivers it.
+                    cx.clone().spawn(async move {
+                        let session = request.session_id;
+                        for update in &script.updates {
+                            cx.send_notification(SessionNotification::new(
+                                session.clone(),
+                                update.clone(),
+                            ))?;
+                        }
+                        let mut stop = script.stop;
+                        if script.ask_permission {
+                            let outcome = cx
+                                .send_request(permission_request(session))
+                                .block_task()
+                                .await?
+                                .outcome;
+                            if outcome == RequestPermissionOutcome::Cancelled {
+                                stop = StopReason::Cancelled;
+                            }
+                            lock(&record).permission_outcomes.push(outcome);
+                        }
+                        responder.respond(PromptResponse::new(stop))
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+    tokio::spawn(agent.connect_to(agent_end));
+    (client_end, handle)
+}
+
+fn permission_request(
+    session: agent_client_protocol::v1::schema::SessionId,
+) -> RequestPermissionRequest {
+    RequestPermissionRequest::new(
+        session,
+        ToolCallUpdate::new(
+            "tool-1",
+            ToolCallUpdateFields::new().title("Lire l'agenda".to_owned()),
+        ),
+        vec![
+            PermissionOption::new("allow-once", "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new(
+                "allow-with-updates",
+                "Always allow",
+                PermissionOptionKind::AllowAlways,
+            ),
+            PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
+        ],
+    )
+}

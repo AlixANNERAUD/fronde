@@ -10,6 +10,7 @@ version = "0.1.0"
 rust-version = "1.100"
 
 [workspace.dependencies]
+agent-client-protocol = { version = "5.3", features = ["process"] }
 anyhow = "1"
 axum = "0.8"
 async-trait = "0.1"
