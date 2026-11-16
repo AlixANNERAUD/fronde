@@ -17,6 +17,7 @@ const NOT_ACTIVE: &str = "Cette demande n'est plus active.";
 const NEW_CONVERSATION: &str =
     "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
+const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
 /// How long the agent gets to start and open its session.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -76,7 +77,7 @@ impl Jarvis {
         connector: Connector,
     ) -> anyhow::Result<Arc<Self>> {
         let log = ConversationLog::open(&data_dir.join("jarvis.jsonl"))?;
-        Ok(Arc::new(Self {
+        let jarvis = Arc::new(Self {
             spec,
             connector,
             log,
@@ -84,7 +85,27 @@ impl Jarvis {
             session: Mutex::new(None),
             pending: Mutex::default(),
             turn: Mutex::new(None),
-        }))
+        });
+        // A turn the server stopped in the middle of would otherwise run forever on the pages.
+        let last_turn = jarvis
+            .log
+            .since(0)
+            .into_iter()
+            .rev()
+            .find_map(|entry| match entry.event {
+                Event::User { .. } => Some(true),
+                Event::TurnEnded { .. } => Some(false),
+                _ => None,
+            });
+        if last_turn == Some(true) {
+            jarvis.append(Event::Notice {
+                text: INTERRUPTED.into(),
+            });
+            jarvis.append(Event::TurnEnded {
+                outcome: TurnOutcome::Error,
+            });
+        }
+        Ok(jarvis)
     }
 
     pub fn log(&self) -> &ConversationLog {

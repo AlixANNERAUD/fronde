@@ -520,3 +520,37 @@ async fn connect_timeout_ends_the_turn() {
     );
     assert_eq!(hanging.dropped.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn open_closes_a_turn_left_open() {
+    let dir = tempfile::tempdir().unwrap();
+    // The server stopped in the middle of a turn: its user message has no `turn_ended`.
+    {
+        let log =
+            jarvis_agent::log::ConversationLog::open(&dir.path().join("jarvis.jsonl")).unwrap();
+        log.append(user("Un")).unwrap();
+        log.append(ended(TurnOutcome::Done)).unwrap();
+        log.append(user("Deux")).unwrap();
+        log.append(Event::Assistant {
+            text: "Je regarde".into(),
+        })
+        .unwrap();
+    }
+    let (jarvis, _) = open(dir.path(), FakeScript::default());
+    let closed = [
+        user("Un"),
+        ended(TurnOutcome::Done),
+        user("Deux"),
+        Event::Assistant {
+            text: "Je regarde".into(),
+        },
+        notice("La réponse précédente a été interrompue."),
+        ended(TurnOutcome::Error),
+    ];
+    assert_eq!(events(&jarvis), closed);
+    drop(jarvis);
+
+    // A log whose last turn ended is left alone.
+    let (jarvis, _) = open(dir.path(), FakeScript::default());
+    assert_eq!(events(&jarvis), closed);
+}
