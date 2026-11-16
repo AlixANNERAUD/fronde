@@ -402,11 +402,18 @@ impl Connection {
     }
 }
 
-/// Jarvis's agent only gets the hub's tools.
+/// Jarvis's agent only gets the hub's tools. The Claude Code adapter loads the user's, project's
+/// and local settings unless told otherwise, and with them the owner's plugins, MCP servers, hooks
+/// and allow rules: none of them apply. The sign-in is not a setting and still works.
 fn session_meta() -> serde_json::Map<String, serde_json::Value> {
     let serde_json::Value::Object(meta) = json!({
         "disableBuiltInTools": true,
-        "claudeCode": {"options": {"allowedTools": ["mcp__jarvis"]}},
+        "claudeCode": {"options": {
+            "allowedTools": ["mcp__jarvis"],
+            "settingSources": [],
+            "strictMcpConfig": true,
+            "allowDangerouslySkipPermissions": false,
+        }},
     }) else {
         unreachable!("the literal is an object")
     };

@@ -111,7 +111,9 @@ upstream MCP servers. `jarvis check --config jarvis.toml` validates the file and
 
 ## Signing Jarvis in to Claude
 
-The agent uses Claude Code's own sign-in and inherits Jarvis's environment.
+The agent uses Claude Code's own sign-in and inherits Jarvis's environment. It reads none of
+Claude Code's settings: your plugins, MCP servers, hooks and permission rules do not apply to
+Jarvis, which only has the hub's tools.
 
 - **Native**: nothing to do. The agent uses your Claude Code sign-in in `~/.claude`. To run your
   installed Claude Code rather than the one bundled with the adapter, set

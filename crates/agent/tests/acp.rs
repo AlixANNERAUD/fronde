@@ -73,10 +73,17 @@ fn selected(option_id: &str) -> RequestPermissionOutcome {
     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id.to_owned()))
 }
 
+/// No built-in tools, only the hub, and nothing from the owner's Claude settings: no plugins,
+/// MCP servers, hooks or allow rules, and no bypass mode.
 fn expected_meta() -> serde_json::Value {
     json!({
         "disableBuiltInTools": true,
-        "claudeCode": {"options": {"allowedTools": ["mcp__jarvis"]}},
+        "claudeCode": {"options": {
+            "allowedTools": ["mcp__jarvis"],
+            "settingSources": [],
+            "strictMcpConfig": true,
+            "allowDangerouslySkipPermissions": false,
+        }},
     })
 }
 

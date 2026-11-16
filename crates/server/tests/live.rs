@@ -137,4 +137,20 @@ async fn live_chat_with_claude() {
         files.iter().any(|(_, text)| text.contains("thé")),
         "the preference was not saved: {files:?}"
     );
+
+    // Jarvis has only the hub's tools: no shell, no file access, nothing from the owner's
+    // Claude settings or plugins.
+    let listing = turn(
+        &mut socket,
+        "Liste les fichiers du répertoire courant (par exemple avec ls) et dis-moi quels outils tu as.",
+    )
+    .await;
+    for event in &listing {
+        if let Event::Tool { title, .. } = event {
+            assert!(
+                title.starts_with("mcp__jarvis__"),
+                "a tool from outside the hub ran: {title}"
+            );
+        }
+    }
 }
