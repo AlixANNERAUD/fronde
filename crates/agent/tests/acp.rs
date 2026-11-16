@@ -295,3 +295,134 @@ async fn agent_start_failure_is_reported() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn permission_after_cancel_is_cancelled() {
+    let script = FakeScript {
+        updates: vec![text_chunk("Je regarde")],
+        ask_permission: true,
+        wait_for_cancel: true,
+        ..FakeScript::default()
+    };
+    let (client, handle, mut rx) = connect(script, None).await;
+    let client = Arc::new(client);
+
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Mon agenda ?").await }
+    });
+    // The prompt has reached the agent once its first update is back.
+    let first = timeout(WAIT, rx.recv()).await.expect("no update");
+    assert_eq!(first, Some(AgentEvent::Text("Je regarde".into())));
+    client.cancel().expect("cancel");
+    let end = timeout(WAIT, turn).await.expect("turn timed out");
+    assert_eq!(
+        end.expect("turn panicked").expect("prompt"),
+        TurnEnd::Cancelled
+    );
+
+    assert_eq!(
+        handle.record().permission_outcomes,
+        vec![RequestPermissionOutcome::Cancelled]
+    );
+    assert_eq!(drain(&mut rx), vec![]);
+}
+
+#[tokio::test]
+async fn stale_permissions_are_closed_at_turn_end() {
+    let script = FakeScript {
+        ask_permission: true,
+        leave_permission_pending: true,
+        ..FakeScript::default()
+    };
+    let (client, handle, mut rx) = connect(script, None).await;
+
+    assert_eq!(prompt(&client, "Mon agenda ?").await, TurnEnd::Done);
+
+    let events = drain(&mut rx);
+    let [
+        AgentEvent::PermissionAsked { id, .. },
+        AgentEvent::PermissionClosed { id: closed },
+    ] = events.as_slice()
+    else {
+        panic!("expected the permission to be asked then closed, got {events:?}");
+    };
+    assert_eq!(closed, id);
+    client
+        .answer_permission(*id, true)
+        .expect_err("a closed permission cannot be answered");
+    timeout(WAIT, async {
+        while handle.record().permission_outcomes.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the agent never got an answer");
+    assert_eq!(
+        handle.record().permission_outcomes,
+        vec![RequestPermissionOutcome::Cancelled]
+    );
+}
+
+#[tokio::test]
+async fn terminal_tool_call_emits_finished() {
+    let script = FakeScript {
+        updates: vec![
+            SessionUpdate::ToolCall(
+                ToolCall::new("t1", "Chercher").status(ToolCallStatus::Completed),
+            ),
+            SessionUpdate::ToolCall(ToolCall::new("t2", "Lire").status(ToolCallStatus::Failed)),
+        ],
+        ..FakeScript::default()
+    };
+    let (client, _handle, mut rx) = connect(script, None).await;
+
+    assert_eq!(prompt(&client, "Salut").await, TurnEnd::Done);
+
+    assert_eq!(
+        drain(&mut rx),
+        vec![
+            AgentEvent::ToolStarted {
+                id: "t1".into(),
+                title: "Chercher".into()
+            },
+            AgentEvent::ToolFinished {
+                id: "t1".into(),
+                ok: true
+            },
+            AgentEvent::ToolStarted {
+                id: "t2".into(),
+                title: "Lire".into()
+            },
+            AgentEvent::ToolFinished {
+                id: "t2".into(),
+                ok: false
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cancel_between_turns_does_not_reach_the_next_turn() {
+    let script = FakeScript {
+        ask_permission: true,
+        ..FakeScript::default()
+    };
+    let (client, handle, mut rx) = connect(script, None).await;
+    let client = Arc::new(client);
+
+    // A cancel arriving after the turn ended.
+    client.cancel().expect("cancel");
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Mon agenda ?").await }
+    });
+    let id = permission_asked(&mut rx).await;
+    client.answer_permission(id, true).expect("answer allow");
+    let end = timeout(WAIT, turn).await.expect("turn timed out");
+    assert_eq!(end.expect("turn panicked").expect("prompt"), TurnEnd::Done);
+    assert_eq!(
+        handle.record().permission_outcomes,
+        vec![selected("allow-once")]
+    );
+}

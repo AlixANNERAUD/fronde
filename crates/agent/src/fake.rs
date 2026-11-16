@@ -11,6 +11,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::{Agent, Channel, Client, ConnectTo, Error};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 /// The session id the fake agent gives to new sessions.
 pub const FAKE_SESSION_ID: &str = "fake-session-1";
@@ -28,6 +29,12 @@ pub struct FakeScript {
     pub resume: bool,
     /// Answer `session/resume` with an error.
     pub refuse_resume: bool,
+    /// Wait for the client's cancel notification before asking the permission.
+    pub wait_for_cancel: bool,
+    /// End the turn without waiting for the permission answer.
+    pub leave_permission_pending: bool,
+    /// Answer each prompt with an error, after the updates.
+    pub fail_prompt: bool,
 }
 
 impl Default for FakeScript {
@@ -38,6 +45,9 @@ impl Default for FakeScript {
             stop: StopReason::EndTurn,
             resume: false,
             refuse_resume: false,
+            wait_for_cancel: false,
+            leave_permission_pending: false,
+            fail_prompt: false,
         }
     }
 }
@@ -85,6 +95,7 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
         record: record.clone(),
     };
     let script = Arc::new(script);
+    let cancelled = Arc::new(Notify::new());
 
     let agent = Agent
         .v1()
@@ -144,8 +155,10 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
         .on_receive_notification(
             {
                 let record = record.clone();
+                let cancelled = cancelled.clone();
                 async move |_notification: CancelNotification, _cx| {
                     lock(&record).cancels += 1;
+                    cancelled.notify_one();
                     Ok(())
                 }
             },
@@ -158,6 +171,7 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
                 async move |request: PromptRequest, responder, cx| {
                     let record = record.clone();
                     let script = script.clone();
+                    let cancelled = cancelled.clone();
                     // Waiting for the permission answer inside the handler would block the
                     // dispatch loop that delivers it.
                     cx.clone().spawn(async move {
@@ -168,17 +182,28 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
                                 update.clone(),
                             ))?;
                         }
+                        if script.fail_prompt {
+                            return responder.respond_with_error(Error::internal_error());
+                        }
                         let mut stop = script.stop;
                         if script.ask_permission {
-                            let outcome = cx
-                                .send_request(permission_request(session))
-                                .block_task()
-                                .await?
-                                .outcome;
-                            if outcome == RequestPermissionOutcome::Cancelled {
-                                stop = StopReason::Cancelled;
+                            if script.wait_for_cancel {
+                                cancelled.notified().await;
                             }
-                            lock(&record).permission_outcomes.push(outcome);
+                            let asked = cx.send_request(permission_request(session));
+                            if script.leave_permission_pending {
+                                cx.spawn(async move {
+                                    let outcome = asked.block_task().await?.outcome;
+                                    lock(&record).permission_outcomes.push(outcome);
+                                    Ok(())
+                                })?;
+                            } else {
+                                let outcome = asked.block_task().await?.outcome;
+                                if outcome == RequestPermissionOutcome::Cancelled {
+                                    stop = StopReason::Cancelled;
+                                }
+                                lock(&record).permission_outcomes.push(outcome);
+                            }
                         }
                         responder.respond(PromptResponse::new(stop))
                     })

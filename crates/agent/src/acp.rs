@@ -35,9 +35,22 @@ pub struct AgentSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     Text(String),
-    ToolStarted { id: String, title: String },
-    ToolFinished { id: String, ok: bool },
-    PermissionAsked { id: u64, title: String },
+    ToolStarted {
+        id: String,
+        title: String,
+    },
+    ToolFinished {
+        id: String,
+        ok: bool,
+    },
+    PermissionAsked {
+        id: u64,
+        title: String,
+    },
+    /// The request was dropped unanswered: the turn was cancelled or ended.
+    PermissionClosed {
+        id: u64,
+    },
 }
 
 /// Why a turn ended.
@@ -103,12 +116,11 @@ impl AgentClient {
     /// Run one turn; events stream to the sender given at connection until it returns.
     pub async fn prompt(&self, text: &str) -> anyhow::Result<TurnEnd> {
         let request = PromptRequest::new(self.session_id.clone(), vec![ContentBlock::from(text)]);
-        let response = self
-            .connection
-            .send_request(request)
-            .block_task()
-            .await
-            .context("the agent failed the turn")?;
+        // A cancel that came after the previous turn ended is not about this one.
+        self.permissions.end_turn();
+        let response = self.connection.send_request(request).block_task().await;
+        self.permissions.end_turn();
+        let response = response.context("the agent failed the turn")?;
         Ok(match response.stop_reason {
             StopReason::Cancelled => TurnEnd::Cancelled,
             StopReason::Refusal => TurnEnd::Refused,
@@ -117,23 +129,26 @@ impl AgentClient {
         })
     }
 
-    /// Ask the agent to stop the current turn; pending permission requests are cancelled.
+    /// Ask the agent to stop the current turn; pending and later permission requests of the
+    /// turn are cancelled.
     pub fn cancel(&self) -> anyhow::Result<()> {
+        self.permissions.cancel();
         self.connection
             .send_notification(CancelNotification::new(self.session_id.clone()))
             .context("cannot reach the agent to cancel the turn")?;
-        for (_, pending) in self.permissions.pending().drain() {
-            // The agent may already have given up on this request.
-            let _ = pending.reply.send(RequestPermissionOutcome::Cancelled);
-        }
         Ok(())
     }
 
     /// Answer the permission request `id` announced by `AgentEvent::PermissionAsked`.
     pub fn answer_permission(&self, id: u64, allow: bool) -> anyhow::Result<()> {
-        let pending = self.permissions.pending().remove(&id).with_context(|| {
-            format!("no pending permission request {id}: it was already answered or cancelled")
-        })?;
+        let pending = self
+            .permissions
+            .state()
+            .pending
+            .remove(&id)
+            .with_context(|| {
+                format!("no pending permission request {id}: it was already answered or cancelled")
+            })?;
         let kind = if allow {
             PermissionOptionKind::AllowOnce
         } else {
@@ -156,10 +171,18 @@ impl AgentClient {
 }
 
 /// Permission requests waiting for a human answer.
-#[derive(Default)]
 struct Permissions {
     last_id: AtomicU64,
-    pending: Mutex<HashMap<u64, PendingPermission>>,
+    state: Mutex<PermissionState>,
+    events: mpsc::UnboundedSender<AgentEvent>,
+}
+
+#[derive(Default)]
+struct PermissionState {
+    /// Set from `cancel` until the turn ends: requests crossing the cancel on the wire are
+    /// refused at once. Cleared again when the next turn starts.
+    cancelling: bool,
+    pending: HashMap<u64, PendingPermission>,
 }
 
 struct PendingPermission {
@@ -168,14 +191,56 @@ struct PendingPermission {
 }
 
 impl Permissions {
-    fn pending(&self) -> MutexGuard<'_, HashMap<u64, PendingPermission>> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    fn new(events: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self {
+            last_id: AtomicU64::new(0),
+            state: Mutex::default(),
+            events,
+        }
     }
 
-    fn add(&self, pending: PendingPermission) -> u64 {
+    fn state(&self) -> MutexGuard<'_, PermissionState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers a request and announces it; `None` when the turn is being cancelled.
+    fn ask(
+        &self,
+        options: Vec<PermissionOption>,
+        title: String,
+    ) -> Option<oneshot::Receiver<RequestPermissionOutcome>> {
+        let mut state = self.state();
+        if state.cancelling {
+            return None;
+        }
+        let (reply, answer) = oneshot::channel();
         let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.pending().insert(id, pending);
-        id
+        state
+            .pending
+            .insert(id, PendingPermission { options, reply });
+        // Announced under the lock so a close of this id can never be sent before it.
+        let _ = self.events.send(AgentEvent::PermissionAsked { id, title });
+        Some(answer)
+    }
+
+    fn cancel(&self) {
+        let mut state = self.state();
+        state.cancelling = true;
+        self.close_pending(&mut state);
+    }
+
+    fn end_turn(&self) {
+        let mut state = self.state();
+        state.cancelling = false;
+        self.close_pending(&mut state);
+    }
+
+    fn close_pending(&self, state: &mut PermissionState) {
+        for (id, pending) in state.pending.drain() {
+            // The agent may already have given up on this request.
+            let _ = pending.reply.send(RequestPermissionOutcome::Cancelled);
+            let _ = self.events.send(AgentEvent::PermissionClosed { id });
+        }
     }
 }
 
@@ -192,19 +257,16 @@ impl Connection {
         transport: impl ConnectTo<Client> + 'static,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> anyhow::Result<Self> {
-        let permissions = Arc::new(Permissions::default());
+        let permissions = Arc::new(Permissions::new(events.clone()));
         let builder = Client
             .v1()
             .on_receive_notification(
-                {
-                    let events = events.clone();
-                    async move |notification: SessionNotification, _cx| {
-                        if let Some(event) = event_from(notification.update) {
-                            // A closed receiver only means nobody is listening any more.
-                            let _ = events.send(event);
-                        }
-                        Ok(())
+                async move |notification: SessionNotification, _cx| {
+                    for event in events_from(notification.update) {
+                        // A closed receiver only means nobody is listening any more.
+                        let _ = events.send(event);
                     }
+                    Ok(())
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
@@ -212,17 +274,16 @@ impl Connection {
                 {
                     let permissions = permissions.clone();
                     async move |request: RequestPermissionRequest, responder, cx| {
-                        let (reply, answer) = oneshot::channel();
-                        let id = permissions.add(PendingPermission {
-                            options: request.options,
-                            reply,
-                        });
                         let title = request
                             .tool_call
                             .fields
                             .title
                             .unwrap_or_else(|| "permission".to_owned());
-                        let _ = events.send(AgentEvent::PermissionAsked { id, title });
+                        let Some(answer) = permissions.ask(request.options, title) else {
+                            return responder.respond(RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Cancelled,
+                            ));
+                        };
                         // Waiting for the human inside the handler would block the dispatch
                         // loop, and with it every other message from the agent.
                         cx.spawn(async move {
@@ -362,27 +423,38 @@ fn connection_end_error(
     }
 }
 
-fn event_from(update: SessionUpdate) -> Option<AgentEvent> {
+fn events_from(update: SessionUpdate) -> Vec<AgentEvent> {
     match update {
         SessionUpdate::AgentMessageChunk(ContentChunk {
             content: ContentBlock::Text(text),
             ..
-        }) => Some(AgentEvent::Text(text.text)),
-        SessionUpdate::ToolCall(call) => Some(AgentEvent::ToolStarted {
-            id: call.tool_call_id.0.to_string(),
-            title: call.title,
-        }),
-        SessionUpdate::ToolCallUpdate(update) => {
-            let ok = match update.fields.status? {
-                ToolCallStatus::Completed => true,
-                ToolCallStatus::Failed => false,
-                _ => return None,
+        }) => vec![AgentEvent::Text(text.text)],
+        SessionUpdate::ToolCall(call) => {
+            let id = call.tool_call_id.0.to_string();
+            let finished = finished(Some(call.status))
+                .map(|ok| AgentEvent::ToolFinished { id: id.clone(), ok });
+            let started = AgentEvent::ToolStarted {
+                id,
+                title: call.title,
             };
-            Some(AgentEvent::ToolFinished {
+            std::iter::once(started).chain(finished).collect()
+        }
+        SessionUpdate::ToolCallUpdate(update) => finished(update.fields.status)
+            .map(|ok| AgentEvent::ToolFinished {
                 id: update.tool_call_id.0.to_string(),
                 ok,
             })
-        }
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a tool call succeeded, once it is over.
+fn finished(status: Option<ToolCallStatus>) -> Option<bool> {
+    match status? {
+        ToolCallStatus::Completed => Some(true),
+        ToolCallStatus::Failed => Some(false),
         _ => None,
     }
 }
