@@ -3,6 +3,7 @@
 use anyhow::{anyhow, bail};
 use chrono::{DateTime, Utc};
 use reqwest::{Method, StatusCode};
+use std::time::Duration;
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,16 @@ pub struct Resource {
     pub href: String,
     pub etag: Option<String>,
     pub ics: String,
+}
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10).min(timeout))
+        .build()
+        .expect("http client")
 }
 
 pub struct CalDav {
@@ -70,7 +81,13 @@ impl CalDav {
             let p = format!("{}/", collection.path());
             collection.set_path(&p);
         }
-        Self { http: reqwest::Client::new(), collection, user, password }
+        Self { http: http_client(DEFAULT_TIMEOUT), collection, user, password }
+    }
+
+    /// Give up on a request after `timeout` (default 30 s).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = http_client(timeout);
+        self
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
@@ -270,6 +287,18 @@ mod tests {
         let res = Resource { href: "/cal/alix/personal/a.ics".into(), etag: Some("\"etag-a\"".into()), ics: String::new() };
         c.update(&res, "X").await.unwrap();
         c.delete(&res).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_server_times_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("REPORT"))
+            .respond_with(ResponseTemplate::new(207).set_delay(std::time::Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let c = client(&server).await.with_timeout(std::time::Duration::from_millis(300));
+        let e = c.query(Kind::Event, None).await.unwrap_err().to_string();
+        assert!(e.contains("unreachable"), "{e}");
     }
 
     #[tokio::test]

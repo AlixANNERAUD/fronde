@@ -4,7 +4,7 @@ use crate::config::UpstreamConfig;
 use crate::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
 use async_trait::async_trait;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
-use rmcp::service::RunningService;
+use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
@@ -75,6 +75,8 @@ impl ToolHandler for Forward {
         }
         match client.call_tool(params).await {
             Ok(r) => to_output(r),
+            // The server answered with an error: report it, the link is fine.
+            Err(ServiceError::McpError(e)) => ToolOutput::error(e.message.to_string()),
             Err(e) => {
                 tracing::warn!("{}: call to {} failed: {e}", self.link.name, self.tool);
                 self.link.broken.notify_one();
@@ -84,7 +86,21 @@ impl ToolHandler for Forward {
     }
 }
 
-async fn connect(cfg: &UpstreamConfig) -> anyhow::Result<Client> {
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connect and list tools, giving up after `CONNECT_TIMEOUT` (a silent server must not block retries).
+async fn connect(cfg: &UpstreamConfig) -> anyhow::Result<(Client, Vec<rmcp::model::Tool>)> {
+    let attempt = async {
+        let client = open(cfg).await?;
+        let tools = client.list_all_tools().await?;
+        anyhow::Ok((client, tools))
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, attempt)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out after {}s", CONNECT_TIMEOUT.as_secs()))?
+}
+
+async fn open(cfg: &UpstreamConfig) -> anyhow::Result<Client> {
     if let Some(url) = &cfg.url {
         let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
         if let Some(t) = &cfg.token {
@@ -107,8 +123,8 @@ pub fn spawn_upstream(cfg: UpstreamConfig, registry: Arc<Registry>) -> tokio::ta
         let mut delay = Duration::from_secs(2);
         loop {
             match connect(&cfg).await {
-                Ok(client) => match client.list_all_tools().await {
-                    Ok(tools) => {
+                Ok((client, tools)) => {
+                    {
                         delay = Duration::from_secs(2);
                         let client = Arc::new(client);
                         registry.unregister_source(&cfg.name);
@@ -136,8 +152,7 @@ pub fn spawn_upstream(cfg: UpstreamConfig, registry: Arc<Registry>) -> tokio::ta
                         *link.client.write().expect("link lock") = None;
                         tracing::warn!("{}: disconnected", cfg.name);
                     }
-                    Err(e) => tracing::warn!("{}: cannot list tools: {e}", cfg.name),
-                },
+                }
                 Err(e) => tracing::warn!("{}: cannot connect: {e:#}", cfg.name),
             }
             tokio::time::sleep(delay).await;
@@ -171,7 +186,9 @@ pub(crate) mod test_server {
         }
 
         async fn call_tool(&self, r: CallToolRequestParams, _c: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
-            let text = r.arguments.and_then(|a| a.get("text").and_then(|t| t.as_str()).map(str::to_string)).unwrap_or_default();
+            let Some(text) = r.arguments.and_then(|a| a.get("text").and_then(|t| t.as_str()).map(str::to_string)) else {
+                return Err(ErrorData::invalid_params("missing text argument", None));
+            };
             Ok(CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(text)])))
         }
     }
@@ -240,6 +257,30 @@ mod tests {
         let out = reg.call("mcphub_echo", json!({"text": "hello"})).await;
         assert!(!out.is_error, "{}", out.to_text());
         assert_eq!(out.value, json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn upstream_error_is_reported_and_link_kept() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        test_server::serve(listener);
+        let reg = Arc::new(Registry::new());
+        spawn_upstream(cfg(addr), reg.clone());
+        assert!(wait_for(&reg, "mcphub_echo", 10).await);
+        let bad = reg.call("mcphub_echo", json!({})).await;
+        assert!(bad.is_error);
+        assert!(bad.to_text().contains("missing text argument"), "{}", bad.to_text());
+        let ok = reg.call("mcphub_echo", json!({"text": "still here"})).await;
+        assert!(!ok.is_error, "link must stay up after an application error: {}", ok.to_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_times_out_on_silent_server() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap();
+        let e = connect(&cfg(addr)).await.unwrap_err();
+        assert!(format!("{e:#}").contains("timed out"), "{e:#}");
+        drop(silent);
     }
 
     #[tokio::test]
