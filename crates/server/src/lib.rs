@@ -68,15 +68,20 @@ pub fn router(hub: Arc<Hub>, token: String) -> Router {
         .merge(protected)
 }
 
-/// Succeeds when the server listening on `address` answers `/health` with a success.
-pub async fn healthcheck(address: SocketAddr) -> anyhow::Result<()> {
-    // A server bound to every interface is reached over loopback.
+/// Where this machine reaches a server listening on `address`: a server bound to every
+/// interface is reached over the loopback of the same family.
+fn reachable(address: SocketAddr) -> SocketAddr {
     let ip = match address.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
         ip => ip,
     };
-    let url = format!("http://{}/health", SocketAddr::new(ip, address.port()));
+    SocketAddr::new(ip, address.port())
+}
+
+/// Succeeds when the server listening on `address` answers `/health` with a success.
+pub async fn healthcheck(address: SocketAddr) -> anyhow::Result<()> {
+    let url = format!("http://{}/health", reachable(address));
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?
@@ -147,7 +152,7 @@ pub async fn start_with(
             command: agent.command,
             env: agent.env.into_iter().collect(),
             cwd,
-            hub_url: format!("http://127.0.0.1:{}/mcp", addr.port()),
+            hub_url: format!("http://{}/mcp", reachable(addr)),
             hub_token: token,
             system_prompt: system_prompt(&user),
         };
@@ -168,4 +173,23 @@ pub async fn start_with(
         }
     });
     Ok((addr, handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reachable_maps_every_interface_to_loopback() {
+        let cases = [
+            ("0.0.0.0:8484", "127.0.0.1:8484"),
+            ("[::]:8484", "[::1]:8484"),
+            ("100.64.1.2:8484", "100.64.1.2:8484"),
+            ("[::1]:8484", "[::1]:8484"),
+        ];
+        for (listen, expected) in cases {
+            let listen: SocketAddr = listen.parse().unwrap();
+            assert_eq!(reachable(listen).to_string(), expected, "{listen}");
+        }
+    }
 }

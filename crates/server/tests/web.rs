@@ -369,6 +369,30 @@ async fn ws_hello_replays_then_streams() {
 }
 
 #[tokio::test]
+async fn hub_url_follows_the_listen_address() {
+    // A server listening on one address only, as on a Tailscale IP, is not on 127.0.0.1.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), true);
+    config.server.listen = "127.0.0.2:0".parse().unwrap();
+    let (connector, seen) = fake_connector();
+    let (addr, _server) = timeout(WAIT, jarvis::start_with(config, connector))
+        .await
+        .unwrap()
+        .unwrap();
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    say(&mut socket, ClientMsg::Hello { last_seq: 0 }).await;
+    say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
+    until_turn_ended(&mut socket).await;
+
+    let spec = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        spec.hub_url,
+        format!("http://127.0.0.2:{}/mcp", addr.port())
+    );
+}
+
+#[tokio::test]
 async fn secure_cookie_marks_the_session_cookie_secure() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config(dir.path(), true);
