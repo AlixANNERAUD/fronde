@@ -12,7 +12,16 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | `crates/agent` (`jarvis-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/client` (`jarvis-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
 | `crates/web` (`jarvis-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `jarvis-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
+| `crates/wasm` (`jarvis-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `tool.rs` the `tool` world, whose tools join the hub's registry |
+| `wit/` | The components' WIT: package `jarvis:component`, shared `settings` interface, `tool` world |
+| `components/` | Components, a Cargo workspace of its own built for `wasm32-wasip2` (`echo` is the test component); not part of the root workspace |
 | `crates/server` | The `jarvis` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
+
+Components are built by `mise run components`, which copies the `.wasm` files to
+`components/dist` (mr-boxington prunes idle target directories); `jarvis-wasm`'s tests load them
+from there, and `mise run test` builds them first. A component may not import `wasi:filesystem` or
+`wasi:sockets`, and its bindings module is the only place allowed `unsafe` code (the generated
+export glue needs it).
 
 The server has no Dioxus dependency: it serves the built interface as static files from
 `JARVIS_SITE_ROOT` (default `target/dx/jarvis-web/release/web/public`, written by
@@ -34,9 +43,10 @@ through mr-boxington.
 | Command | Does |
 | --- | --- |
 | `mise install` | Installs the pinned tools |
-| `mise run format` | Formats the code |
-| `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server code and the web interface (native and wasm32) |
-| `mise run test` | The test suite (nextest) |
+| `mise run format` | Formats the code, components included |
+| `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server code, the web interface (native and wasm32) and the components (wasm32-wasip2) |
+| `mise run components` | Release build of the components for wasm32-wasip2 into `components/dist` |
+| `mise run test` | The test suite (nextest), after `components` |
 | `mise run deny` | cargo-deny: advisories, licences, bans, sources |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
 | `mise run dev` | The server on http://127.0.0.1:8484 for `web-dev` (password `jarvis`; config and data in `target/dev`) |

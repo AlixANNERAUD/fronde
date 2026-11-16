@@ -14,6 +14,7 @@ agent-client-protocol = { version = "5.3", features = ["process"] }
 anyhow = "1"
 axum = "0.8"
 async-trait = "0.1"
+base64 = "0.22"
 dioxus = { version = "0.7.10", features = ["router"] }
 dioxus-html = "0.7.10"
 dioxus-ssr = "0.7.10"
@@ -21,6 +22,8 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 gloo-net = { version = "0.6", default-features = false, features = ["websocket"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
+http = "1"
+http-body-util = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +52,10 @@ wiremock = "0.6"
 uuid = { version = "1", features = ["v4"] }
 wasm-bindgen = "0.2"
 web-sys = "0.3"
+# Only what a host of tool components uses: no GC, threads, cache or debugging support.
+wasmtime = { version = "50.0.1", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"] }
+wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2", "default-send-request"] }
 url = { version = "2", features = ["serde"] }
 
 [workspace.lints.rust]

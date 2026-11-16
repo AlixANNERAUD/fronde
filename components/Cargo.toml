@@ -1,0 +1,28 @@
+# Tool components, built for wasm32-wasip2 by `mise run components` and loaded by `jarvis-wasm`.
+# A workspace of their own: the guest bindings need `unsafe` (see each crate's `bindings` module),
+# and their dependencies stay out of the server's lock file, lints and test runs.
+[workspace]
+resolver = "3"
+members = ["echo"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+version = "0.1.0"
+rust-version = "1.100"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = "0.63"
+wstd = "0.6.8"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

@@ -1,4 +1,4 @@
 # Selected with MISE_ENV=ci: CI caches its target directory itself, so it does not route Cargo
 # through mr-boxington.
 [tools]
-rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools", targets = "wasm32-unknown-unknown", mr_boxington = false }
+rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools", targets = "wasm32-unknown-unknown,wasm32-wasip2", mr_boxington = false }

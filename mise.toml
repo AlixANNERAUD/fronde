@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools", targets = "wasm32-unknown-unknown", mr_boxington = true }
+rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools", targets = "wasm32-unknown-unknown,wasm32-wasip2", mr_boxington = true }
 mr-boxington = "latest"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.149"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
@@ -16,21 +16,23 @@ DX_TELEMETRY_ENABLED = "false"
 
 [tasks.format]
 description = "Format the code"
-run = "cargo fmt --all"
+run = ["cargo fmt --all", "cargo fmt --manifest-path components/Cargo.toml --all"]
 
 [tasks.lint]
-description = "Check formatting and run clippy on the server and web code"
+description = "Check formatting and run clippy on the server, web and component code"
 depends = ["web-css"]
 run = [
   "cargo fmt --all --check",
   "cargo clippy $JARVIS_SERVER_PACKAGES --all-targets -- -D warnings",
   "cargo clippy --package jarvis-web --all-targets -- -D warnings",
   "cargo clippy --package jarvis-web --target wasm32-unknown-unknown -- -D warnings",
+  "cargo fmt --manifest-path components/Cargo.toml --all --check",
+  "cargo clippy --manifest-path components/Cargo.toml --target wasm32-wasip2 -- -D warnings",
 ]
 
 [tasks.test]
 description = "Run the test suite"
-depends = ["web-css"]
+depends = ["web-css", "components"]
 run = [
   "cargo nextest run $JARVIS_SERVER_PACKAGES --no-tests=pass",
   "cargo nextest run --package jarvis-web",
@@ -43,6 +45,16 @@ run = [
 description = "Generate the web interface's stylesheet"
 hide = true
 run = "tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css"
+
+# Tool components are a workspace of their own, built for WASI. The .wasm files are copied to
+# components/dist, where jarvis-wasm's tests load them: mr-boxington prunes idle target directories.
+[tasks.components]
+description = "Build the tool components for wasm32-wasip2 into components/dist"
+run = [
+  "cargo build --manifest-path components/Cargo.toml --target wasm32-wasip2 --release",
+  "mkdir -p components/dist",
+  "cp components/target/wasm32-wasip2/release/*.wasm components/dist/",
+]
 
 [tasks.deny]
 description = "Check advisories, licences, bans and sources"
