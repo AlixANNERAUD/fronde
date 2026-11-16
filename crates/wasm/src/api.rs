@@ -7,15 +7,22 @@ use wasmtime::component::Component;
 
 const PACKAGE: &str = "fronde:component/";
 
-/// The versions this host serves, as `major.minor`: what a component's manifest names as `api`.
-pub(crate) const SERVED: &[&str] = &["0.1"];
-
+/// A version of `fronde:component` this host serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Api {
+pub enum Api {
     V0_1,
 }
 
 impl Api {
+    pub const ALL: [Self; 1] = [Self::V0_1];
+
+    /// `major.minor`, as a component's manifest names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V0_1 => "0.1",
+        }
+    }
+
     /// The version of the `fronde:component` interfaces the component imports and exports, or
     /// `None` when it uses none. Refuses a version this host does not serve, or a mix.
     pub(crate) fn of(
@@ -33,11 +40,14 @@ impl Api {
             let Some(interface) = item.strip_prefix(PACKAGE) else {
                 continue;
             };
-            let version = interface.split_once('@').map_or("", |(_, v)| v);
-            let Some(api) = Self::serving(version) else {
+            let version = interface.split_once('@').map(|(_, v)| v);
+            let Some(api) = version.and_then(Self::serving) else {
+                let built = version.map_or("without a version".to_string(), |v| {
+                    format!("built for fronde:component@{v}")
+                });
                 bail!(
-                    "component {name} uses {item}, built for fronde:component@{version}, but this \
-                     Fronde serves {}: rebuild it with a fronde-component release for one of those",
+                    "component {name} uses {item}, {built}, but this Fronde serves {}: rebuild \
+                     it with a fronde-component release for one of those",
                     served()
                 );
             };
@@ -61,9 +71,9 @@ impl Api {
     }
 }
 
-/// "0.1", or "0.1 and 0.2".
+/// "0.1", or "0.1, 0.2".
 pub(crate) fn served() -> String {
-    SERVED.join(", ")
+    Api::ALL.map(Api::as_str).join(", ")
 }
 
 #[cfg(test)]

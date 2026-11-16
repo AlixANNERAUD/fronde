@@ -15,7 +15,8 @@ mod manifest;
 mod tool;
 mod v0_1;
 
-pub use egress::{Credential, Origin};
+pub use api::Api;
+pub use egress::{Allowed, Credential, Origin};
 pub use host::{ComponentHost, Limits};
 pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, NetworkRule, World};
 use std::collections::BTreeMap;
@@ -28,10 +29,7 @@ pub struct ComponentSpec {
     /// Source of its tools in the registry.
     pub name: String,
     pub path: PathBuf,
-    pub allow: Vec<Origin>,
-    /// Whether the allowed origins may resolve to loopback, link-local or cloud metadata
-    /// addresses, which are refused otherwise: only for a service on the host itself.
-    pub allow_local: bool,
+    pub allow: Vec<Allowed>,
     /// Added by the host to requests for that origin, which must also be allowed.
     pub credentials: Vec<(Origin, Credential)>,
     /// What the guest reads through `settings.get`: never secrets.

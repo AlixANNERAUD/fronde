@@ -26,7 +26,6 @@ async fn calendar_component_lists_its_tools() {
         name: "calendar".into(),
         path: calendar_wasm(),
         allow: vec![],
-        allow_local: false,
         credentials: vec![],
         settings: BTreeMap::new(),
     };

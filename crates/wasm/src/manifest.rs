@@ -4,7 +4,7 @@
 //! The manifest is a request, never a grant: the configuration decides what a component gets,
 //! within what its manifest declares. Parsing is strict, so that a typo cannot widen a request.
 
-use crate::api;
+use crate::api::{self, Api};
 use crate::egress::Origin;
 use crate::host::Limits;
 use anyhow::{Context, bail, ensure};
@@ -23,8 +23,8 @@ pub struct Manifest {
     pub id: String,
     pub version: semver::Version,
     pub world: World,
-    /// The `fronde:component` version, `major.minor`.
-    pub api: String,
+    /// The `fronde:component` version it targets.
+    pub api: Api,
     pub description: String,
     pub license: String,
     pub authors: Vec<String>,
@@ -152,12 +152,13 @@ impl Manifest {
         );
         let version = semver::Version::parse(&raw.version)
             .with_context(|| format!("version {:?} is not semver", raw.version))?;
-        ensure!(
-            api::SERVED.contains(&raw.api.as_str()),
-            "api {:?} is not a fronde:component version this Fronde serves ({})",
-            raw.api,
-            api::served()
-        );
+        let Some(api) = Api::ALL.into_iter().find(|a| a.as_str() == raw.api) else {
+            bail!(
+                "api {:?} is not a fronde:component version this Fronde serves ({})",
+                raw.api,
+                api::served()
+            );
+        };
         ensure!(!raw.description.trim().is_empty(), "description is empty");
         ensure!(!raw.license.trim().is_empty(), "license is empty");
         let settings = raw.settings.unwrap_or_else(
@@ -186,7 +187,7 @@ impl Manifest {
             id: raw.id,
             version,
             world: raw.world,
-            api: raw.api,
+            api,
             description: raw.description,
             license: raw.license,
             authors: raw.authors,
@@ -241,7 +242,9 @@ impl NetworkRule {
             "{s:?}: a setting stands alone, as \"{{{{ name }}}}\""
         );
         let Some(wildcard) = s.find('*') else {
-            return Ok(Self::Origin(s.parse()?));
+            let origin: Origin = s.parse()?;
+            check_public_name(s, &origin.host)?;
+            return Ok(Self::Origin(origin));
         };
         // Only `scheme://*.domain[:port]`: never all hosts, a wildcard scheme or port, or a
         // wildcard inside a name.
@@ -256,10 +259,11 @@ impl NetworkRule {
         let origin: Origin = format!("{}{}", &s[..scheme_end], &s[scheme_end + 2..])
             .parse()
             .with_context(|| format!("{s:?} is not scheme://*.domain[:port]"))?;
+        check_public_name(s, &origin.host)?;
         ensure!(
-            origin.host.contains('.') && origin.host.parse::<std::net::Ipv4Addr>().is_err(),
+            origin.host.contains('.'),
             "{s:?}: a wildcard covers subdomains of a domain such as example.com, not of a \
-             top-level domain or an address"
+             top-level domain"
         );
         Ok(Self::Subdomains {
             https: origin.https,
@@ -267,6 +271,22 @@ impl NetworkRule {
             port: origin.port,
         })
     }
+}
+
+/// A manifest names public hosts: an address or a local name is the user's to allow, through a
+/// URL setting and an origin the configuration declares local.
+fn check_public_name(entry: &str, host: &str) -> anyhow::Result<()> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    ensure!(
+        bare.parse::<std::net::IpAddr>().is_err(),
+        "{entry:?}: name a host, not an address; for a server of the user's, use a URL setting \
+         (\"{{{{ name }}}}\")"
+    );
+    ensure!(
+        bare != "localhost" && !bare.ends_with(".localhost"),
+        "{entry:?}: localhost is the user's to allow; use a URL setting (\"{{{{ name }}}}\")"
+    );
+    Ok(())
 }
 
 impl CredentialRequest {
@@ -518,7 +538,7 @@ mod tests {
     fn calendar_manifest_declares_its_collections_and_credential() {
         let m = manifest_of("calendar");
         assert_eq!(m.id, "fronde/calendar");
-        assert_eq!(m.api, "0.1");
+        assert_eq!(m.api, Api::V0_1);
         let collections = vec![
             NetworkRule::Setting("events_url".into()),
             NetworkRule::Setting("reminders_url".into()),
@@ -640,6 +660,22 @@ mod tests {
             "https://*.10.0.0.1",
             "https://example.com/path",
             "example.com",
+        ] {
+            let e = refused(&with(&format!("[permissions]\nnetwork = [{bad:?}]")));
+            assert!(e.contains("permissions.network"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn network_names_no_address_or_local_host() {
+        for bad in [
+            "http://127.0.0.1:8080",
+            "https://10.0.0.2",
+            "https://[::1]",
+            "https://[fd00::1]:8443",
+            "http://localhost:5232",
+            "https://cal.localhost",
+            "https://*.dev.localhost",
         ] {
             let e = refused(&with(&format!("[permissions]\nnetwork = [{bad:?}]")));
             assert!(e.contains("permissions.network"), "{bad}: {e}");

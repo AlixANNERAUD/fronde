@@ -172,7 +172,6 @@ pub(crate) struct Sandbox {
     host: ComponentHost,
     pub(crate) name: String,
     grants: Grants,
-    allow_local: bool,
     settings: Arc<BTreeMap<String, String>>,
 }
 
@@ -181,7 +180,6 @@ impl Sandbox {
         Ok(Self {
             host: host.clone(),
             grants: Grants::new(&spec.allow, &spec.credentials)?,
-            allow_local: spec.allow_local,
             name: spec.name,
             settings: Arc::new(spec.settings),
         })
@@ -201,7 +199,6 @@ impl Sandbox {
                 egress: Egress {
                     grants: self.grants.clone(),
                     request_timeout: limits.request_timeout,
-                    allow_local: self.allow_local,
                 },
                 settings: self.settings.clone(),
                 limits: StoreLimitsBuilder::new()

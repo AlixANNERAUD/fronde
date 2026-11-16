@@ -131,9 +131,19 @@ impl Credential {
     }
 }
 
+/// An origin a component may reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allowed {
+    pub origin: Origin,
+    /// Whether it may resolve to a local address (loopback, private, link-local, cloud metadata),
+    /// which is refused otherwise: only for a service on the host or its network.
+    pub local: bool,
+}
+
 #[derive(Clone)]
 struct Grant {
     origin: Origin,
+    local: bool,
     authorization: Option<HeaderValue>,
 }
 
@@ -143,13 +153,14 @@ pub(crate) struct Grants(Arc<[Grant]>);
 
 impl Grants {
     pub(crate) fn new(
-        allow: &[Origin],
+        allow: &[Allowed],
         credentials: &[(Origin, Credential)],
     ) -> anyhow::Result<Self> {
         let mut grants: Vec<Grant> = allow
             .iter()
-            .map(|origin| Grant {
-                origin: origin.clone(),
+            .map(|a| Grant {
+                origin: a.origin.clone(),
+                local: a.local,
                 authorization: None,
             })
             .collect();
@@ -179,8 +190,6 @@ pub(crate) struct Egress {
     pub(crate) grants: Grants,
     /// For each request, from sending it to the end of the response body.
     pub(crate) request_timeout: Duration,
-    /// Whether allowed names may resolve to loopback, link-local or metadata addresses.
-    pub(crate) allow_local: bool,
 }
 
 impl WasiHttpHooks for Egress {
@@ -218,9 +227,9 @@ impl WasiHttpHooks for Egress {
         // The host's timeouts replace the guest's. Redirects are not followed: a new location is
         // a new request, checked again here.
         let deadline = Instant::now() + self.request_timeout;
-        let allow_local = self.allow_local;
+        let local = grant.local;
         Box::new(async move {
-            let send = dial::send(request, CONNECT_TIMEOUT, allow_local);
+            let send = dial::send(request, CONNECT_TIMEOUT, local);
             let (response, io) = tokio::time::timeout_at(deadline, send)
                 .await
                 .map_err(|_| Error::HttpResponseTimeout)??;
@@ -277,8 +286,21 @@ mod tests {
     use super::*;
 
     fn grants(allow: &[&str]) -> Grants {
-        let allow: Vec<Origin> = allow.iter().map(|s| s.parse().unwrap()).collect();
+        let allow: Vec<Allowed> = allow
+            .iter()
+            .map(|s| Allowed {
+                origin: s.parse().unwrap(),
+                local: false,
+            })
+            .collect();
         Grants::new(&allow, &[]).unwrap()
+    }
+
+    fn allowed_origin(o: &Origin) -> Allowed {
+        Allowed {
+            origin: o.clone(),
+            local: true,
+        }
     }
 
     fn allowed(g: &Grants, uri: &str) -> bool {
@@ -335,7 +357,7 @@ mod tests {
         let cred = || Credential::Bearer("t".into());
         for origin in ["http://cal.example", "http://10.0.0.2:8080"] {
             let o: Origin = origin.parse().unwrap();
-            let e = Grants::new(std::slice::from_ref(&o), &[(o.clone(), cred())])
+            let e = Grants::new(&[allowed_origin(&o)], &[(o.clone(), cred())])
                 .err()
                 .unwrap()
                 .to_string();
@@ -349,7 +371,7 @@ mod tests {
         ] {
             let o: Origin = origin.parse().unwrap();
             assert!(
-                Grants::new(std::slice::from_ref(&o), &[(o.clone(), cred())]).is_ok(),
+                Grants::new(&[allowed_origin(&o)], &[(o.clone(), cred())]).is_ok(),
                 "{origin}"
             );
         }

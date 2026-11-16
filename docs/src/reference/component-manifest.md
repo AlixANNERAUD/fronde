@@ -64,7 +64,10 @@ format = "uri"
 | `"https://*.example.com"` | Any subdomain of `example.com`, not `example.com` itself. `*` may only be the first label of the host: not alone, not in the scheme or port, not inside a name, not over a top-level domain or an address. |
 | `"{{ events_url }}"` | The origin of the URL the user gives in that setting, which must be declared with `format = "uri"`. Unlike Spin, a setting stands for a whole entry, never part of one. |
 
-Only `http` and `https` exist; no path, user or query.
+Only `http` and `https` exist; no path, user or query. Hosts are public names: an address
+(`127.0.0.1`, `[::1]`) or `localhost` (and `*.localhost`) is refused. A server of the user's, on
+the machine or its network, is reached through a URL setting whose origin the configuration
+allows as local.
 
 ## `[[credentials]]`
 

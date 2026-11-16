@@ -61,12 +61,13 @@ become a lasting memory.
 
 Components get no filesystem, sockets, environment or arguments. Their HTTP goes through a gate
 that denies every origin not allowed for that component, does not follow redirects and does not
-let the component set `Authorization` or `Cookie`. An allowed name that resolves to a loopback,
-link-local or cloud metadata address is refused too, unless the component is allowed local
-services: a public name cannot be pointed at the host or its cloud's metadata service. The host
-adds the credentials for an allowed origin itself, so a component never holds a secret it could
-leak elsewhere. Each call has a memory cap, a CPU budget and a timeout. Loading components from the configuration is **planned**;
-see [Component interface](../reference/wit-interface.md).
+let the component set `Authorization` or `Cookie`. An allowed name that resolves to a local
+address (loopback, private network, link-local, cloud metadata) is refused too, unless that
+origin is allowed as local: a public name cannot be pointed at the host, its network or its
+cloud's metadata service. The host adds the credentials for an allowed origin itself, so a
+component never holds a secret it could leak elsewhere. Each call has a memory cap, a CPU budget
+and a timeout. Loading components from the configuration is **planned**; see
+[Component interface](../reference/wit-interface.md).
 
 ## What is out of scope
 

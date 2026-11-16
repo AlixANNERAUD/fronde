@@ -2,7 +2,9 @@
 //! `mise run components`.
 
 use fronde_hub::tools::{Registry, register_meta_tools};
-use fronde_wasm::{ComponentHost, ComponentSpec, Credential, Limits, LoadedComponent, Origin};
+use fronde_wasm::{
+    Allowed, ComponentHost, ComponentSpec, Credential, Limits, LoadedComponent, Origin,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -29,7 +31,6 @@ fn spec() -> ComponentSpec {
         name: "echo".into(),
         path: echo_wasm(),
         allow: vec![],
-        allow_local: false,
         credentials: vec![],
         settings: BTreeMap::new(),
     }
@@ -42,6 +43,14 @@ async fn load(spec: ComponentSpec) -> LoadedComponent {
 
 fn origin(server: &MockServer) -> Origin {
     server.uri().parse().unwrap()
+}
+
+/// The test servers listen on 127.0.0.1, a local address: their origins are allowed as local.
+fn local(server: &MockServer) -> Allowed {
+    Allowed {
+        origin: origin(server),
+        local: true,
+    }
 }
 
 /// Answers 200 with the Authorization header it received in `x-echo-authorization`.
@@ -112,9 +121,7 @@ async fn allowed_origin_gets_host_credential() {
         .mount(&server)
         .await;
     let mut spec = spec();
-    spec.allow = vec![origin(&server)];
-    // The test servers listen on 127.0.0.1.
-    spec.allow_local = true;
+    spec.allow = vec![local(&server)];
     spec.credentials = vec![(
         origin(&server),
         Credential::Basic {
@@ -147,9 +154,7 @@ async fn each_credential_reaches_only_its_origin() {
             .await;
     }
     let mut spec = spec();
-    spec.allow = vec![origin(&a), origin(&b)];
-    // The test servers listen on 127.0.0.1.
-    spec.allow_local = true;
+    spec.allow = vec![local(&a), local(&b)];
     spec.credentials = vec![
         (origin(&a), Credential::Bearer("token-a".into())),
         (origin(&b), Credential::Bearer("token-b".into())),
@@ -175,9 +180,7 @@ async fn waiting_on_http_is_not_charged() {
     })
     .unwrap();
     let mut spec = spec();
-    spec.allow = vec![origin(&server)];
-    // The test servers listen on 127.0.0.1.
-    spec.allow_local = true;
+    spec.allow = vec![local(&server)];
     let echo = LoadedComponent::load(&host, spec).await.unwrap();
     let out = echo.call("echo_fetch", &json!({"url": server.uri()})).await;
     assert!(!out.is_error, "{}", out.to_text());
@@ -230,9 +233,13 @@ async fn slow_responses_time_out() {
         .await;
     let dripping = dripping_server().await;
     let mut spec = spec();
-    spec.allow = vec![origin(&late), dripping.parse().unwrap()];
-    // The test servers listen on 127.0.0.1.
-    spec.allow_local = true;
+    spec.allow = vec![
+        local(&late),
+        Allowed {
+            origin: dripping.parse().unwrap(),
+            local: true,
+        },
+    ];
     let echo = LoadedComponent::load(&host, spec).await.unwrap();
     for url in [late.uri(), dripping] {
         let started = Instant::now();
@@ -273,7 +280,10 @@ async fn denies_unlisted_origin() {
         .await;
     let mut spec = spec();
     // Same host, another port: only the exact origin is allowed.
-    spec.allow = vec!["http://127.0.0.1:9".parse().unwrap()];
+    spec.allow = vec![Allowed {
+        origin: "http://127.0.0.1:9".parse().unwrap(),
+        local: true,
+    }];
     let echo = load(spec).await;
     let out = echo
         .call(
@@ -290,29 +300,43 @@ async fn denies_unlisted_origin() {
 }
 
 #[tokio::test]
-async fn local_addresses_need_allow_local() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("local"))
-        .mount(&server)
-        .await;
-    // An allowed name that resolves to a loopback address.
-    let url = format!("http://localhost:{}/", server.address().port());
+async fn local_addresses_need_a_local_origin() {
+    let (marked, other) = (MockServer::start().await, MockServer::start().await);
+    for server in [&marked, &other] {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("local"))
+            .mount(server)
+            .await;
+    }
+    // Allowed names that resolve to a loopback address; only the first is declared local.
+    let url = |server: &MockServer| format!("http://localhost:{}", server.address().port());
     let mut spec = spec();
-    spec.allow = vec![url.trim_end_matches('/').parse().unwrap()];
-    let echo = load(spec.clone()).await;
-    let out = echo.call("echo_fetch", &json!({ "url": url })).await;
+    spec.allow = vec![
+        Allowed {
+            origin: url(&marked).parse().unwrap(),
+            local: true,
+        },
+        Allowed {
+            origin: url(&other).parse().unwrap(),
+            local: false,
+        },
+    ];
+    let echo = load(spec).await;
+
+    let out = echo
+        .call("echo_fetch", &json!({ "url": url(&other) }))
+        .await;
     assert!(out.is_error, "{}", out.to_text());
     assert!(
         out.to_text().to_lowercase().contains("prohibited"),
         "{}",
         out.to_text()
     );
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(other.received_requests().await.unwrap().is_empty());
 
-    spec.allow_local = true;
-    let echo = load(spec).await;
-    let out = echo.call("echo_fetch", &json!({ "url": url })).await;
+    let out = echo
+        .call("echo_fetch", &json!({ "url": url(&marked) }))
+        .await;
     assert!(!out.is_error, "{}", out.to_text());
     assert_eq!(out.value["body"], "local");
 }
@@ -325,9 +349,7 @@ async fn guest_cannot_set_authorization() {
         .mount(&server)
         .await;
     let mut spec = spec();
-    spec.allow = vec![origin(&server)];
-    // The test servers listen on 127.0.0.1.
-    spec.allow_local = true;
+    spec.allow = vec![local(&server)];
     let echo = load(spec).await;
     let out = echo
         .call(
@@ -419,6 +441,9 @@ async fn rejects_unsupported_api_version() {
         r#"(component
              (import "fronde:component/settings@1.0.0" (instance))
              (instance $i) (export "fronde:component/tools@0.1.0" (instance $i)))"#,
+        r#"(component
+             (import "fronde:component/settings" (instance))
+             (instance $i) (export "fronde:component/tools@0.1.0" (instance $i)))"#,
     ] {
         let path = dir.path().join("future.wat");
         std::fs::write(&path, wat).unwrap();
@@ -428,7 +453,8 @@ async fn rejects_unsupported_api_version() {
             .unwrap()
             .to_string();
         assert!(e.contains("this Fronde serves 0.1"), "{e}");
-        assert!(e.contains("fronde:component@"), "{e}");
+        // An unversioned name reads "without a version", not an empty one.
+        assert!(!e.contains("@,"), "{e}");
     }
 }
 
