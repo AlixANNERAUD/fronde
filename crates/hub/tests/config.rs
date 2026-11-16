@@ -359,6 +359,71 @@ fn component_hash_must_be_hex() {
     assert!(e.contains("64 lower-case hex digits"), "{e}");
 }
 
+/// The `[[sources]]` entry the error for an old `[calendar]` section gives.
+fn calendar_replacement(calendar: &str) -> String {
+    let e = refused(&format!("{MIN}\n[calendar]\n{calendar}"));
+    let start = e.find("Replace the section with:\n\n").expect(&e) + 27;
+    let end = e.find("\nThe calendar shipped").expect(&e);
+    e[start..end].to_string()
+}
+
+#[test]
+fn the_calendar_migration_gives_a_working_entry() {
+    let entry = calendar_replacement(
+        "events_url = \"https://cloud.example/dav/alix/personal/\"\n\
+         reminders_url = \"https://cloud.example/dav/alix/tasks/\"\n\
+         username = \"alix\"\npassword = { env = \"CALDAV_PASSWORD\" }\n",
+    );
+    assert!(
+        entry.contains("allow = [\"https://cloud.example\"]"),
+        "{entry}"
+    );
+    assert!(!entry.contains("sha256"), "shipped: no hashes: {entry}");
+    // Followed literally, it loads.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(&path, format!("{MIN}\n{entry}")).unwrap();
+    let config = fronde_hub::config::load(&path).unwrap();
+    let [fronde_hub::config::SourceConfig::Component(c)] = &config.sources[..] else {
+        panic!("{:?}", config.sources)
+    };
+    assert_eq!(c.name, "calendar");
+    assert!(c.path.ends_with("calendar.wasm"), "{}", c.path.display());
+    assert_eq!(
+        c.settings["events_url"],
+        "https://cloud.example/dav/alix/personal/"
+    );
+    let [credential] = &c.credentials[..] else {
+        panic!("{:?}", c.credentials)
+    };
+    let basic = credential.basic.as_ref().unwrap();
+    assert_eq!(basic.username, "alix");
+    assert!(
+        matches!(&basic.password, fronde_hub::config::Secret::Env { env } if env == "CALDAV_PASSWORD")
+    );
+
+    // A server on the network, over plain http, with reminders elsewhere.
+    let entry = calendar_replacement(
+        "events_url = \"http://192.168.1.10:5232/alix/cal/\"\n\
+         reminders_url = \"https://tasks.example/alix/\"\n\
+         username = \"alix\"\npassword = { file = \"caldav\" }\n",
+    );
+    assert!(
+        entry.contains(
+            "allow = [{ origin = \"http://192.168.1.10:5232\", local = true }, \"https://tasks.example\"]"
+        ),
+        "{entry}"
+    );
+    assert!(entry.contains("Serve CalDAV over https"), "{entry}");
+    assert_eq!(
+        entry.matches("[[sources.credentials]]").count(),
+        2,
+        "{entry}"
+    );
+    std::fs::write(&path, format!("{MIN}\n{entry}")).unwrap();
+    fronde_hub::config::load(&path).unwrap();
+}
+
 #[test]
 fn old_sections_point_to_sources() {
     let e = refused(&format!(

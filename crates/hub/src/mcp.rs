@@ -120,6 +120,28 @@ mod tests {
         Arc::new(hub)
     }
 
+    #[tokio::test]
+    async fn hub_tools_use_reserved_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = start_hub(dir.path()).await;
+        let own: Vec<String> = hub
+            .registry
+            .all()
+            .into_iter()
+            .filter(|d| d.source == "hub")
+            .map(|d| d.name)
+            .collect();
+        assert!(own.len() >= 5, "{own:?}");
+        for name in own {
+            assert!(
+                crate::config::RESERVED_TOOL_PREFIXES
+                    .iter()
+                    .any(|p| name.starts_with(p)),
+                "{name} needs a reserved prefix"
+            );
+        }
+    }
+
     async fn connect(hub: Arc<Hub>) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
         let (a, b) = tokio::io::duplex(1 << 16);
         tokio::spawn(async move {

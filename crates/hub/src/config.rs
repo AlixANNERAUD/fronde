@@ -326,6 +326,10 @@ fn default_user() -> String {
     "me".to_string()
 }
 
+/// Prefixes of the hub's own tools (`search_tools`, `use_tool`, `memory_*`) and of its source
+/// name: no component may declare them.
+pub const RESERVED_TOOL_PREFIXES: [&str; 4] = ["hub_", "memory_", "search_", "use_"];
+
 /// True for names usable as tool prefixes: `^[a-z][a-z0-9_]{0,63}$`.
 pub fn is_valid_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -401,12 +405,15 @@ fn replaced_sections(text: &str) -> anyhow::Result<()> {
     let Ok(table) = text.parse::<toml::Table>() else {
         return Ok(()); // the full parse reports it
     };
-    if table.contains_key("calendar") {
+    if let Some(old) = table.get("calendar") {
         bail!(
-            "[calendar] is gone: the calendar is now a component. Replace it with a [[sources]] \
-             entry with kind = \"component\" and path = \"…/calendar.wasm\", its URLs under \
-             [sources.settings] and the account under [[sources.credentials]]; see \
-             fronde.example.toml and the \"Configure the calendar\" guide"
+            "[calendar] is gone: the calendar is now a component. Replace the section with:\n\n\
+             {}\n\
+             The calendar shipped with this Fronde needs no hashes: `fronde check` says \
+             \"approved: shipped with this build\". A calendar.wasm from elsewhere needs the \
+             sha256 and manifest_sha256 that `fronde check` prints, added to the entry once you \
+             have read its manifest. See the \"Configure the calendar\" guide.",
+            calendar_source(old)
         );
     }
     if table.contains_key("mcp") {
@@ -416,6 +423,124 @@ fn replaced_sections(text: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The `[[sources]]` entry that replaces an old `[calendar]` section, with its values.
+fn calendar_source(old: &toml::Value) -> String {
+    let text = |key: &str, default: &str| {
+        old.get(key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or(default)
+            .to_string()
+    };
+    let quoted = |s: &str| toml::Value::String(s.to_string()).to_string();
+    let events = text(
+        "events_url",
+        "https://cloud.example/remote.php/dav/calendars/you/personal/",
+    );
+    let reminders = text(
+        "reminders_url",
+        "https://cloud.example/remote.php/dav/calendars/you/tasks/",
+    );
+    let username = text("username", "you");
+    let password = old.get("password").map_or_else(
+        || "{ env = \"FRONDE_CALDAV_PASSWORD\" }".to_string(),
+        toml::Value::to_string,
+    );
+    let mut origins: Vec<Url> = Vec::new();
+    for url in [&events, &reminders] {
+        if let Ok(url) = Url::parse(url)
+            && let Ok(origin) = parse_origin(&url.origin().ascii_serialization())
+            && !origins.contains(&origin)
+        {
+            origins.push(origin);
+        }
+    }
+    let shown = |o: &Url| o.as_str().trim_end_matches('/').to_string();
+    let allow: Vec<String> = origins
+        .iter()
+        .map(|o| {
+            if is_local_host(o) {
+                format!("{{ origin = \"{}\", local = true }}", shown(o))
+            } else {
+                format!("\"{}\"", shown(o))
+            }
+        })
+        .collect();
+    let mut entry = format!(
+        "[[sources]]\n\
+         kind = \"component\"\n\
+         name = \"calendar\"\n\
+         path = {}\n\
+         # The origins of both URLs; a server on this machine or its network: {{ origin = \"…\", local = true }}\n\
+         allow = [{}]\n\
+         [sources.settings]\n\
+         events_url = {}\n\
+         reminders_url = {}\n",
+        quoted(&shipped_calendar().map_or_else(
+            || "/app/components/calendar.wasm".to_string(),
+            |p| p.display().to_string()
+        )),
+        allow.join(", "),
+        quoted(&events),
+        quoted(&reminders),
+    );
+    for origin in &origins {
+        if origin.scheme() == "http" && !is_loopback_host(origin) {
+            entry.push_str(
+                "# Plain http: Fronde sends the password only over https or to this machine (in \
+                 Docker, the container). Serve CalDAV over https.\n",
+            );
+        }
+        entry.push_str(&format!(
+            "[[sources.credentials]]\n\
+             origin = \"{}\"\n\
+             basic = {{ username = {}, password = {password} }}\n",
+            shown(origin),
+            quoted(&username),
+        ));
+    }
+    entry
+}
+
+/// Where the shipped calendar component is: beside the binary as in the image
+/// (`/app/components`), or in `components/dist` of the checkout this binary was built from.
+pub fn shipped_calendar() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let candidates = [
+        exe.as_deref()
+            .and_then(Path::parent)
+            .map(|d| d.join("components/calendar.wasm")),
+        Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/dist/calendar.wasm")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_file())
+        .and_then(|p| p.canonicalize().ok())
+}
+
+fn is_loopback_host(origin: &Url) -> bool {
+    match origin.host() {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// A host on this machine or a private network, as far as the URL alone tells.
+fn is_local_host(origin: &Url) -> bool {
+    match origin.host() {
+        Some(url::Host::Domain(d)) => {
+            d == "localhost" || !d.contains('.') || d.ends_with(".local") || d.ends_with(".lan")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+        None => false,
+    }
 }
 
 fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
