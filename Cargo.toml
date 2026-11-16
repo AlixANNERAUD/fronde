@@ -30,7 +30,9 @@ serde_path_to_error = "0.1"
 subtle = "2"
 tempfile = "3"
 tokio = { version = "1.54", features = ["full"] }
+tokio-tungstenite = "0.29"
 tokio-util = "0.7"
+tower-sessions = { version = "0.14", default-features = false, features = ["axum-core", "memory-store"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

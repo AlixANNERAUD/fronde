@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,6 +30,9 @@ enum Command {
 fn check(path: &std::path::Path) -> anyhow::Result<()> {
     let config = jarvis_hub::config::load(path)?;
     jarvis::check_token(&config.server.token.resolve()?)?;
+    if let Some(web) = &config.web {
+        jarvis::check_password(&web.password.resolve().context("web.password")?)?;
+    }
     if let Some(c) = &config.calendar {
         c.password.resolve()?;
     }

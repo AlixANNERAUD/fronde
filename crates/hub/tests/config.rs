@@ -21,6 +21,7 @@ fn loads_example() {
     assert_eq!(c.data.timezone, chrono_tz::Europe::Paris);
     assert_eq!(c.mcp.len(), 1);
     assert_eq!(c.data.user, "alix");
+    assert!(c.web.is_some());
 }
 
 #[test]
@@ -33,6 +34,36 @@ fn defaults_apply() {
         (4000, 2000, true)
     );
     assert!(c.calendar.is_none());
+    assert!(c.web.is_none());
+    assert_eq!(c.agent.command, ["claude-agent-acp"]);
+    assert!(c.agent.env.is_empty());
+}
+
+#[test]
+fn loads_web_and_agent() {
+    let s = format!(
+        "{MIN}\n[web]\npassword = {{ env = \"P\" }}\nsecure_cookie = true\n[agent]\ncommand = [\"npx\", \"claude-agent-acp\"]\nenv = {{ CLAUDE_CODE_OAUTH_TOKEN_FILE = \"/run/secrets/claude\" }}\n"
+    );
+    let c = load_str(&s).unwrap();
+    let web = c.web.unwrap();
+    assert!(matches!(web.password, Secret::Env { env } if env == "P"));
+    assert!(web.secure_cookie);
+    assert_eq!(c.agent.command, ["npx", "claude-agent-acp"]);
+    assert_eq!(
+        c.agent
+            .env
+            .get("CLAUDE_CODE_OAUTH_TOKEN_FILE")
+            .map(String::as_str),
+        Some("/run/secrets/claude")
+    );
+    let s = format!("{MIN}\n[web]\npassword = {{ env = \"P\" }}\n");
+    assert!(!load_str(&s).unwrap().web.unwrap().secure_cookie);
+}
+
+#[test]
+fn rejects_password_written_in_the_toml() {
+    let s = format!("{MIN}\n[web]\npassword = \"hunter2\"\n");
+    assert!(load_str(&s).is_err());
 }
 
 #[test]

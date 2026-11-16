@@ -63,6 +63,31 @@ pub struct Entry {
     pub event: Event,
 }
 
+/// What the chat page sends over the WebSocket.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMsg {
+    /// Start streaming: the entries after `last_seq`, then the live ones.
+    Hello {
+        last_seq: u64,
+    },
+    Send {
+        text: String,
+    },
+    Cancel,
+    Answer {
+        id: u64,
+        allow: bool,
+    },
+}
+
+/// What the server sends over the WebSocket.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMsg {
+    Entry(Entry),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +106,52 @@ mod tests {
             r#"{"seq":1,"at":"2026-11-16T10:00:00Z","event":{"type":"assistant","text":"hi"}}"#
         );
         assert_eq!(serde_json::from_str::<Entry>(&json).unwrap(), entry);
+    }
+
+    #[test]
+    fn client_messages_json_shape() {
+        let cases = [
+            (
+                r#"{"type":"hello","last_seq":3}"#,
+                ClientMsg::Hello { last_seq: 3 },
+            ),
+            (
+                r#"{"type":"send","text":"salut"}"#,
+                ClientMsg::Send {
+                    text: "salut".into(),
+                },
+            ),
+            (r#"{"type":"cancel"}"#, ClientMsg::Cancel),
+            (
+                r#"{"type":"answer","id":7,"allow":false}"#,
+                ClientMsg::Answer {
+                    id: 7,
+                    allow: false,
+                },
+            ),
+        ];
+        for (json, message) in cases {
+            assert_eq!(serde_json::from_str::<ClientMsg>(json).unwrap(), message);
+            assert_eq!(serde_json::to_string(&message).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn server_entry_message_json_shape() {
+        let entry = Entry {
+            seq: 2,
+            at: "2026-11-16T10:00:00Z".parse().unwrap(),
+            event: Event::User { text: "hi".into() },
+        };
+        let json = serde_json::to_string(&ServerMsg::Entry(entry.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"entry","seq":2,"at":"2026-11-16T10:00:00Z","event":{"type":"user","text":"hi"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerMsg>(&json).unwrap(),
+            ServerMsg::Entry(entry)
+        );
     }
 
     #[test]

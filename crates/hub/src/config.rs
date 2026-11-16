@@ -2,6 +2,7 @@
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -16,6 +17,36 @@ pub struct Config {
     pub calendar: Option<CalendarConfig>,
     #[serde(default)]
     pub mcp: Vec<UpstreamConfig>,
+    /// The chat page; without it the server is only the hub.
+    pub web: Option<WebConfig>,
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    pub password: Secret,
+    /// Mark the session cookie `Secure`; turn on when the page is served over https.
+    #[serde(default)]
+    pub secure_cookie: bool,
+}
+
+/// The coding agent Jarvis talks to over ACP.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentConfig {
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: vec!["claude-agent-acp".to_string()],
+            env: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
