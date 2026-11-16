@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <response>
+    <href>/cal/alix/personal/a.ics</href>
+    <propstat>
+      <prop>
+        <getetag>"etag-a"</getetag>
+        <C:calendar-data>BEGIN:VCALENDAR&#13;
+VERSION:2.0&#13;
+BEGIN:VEVENT&#13;
+UID:a&#13;
+SUMMARY:Rendez-vous &amp; café&#13;
+DTSTART:20261116T090000Z&#13;
+END:VEVENT&#13;
+END:VCALENDAR&#13;
+</C:calendar-data>
+      </prop>
+      <status>HTTP/1.1 200 OK</status>
+    </propstat>
+  </response>
+  <response>
+    <href>/cal/alix/personal/b.ics</href>
+    <propstat><prop><getetag>"etag-b"</getetag><C:calendar-data><![CDATA[BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:b
+SUMMARY:B
+DTSTART:20261117T090000Z
+END:VEVENT
+END:VCALENDAR
+]]></C:calendar-data></prop><status>HTTP/1.1 200 OK</status></propstat>
+  </response>
+  <response>
+    <href>/cal/alix/personal/gone.ics</href>
+    <propstat><prop><getetag/></prop><status>HTTP/1.1 404 Not Found</status></propstat>
+  </response>
+</multistatus>
