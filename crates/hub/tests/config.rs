@@ -37,6 +37,23 @@ fn defaults_apply() {
     assert!(c.web.is_none());
     assert_eq!(c.agent.command, ["claude-agent-acp"]);
     assert!(c.agent.env.is_empty());
+    assert_eq!(c.agent.builtin_tools, ["WebSearch", "WebFetch"]);
+}
+
+#[test]
+fn builtin_tools_can_be_narrowed_or_emptied() {
+    let c = load_str(&format!("{MIN}\n[agent]\nbuiltin_tools = [\"WebFetch\"]\n")).unwrap();
+    assert_eq!(c.agent.builtin_tools, ["WebFetch"]);
+    let c = load_str(&format!("{MIN}\n[agent]\nbuiltin_tools = []\n")).unwrap();
+    assert!(c.agent.builtin_tools.is_empty());
+}
+
+#[test]
+fn rejects_unsafe_builtin_tool() {
+    let s = format!("{MIN}\n[agent]\nbuiltin_tools = [\"WebSearch\", \"Bash\"]\n");
+    let e = format!("{:#}", load_str(&s).unwrap_err());
+    assert!(e.contains("\"Bash\" is not allowed"), "{e}");
+    assert!(e.contains("WebSearch"), "{e}");
 }
 
 #[test]

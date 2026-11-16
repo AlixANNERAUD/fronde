@@ -30,6 +30,8 @@ pub struct AgentSpec {
     pub hub_url: String,
     pub hub_token: String,
     pub system_prompt: String,
+    /// Claude Code's own tools the session gets besides the hub's, such as `WebSearch`.
+    pub builtin_tools: Vec<String>,
 }
 
 /// What the agent does during a turn.
@@ -428,7 +430,7 @@ impl Connection {
             let request = ResumeSessionRequest::new(id.clone(), spec.cwd.clone())
                 .mcp_servers(vec![hub.clone()])
                 .system_prompt(system_prompt.clone())
-                .meta(session_meta());
+                .meta(session_meta(&spec.builtin_tools));
             match connection.send_request(request).block_task().await {
                 Ok(_) => resumed = Some(SessionId::from(id)),
                 Err(error) => {
@@ -442,7 +444,7 @@ impl Connection {
                 let request = NewSessionRequest::new(spec.cwd.clone())
                     .mcp_servers(vec![hub])
                     .system_prompt(system_prompt)
-                    .meta(session_meta());
+                    .meta(session_meta(&spec.builtin_tools));
                 connection
                     .send_request(request)
                     .block_task()
@@ -467,14 +469,21 @@ impl Connection {
     }
 }
 
-/// Jarvis's agent only gets the hub's tools. The Claude Code adapter loads the user's, project's
-/// and local settings unless told otherwise, and with them the owner's plugins, MCP servers, hooks
-/// and allow rules: none of them apply. The sign-in is not a setting and still works.
-fn session_meta() -> serde_json::Map<String, serde_json::Value> {
+/// Jarvis's agent gets the hub's tools and the listed built-in ones, all allowed up front. The
+/// Claude Code adapter loads the user's, project's and local settings unless told otherwise, and
+/// with them the owner's plugins, MCP servers, hooks and allow rules: none of them apply. The
+/// sign-in is not a setting and still works.
+fn session_meta(builtin_tools: &[String]) -> serde_json::Map<String, serde_json::Value> {
+    let allowed: Vec<&str> = std::iter::once("mcp__jarvis")
+        .chain(builtin_tools.iter().map(String::as_str))
+        .collect();
+    // The adapter prefers `tools` over `disableBuiltInTools`; the flag stays so that an adapter
+    // ignoring `tools` falls back to no built-in tool rather than all of them.
     let serde_json::Value::Object(meta) = json!({
         "disableBuiltInTools": true,
         "claudeCode": {"options": {
-            "allowedTools": ["mcp__jarvis"],
+            "tools": builtin_tools,
+            "allowedTools": allowed,
             "settingSources": [],
             "strictMcpConfig": true,
             "allowDangerouslySkipPermissions": false,

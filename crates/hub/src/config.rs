@@ -38,6 +38,8 @@ pub struct WebConfig {
 pub struct AgentConfig {
     pub command: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// Claude Code's own tools the agent gets besides the hub's; empty for none.
+    pub builtin_tools: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -45,9 +47,14 @@ impl Default for AgentConfig {
         Self {
             command: vec!["claude-agent-acp".to_string()],
             env: BTreeMap::new(),
+            builtin_tools: SAFE_BUILTIN_TOOLS.map(str::to_string).to_vec(),
         }
     }
 }
+
+/// Built-in tools an assistant with no shell and no files may use: they read the web and touch
+/// nothing on the machine. Widening this list is a deliberate decision.
+pub const SAFE_BUILTIN_TOOLS: [&str; 2] = ["WebSearch", "WebFetch"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,6 +166,13 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         }
         if m.url.is_some() == m.command.is_some() {
             bail!("mcp {:?}: set exactly one of url or command", m.name);
+        }
+    }
+    for tool in &config.agent.builtin_tools {
+        if !SAFE_BUILTIN_TOOLS.contains(&tool.as_str()) {
+            bail!(
+                "agent.builtin_tools: {tool:?} is not allowed; use only {SAFE_BUILTIN_TOOLS:?}, or [] for none"
+            );
         }
     }
     Ok(config)

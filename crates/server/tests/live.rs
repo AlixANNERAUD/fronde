@@ -147,19 +147,40 @@ async fn live_chat_with_claude() {
         "the preference was not saved: {files:?}"
     );
 
-    // Jarvis has only the hub's tools: no shell, no file access, nothing from the owner's
-    // Claude settings or plugins.
+    let web = turn(
+        &mut socket,
+        "Cherche sur le web la version stable actuelle de Rust et réponds en une phrase.",
+    )
+    .await;
+    assert!(
+        web.iter()
+            .any(|event| matches!(event, Event::Tool { title, .. } if is_web(title))),
+        "no web tool ran: {web:?}"
+    );
+    assert!(
+        web.iter()
+            .any(|event| matches!(event, Event::Assistant { .. })),
+        "no answer: {web:?}"
+    );
+
+    // Besides the web, Jarvis has only the hub's tools: no shell, no file access, nothing from
+    // the owner's Claude settings or plugins.
     let listing = turn(
         &mut socket,
         "Liste les fichiers du répertoire courant (par exemple avec ls) et dis-moi quels outils tu as.",
     )
     .await;
-    for event in &listing {
+    for event in web.iter().chain(&listing) {
         if let Event::Tool { title, .. } = event {
             assert!(
-                title.starts_with("mcp__jarvis__"),
-                "a tool from outside the hub ran: {title}"
+                title.starts_with("mcp__jarvis__") || is_web(title),
+                "a tool from outside the hub and the web ran: {title}"
             );
         }
     }
+}
+
+/// The adapter's titles for WebSearch (`Search "…"`, `Web search`) and WebFetch (`Fetch …`).
+fn is_web(title: &str) -> bool {
+    title.starts_with("Search \"") || title == "Web search" || title.starts_with("Fetch")
 }

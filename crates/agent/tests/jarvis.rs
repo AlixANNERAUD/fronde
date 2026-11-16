@@ -33,6 +33,7 @@ fn spec() -> AgentSpec {
         hub_url: "http://127.0.0.1:7878/mcp".into(),
         hub_token: "hub-token".into(),
         system_prompt: "You are Jarvis.".into(),
+        builtin_tools: vec!["WebSearch".into(), "WebFetch".into()],
     }
 }
 

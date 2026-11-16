@@ -45,3 +45,6 @@ command = ["claude-agent-acp"]
 # Claude Code instead of the adapter's own:
 # env = { CLAUDE_CODE_EXECUTABLE = "/home/alix/.local/bin/claude" }
 env = {}
+# Claude Code's own tools Jarvis may use besides the hub's. Only the web ones are allowed; [] for
+# none.
+builtin_tools = ["WebSearch", "WebFetch"]

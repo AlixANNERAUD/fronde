@@ -21,6 +21,7 @@ fn spec() -> AgentSpec {
         hub_url: "http://127.0.0.1:7878/mcp".into(),
         hub_token: "hub-token".into(),
         system_prompt: "You are Jarvis.".into(),
+        builtin_tools: vec!["WebSearch".into(), "WebFetch".into()],
     }
 }
 
@@ -28,11 +29,19 @@ async fn connect(
     script: FakeScript,
     resume: Option<&str>,
 ) -> (AgentClient, FakeHandle, mpsc::UnboundedReceiver<AgentEvent>) {
+    connect_with(&spec(), script, resume).await
+}
+
+async fn connect_with(
+    spec: &AgentSpec,
+    script: FakeScript,
+    resume: Option<&str>,
+) -> (AgentClient, FakeHandle, mpsc::UnboundedReceiver<AgentEvent>) {
     let (transport, handle) = fake_agent(script);
     let (events, rx) = mpsc::unbounded_channel();
     let client = timeout(
         WAIT,
-        AgentClient::connect(transport, &spec(), resume.map(str::to_owned), events),
+        AgentClient::connect(transport, spec, resume.map(str::to_owned), events),
     )
     .await
     .expect("connect timed out")
@@ -73,13 +82,14 @@ fn selected(option_id: &str) -> RequestPermissionOutcome {
     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id.to_owned()))
 }
 
-/// No built-in tools, only the hub, and nothing from the owner's Claude settings: no plugins,
-/// MCP servers, hooks or allow rules, and no bypass mode.
+/// The hub and the web tools, allowed up front, and nothing from the owner's Claude settings: no
+/// plugins, MCP servers, hooks or allow rules, and no bypass mode.
 fn expected_meta() -> serde_json::Value {
     json!({
         "disableBuiltInTools": true,
         "claudeCode": {"options": {
-            "allowedTools": ["mcp__jarvis"],
+            "tools": ["WebSearch", "WebFetch"],
+            "allowedTools": ["mcp__jarvis", "WebSearch", "WebFetch"],
             "settingSources": [],
             "strictMcpConfig": true,
             "allowDangerouslySkipPermissions": false,
@@ -114,6 +124,31 @@ async fn new_session_sends_hub_and_meta() {
     );
     assert_eq!(record.modes, vec!["default"]);
     assert!(record.resumes.is_empty());
+}
+
+#[tokio::test]
+async fn no_builtin_tools_leaves_only_the_hub() {
+    let spec = AgentSpec {
+        builtin_tools: Vec::new(),
+        ..spec()
+    };
+    let (_client, handle, _rx) = connect_with(&spec, FakeScript::default(), None).await;
+
+    let record = handle.record();
+    let meta = serde_json::Value::Object(record.new_sessions[0].meta.clone().expect("no _meta"));
+    assert_eq!(
+        meta,
+        json!({
+            "disableBuiltInTools": true,
+            "claudeCode": {"options": {
+                "tools": [],
+                "allowedTools": ["mcp__jarvis"],
+                "settingSources": [],
+                "strictMcpConfig": true,
+                "allowDangerouslySkipPermissions": false,
+            }},
+        })
+    );
 }
 
 #[tokio::test]
