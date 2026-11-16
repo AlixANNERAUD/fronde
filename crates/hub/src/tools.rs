@@ -162,6 +162,11 @@ impl Registry {
         tools.values().filter(|(d, _)| !d.deferred).map(|(d, _)| d.clone()).collect()
     }
 
+    pub fn deferred(&self) -> Vec<ToolDef> {
+        let tools = self.tools.read().expect("registry lock");
+        tools.values().filter(|(d, _)| d.deferred).map(|(d, _)| d.clone()).collect()
+    }
+
     pub fn deferred_names(&self) -> Vec<String> {
         let tools = self.tools.read().expect("registry lock");
         tools.values().filter(|(d, _)| d.deferred).map(|(d, _)| d.name.clone()).collect()

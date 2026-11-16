@@ -114,6 +114,11 @@ impl MemoryStore {
         self.capped(file).map(|(_, _, l)| l)
     }
 
+    /// Read the core without waiting for writers (files are replaced atomically).
+    pub fn core_now(&self) -> Core {
+        Core { user: read(&self.dir.join("USER.md")), memory: read(&self.dir.join("MEMORY.md")) }
+    }
+
     pub async fn core(&self) -> Core {
         let _g = self.lock.lock().await;
         Core { user: read(&self.dir.join("USER.md")), memory: read(&self.dir.join("MEMORY.md")) }
