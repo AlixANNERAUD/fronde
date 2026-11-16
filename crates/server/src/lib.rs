@@ -18,6 +18,7 @@ use jarvis_hub::mcp::HubServer;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
@@ -79,6 +80,12 @@ fn system_prompt(user: &str) -> String {
     )
 }
 
+/// Where the chat's browser bundle and stylesheet are: `JARVIS_SITE_ROOT`, else `target/site`,
+/// where `cargo leptos build` writes them.
+fn site_root() -> PathBuf {
+    std::env::var_os("JARVIS_SITE_ROOT").map_or_else(|| PathBuf::from("target/site"), PathBuf::from)
+}
+
 /// Resolve secrets, start the hub and serve HTTP in the background.
 pub async fn start(config: Config) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     start_with(config, process_connector()).await
@@ -129,6 +136,7 @@ pub async fn start_with(
                 throttle: Default::default(),
             },
             secure_cookie,
+            &site_root(),
         ));
     }
     let handle = tokio::spawn(async move {

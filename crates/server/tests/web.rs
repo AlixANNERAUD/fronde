@@ -411,3 +411,84 @@ fn check_requires_web_password_secret() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("web.password"), "{stderr}");
 }
+
+#[tokio::test]
+async fn sign_in_page_renders() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+
+    let page = get(addr, "/sign-in", None).await;
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(html.contains("<title>Connexion · Jarvis</title>"), "{html}");
+    assert!(html.contains("href=\"/pkg/jarvis.css\""), "{html}");
+    assert!(html.contains("action=\"/sign-in\""), "{html}");
+    assert!(html.contains("type=\"password\""), "{html}");
+    assert!(html.contains("Mot de passe"), "{html}");
+    assert!(html.contains("Se connecter"), "{html}");
+    assert!(!html.contains("role=\"alert\""), "{html}");
+
+    let wrong = get(addr, "/sign-in?error=1", None)
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(wrong.contains("Mot de passe incorrect."), "{wrong}");
+    let locked = get(addr, "/sign-in?error=2", None)
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        locked.contains("Trop d'essais, réessaie dans une minute."),
+        "{locked}"
+    );
+}
+
+#[tokio::test]
+async fn chat_page_redirects_without_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+
+    for cookie in [None, Some("jarvis_session=forged")] {
+        let page = get(addr, "/", cookie).await;
+        assert_eq!(page.status(), 303);
+        assert_eq!(page.headers()[LOCATION], "/sign-in");
+    }
+}
+
+#[tokio::test]
+async fn chat_page_renders_island_when_signed_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+
+    let page = get(addr, "/", Some(&cookie)).await;
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(html.contains("<title>Jarvis</title>"), "{html}");
+    assert!(html.contains("<leptos-island"), "{html}");
+    assert!(html.contains("ChatPanel"), "{html}");
+    assert!(html.contains("/pkg/jarvis.js"), "{html}");
+    assert!(html.contains("action=\"/sign-out\""), "{html}");
+    assert!(html.contains("Se déconnecter"), "{html}");
+    assert!(html.contains("<textarea"), "{html}");
+}
+
+#[tokio::test]
+async fn hello_after_a_log_reset_replays_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+
+    // A page that saw entries the log no longer has (it was deleted) gets the whole log again.
+    say(&mut socket, ClientMsg::Hello { last_seq: 0 }).await;
+    say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
+    let turn = until_turn_ended(&mut socket).await;
+    let mut stale = open_chat(addr, &cookie).await;
+    say(&mut stale, ClientMsg::Hello { last_seq: 100 }).await;
+    for entry in &turn {
+        assert_eq!(&next_entry(&mut stale).await, entry);
+    }
+}

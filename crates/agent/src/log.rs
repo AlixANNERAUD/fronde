@@ -106,6 +106,11 @@ impl ConversationLog {
         state.entries[start..].to_vec()
     }
 
+    /// The seq of the newest entry, 0 when the log is empty.
+    pub fn last_seq(&self) -> u64 {
+        self.lock().entries.last().map_or(0, |entry| entry.seq)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Entry> {
         self.live.subscribe()
     }
@@ -156,6 +161,14 @@ mod tests {
         let seqs: Vec<u64> = log.since(1).iter().map(|e| e.seq).collect();
         assert_eq!(seqs, [2, 3]);
         assert!(log.since(3).is_empty());
+        assert_eq!(log.last_seq(), 3);
+    }
+
+    #[test]
+    fn empty_log_last_seq_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ConversationLog::open(&dir.path().join("log.jsonl")).unwrap();
+        assert_eq!(log.last_seq(), 0);
     }
 
     #[test]

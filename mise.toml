@@ -3,26 +3,79 @@ rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools", targets 
 mr-boxington = "latest"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.149"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+"github:leptos-rs/cargo-leptos" = "0.3.11"
+# Must match the wasm-bindgen version in Cargo.lock. The statically linked (musl) build runs on
+# any Linux, whatever its glibc.
+"github:wasm-bindgen/wasm-bindgen" = { version = "0.2.130", matching = "unknown-linux-musl" }
+# cargo-leptos uses these from the PATH instead of downloading them at each clean build. The
+# versions are cargo-leptos 0.3.11's defaults.
+"github:WebAssembly/binaryen" = { version = "123", version_prefix = "version_" }
+"aqua:tailwindlabs/tailwindcss" = "4.2.1"
+
+[env]
+# The browser bundle is built separately for wasm32, so server-side commands leave it out to
+# avoid unifying the `ssr` and `hydrate` features of the app crate.
+JARVIS_SERVER_PACKAGES = "--workspace --exclude jarvis-frontend"
 
 [tasks.format]
 description = "Format the code"
 run = "cargo fmt --all"
 
 [tasks.lint]
-description = "Check formatting and run clippy"
+description = "Check formatting and run clippy on the server and browser code"
 run = [
   "cargo fmt --all --check",
-  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy $JARVIS_SERVER_PACKAGES --all-targets -- -D warnings",
+  "cargo clippy --package jarvis-frontend --target wasm32-unknown-unknown -- -D warnings",
 ]
 
 [tasks.test]
 description = "Run the test suite"
-run = "cargo nextest run --workspace --no-tests=pass"
+run = "cargo nextest run $JARVIS_SERVER_PACKAGES --no-tests=pass"
 
 [tasks.deny]
 description = "Check advisories, licences, bans and sources"
 run = "cargo deny check"
 
 [tasks.check]
-description = "Everything CI checks"
+description = "Everything CI checks, except the release build"
 depends = ["lint", "test", "deny"]
+
+# The first run writes a development configuration under target/dev: a random token, the
+# password `jarvis` and a data directory of its own. cargo-leptos 0.3.11 reads the binary's
+# arguments from its command line only, hence `-- serve`; `listen` must match `site-addr` in
+# Cargo.toml.
+[tasks.dev]
+description = "Run the server with live reload on http://127.0.0.1:3000 (password: jarvis)"
+run = '''
+set -eu
+dev=target/dev
+if [ ! -f "$dev/jarvis.toml" ]; then
+  mkdir -p "$dev/data"
+  head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$dev/token"
+  printf jarvis > "$dev/password"
+  cat > "$dev/jarvis.toml" <<EOF
+[server]
+listen = "127.0.0.1:3000"
+token = { file = "$PWD/$dev/token" }
+
+[data]
+dir = "$PWD/$dev/data"
+timezone = "Europe/Paris"
+
+[memory]
+git = false
+
+[web]
+password = { file = "$PWD/$dev/password" }
+EOF
+fi
+cargo leptos watch -- serve --config "$dev/jarvis.toml"
+'''
+
+[tasks.dev.env]
+JARVIS_SITE_ROOT = "target/site"
+
+[tasks.build]
+description = "Build the release binary and the site into target/site"
+run = "cargo leptos build --release"

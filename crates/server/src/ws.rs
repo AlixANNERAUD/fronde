@@ -54,7 +54,9 @@ async fn chat(mut socket: WebSocket, jarvis: Arc<Jarvis>) {
                     Ok(ClientMsg::Hello { last_seq }) => {
                         // Subscribed first, so nothing falls between the replay and the stream.
                         live = Some(jarvis.log().subscribe());
-                        last_sent = last_seq;
+                        // A page ahead of the log saw a log since deleted: it gets the whole new
+                        // one, whose first entry tells it to start over.
+                        last_sent = if last_seq > jarvis.log().last_seq() { 0 } else { last_seq };
                         if replay(&mut socket, &jarvis, &mut last_sent).await.is_err() {
                             return;
                         }

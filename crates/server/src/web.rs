@@ -1,18 +1,24 @@
 //! The chat's web side: password sign-in kept in a session cookie, and the pages behind it.
 
 use crate::ws;
-use axum::extract::{Query, State};
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use jarvis_agent::jarvis::Jarvis;
+use jarvis_app::{App, shell};
+use leptos::config::LeptosOptions;
+use leptos_axum::{LeptosRoutes, generate_route_list};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::time::Instant;
+use tower_http::services::ServeDir;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::cookie::time;
 use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
@@ -76,7 +82,8 @@ fn same_password(given: &str, expected: &str) -> bool {
     bool::from(given.as_slice().ct_eq(expected.as_slice()))
 }
 
-pub fn router(web: Web, secure_cookie: bool) -> Router {
+/// `site_root` holds what `cargo leptos build` writes: the browser bundle and the stylesheet.
+pub fn router(web: Web, secure_cookie: bool, site_root: &Path) -> Router {
     let sessions = SessionManagerLayer::new(MemoryStore::default())
         .with_name("jarvis_session")
         .with_http_only(true)
@@ -84,47 +91,46 @@ pub fn router(web: Web, secure_cookie: bool) -> Router {
         .with_secure(secure_cookie)
         .with_expiry(Expiry::OnInactivity(SESSION_IDLE));
     Router::new()
-        .route("/", get(home))
-        .route("/sign-in", get(sign_in_page).post(sign_in))
+        .route("/sign-in", post(sign_in))
         .route("/sign-out", post(sign_out))
         .route("/ws", get(ws::upgrade))
         .with_state(Arc::new(web))
+        .merge(pages(site_root))
         .layer(sessions)
+}
+
+/// The Leptos pages, and the site root's files for any other path.
+fn pages(site_root: &Path) -> Router {
+    let options = LeptosOptions::builder()
+        .output_name("jarvis")
+        .site_root(site_root.to_string_lossy().into_owned())
+        .site_pkg_dir("pkg")
+        .build();
+    let shell_options = options.clone();
+    Router::new()
+        .leptos_routes(&options, generate_route_list(App), move || {
+            shell(shell_options.clone())
+        })
+        .route_layer(middleware::from_fn(require_session))
+        .fallback_service(
+            ServeDir::new(site_root)
+                .precompressed_br()
+                .precompressed_gzip(),
+        )
+        .with_state(options)
+}
+
+/// Sends visitors without a session to the sign-in page, the only page open to them.
+async fn require_session(session: Session, request: Request, next: Next) -> Response {
+    if request.uri().path() == "/sign-in" || is_signed_in(&session).await {
+        next.run(request).await
+    } else {
+        Redirect::to("/sign-in").into_response()
+    }
 }
 
 pub async fn is_signed_in(session: &Session) -> bool {
     matches!(session.get::<bool>(SIGNED_IN).await, Ok(Some(true)))
-}
-
-// Placeholder pages: the Leptos app replaces them.
-async fn home(session: Session) -> Response {
-    if !is_signed_in(&session).await {
-        return Redirect::to("/sign-in").into_response();
-    }
-    Html(
-        "<!doctype html><title>Jarvis</title><h1>Jarvis</h1>\
-         <form method=\"post\" action=\"/sign-out\"><button>Se déconnecter</button></form>",
-    )
-    .into_response()
-}
-
-#[derive(Deserialize)]
-struct SignInQuery {
-    error: Option<String>,
-}
-
-async fn sign_in_page(Query(query): Query<SignInQuery>) -> Html<String> {
-    let error = match query.error.as_deref() {
-        Some("2") => "<p>Trop d'essais, réessaie dans une minute.</p>",
-        Some(_) => "<p>Mot de passe incorrect.</p>",
-        None => "",
-    };
-    Html(format!(
-        "<!doctype html><title>Jarvis</title>{error}\
-         <form method=\"post\" action=\"/sign-in\">\
-         <input type=\"password\" name=\"password\" aria-label=\"Mot de passe\" autofocus required>\
-         <button>Se connecter</button></form>"
-    ))
 }
 
 #[derive(Deserialize)]

@@ -10,7 +10,15 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | `crates/hub` (`jarvis-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
 | `crates/protocol` (`jarvis-protocol`) | Types shared by the conversation log, the server and the frontend (`Event`, `Entry`); serde and chrono only |
 | `crates/agent` (`jarvis-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
-| `crates/server` | The `jarvis` binary and library: configuration check, HTTP routes, `/mcp` behind a bearer token |
+| `crates/app` (`jarvis-app`) | The Leptos web chat: sign-in and chat pages, the `ChatPanel` island and its WebSocket; `chat_model.rs` turns log entries into what the chat shows |
+| `crates/frontend` (`jarvis-frontend`) | The browser bundle (wasm32): hydrates the app's island |
+| `crates/server` | The `jarvis` binary and library: configuration check, HTTP routes, `/mcp` behind a bearer token, the chat pages and `/ws` |
+
+`jarvis-app` builds with `ssr` for the server and with `hydrate` for the browser, never both:
+server-side Cargo commands leave out `jarvis-frontend` (`$JARVIS_SERVER_PACKAGES`). UI classes
+come from Rust/UI (`crates/app/src/components/LICENSE-rust-ui`); styles are Tailwind in
+`style/main.css`. The server reads the built site from `JARVIS_SITE_ROOT` (default
+`target/site`).
 
 ## Commands
 
@@ -21,10 +29,12 @@ through mr-boxington.
 | --- | --- |
 | `mise install` | Installs the pinned tools |
 | `mise run format` | Formats the code |
-| `mise run lint` | rustfmt check and clippy with `-D warnings` |
+| `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server code and the wasm bundle |
 | `mise run test` | The test suite (nextest) |
 | `mise run deny` | cargo-deny: advisories, licences, bans, sources |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
+| `mise run dev` | The server with live reload on http://127.0.0.1:3000 (password `jarvis`; config in `target/dev`) |
+| `mise run build` | Release build: `target/release/jarvis` and the site in `target/site` |
 
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 
