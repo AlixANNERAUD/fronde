@@ -12,7 +12,11 @@ use ics::{Event, Reminder};
 
 #[async_trait]
 pub trait CalendarBackend: Send + Sync {
-    async fn list_events(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> anyhow::Result<Vec<Event>>;
+    async fn list_events(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<Event>>;
     async fn get_event(&self, uid: &str) -> anyhow::Result<Option<Event>>;
     /// Creates or replaces (by uid).
     async fn put_event(&self, e: &Event) -> anyhow::Result<()>;
@@ -30,15 +34,22 @@ pub struct CalDavBackend {
     pub tz: Tz,
 }
 
-const RECURRING: &str = "this is a recurring series; change it in your calendar app (not supported here yet)";
+const RECURRING: &str =
+    "this is a recurring series; change it in your calendar app (not supported here yet)";
 
 fn is_recurring(res: &Resource) -> bool {
-    res.ics.lines().any(|l| l.starts_with("RRULE") || l.starts_with("RECURRENCE-ID"))
+    res.ics
+        .lines()
+        .any(|l| l.starts_with("RRULE") || l.starts_with("RECURRENCE-ID"))
 }
 
 #[async_trait]
 impl CalendarBackend for CalDavBackend {
-    async fn list_events(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> anyhow::Result<Vec<Event>> {
+    async fn list_events(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<Event>> {
         let mut out = Vec::new();
         for res in self.events.query(Kind::Event, Some((from, to))).await? {
             match ics::parse_events(&res.ics, self.tz) {
@@ -50,15 +61,21 @@ impl CalendarBackend for CalDavBackend {
     }
 
     async fn get_event(&self, uid: &str) -> anyhow::Result<Option<Event>> {
-        let Some(res) = self.events.find_uid(Kind::Event, uid).await? else { return Ok(None) };
-        Ok(ics::parse_events(&res.ics, self.tz)?.into_iter().find(|e| e.uid == uid))
+        let Some(res) = self.events.find_uid(Kind::Event, uid).await? else {
+            return Ok(None);
+        };
+        Ok(ics::parse_events(&res.ics, self.tz)?
+            .into_iter()
+            .find(|e| e.uid == uid))
     }
 
     async fn put_event(&self, e: &Event) -> anyhow::Result<()> {
         match self.events.find_uid(Kind::Event, &e.uid).await? {
             Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
             Some(res) => {
-                let old = ics::parse_events(&res.ics, self.tz)?.into_iter().find(|x| x.uid == e.uid);
+                let old = ics::parse_events(&res.ics, self.tz)?
+                    .into_iter()
+                    .find(|x| x.uid == e.uid);
                 let text = match old {
                     Some(old) => ics::update_event_ics(&res.ics, &old, e)?,
                     None => ics::event_to_ics(e),
@@ -89,22 +106,32 @@ impl CalendarBackend for CalDavBackend {
     }
 
     async fn get_reminder(&self, uid: &str) -> anyhow::Result<Option<Reminder>> {
-        let Some(res) = self.reminders.find_uid(Kind::Todo, uid).await? else { return Ok(None) };
-        Ok(ics::parse_reminders(&res.ics, self.tz)?.into_iter().find(|r| r.uid == uid))
+        let Some(res) = self.reminders.find_uid(Kind::Todo, uid).await? else {
+            return Ok(None);
+        };
+        Ok(ics::parse_reminders(&res.ics, self.tz)?
+            .into_iter()
+            .find(|r| r.uid == uid))
     }
 
     async fn put_reminder(&self, r: &Reminder) -> anyhow::Result<()> {
         match self.reminders.find_uid(Kind::Todo, &r.uid).await? {
             Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
             Some(res) => {
-                let old = ics::parse_reminders(&res.ics, self.tz)?.into_iter().find(|x| x.uid == r.uid);
+                let old = ics::parse_reminders(&res.ics, self.tz)?
+                    .into_iter()
+                    .find(|x| x.uid == r.uid);
                 let text = match old {
                     Some(old) => ics::update_reminder_ics(&res.ics, &old, r)?,
                     None => ics::reminder_to_ics(r),
                 };
                 self.reminders.update(&res, &text).await
             }
-            None => self.reminders.create(&r.uid, &ics::reminder_to_ics(r)).await,
+            None => {
+                self.reminders
+                    .create(&r.uid, &ics::reminder_to_ics(r))
+                    .await
+            }
         }
     }
 
@@ -135,9 +162,20 @@ RRULE:FREQ=WEEKLY
 END:VEVENT
 END:VCALENDAR
 </C:calendar-data></prop></propstat></response></multistatus>"#;
-        Mock::given(method("REPORT")).respond_with(ResponseTemplate::new(207).set_body_string(body)).mount(&server).await;
-        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(204)).expect(0).mount(&server).await;
-        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(204)).expect(0).mount(&server).await;
+        Mock::given(method("REPORT"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(body))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
         let url: url::Url = format!("{}/c/", server.uri()).parse().unwrap();
         let b = CalDavBackend {
             events: CalDav::new(url.clone(), "u".into(), "p".into()),
@@ -145,8 +183,20 @@ END:VCALENDAR
             tz: chrono_tz::Europe::Paris,
         };
         let e = b.get_event("r").await.unwrap().unwrap();
-        assert!(b.put_event(&e).await.unwrap_err().to_string().contains("recurring"));
-        assert!(b.delete_event("r").await.unwrap_err().to_string().contains("recurring"));
+        assert!(
+            b.put_event(&e)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recurring")
+        );
+        assert!(
+            b.delete_event("r")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recurring")
+        );
     }
 
     fn multistatus(ics: &str) -> String {
@@ -166,34 +216,78 @@ END:VCALENDAR
 
     #[tokio::test]
     async fn update_patches_existing_resource() {
-        let rich = std::fs::read_to_string(format!("{}/tests/fixtures/rich.ics", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let rich = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/rich.ics",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
         let server = MockServer::start().await;
-        Mock::given(method("REPORT")).respond_with(ResponseTemplate::new(207).set_body_string(multistatus(&rich))).mount(&server).await;
-        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&server).await;
+        Mock::given(method("REPORT"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(multistatus(&rich)))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
         let b = backend_with(&server).await;
         let mut e = b.get_event("rich-1").await.unwrap().unwrap();
         e.title = "Nouveau titre".into();
         b.put_event(&e).await.unwrap();
-        let put = server.received_requests().await.unwrap().into_iter().find(|r| r.method.as_str() == "PUT").unwrap();
+        let put = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .unwrap();
         let body = String::from_utf8(put.body).unwrap();
-        for kept in ["BEGIN:VALARM", "ATTENDEE;CN=Bob", "DTSTART;TZID=Romance Standard Time:20261120T100000", "SUMMARY:Nouveau titre"] {
+        for kept in [
+            "BEGIN:VALARM",
+            "ATTENDEE;CN=Bob",
+            "DTSTART;TZID=Romance Standard Time:20261120T100000",
+            "SUMMARY:Nouveau titre",
+        ] {
             assert!(body.contains(kept), "lost {kept:?} in\n{body}");
         }
     }
 
     #[tokio::test]
     async fn done_patches_existing_task() {
-        let todo = std::fs::read_to_string(format!("{}/tests/fixtures/daytodo.ics", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let todo = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/daytodo.ics",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
         let server = MockServer::start().await;
-        Mock::given(method("REPORT")).respond_with(ResponseTemplate::new(207).set_body_string(multistatus(&todo))).mount(&server).await;
-        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&server).await;
+        Mock::given(method("REPORT"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(multistatus(&todo)))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
         let b = backend_with(&server).await;
         let mut r = b.get_reminder("day-todo").await.unwrap().unwrap();
         r.done = true;
         b.put_reminder(&r).await.unwrap();
-        let put = server.received_requests().await.unwrap().into_iter().find(|r| r.method.as_str() == "PUT").unwrap();
+        let put = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .unwrap();
         let body = String::from_utf8(put.body).unwrap();
-        assert!(body.contains("DUE;VALUE=DATE:20261118") && body.contains("PRIORITY:1") && body.contains("STATUS:COMPLETED"), "{body}");
+        assert!(
+            body.contains("DUE;VALUE=DATE:20261118")
+                && body.contains("PRIORITY:1")
+                && body.contains("STATUS:COMPLETED"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -209,26 +303,52 @@ DTSTART:20261116T180000Z
 END:VEVENT
 END:VCALENDAR
 </C:calendar-data></prop></propstat></response></multistatus>"#;
-        Mock::given(method("REPORT")).respond_with(ResponseTemplate::new(207).set_body_string(body)).mount(&server).await;
+        Mock::given(method("REPORT"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(body))
+            .mount(&server)
+            .await;
         let b = backend_with(&server).await;
         let now = Utc::now();
         let events = b.list_events(now, now).await.unwrap();
-        assert_eq!(events.iter().map(|e| e.uid.as_str()).collect::<Vec<_>>(), vec!["ok"]);
+        assert_eq!(
+            events.iter().map(|e| e.uid.as_str()).collect::<Vec<_>>(),
+            vec!["ok"]
+        );
     }
 
     /// Live round trip against a real server: JARVIS_TEST_CALDAV_URL (+ _USER, _PASSWORD).
     #[tokio::test]
     #[ignore]
     async fn caldav_roundtrip_live() {
-        let url: url::Url = std::env::var("JARVIS_TEST_CALDAV_URL").expect("JARVIS_TEST_CALDAV_URL").parse().unwrap();
+        let url: url::Url = std::env::var("JARVIS_TEST_CALDAV_URL")
+            .expect("JARVIS_TEST_CALDAV_URL")
+            .parse()
+            .unwrap();
         let user = std::env::var("JARVIS_TEST_CALDAV_USER").unwrap_or_default();
         let pw = std::env::var("JARVIS_TEST_CALDAV_PASSWORD").unwrap_or_default();
         let tz = chrono_tz::Europe::Paris;
-        let b = CalDavBackend { events: CalDav::new(url.clone(), user.clone(), pw.clone()), reminders: CalDav::new(url, user, pw), tz };
+        let b = CalDavBackend {
+            events: CalDav::new(url.clone(), user.clone(), pw.clone()),
+            reminders: CalDav::new(url, user, pw),
+            tz,
+        };
         let start = Utc::now() + chrono::Duration::days(1);
-        let e = Event { uid: uuid::Uuid::new_v4().to_string(), title: "jarvis test".into(), start: ics::When::At(start), end: None, location: None, description: None };
+        let e = Event {
+            uid: uuid::Uuid::new_v4().to_string(),
+            title: "jarvis test".into(),
+            start: ics::When::At(start),
+            end: None,
+            location: None,
+            description: None,
+        };
         b.put_event(&e).await.unwrap();
-        let listed = b.list_events(start - chrono::Duration::hours(1), start + chrono::Duration::hours(1)).await.unwrap();
+        let listed = b
+            .list_events(
+                start - chrono::Duration::hours(1),
+                start + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
         assert!(listed.iter().any(|x| x.uid == e.uid));
         assert!(b.delete_event(&e.uid).await.unwrap());
     }

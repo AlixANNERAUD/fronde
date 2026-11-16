@@ -3,8 +3,8 @@
 use crate::Hub;
 use crate::guide::instructions;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -24,7 +24,11 @@ impl HubServer {
 
 impl ServerHandler for HubServer {
     fn get_info(&self) -> ServerConfig {
-        let text = instructions(&self.hub.config.data.user, &self.hub.registry.deferred(), &self.hub.memory.core_now());
+        let text = instructions(
+            &self.hub.config.data.user,
+            &self.hub.registry.deferred(),
+            &self.hub.memory.core_now(),
+        );
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("jarvis-hub", env!("CARGO_PKG_VERSION")))
             .with_instructions(text)
@@ -43,7 +47,10 @@ impl ServerHandler for HubServer {
             .map(|d| {
                 let schema = match d.input_schema {
                     Value::Object(m) => m,
-                    _ => serde_json::Map::from_iter([("type".to_string(), Value::String("object".into()))]),
+                    _ => serde_json::Map::from_iter([(
+                        "type".to_string(),
+                        Value::String("object".into()),
+                    )]),
                 };
                 Tool::new(d.name, d.description, schema)
             })
@@ -56,10 +63,17 @@ impl ServerHandler for HubServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let args = request.arguments.map(Value::Object).unwrap_or(Value::Object(Default::default()));
+        let args = request
+            .arguments
+            .map(Value::Object)
+            .unwrap_or(Value::Object(Default::default()));
         let out = self.hub.registry.call(&request.name, args).await;
         let content = vec![ContentBlock::text(out.to_text())];
-        let result = if out.is_error { CallToolResult::error(content) } else { CallToolResult::success(content) };
+        let result = if out.is_error {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        };
         Ok(CallToolResponse::Complete(result))
     }
 }
@@ -78,7 +92,12 @@ mod tests {
         );
         let config: crate::config::Config = toml::from_str(&toml).unwrap();
         let hub = Hub::start(config).await.unwrap();
-        let (mut d, h) = typed_tool("mcphub_secret_tool", "Hidden", true, |_: serde_json::Value| async { ToolOutput::ok(1) });
+        let (mut d, h) = typed_tool(
+            "mcphub_secret_tool",
+            "Hidden",
+            true,
+            |_: serde_json::Value| async { ToolOutput::ok(1) },
+        );
         d.source = "mcphub".into();
         hub.registry.register(d, h).unwrap();
         Arc::new(hub)
@@ -97,7 +116,14 @@ mod tests {
     async fn instructions_reach_the_client() {
         let dir = tempfile::tempdir().unwrap();
         let hub = start_hub(dir.path()).await;
-        hub.memory.add(crate::memory::MemoryFile::Memory, "likes tea", chrono::Utc::now()).await.unwrap();
+        hub.memory
+            .add(
+                crate::memory::MemoryFile::Memory,
+                "likes tea",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
         let client = connect(hub).await;
         let info = client.peer_info().unwrap();
         let text = info.instructions.clone().unwrap();
@@ -110,7 +136,13 @@ mod tests {
     async fn list_tools_shows_visible_only() {
         let dir = tempfile::tempdir().unwrap();
         let client = connect(start_hub(dir.path()).await).await;
-        let names: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
+        let names: Vec<String> = client
+            .list_all_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
         for n in ["memory_add", "memory_search", "search_tools", "use_tool"] {
             assert!(names.contains(&n.to_string()), "{n} missing from {names:?}");
         }
@@ -121,22 +153,35 @@ mod tests {
     async fn call_tool_roundtrip_memory_add() {
         let dir = tempfile::tempdir().unwrap();
         let client = connect(start_hub(dir.path()).await).await;
-        let args = serde_json::json!({"file": "memory", "text": "owns a bike"}).as_object().unwrap().clone();
-        let r = client.call_tool(CallToolRequestParams::new("memory_add").with_arguments(args)).await.unwrap();
+        let args = serde_json::json!({"file": "memory", "text": "owns a bike"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let r = client
+            .call_tool(CallToolRequestParams::new("memory_add").with_arguments(args))
+            .await
+            .unwrap();
         assert_ne!(r.is_error, Some(true));
         let text = match &r.content[0] {
             rmcp::model::ContentBlock::Text(t) => t.text.clone(),
             other => panic!("{other:?}"),
         };
         assert!(text.contains("\"file\":\"MEMORY.md\""), "{text}");
-        assert!(std::fs::read_to_string(dir.path().join("memory/MEMORY.md")).unwrap().contains("owns a bike"));
+        assert!(
+            std::fs::read_to_string(dir.path().join("memory/MEMORY.md"))
+                .unwrap()
+                .contains("owns a bike")
+        );
     }
 
     #[tokio::test]
     async fn unknown_tool_is_tool_error_not_protocol_error() {
         let dir = tempfile::tempdir().unwrap();
         let client = connect(start_hub(dir.path()).await).await;
-        let r = client.call_tool(CallToolRequestParams::new("nope")).await.unwrap();
+        let r = client
+            .call_tool(CallToolRequestParams::new("nope"))
+            .await
+            .unwrap();
         assert_eq!(r.is_error, Some(true));
     }
 }

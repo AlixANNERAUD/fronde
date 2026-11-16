@@ -22,7 +22,11 @@ pub enum MemoryFile {
 
 #[derive(Debug)]
 pub enum MemoryError {
-    Full { file: &'static str, would_be: usize, limit: usize },
+    Full {
+        file: &'static str,
+        would_be: usize,
+        limit: usize,
+    },
     NotFound,
     Ambiguous(usize),
     Empty,
@@ -33,16 +37,26 @@ pub enum MemoryError {
 impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MemoryError::Full { file, would_be, limit } => write!(
+            MemoryError::Full {
+                file,
+                would_be,
+                limit,
+            } => write!(
                 f,
                 "{file} would be {would_be}/{limit} characters; merge or remove lines with memory_replace first"
             ),
             MemoryError::NotFound => write!(f, "text not found; copy it exactly from the memory"),
             MemoryError::Ambiguous(n) => {
-                write!(f, "text found {n} times; include more of the line so it is unique")
+                write!(
+                    f,
+                    "text found {n} times; include more of the line so it is unique"
+                )
             }
             MemoryError::Empty => write!(f, "text is empty"),
-            MemoryError::AppendOnly => write!(f, "the journal is append-only; use memory_add with file = journal"),
+            MemoryError::AppendOnly => write!(
+                f,
+                "the journal is append-only; use memory_add with file = journal"
+            ),
             MemoryError::Io(e) => write!(f, "memory storage error: {e}"),
         }
     }
@@ -110,7 +124,9 @@ impl MemoryStore {
     fn capped(&self, file: MemoryFile) -> Option<(PathBuf, &'static str, usize)> {
         match file {
             MemoryFile::User => Some((self.dir.join("USER.md"), "USER.md", self.user_limit)),
-            MemoryFile::Memory => Some((self.dir.join("MEMORY.md"), "MEMORY.md", self.memory_limit)),
+            MemoryFile::Memory => {
+                Some((self.dir.join("MEMORY.md"), "MEMORY.md", self.memory_limit))
+            }
             MemoryFile::Journal => None,
         }
     }
@@ -132,7 +148,12 @@ impl MemoryStore {
         self.core_now()
     }
 
-    pub async fn add(&self, file: MemoryFile, text: &str, now: DateTime<Utc>) -> Result<PathBuf, MemoryError> {
+    pub async fn add(
+        &self,
+        file: MemoryFile,
+        text: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PathBuf, MemoryError> {
         let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.is_empty() {
             return Err(MemoryError::Empty);
@@ -147,14 +168,21 @@ impl MemoryStore {
                 content.push_str(&format!("- {line}\n"));
                 let would_be = content.chars().count();
                 if would_be > limit {
-                    return Err(MemoryError::Full { file: name, would_be, limit });
+                    return Err(MemoryError::Full {
+                        file: name,
+                        would_be,
+                        limit,
+                    });
                 }
                 write_atomic(&path, &content)?;
                 Ok(path)
             }
             None => {
                 let local = now.with_timezone(&self.tz);
-                let path = self.dir.join("journal").join(format!("{}.md", local.format("%Y-%m-%d")));
+                let path = self
+                    .dir
+                    .join("journal")
+                    .join(format!("{}.md", local.format("%Y-%m-%d")));
                 let mut content = read(&path)?;
                 if !content.is_empty() && !content.ends_with('\n') {
                     content.push('\n');
@@ -166,8 +194,15 @@ impl MemoryStore {
         }
     }
 
-    pub async fn replace(&self, file: MemoryFile, old: &str, new: &str) -> Result<PathBuf, MemoryError> {
-        let Some((path, name, limit)) = self.capped(file) else { return Err(MemoryError::AppendOnly) };
+    pub async fn replace(
+        &self,
+        file: MemoryFile,
+        old: &str,
+        new: &str,
+    ) -> Result<PathBuf, MemoryError> {
+        let Some((path, name, limit)) = self.capped(file) else {
+            return Err(MemoryError::AppendOnly);
+        };
         if old.is_empty() {
             return Err(MemoryError::Empty);
         }
@@ -182,7 +217,9 @@ impl MemoryStore {
         let updated = if new.is_empty() {
             let end = start + old.len();
             let line_start = content[..start].rfind('\n').map_or(0, |i| i + 1);
-            let line_end = content[end..].find('\n').map_or(content.len(), |i| end + i + 1);
+            let line_end = content[end..]
+                .find('\n')
+                .map_or(content.len(), |i| end + i + 1);
             format!("{}{}", &content[..line_start], &content[line_end..])
         } else {
             content.replacen(old, new, 1)
@@ -190,7 +227,11 @@ impl MemoryStore {
         let would_be = updated.chars().count();
         // A file already over its cap (edited by hand) may always shrink.
         if would_be > limit && would_be > content.chars().count() {
-            return Err(MemoryError::Full { file: name, would_be, limit });
+            return Err(MemoryError::Full {
+                file: name,
+                would_be,
+                limit,
+            });
         }
         write_atomic(&path, &updated)?;
         Ok(path)
@@ -206,7 +247,11 @@ mod tests {
 
     fn store(limit: usize) -> (tempfile::TempDir, MemoryStore) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MemoryConfig { memory_limit: limit, user_limit: limit, git: false };
+        let cfg = MemoryConfig {
+            memory_limit: limit,
+            user_limit: limit,
+            git: false,
+        };
         let s = MemoryStore::open(dir.path(), &cfg, chrono_tz::Europe::Paris).unwrap();
         (dir, s)
     }
@@ -227,7 +272,9 @@ mod tests {
     async fn add_appends_bullet() {
         let (_d, s) = store(100);
         s.add(MemoryFile::Memory, "likes tea", now()).await.unwrap();
-        s.add(MemoryFile::User, "is called Alix", now()).await.unwrap();
+        s.add(MemoryFile::User, "is called Alix", now())
+            .await
+            .unwrap();
         let core = s.core().await;
         assert_eq!(core.memory, "- likes tea\n");
         assert_eq!(core.user, "- is called Alix\n");
@@ -238,21 +285,35 @@ mod tests {
         let (_d, s) = store(100);
         s.add(MemoryFile::Memory, "a\r\nb\nc", now()).await.unwrap();
         assert_eq!(s.core().await.memory, "- a b c\n");
-        assert!(matches!(s.add(MemoryFile::Memory, "  \n", now()).await, Err(MemoryError::Empty)));
+        assert!(matches!(
+            s.add(MemoryFile::Memory, "  \n", now()).await,
+            Err(MemoryError::Empty)
+        ));
     }
 
     #[tokio::test]
     async fn full_error_tells_how_to_fix() {
         let (_d, s) = store(50);
-        s.add(MemoryFile::Memory, &"x".repeat(40), now()).await.unwrap();
-        let e = s.add(MemoryFile::Memory, "one more fact", now()).await.unwrap_err().to_string();
-        assert!(e.contains("MEMORY.md") && e.contains("50") && e.contains("memory_replace"), "{e}");
+        s.add(MemoryFile::Memory, &"x".repeat(40), now())
+            .await
+            .unwrap();
+        let e = s
+            .add(MemoryFile::Memory, "one more fact", now())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("MEMORY.md") && e.contains("50") && e.contains("memory_replace"),
+            "{e}"
+        );
     }
 
     #[tokio::test]
     async fn cap_counts_chars_not_bytes() {
         let (_d, s) = store(45);
-        s.add(MemoryFile::Memory, &"é".repeat(40), now()).await.unwrap();
+        s.add(MemoryFile::Memory, &"é".repeat(40), now())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -261,24 +322,57 @@ mod tests {
         for t in ["likes tea", "likes coffee", "owns a cat"] {
             s.add(MemoryFile::Memory, t, now()).await.unwrap();
         }
-        s.replace(MemoryFile::Memory, "tea", "green tea").await.unwrap();
-        assert!(matches!(s.replace(MemoryFile::Memory, "likes", "x").await, Err(MemoryError::Ambiguous(2))));
-        assert!(matches!(s.replace(MemoryFile::Memory, "dog", "x").await, Err(MemoryError::NotFound)));
+        s.replace(MemoryFile::Memory, "tea", "green tea")
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.replace(MemoryFile::Memory, "likes", "x").await,
+            Err(MemoryError::Ambiguous(2))
+        ));
+        assert!(matches!(
+            s.replace(MemoryFile::Memory, "dog", "x").await,
+            Err(MemoryError::NotFound)
+        ));
         s.replace(MemoryFile::Memory, "a cat", "").await.unwrap();
         assert_eq!(s.core().await.memory, "- likes green tea\n- likes coffee\n");
-        let e = s.replace(MemoryFile::Journal, "a", "b").await.unwrap_err().to_string();
+        let e = s
+            .replace(MemoryFile::Journal, "a", "b")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("append-only"), "{e}");
     }
 
     #[tokio::test]
     async fn over_cap_file_can_be_pruned() {
         let (dir, s) = store(50);
-        std::fs::write(dir.path().join("MEMORY.md"), format!("- {}\n- {}\n", "x".repeat(80), "w".repeat(80))).unwrap();
-        s.replace(MemoryFile::Memory, &"x".repeat(80), "").await.unwrap();
-        assert_eq!(s.core().await.memory, format!("- {}\n", "w".repeat(80)), "shrinking is allowed even above the cap");
-        std::fs::write(dir.path().join("MEMORY.md"), format!("- {}\n", "y".repeat(80))).unwrap();
-        s.replace(MemoryFile::Memory, &"y".repeat(80), "short").await.unwrap();
-        assert!(s.replace(MemoryFile::Memory, "short", &"z".repeat(80)).await.is_err(), "growing past the cap is still refused");
+        std::fs::write(
+            dir.path().join("MEMORY.md"),
+            format!("- {}\n- {}\n", "x".repeat(80), "w".repeat(80)),
+        )
+        .unwrap();
+        s.replace(MemoryFile::Memory, &"x".repeat(80), "")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.core().await.memory,
+            format!("- {}\n", "w".repeat(80)),
+            "shrinking is allowed even above the cap"
+        );
+        std::fs::write(
+            dir.path().join("MEMORY.md"),
+            format!("- {}\n", "y".repeat(80)),
+        )
+        .unwrap();
+        s.replace(MemoryFile::Memory, &"y".repeat(80), "short")
+            .await
+            .unwrap();
+        assert!(
+            s.replace(MemoryFile::Memory, "short", &"z".repeat(80))
+                .await
+                .is_err(),
+            "growing past the cap is still refused"
+        );
     }
 
     #[tokio::test]
@@ -302,9 +396,15 @@ mod tests {
     async fn journal_uses_local_date() {
         let (dir, s) = store(10);
         let t = Utc.with_ymd_and_hms(2026, 11, 16, 23, 30, 0).unwrap();
-        let p = s.add(MemoryFile::Journal, "went to bed late", t).await.unwrap();
+        let p = s
+            .add(MemoryFile::Journal, "went to bed late", t)
+            .await
+            .unwrap();
         assert_eq!(p, dir.path().join("journal/2026-11-17.md"));
-        assert_eq!(std::fs::read_to_string(p).unwrap(), "- 00:30 went to bed late\n");
+        assert_eq!(
+            std::fs::read_to_string(p).unwrap(),
+            "- 00:30 went to bed late\n"
+        );
     }
 
     #[tokio::test]
@@ -314,7 +414,11 @@ mod tests {
         let tasks: Vec<_> = (0..50)
             .map(|i| {
                 let s = s.clone();
-                tokio::spawn(async move { s.add(MemoryFile::Memory, &format!("fact {i:03}"), now()).await.is_ok() })
+                tokio::spawn(async move {
+                    s.add(MemoryFile::Memory, &format!("fact {i:03}"), now())
+                        .await
+                        .is_ok()
+                })
             })
             .collect();
         let mut oks = 0;

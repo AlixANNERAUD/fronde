@@ -29,8 +29,13 @@ impl Hub {
     /// Open memory, register native tools and start upstream connections (in the background).
     pub async fn start(config: Config) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create data dir {}", dir.display()))?;
-        let memory = Arc::new(MemoryStore::open(&dir.join("memory"), &config.memory, config.data.timezone)?);
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("cannot create data dir {}", dir.display()))?;
+        let memory = Arc::new(MemoryStore::open(
+            &dir.join("memory"),
+            &config.memory,
+            config.data.timezone,
+        )?);
         let index = Arc::new(MemoryIndex::open(&dir.join("index.sqlite"))?);
         index.reindex_all(memory.dir())?;
 
@@ -49,6 +54,10 @@ impl Hub {
         for m in &config.mcp {
             upstream::spawn_upstream(m.clone(), registry.clone());
         }
-        Ok(Self { registry, memory, config })
+        Ok(Self {
+            registry,
+            memory,
+            config,
+        })
     }
 }

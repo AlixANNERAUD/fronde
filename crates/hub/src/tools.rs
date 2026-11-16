@@ -33,7 +33,11 @@ pub struct ToolOutput {
 impl ToolOutput {
     pub fn ok(v: impl Serialize) -> Self {
         let value = serde_json::to_value(v).unwrap_or_else(|e| Value::String(e.to_string()));
-        Self { value, next: None, is_error: false }
+        Self {
+            value,
+            next: None,
+            is_error: false,
+        }
     }
 
     pub fn with_next(mut self, next: impl Into<String>) -> Self {
@@ -42,7 +46,11 @@ impl ToolOutput {
     }
 
     pub fn error(msg: impl Into<String>) -> Self {
-        Self { value: Value::String(msg.into()), next: None, is_error: true }
+        Self {
+            value: Value::String(msg.into()),
+            next: None,
+            is_error: true,
+        }
     }
 
     /// `{"result":…,"next":…}` or `{"error":…}`.
@@ -102,7 +110,8 @@ where
     F: Fn(A) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ToolOutput> + Send + 'static,
 {
-    let schema = serde_json::to_value(schemars::schema_for!(A)).unwrap_or(json!({"type": "object"}));
+    let schema =
+        serde_json::to_value(schemars::schema_for!(A)).unwrap_or(json!({"type": "object"}));
     let def = ToolDef {
         name: name.to_string(),
         description: description.to_string(),
@@ -110,7 +119,13 @@ where
         deferred,
         source: "hub".to_string(),
     };
-    (def, Arc::new(Typed { f, _types: PhantomData }))
+    (
+        def,
+        Arc::new(Typed {
+            f,
+            _types: PhantomData,
+        }),
+    )
 }
 
 type Entry = (ToolDef, Arc<dyn ToolHandler>);
@@ -128,7 +143,10 @@ impl Registry {
 
     pub fn register(&self, def: ToolDef, handler: Arc<dyn ToolHandler>) -> anyhow::Result<()> {
         if !is_valid_name(&def.name) {
-            bail!("tool name {:?} must match ^[a-z][a-z0-9_]{{0,63}}$", def.name);
+            bail!(
+                "tool name {:?} must match ^[a-z][a-z0-9_]{{0,63}}$",
+                def.name
+            );
         }
         let mut tools = self.tools.write().expect("registry lock");
         if tools.contains_key(&def.name) {
@@ -154,30 +172,55 @@ impl Registry {
 
     /// Deferred tools matching a need, best first.
     pub fn search(&self, query: &str, limit: usize) -> Vec<ToolDef> {
-        self.index.search(query, limit).iter().filter_map(|n| self.get(n)).collect()
+        self.index
+            .search(query, limit)
+            .iter()
+            .filter_map(|n| self.get(n))
+            .collect()
     }
 
     pub fn visible(&self) -> Vec<ToolDef> {
         let tools = self.tools.read().expect("registry lock");
-        tools.values().filter(|(d, _)| !d.deferred).map(|(d, _)| d.clone()).collect()
+        tools
+            .values()
+            .filter(|(d, _)| !d.deferred)
+            .map(|(d, _)| d.clone())
+            .collect()
     }
 
     pub fn deferred(&self) -> Vec<ToolDef> {
         let tools = self.tools.read().expect("registry lock");
-        tools.values().filter(|(d, _)| d.deferred).map(|(d, _)| d.clone()).collect()
+        tools
+            .values()
+            .filter(|(d, _)| d.deferred)
+            .map(|(d, _)| d.clone())
+            .collect()
     }
 
     pub fn deferred_names(&self) -> Vec<String> {
         let tools = self.tools.read().expect("registry lock");
-        tools.values().filter(|(d, _)| d.deferred).map(|(d, _)| d.name.clone()).collect()
+        tools
+            .values()
+            .filter(|(d, _)| d.deferred)
+            .map(|(d, _)| d.name.clone())
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<ToolDef> {
-        self.tools.read().expect("registry lock").get(name).map(|(d, _)| d.clone())
+        self.tools
+            .read()
+            .expect("registry lock")
+            .get(name)
+            .map(|(d, _)| d.clone())
     }
 
     pub async fn call(&self, name: &str, args: Value) -> ToolOutput {
-        let handler = self.tools.read().expect("registry lock").get(name).map(|(_, h)| h.clone());
+        let handler = self
+            .tools
+            .read()
+            .expect("registry lock")
+            .get(name)
+            .map(|(_, h)| h.clone());
         match handler {
             Some(h) => h.call(args).await,
             None => ToolOutput::error(format!(
@@ -214,7 +257,9 @@ pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
         move |a: SearchArgs| {
             let r = r.clone();
             async move {
-                let Some(r) = r.upgrade() else { return ToolOutput::error("hub is shutting down") };
+                let Some(r) = r.upgrade() else {
+                    return ToolOutput::error("hub is shutting down");
+                };
                 let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
                 let found: Vec<Value> = r
                     .search(&a.need, limit)
@@ -222,7 +267,8 @@ pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
                     .map(|d| json!({"name": d.name, "description": d.description, "input_schema": d.input_schema}))
                     .collect();
                 if found.is_empty() {
-                    ToolOutput::ok(found).with_next("No tool matches. Rephrase the need, or answer without a tool.")
+                    ToolOutput::ok(found)
+                        .with_next("No tool matches. Rephrase the need, or answer without a tool.")
                 } else {
                     ToolOutput::ok(found).with_next("Call use_tool with one of these names.")
                 }
@@ -231,16 +277,25 @@ pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
     );
     registry.register(def, h)?;
     let r = Arc::downgrade(registry);
-    let (def, h) = typed_tool("use_tool", "Call a tool found with search_tools.", false, move |a: UseArgs| {
-        let r = r.clone();
-        async move {
-            let Some(r) = r.upgrade() else { return ToolOutput::error("hub is shutting down") };
-            if a.name == "use_tool" {
-                return ToolOutput::error("use_tool cannot call itself; pass the name of the tool you need");
+    let (def, h) = typed_tool(
+        "use_tool",
+        "Call a tool found with search_tools.",
+        false,
+        move |a: UseArgs| {
+            let r = r.clone();
+            async move {
+                let Some(r) = r.upgrade() else {
+                    return ToolOutput::error("hub is shutting down");
+                };
+                if a.name == "use_tool" {
+                    return ToolOutput::error(
+                        "use_tool cannot call itself; pass the name of the tool you need",
+                    );
+                }
+                r.call(&a.name, a.arguments).await
             }
-            r.call(&a.name, a.arguments).await
-        }
-    });
+        },
+    );
     registry.register(def, h)
 }
 
@@ -256,7 +311,9 @@ mod tests {
     }
 
     fn double(deferred: bool, name: &str) -> (ToolDef, Arc<dyn ToolHandler>) {
-        typed_tool(name, "Double a number.", deferred, |a: A| async move { ToolOutput::ok(a.n * 2) })
+        typed_tool(name, "Double a number.", deferred, |a: A| async move {
+            ToolOutput::ok(a.n * 2)
+        })
     }
 
     #[tokio::test]
@@ -321,7 +378,10 @@ mod tests {
     #[test]
     fn to_text_shapes() {
         assert_eq!(ToolOutput::ok(1).to_text(), r#"{"result":1}"#);
-        assert_eq!(ToolOutput::ok("a").with_next("b").to_text(), r#"{"result":"a","next":"b"}"#);
+        assert_eq!(
+            ToolOutput::ok("a").with_next("b").to_text(),
+            r#"{"result":"a","next":"b"}"#
+        );
         assert_eq!(ToolOutput::error("boom").to_text(), r#"{"error":"boom"}"#);
     }
 }

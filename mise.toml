@@ -1,0 +1,28 @@
+[tools]
+rust = { version = "1.99.1", components = "rustfmt,clippy,llvm-tools", targets = "wasm32-unknown-unknown", mr_boxington = true }
+mr-boxington = "latest"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.149"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+
+[tasks.format]
+description = "Format the code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Check formatting and run clippy"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+]
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo nextest run --workspace --no-tests=pass"
+
+[tasks.deny]
+description = "Check advisories, licences, bans and sources"
+run = "cargo deny check"
+
+[tasks.check]
+description = "Everything CI checks"
+depends = ["lint", "test", "deny"]

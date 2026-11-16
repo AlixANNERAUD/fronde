@@ -31,7 +31,12 @@ async fn mcp_rejects_missing_or_wrong_token() {
     let c = reqwest::Client::new();
     let url = format!("http://{addr}/mcp");
     assert_eq!(c.post(&url).send().await.unwrap().status(), 401);
-    let wrong = c.post(&url).bearer_auth("0123456789abcdef0123456789abcdeX").send().await.unwrap();
+    let wrong = c
+        .post(&url)
+        .bearer_auth("0123456789abcdef0123456789abcdeX")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(wrong.status(), 401);
 }
 
@@ -40,11 +45,21 @@ async fn mcp_initialize_and_list_tools() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, _h) = jarvis::start(config(dir.path(), TOKEN)).await.unwrap();
     let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")).auth_header(TOKEN),
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(TOKEN),
     );
     let client = ().serve(transport).await.unwrap();
-    let names: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    assert!(names.contains(&"memory_add".to_string()) && names.contains(&"search_tools".to_string()), "{names:?}");
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        names.contains(&"memory_add".to_string()) && names.contains(&"search_tools".to_string()),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]
@@ -68,8 +83,13 @@ async fn non_localhost_host_header_is_accepted_with_token() {
 #[tokio::test]
 async fn short_token_refuses_to_start() {
     let dir = tempfile::tempdir().unwrap();
-    let e = jarvis::start(config(dir.path(), "short")).await.unwrap_err();
-    assert!(format!("{e:#}").contains("server.token must be at least 32 characters"), "{e:#}");
+    let e = jarvis::start(config(dir.path(), "short"))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:#}").contains("server.token must be at least 32 characters"),
+        "{e:#}"
+    );
 }
 
 #[test]
@@ -77,7 +97,11 @@ fn check_reports_unknown_key() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("jarvis.toml");
     std::fs::write(&path, "[server]\nlistn = 1\n").unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jarvis")).args(["check", "--config"]).arg(&path).output().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jarvis"))
+        .args(["check", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("listn"));
 }
@@ -88,7 +112,16 @@ fn check_accepts_valid_config() {
     std::fs::write(dir.path().join("token"), TOKEN).unwrap();
     let path = dir.path().join("jarvis.toml");
     std::fs::write(&path, format!("[server]\ntoken = {{ file = {:?} }}\n[data]\ndir = \"/tmp/x\"\ntimezone = \"Europe/Paris\"\n", dir.path().join("token").display().to_string())).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jarvis")).args(["check", "--config"]).arg(&path).output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jarvis"))
+        .args(["check", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("config OK"));
 }

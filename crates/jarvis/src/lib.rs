@@ -23,7 +23,11 @@ pub fn check_token(token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn require_token(State(token): State<Arc<String>>, req: Request, next: Next) -> Result<Response, StatusCode> {
+async fn require_token(
+    State(token): State<Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
     let given = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -47,8 +51,13 @@ pub fn router(hub: Arc<Hub>, token: String) -> Router {
     );
     let protected = Router::new()
         .nest_service("/mcp", mcp)
-        .layer(middleware::from_fn_with_state(Arc::new(token), require_token));
-    Router::new().route("/health", get(|| async { "ok" })).merge(protected)
+        .layer(middleware::from_fn_with_state(
+            Arc::new(token),
+            require_token,
+        ));
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .merge(protected)
 }
 
 /// Resolve secrets, start the hub and serve HTTP in the background.
@@ -57,7 +66,9 @@ pub async fn start(config: Config) -> anyhow::Result<(SocketAddr, tokio::task::J
     check_token(&token)?;
     let listen = config.server.listen;
     let hub = Arc::new(Hub::start(config).await?);
-    let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("cannot listen on {listen}"))?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("cannot listen on {listen}"))?;
     let addr = listener.local_addr()?;
     let app = router(hub, token);
     let handle = tokio::spawn(async move {

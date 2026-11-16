@@ -39,27 +39,55 @@ mod tests {
     use serde_json::json;
 
     fn def(name: &str, source: &str) -> ToolDef {
-        ToolDef { name: name.into(), description: String::new(), input_schema: json!({}), deferred: true, source: source.into() }
+        ToolDef {
+            name: name.into(),
+            description: String::new(),
+            input_schema: json!({}),
+            deferred: true,
+            source: source.into(),
+        }
     }
 
     #[test]
     fn instructions_list_deferred_and_core() {
-        let core = Core { user: "- is called Alix\n".into(), memory: "- likes tea\n".into() };
-        let text = instructions("alix", &[def("mcphub_a", "mcphub"), def("ha_light", "ha"), def("mcphub_b", "mcphub")], &core);
-        assert!(text.starts_with("Tools and memory hub for alix.\n- By default, answer without tools."));
+        let core = Core {
+            user: "- is called Alix\n".into(),
+            memory: "- likes tea\n".into(),
+        };
+        let text = instructions(
+            "alix",
+            &[
+                def("mcphub_a", "mcphub"),
+                def("ha_light", "ha"),
+                def("mcphub_b", "mcphub"),
+            ],
+            &core,
+        );
+        assert!(
+            text.starts_with("Tools and memory hub for alix.\n- By default, answer without tools.")
+        );
         assert!(text.contains("Save with memory_add only what alix said or confirmed"));
-        assert!(text.contains("## Other tools\nha: ha_light\nmcphub: mcphub_a, mcphub_b\n"), "{text}");
+        assert!(
+            text.contains("## Other tools\nha: ha_light\nmcphub: mcphub_a, mcphub_b\n"),
+            "{text}"
+        );
         assert!(text.contains("## About alix (USER.md)\n- is called Alix\n"));
         assert!(text.contains("## Memory (MEMORY.md)\n- likes tea\n"));
     }
 
     #[test]
     fn instructions_omit_empty_sections() {
-        let core = Core { user: "  \n".into(), memory: String::new() };
+        let core = Core {
+            user: "  \n".into(),
+            memory: String::new(),
+        };
         let text = instructions("me", &[], &core);
         assert!(!text.contains("## Other tools"));
         assert!(!text.contains("## About"));
         assert!(!text.contains("## Memory"));
-        assert!(!text.contains("More tools exist"), "no hint about deferred tools when there are none");
+        assert!(
+            !text.contains("More tools exist"),
+            "no hint about deferred tools when there are none"
+        );
     }
 }

@@ -42,7 +42,8 @@ fn local_to_utc(ndt: NaiveDateTime, tz: Tz) -> Result<DateTime<Utc>, String> {
 
 /// Times stored by other clients are never rejected: a time in a DST gap moves one hour later.
 fn lenient(ndt: NaiveDateTime, tz: Tz) -> DateTime<Utc> {
-    local_to_utc(ndt, tz).unwrap_or_else(|_| local_to_utc(ndt + Duration::hours(1), tz).unwrap_or(ndt.and_utc()))
+    local_to_utc(ndt, tz)
+        .unwrap_or_else(|_| local_to_utc(ndt + Duration::hours(1), tz).unwrap_or(ndt.and_utc()))
 }
 
 fn to_when(d: DatePerhapsTime, tz: Tz) -> When {
@@ -79,7 +80,10 @@ pub fn unfold(ics: &str) -> Vec<String> {
 
 /// Property name of a content line, uppercased ("DTSTART" for "DTSTART;TZID=X:…").
 pub fn prop_name(line: &str) -> String {
-    line.split([';', ':']).next().unwrap_or_default().to_ascii_uppercase()
+    line.split([';', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
 }
 
 /// Value of a content line (after the first ':' outside parameter quotes).
@@ -97,11 +101,15 @@ pub fn prop_value(line: &str) -> &str {
 
 /// True when the document has a component whose UID is exactly `uid`.
 pub fn has_uid(ics: &str, uid: &str) -> bool {
-    !uid.is_empty() && unfold(ics).iter().any(|l| prop_name(l) == "UID" && prop_value(l) == uid)
+    !uid.is_empty()
+        && unfold(ics)
+            .iter()
+            .any(|l| prop_name(l) == "UID" && prop_value(l) == uid)
 }
 
 fn parse(ics: &str) -> anyhow::Result<Calendar> {
-    ics.parse::<Calendar>().map_err(|e| anyhow!("invalid iCalendar data: {e}"))
+    ics.parse::<Calendar>()
+        .map_err(|e| anyhow!("invalid iCalendar data: {e}"))
 }
 
 fn calendar() -> Calendar {
@@ -149,7 +157,10 @@ pub fn parse_reminders(ics: &str, tz: Tz) -> anyhow::Result<Vec<Reminder>> {
 
 pub fn event_to_ics(e: &Event) -> String {
     let mut ev = icalendar::Event::new();
-    ev.uid(&e.uid).timestamp(Utc::now()).summary(&e.title).starts(to_dpt(&e.start));
+    ev.uid(&e.uid)
+        .timestamp(Utc::now())
+        .summary(&e.title)
+        .starts(to_dpt(&e.start));
     if let Some(end) = &e.end {
         ev.ends(to_dpt(end));
     }
@@ -166,7 +177,10 @@ pub fn event_to_ics(e: &Event) -> String {
 
 pub fn reminder_to_ics(r: &Reminder) -> String {
     let mut todo = icalendar::Todo::new();
-    todo.uid(&r.uid).timestamp(Utc::now()).summary(&r.text).due(CalendarDateTime::Utc(r.due));
+    todo.uid(&r.uid)
+        .timestamp(Utc::now())
+        .summary(&r.text)
+        .due(CalendarDateTime::Utc(r.due));
     if r.done {
         todo.status(TodoStatus::Completed);
     }
@@ -176,7 +190,11 @@ pub fn reminder_to_ics(r: &Reminder) -> String {
 }
 
 fn escape_text(s: &str) -> String {
-    s.replace('\\', "\\\\").replace(';', "\\;").replace(',', "\\,").replace('\r', "").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace(';', "\\;")
+        .replace(',', "\\,")
+        .replace('\r', "")
+        .replace('\n', "\\n")
 }
 
 fn when_line(name: &str, w: &When) -> String {
@@ -225,13 +243,22 @@ fn patch(ics: &str, comp: &str, uid: &str, changes: &[Change]) -> anyhow::Result
     };
     let begin = format!("BEGIN:{comp}");
     let mut start = 0;
-    while let Some(off) = lines[start..].iter().position(|l| l.eq_ignore_ascii_case(&begin)) {
+    while let Some(off) = lines[start..]
+        .iter()
+        .position(|l| l.eq_ignore_ascii_case(&begin))
+    {
         let b = start + off;
         let depths = depth_after(&lines[b..]);
-        let len = depths.iter().position(|&d| d == 0).unwrap_or(depths.len() - 1);
+        let len = depths
+            .iter()
+            .position(|&d| d == 0)
+            .unwrap_or(depths.len() - 1);
         let block = &lines[b..=b + len];
-        let own = |k: usize| depths[k] == 1 && !matches!(prop_name(&block[k]).as_str(), "BEGIN" | "END");
-        if (0..block.len()).any(|k| own(k) && prop_name(&block[k]) == "UID" && prop_value(&block[k]) == uid) {
+        let own =
+            |k: usize| depths[k] == 1 && !matches!(prop_name(&block[k]).as_str(), "BEGIN" | "END");
+        if (0..block.len())
+            .any(|k| own(k) && prop_name(&block[k]) == "UID" && prop_value(&block[k]) == uid)
+        {
             let mut out: Vec<String> = lines[..b].to_vec();
             for (k, l) in block[..block.len() - 1].iter().enumerate() {
                 if !(own(k) && changes.iter().any(|(name, _)| prop_name(l) == *name)) {
@@ -255,7 +282,10 @@ fn stamp_line(name: &'static str) -> Option<String> {
 pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Result<String> {
     let mut changes: Vec<Change> = vec![("DTSTAMP", stamp_line("DTSTAMP"))];
     if new.title != old.title {
-        changes.push(("SUMMARY", Some(format!("SUMMARY:{}", escape_text(&new.title)))));
+        changes.push((
+            "SUMMARY",
+            Some(format!("SUMMARY:{}", escape_text(&new.title))),
+        ));
     }
     if new.start != old.start {
         changes.push(("DTSTART", Some(when_line("DTSTART", &new.start))));
@@ -265,19 +295,36 @@ pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Res
         changes.push(("DURATION", None));
     }
     if new.location != old.location {
-        changes.push(("LOCATION", new.location.as_deref().map(|l| format!("LOCATION:{}", escape_text(l)))));
+        changes.push((
+            "LOCATION",
+            new.location
+                .as_deref()
+                .map(|l| format!("LOCATION:{}", escape_text(l))),
+        ));
     }
     if new.description != old.description {
-        changes.push(("DESCRIPTION", new.description.as_deref().map(|d| format!("DESCRIPTION:{}", escape_text(d)))));
+        changes.push((
+            "DESCRIPTION",
+            new.description
+                .as_deref()
+                .map(|d| format!("DESCRIPTION:{}", escape_text(d))),
+        ));
     }
     patch(original, "VEVENT", &new.uid, &changes)
 }
 
 /// The stored task text with only the fields that changed rewritten.
-pub fn update_reminder_ics(original: &str, old: &Reminder, new: &Reminder) -> anyhow::Result<String> {
+pub fn update_reminder_ics(
+    original: &str,
+    old: &Reminder,
+    new: &Reminder,
+) -> anyhow::Result<String> {
     let mut changes: Vec<Change> = vec![("DTSTAMP", stamp_line("DTSTAMP"))];
     if new.text != old.text {
-        changes.push(("SUMMARY", Some(format!("SUMMARY:{}", escape_text(&new.text)))));
+        changes.push((
+            "SUMMARY",
+            Some(format!("SUMMARY:{}", escape_text(&new.text))),
+        ));
     }
     if new.due != old.due {
         changes.push(("DUE", Some(when_line("DUE", &When::At(new.due)))));
@@ -303,12 +350,19 @@ pub fn parse_local(s: &str, tz: Tz) -> Result<When, String> {
     if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         return Ok(When::At(t.with_timezone(&Utc)));
     }
-    for f in ["%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"] {
+    for f in [
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
         if let Ok(n) = NaiveDateTime::parse_from_str(s, f) {
             return local_to_utc(n, tz).map(When::At);
         }
     }
-    Err(format!("cannot read {s:?}; use YYYY-MM-DD or YYYY-MM-DDTHH:MM (local time, {tz})"))
+    Err(format!(
+        "cannot read {s:?}; use YYYY-MM-DD or YYYY-MM-DDTHH:MM (local time, {tz})"
+    ))
 }
 
 pub fn format_local(w: &When, tz: Tz) -> String {
@@ -325,7 +379,11 @@ mod tests {
     use chrono_tz::Europe::Paris;
 
     fn fixture(name: &str) -> String {
-        std::fs::read_to_string(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
     }
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> When {
@@ -341,7 +399,10 @@ mod tests {
         assert_eq!(e.location.as_deref(), Some("Lyon"));
 
         let e = &parse_events(&fixture("allday.ics"), Paris).unwrap()[0];
-        assert_eq!(e.start, When::Date(NaiveDate::from_ymd_opt(2026, 11, 21).unwrap()));
+        assert_eq!(
+            e.start,
+            When::Date(NaiveDate::from_ymd_opt(2026, 11, 21).unwrap())
+        );
 
         let es = parse_events(&fixture("floating.ics"), Paris).unwrap();
         assert_eq!(es[0].start, utc(2026, 11, 20, 9, 0));
@@ -354,7 +415,10 @@ mod tests {
         let rs = parse_reminders(&fixture("todo.ics"), Paris).unwrap();
         assert_eq!(rs.len(), 2, "VTODO without DUE is ignored");
         assert_eq!(rs[0].text, "Appeler la CAF");
-        assert_eq!(rs[0].due, Utc.with_ymd_and_hms(2026, 11, 18, 8, 0, 0).unwrap());
+        assert_eq!(
+            rs[0].due,
+            Utc.with_ymd_and_hms(2026, 11, 18, 8, 0, 0).unwrap()
+        );
         assert!(!rs[0].done);
         assert!(rs[1].done);
     }
@@ -386,29 +450,69 @@ mod tests {
 
     #[test]
     fn roundtrip_reminder() {
-        let r = Reminder { uid: "r1".into(), text: "Sortir les poubelles".into(), due: Utc.with_ymd_and_hms(2026, 11, 18, 19, 0, 0).unwrap(), done: false };
-        assert_eq!(parse_reminders(&reminder_to_ics(&r), Paris).unwrap(), vec![r.clone()]);
+        let r = Reminder {
+            uid: "r1".into(),
+            text: "Sortir les poubelles".into(),
+            due: Utc.with_ymd_and_hms(2026, 11, 18, 19, 0, 0).unwrap(),
+            done: false,
+        };
+        assert_eq!(
+            parse_reminders(&reminder_to_ics(&r), Paris).unwrap(),
+            vec![r.clone()]
+        );
         let done = Reminder { done: true, ..r };
         assert!(reminder_to_ics(&done).contains("STATUS:COMPLETED"));
-        assert_eq!(parse_reminders(&reminder_to_ics(&done), Paris).unwrap(), vec![done]);
+        assert_eq!(
+            parse_reminders(&reminder_to_ics(&done), Paris).unwrap(),
+            vec![done]
+        );
     }
 
     #[test]
     fn parse_local_forms() {
-        assert_eq!(parse_local("2026-11-16", Paris).unwrap(), When::Date(NaiveDate::from_ymd_opt(2026, 11, 16).unwrap()));
-        assert_eq!(parse_local("2026-11-16T14:30", Paris).unwrap(), utc(2026, 11, 16, 13, 30));
-        assert_eq!(parse_local("2026-11-16 14:30", Paris).unwrap(), utc(2026, 11, 16, 13, 30));
-        assert_eq!(parse_local("2026-11-16T14:30:00+00:00", Paris).unwrap(), utc(2026, 11, 16, 14, 30));
+        assert_eq!(
+            parse_local("2026-11-16", Paris).unwrap(),
+            When::Date(NaiveDate::from_ymd_opt(2026, 11, 16).unwrap())
+        );
+        assert_eq!(
+            parse_local("2026-11-16T14:30", Paris).unwrap(),
+            utc(2026, 11, 16, 13, 30)
+        );
+        assert_eq!(
+            parse_local("2026-11-16 14:30", Paris).unwrap(),
+            utc(2026, 11, 16, 13, 30)
+        );
+        assert_eq!(
+            parse_local("2026-11-16T14:30:00+00:00", Paris).unwrap(),
+            utc(2026, 11, 16, 14, 30)
+        );
         let gap = parse_local("2026-03-29T02:30", Paris).unwrap_err();
         assert!(gap.contains("does not exist"), "{gap}");
-        assert_eq!(parse_local("2026-10-25T02:30", Paris).unwrap(), utc(2026, 10, 25, 0, 30), "ambiguous → earliest");
-        assert!(parse_local("demain", Paris).unwrap_err().contains("YYYY-MM-DD"));
+        assert_eq!(
+            parse_local("2026-10-25T02:30", Paris).unwrap(),
+            utc(2026, 10, 25, 0, 30),
+            "ambiguous → earliest"
+        );
+        assert!(
+            parse_local("demain", Paris)
+                .unwrap_err()
+                .contains("YYYY-MM-DD")
+        );
     }
 
     #[test]
     fn format_local_forms() {
-        assert_eq!(format_local(&utc(2026, 11, 16, 13, 30), Paris), "2026-11-16T14:30+01:00");
-        assert_eq!(format_local(&When::Date(NaiveDate::from_ymd_opt(2026, 11, 16).unwrap()), Paris), "2026-11-16");
+        assert_eq!(
+            format_local(&utc(2026, 11, 16, 13, 30), Paris),
+            "2026-11-16T14:30+01:00"
+        );
+        assert_eq!(
+            format_local(
+                &When::Date(NaiveDate::from_ymd_opt(2026, 11, 16).unwrap()),
+                Paris
+            ),
+            "2026-11-16"
+        );
     }
 
     fn kept_lines(ics: &str) -> Vec<String> {
@@ -419,7 +523,10 @@ mod tests {
     fn update_event_keeps_unmodeled_properties() {
         let original = fixture("rich.ics");
         let old = parse_events(&original, Paris).unwrap().remove(0);
-        let new = Event { title: "Point projet (déplacé, salle 2)".into(), ..old.clone() };
+        let new = Event {
+            title: "Point projet (déplacé, salle 2)".into(),
+            ..old.clone()
+        };
         let out = update_event_ics(&original, &old, &new).unwrap();
         let lines = kept_lines(&out);
         for kept in [
@@ -435,15 +542,25 @@ mod tests {
             assert!(lines.iter().any(|l| l == kept), "lost {kept:?} in\n{out}");
         }
         assert!(!lines.iter().any(|l| l == "SUMMARY:Point projet"));
-        assert_eq!(parse_events(&out, Paris).unwrap()[0].title, "Point projet (déplacé, salle 2)");
-        assert_eq!(parse_events(&out, Paris).unwrap()[0].start, old.start, "start untouched");
+        assert_eq!(
+            parse_events(&out, Paris).unwrap()[0].title,
+            "Point projet (déplacé, salle 2)"
+        );
+        assert_eq!(
+            parse_events(&out, Paris).unwrap()[0].start,
+            old.start,
+            "start untouched"
+        );
     }
 
     #[test]
     fn update_event_end_replaces_duration() {
         let original = fixture("rich.ics");
         let old = parse_events(&original, Paris).unwrap().remove(0);
-        let new = Event { end: Some(utc(2026, 11, 20, 11, 0)), ..old.clone() };
+        let new = Event {
+            end: Some(utc(2026, 11, 20, 11, 0)),
+            ..old.clone()
+        };
         let out = update_event_ics(&original, &old, &new).unwrap();
         let lines = kept_lines(&out);
         assert!(!lines.iter().any(|l| prop_name(l) == "DURATION"));
@@ -455,11 +572,22 @@ mod tests {
     fn update_reminder_done_keeps_date_due() {
         let original = fixture("daytodo.ics");
         let old = parse_reminders(&original, Paris).unwrap().remove(0);
-        let new = Reminder { done: true, ..old.clone() };
+        let new = Reminder {
+            done: true,
+            ..old.clone()
+        };
         let out = update_reminder_ics(&original, &old, &new).unwrap();
         let lines = kept_lines(&out);
-        for kept in ["DUE;VALUE=DATE:20261118", "PRIORITY:1", "DESCRIPTION:Notes de la tache", "STATUS:COMPLETED"] {
-            assert!(lines.iter().any(|l| l == kept), "missing {kept:?} in\n{out}");
+        for kept in [
+            "DUE;VALUE=DATE:20261118",
+            "PRIORITY:1",
+            "DESCRIPTION:Notes de la tache",
+            "STATUS:COMPLETED",
+        ] {
+            assert!(
+                lines.iter().any(|l| l == kept),
+                "missing {kept:?} in\n{out}"
+            );
         }
         assert!(lines.iter().any(|l| prop_name(l) == "COMPLETED"));
         assert!(parse_reminders(&out, Paris).unwrap()[0].done);
@@ -470,9 +598,15 @@ mod tests {
         let original = fixture("rich.ics");
         let old = parse_events(&original, Paris).unwrap().remove(0);
         let long = "é".repeat(100);
-        let new = Event { description: Some(long.clone()), ..old.clone() };
+        let new = Event {
+            description: Some(long.clone()),
+            ..old.clone()
+        };
         let out = update_event_ics(&original, &old, &new).unwrap();
         assert!(out.split("\r\n").all(|l| l.len() <= 75), "{out}");
-        assert_eq!(parse_events(&out, Paris).unwrap()[0].description.as_deref(), Some(long.as_str()));
+        assert_eq!(
+            parse_events(&out, Paris).unwrap()[0].description.as_deref(),
+            Some(long.as_str())
+        );
     }
 }

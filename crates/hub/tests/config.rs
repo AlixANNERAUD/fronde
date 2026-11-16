@@ -28,7 +28,10 @@ fn defaults_apply() {
     let c = load_str(MIN).unwrap();
     assert_eq!(c.server.listen.to_string(), "127.0.0.1:8484");
     assert_eq!(c.data.user, "me");
-    assert_eq!((c.memory.memory_limit, c.memory.user_limit, c.memory.git), (4000, 2000, true));
+    assert_eq!(
+        (c.memory.memory_limit, c.memory.user_limit, c.memory.git),
+        (4000, 2000, true)
+    );
     assert!(c.calendar.is_none());
 }
 
@@ -62,15 +65,34 @@ fn rejects_bad_tool_prefix_name() {
 #[test]
 fn secret_from_env_and_file() {
     unsafe { std::env::set_var("HUB_TEST_SECRET", "abc") };
-    assert_eq!(Secret::Env { env: "HUB_TEST_SECRET".into() }.resolve().unwrap(), "abc");
+    assert_eq!(
+        Secret::Env {
+            env: "HUB_TEST_SECRET".into()
+        }
+        .resolve()
+        .unwrap(),
+        "abc"
+    );
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(b"s3cret\n").unwrap();
-    assert_eq!(Secret::File { file: f.path().into() }.resolve().unwrap(), "s3cret");
+    assert_eq!(
+        Secret::File {
+            file: f.path().into()
+        }
+        .resolve()
+        .unwrap(),
+        "s3cret"
+    );
 }
 
 #[test]
 fn missing_secret_explains() {
-    let e = Secret::Env { env: "ABSENT_X".into() }.resolve().unwrap_err().to_string();
+    let e = Secret::Env {
+        env: "ABSENT_X".into(),
+    }
+    .resolve()
+    .unwrap_err()
+    .to_string();
     assert!(e.contains("ABSENT_X") && e.contains("set"), "{e}");
 }
 
@@ -78,6 +100,8 @@ fn missing_secret_explains() {
 fn rejects_reserved_and_duplicate_upstream_names() {
     let s = format!("{MIN}\n[[mcp]]\nname = \"hub\"\nurl = \"http://x/mcp\"\n");
     assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("reserved"));
-    let s = format!("{MIN}\n[[mcp]]\nname = \"a\"\nurl = \"http://x/mcp\"\n[[mcp]]\nname = \"a\"\nurl = \"http://y/mcp\"\n");
+    let s = format!(
+        "{MIN}\n[[mcp]]\nname = \"a\"\nurl = \"http://x/mcp\"\n[[mcp]]\nname = \"a\"\nurl = \"http://y/mcp\"\n"
+    );
     assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("twice"));
 }

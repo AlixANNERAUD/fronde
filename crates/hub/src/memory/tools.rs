@@ -45,16 +45,24 @@ impl Ctx {
         if let Err(e) = self.index.reindex_file(&root, &path) {
             tracing::warn!("memory index: {e:#}");
         }
-        let name = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let name = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         if self.git {
             let msg = format!("memory: {action} {name}");
             let _ = tokio::task::spawn_blocking(move || commit_all(&root, &msg)).await;
         }
-        let chars = std::fs::read_to_string(&path).map(|s| s.chars().count()).unwrap_or(0);
+        let chars = std::fs::read_to_string(&path)
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
         let limit = self.store.limit(file);
         let out = ToolOutput::ok(json!({"file": name, "chars": chars, "limit": limit}));
         match limit {
-            Some(l) if chars * 10 > l * 8 => out.with_next("Memory is nearly full: merge or prune with memory_replace soon."),
+            Some(l) if chars * 10 > l * 8 => {
+                out.with_next("Memory is nearly full: merge or prune with memory_replace soon.")
+            }
             _ => out,
         }
     }
@@ -127,8 +135,13 @@ mod tests {
 
     fn setup(limit: usize, git: bool) -> (tempfile::TempDir, Registry) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = MemoryConfig { memory_limit: limit, user_limit: limit, git };
-        let store = Arc::new(MemoryStore::open(dir.path(), &cfg, chrono_tz::Europe::Paris).unwrap());
+        let cfg = MemoryConfig {
+            memory_limit: limit,
+            user_limit: limit,
+            git,
+        };
+        let store =
+            Arc::new(MemoryStore::open(dir.path(), &cfg, chrono_tz::Europe::Paris).unwrap());
         let index = Arc::new(MemoryIndex::open(&dir.path().join(".index.sqlite")).unwrap());
         let reg = Registry::new();
         register_memory_tools(&reg, store, index, git).unwrap();
@@ -138,14 +151,24 @@ mod tests {
     #[tokio::test]
     async fn add_then_search_finds_it() {
         let (_d, reg) = setup(1000, false);
-        let out = reg.call("memory_add", json!({"file": "memory", "text": "Alix prefers trains to planes"})).await;
+        let out = reg
+            .call(
+                "memory_add",
+                json!({"file": "memory", "text": "Alix prefers trains to planes"}),
+            )
+            .await;
         assert!(!out.is_error, "{}", out.to_text());
         assert_eq!(out.value["file"], "MEMORY.md");
         assert_eq!(out.value["limit"], 1000);
         let found = reg.call("memory_search", json!({"query": "train"})).await;
         assert_eq!(found.value[0]["file"], "MEMORY.md");
         assert_eq!(found.value[0]["line"], 1);
-        let gone = reg.call("memory_replace", json!({"file": "memory", "old": "trains to planes", "new": ""})).await;
+        let gone = reg
+            .call(
+                "memory_replace",
+                json!({"file": "memory", "old": "trains to planes", "new": ""}),
+            )
+            .await;
         assert!(!gone.is_error, "{}", gone.to_text());
         let found = reg.call("memory_search", json!({"query": "train"})).await;
         assert_eq!(found.value, json!([]));
@@ -154,31 +177,53 @@ mod tests {
     #[tokio::test]
     async fn near_full_adds_next_hint() {
         let (_d, reg) = setup(100, false);
-        let out = reg.call("memory_add", json!({"file": "user", "text": "x".repeat(85)})).await;
+        let out = reg
+            .call(
+                "memory_add",
+                json!({"file": "user", "text": "x".repeat(85)}),
+            )
+            .await;
         assert!(out.next.unwrap().contains("nearly full"));
         let (_d, reg) = setup(1000, false);
-        let out = reg.call("memory_add", json!({"file": "user", "text": "short"})).await;
+        let out = reg
+            .call("memory_add", json!({"file": "user", "text": "short"}))
+            .await;
         assert!(out.next.is_none());
     }
 
     #[tokio::test]
     async fn full_is_a_tool_error() {
         let (_d, reg) = setup(10, false);
-        let out = reg.call("memory_add", json!({"file": "memory", "text": "this is far too long"})).await;
+        let out = reg
+            .call(
+                "memory_add",
+                json!({"file": "memory", "text": "this is far too long"}),
+            )
+            .await;
         assert!(out.is_error);
         assert!(out.to_text().contains("memory_replace"));
     }
 
     #[tokio::test]
     async fn git_commits_each_write() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             eprintln!("git absent: skipped");
             return;
         }
         let (dir, reg) = setup(1000, true);
-        reg.call("memory_add", json!({"file": "memory", "text": "one"})).await;
-        reg.call("memory_add", json!({"file": "journal", "text": "two"})).await;
-        let log = std::process::Command::new("git").args(["log", "--oneline"]).current_dir(dir.path()).output().unwrap();
+        reg.call("memory_add", json!({"file": "memory", "text": "one"}))
+            .await;
+        reg.call("memory_add", json!({"file": "journal", "text": "two"}))
+            .await;
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2);
     }
 }

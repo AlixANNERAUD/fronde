@@ -51,9 +51,13 @@ impl ToolIndex {
 
     /// Names of matching tools, best first.
     pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
-        let Some(q) = fts_query(query) else { return Vec::new() };
+        let Some(q) = fts_query(query) else {
+            return Vec::new();
+        };
         let db = self.db.lock().expect("index lock");
-        let Ok(mut stmt) = db.prepare("SELECT name FROM t WHERE t MATCH ?1 ORDER BY bm25(t) LIMIT ?2") else {
+        let Ok(mut stmt) =
+            db.prepare("SELECT name FROM t WHERE t MATCH ?1 ORDER BY bm25(t) LIMIT ?2")
+        else {
             return Vec::new();
         };
         stmt.query_map(params![q, limit as i64], |row| row.get(0))
@@ -83,7 +87,10 @@ mod tests {
     fn finds_by_description_words() {
         let i = ToolIndex::new();
         i.upsert(&def("mcphub_ha_turn_on", "Turn on a light or switch"));
-        i.upsert(&def("mcphub_mealie_add_item", "Add an item to the shopping list"));
+        i.upsert(&def(
+            "mcphub_mealie_add_item",
+            "Add an item to the shopping list",
+        ));
         assert_eq!(i.search("shopping list", 5)[0], "mcphub_mealie_add_item");
         assert_eq!(i.search("turn on", 5)[0], "mcphub_ha_turn_on");
         i.remove("mcphub_ha_turn_on");
@@ -110,14 +117,20 @@ mod tests {
     fn registry_with_echo() -> Arc<Registry> {
         let r = Arc::new(Registry::new());
         register_meta_tools(&r).unwrap();
-        let (mut d, h) = typed_tool("mcphub_echo", "Echo text back to the caller", true, |v: serde_json::Value| async move {
-            ToolOutput::ok(v)
-        });
+        let (mut d, h) = typed_tool(
+            "mcphub_echo",
+            "Echo text back to the caller",
+            true,
+            |v: serde_json::Value| async move { ToolOutput::ok(v) },
+        );
         d.source = "mcphub".into();
         r.register(d, h).unwrap();
-        let (d, h) = typed_tool("memory_like", "Echo text but visible", false, |v: serde_json::Value| async move {
-            ToolOutput::ok(v)
-        });
+        let (d, h) = typed_tool(
+            "memory_like",
+            "Echo text but visible",
+            false,
+            |v: serde_json::Value| async move { ToolOutput::ok(v) },
+        );
         r.register(d, h).unwrap();
         r
     }
@@ -127,7 +140,13 @@ mod tests {
         let r = registry_with_echo();
         let out = r.call("search_tools", json!({"need": "echo text"})).await;
         assert!(!out.is_error, "{}", out.to_text());
-        let names: Vec<_> = out.value.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        let names: Vec<_> = out
+            .value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(names, vec!["mcphub_echo"]);
         assert!(out.value[0]["input_schema"].is_object());
         assert!(out.next.unwrap().contains("use_tool"));
@@ -139,9 +158,16 @@ mod tests {
     #[tokio::test]
     async fn use_tool_calls_deferred() {
         let r = registry_with_echo();
-        let out = r.call("use_tool", json!({"name": "mcphub_echo", "arguments": {"x": 1}})).await;
+        let out = r
+            .call(
+                "use_tool",
+                json!({"name": "mcphub_echo", "arguments": {"x": 1}}),
+            )
+            .await;
         assert_eq!(out.value, json!({"x": 1}));
-        let missing = r.call("use_tool", json!({"name": "nope", "arguments": {}})).await;
+        let missing = r
+            .call("use_tool", json!({"name": "nope", "arguments": {}}))
+            .await;
         assert!(missing.is_error);
     }
 
@@ -149,6 +175,8 @@ mod tests {
     fn meta_tools_are_visible() {
         let r = registry_with_echo();
         let names: Vec<_> = r.visible().into_iter().map(|d| d.name).collect();
-        assert!(names.contains(&"search_tools".to_string()) && names.contains(&"use_tool".to_string()));
+        assert!(
+            names.contains(&"search_tools".to_string()) && names.contains(&"use_tool".to_string())
+        );
     }
 }

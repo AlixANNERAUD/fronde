@@ -20,7 +20,13 @@ pub fn tool_name(server: &str, tool: &str) -> String {
     let mut name: String = format!("{server}_{tool}")
         .chars()
         .map(|c| c.to_ascii_lowercase())
-        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     name.truncate(64);
     name
@@ -34,7 +40,10 @@ struct Link {
 
 impl Link {
     fn unreachable(&self) -> ToolOutput {
-        ToolOutput::error(format!("{} is unreachable right now; retry later or do without it", self.name))
+        ToolOutput::error(format!(
+            "{} is unreachable right now; retry later or do without it",
+            self.name
+        ))
     }
 }
 
@@ -61,14 +70,20 @@ fn to_output(r: CallToolResult) -> ToolOutput {
             Value::String(parts.join("\n"))
         }
     };
-    ToolOutput { value, next: None, is_error }
+    ToolOutput {
+        value,
+        next: None,
+        is_error,
+    }
 }
 
 #[async_trait]
 impl ToolHandler for Forward {
     async fn call(&self, args: Value) -> ToolOutput {
         let client = self.link.client.read().expect("link lock").clone();
-        let Some(client) = client else { return self.link.unreachable() };
+        let Some(client) = client else {
+            return self.link.unreachable();
+        };
         let mut params = CallToolRequestParams::new(self.tool.clone());
         if let Value::Object(map) = args {
             params = params.with_arguments(map);
@@ -106,7 +121,10 @@ async fn open(cfg: &UpstreamConfig) -> anyhow::Result<Client> {
         if let Some(t) = &cfg.token {
             config = config.auth_header(t.resolve()?);
         }
-        Ok(().serve(StreamableHttpClientTransport::from_config(config)).await?)
+        Ok(
+            ().serve(StreamableHttpClientTransport::from_config(config))
+                .await?,
+        )
     } else if let Some([program, args @ ..]) = cfg.command.as_deref() {
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args);
@@ -119,39 +137,44 @@ async fn open(cfg: &UpstreamConfig) -> anyhow::Result<Client> {
 /// Connect to an upstream server forever: register its tools as deferred, re-register on reconnect.
 pub fn spawn_upstream(cfg: UpstreamConfig, registry: Arc<Registry>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let link = Arc::new(Link { name: cfg.name.clone(), client: RwLock::new(None), broken: Notify::new() });
+        let link = Arc::new(Link {
+            name: cfg.name.clone(),
+            client: RwLock::new(None),
+            broken: Notify::new(),
+        });
         let mut delay = Duration::from_secs(2);
         loop {
             match connect(&cfg).await {
                 Ok((client, tools)) => {
-                    {
-                        delay = Duration::from_secs(2);
-                        let client = Arc::new(client);
-                        registry.unregister_source(&cfg.name);
-                        for t in tools {
-                            let def = ToolDef {
-                                name: tool_name(&cfg.name, &t.name),
-                                description: t.description.as_deref().unwrap_or_default().to_string(),
-                                input_schema: Value::Object((*t.input_schema).clone()),
-                                deferred: true,
-                                source: cfg.name.clone(),
-                            };
-                            let handler = Arc::new(Forward { link: link.clone(), tool: t.name.to_string() });
-                            if let Err(e) = registry.register(def, handler) {
-                                tracing::warn!("{}: skipped tool {}: {e:#}", cfg.name, t.name);
-                            }
+                    delay = Duration::from_secs(2);
+                    let client = Arc::new(client);
+                    registry.unregister_source(&cfg.name);
+                    for t in tools {
+                        let def = ToolDef {
+                            name: tool_name(&cfg.name, &t.name),
+                            description: t.description.as_deref().unwrap_or_default().to_string(),
+                            input_schema: Value::Object((*t.input_schema).clone()),
+                            deferred: true,
+                            source: cfg.name.clone(),
+                        };
+                        let handler = Arc::new(Forward {
+                            link: link.clone(),
+                            tool: t.name.to_string(),
+                        });
+                        if let Err(e) = registry.register(def, handler) {
+                            tracing::warn!("{}: skipped tool {}: {e:#}", cfg.name, t.name);
                         }
-                        *link.client.write().expect("link lock") = Some(client.clone());
-                        tracing::info!("{}: connected", cfg.name);
-                        loop {
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(5)) => if client.is_closed() { break },
-                                _ = link.broken.notified() => break,
-                            }
-                        }
-                        *link.client.write().expect("link lock") = None;
-                        tracing::warn!("{}: disconnected", cfg.name);
                     }
+                    *link.client.write().expect("link lock") = Some(client.clone());
+                    tracing::info!("{}: connected", cfg.name);
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => if client.is_closed() { break },
+                            _ = link.broken.notified() => break,
+                        }
+                    }
+                    *link.client.write().expect("link lock") = None;
+                    tracing::warn!("{}: disconnected", cfg.name);
                 }
                 Err(e) => tracing::warn!("{}: cannot connect: {e:#}", cfg.name),
             }
@@ -166,7 +189,9 @@ pub(crate) mod test_server {
     //! A tiny MCP server with one `echo` tool, served over HTTP, that can be switched off.
     use rmcp::model::*;
     use rmcp::service::RequestContext;
-    use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager};
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
     use rmcp::{ErrorData, RoleServer, ServerHandler};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,37 +204,61 @@ pub(crate) mod test_server {
             ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
         }
 
-        async fn list_tools(&self, _r: Option<PaginatedRequestParams>, _c: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
-            let schema = serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}});
+        async fn list_tools(
+            &self,
+            _r: Option<PaginatedRequestParams>,
+            _c: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            let schema =
+                serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}});
             let schema = schema.as_object().unwrap().clone();
-            Ok(ListToolsResult::with_all_items(vec![Tool::new("echo", "Echo text back to the caller", schema)]))
+            Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "echo",
+                "Echo text back to the caller",
+                schema,
+            )]))
         }
 
-        async fn call_tool(&self, r: CallToolRequestParams, _c: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
-            let Some(text) = r.arguments.and_then(|a| a.get("text").and_then(|t| t.as_str()).map(str::to_string)) else {
+        async fn call_tool(
+            &self,
+            r: CallToolRequestParams,
+            _c: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            let Some(text) = r
+                .arguments
+                .and_then(|a| a.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            else {
                 return Err(ErrorData::invalid_params("missing text argument", None));
             };
-            Ok(CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(text)])))
+            Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                ContentBlock::text(text),
+            ])))
         }
     }
 
     /// Serve on `listener`; returns a switch: set it to true to answer 503 to everything.
     pub fn serve(listener: tokio::net::TcpListener) -> Arc<AtomicBool> {
         let down = Arc::new(AtomicBool::new(false));
-        let svc = StreamableHttpService::new(|| Ok(Echo), Arc::new(LocalSessionManager::default()), StreamableHttpServerConfig::default());
+        let svc = StreamableHttpService::new(
+            || Ok(Echo),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
         let flag = down.clone();
-        let app = axum::Router::new().nest_service("/mcp", svc).layer(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let flag = flag.clone();
-                async move {
-                    if flag.load(Ordering::SeqCst) {
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
-                    } else {
-                        next.run(req).await
+        let app = axum::Router::new()
+            .nest_service("/mcp", svc)
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let flag = flag.clone();
+                    async move {
+                        if flag.load(Ordering::SeqCst) {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            next.run(req).await
+                        }
                     }
-                }
-            },
-        ));
+                },
+            ));
         tokio::spawn(async move { axum::serve(listener, app).await });
         down
     }
@@ -225,7 +274,12 @@ mod tests {
     use std::time::Duration;
 
     fn cfg(addr: std::net::SocketAddr) -> UpstreamConfig {
-        UpstreamConfig { name: "mcphub".into(), url: Some(format!("http://{addr}/mcp").parse().unwrap()), command: None, token: None }
+        UpstreamConfig {
+            name: "mcphub".into(),
+            url: Some(format!("http://{addr}/mcp").parse().unwrap()),
+            command: None,
+            token: None,
+        }
     }
 
     async fn wait_for(reg: &Registry, name: &str, secs: u64) -> bool {
@@ -269,9 +323,17 @@ mod tests {
         assert!(wait_for(&reg, "mcphub_echo", 10).await);
         let bad = reg.call("mcphub_echo", json!({})).await;
         assert!(bad.is_error);
-        assert!(bad.to_text().contains("missing text argument"), "{}", bad.to_text());
+        assert!(
+            bad.to_text().contains("missing text argument"),
+            "{}",
+            bad.to_text()
+        );
         let ok = reg.call("mcphub_echo", json!({"text": "still here"})).await;
-        assert!(!ok.is_error, "link must stay up after an application error: {}", ok.to_text());
+        assert!(
+            !ok.is_error,
+            "link must stay up after an application error: {}",
+            ok.to_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -307,10 +369,18 @@ mod tests {
         down.store(true, Ordering::SeqCst);
         let out = reg.call("mcphub_echo", json!({"text": "hello"})).await;
         assert!(out.is_error);
-        assert!(out.to_text().contains("mcphub is unreachable"), "{}", out.to_text());
+        assert!(
+            out.to_text().contains("mcphub is unreachable"),
+            "{}",
+            out.to_text()
+        );
         down.store(false, Ordering::SeqCst);
         for _ in 0..100 {
-            if !reg.call("mcphub_echo", json!({"text": "back"})).await.is_error {
+            if !reg
+                .call("mcphub_echo", json!({"text": "back"}))
+                .await
+                .is_error
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

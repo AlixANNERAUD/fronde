@@ -45,7 +45,11 @@ pub struct MemoryConfig {
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { memory_limit: 4000, user_limit: 2000, git: true }
+        Self {
+            memory_limit: 4000,
+            user_limit: 2000,
+            git: true,
+        }
     }
 }
 
@@ -83,8 +87,9 @@ impl Secret {
                     .with_context(|| format!("cannot read secret file {}", file.display()))?;
                 Ok(s.trim_end_matches(['\n', '\r']).to_string())
             }
-            Secret::Env { env } => std::env::var(env)
-                .with_context(|| format!("environment variable {env} is not set; set it or use {{ file = \"…\" }}")),
+            Secret::Env { env } => std::env::var(env).with_context(|| {
+                format!("environment variable {env} is not set; set it or use {{ file = \"…\" }}")
+            }),
         }
     }
 }
