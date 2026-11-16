@@ -220,16 +220,7 @@ impl Supervisor {
 
     /// Register a started source's tools in place of its earlier ones.
     fn up(&self, name: &str, session: Session) -> Option<Closed> {
-        self.registry.unregister_source(name);
-        let mut count = 0;
-        for (mut def, handler) in session.tools {
-            def.source = name.to_string();
-            let tool = def.name.clone();
-            match self.registry.register(def, handler) {
-                Ok(()) => count += 1,
-                Err(e) => tracing::warn!("{name}: skipped tool {tool}: {e:#}"),
-            }
-        }
+        let count = self.registry.replace_source(name, session.tools);
         tracing::info!("{name}: started with {count} tools");
         self.set(name, Health::Up { tools: count });
         session.closed
@@ -237,18 +228,15 @@ impl Supervisor {
 
     /// Keep a stopped source's tools listed, each saying the source is unreachable.
     fn down(&self, name: &str, error: String) {
-        let defs: Vec<ToolDef> = self
+        let unreachable: Arc<dyn ToolHandler> = Arc::new(Unreachable(name.to_string()));
+        let stubs: Vec<Tool> = self
             .registry
             .all()
             .into_iter()
             .filter(|d| d.source == name)
+            .map(|d| (d, unreachable.clone()))
             .collect();
-        self.registry.unregister_source(name);
-        for def in defs {
-            let _ = self
-                .registry
-                .register(def, Arc::new(Unreachable(name.to_string())));
-        }
+        self.registry.replace_source(name, stubs);
         self.set(name, Health::Down { error });
     }
 }

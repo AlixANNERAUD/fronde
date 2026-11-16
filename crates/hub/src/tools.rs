@@ -143,15 +143,28 @@ impl Registry {
     }
 
     pub fn register(&self, def: ToolDef, handler: Arc<dyn ToolHandler>) -> anyhow::Result<()> {
+        let mut tools = self.tools.write().expect("registry lock");
+        self.insert(&mut tools, def, handler)
+    }
+
+    fn insert(
+        &self,
+        tools: &mut BTreeMap<String, Entry>,
+        def: ToolDef,
+        handler: Arc<dyn ToolHandler>,
+    ) -> anyhow::Result<()> {
         if !is_valid_name(&def.name) {
             bail!(
                 "tool name {:?} must match ^[a-z][a-z0-9_]{{0,63}}$",
                 def.name
             );
         }
-        let mut tools = self.tools.write().expect("registry lock");
-        if tools.contains_key(&def.name) {
-            bail!("tool {:?} is already registered", def.name);
+        if let Some((other, _)) = tools.get(&def.name) {
+            bail!(
+                "tool {:?} is already registered by {}",
+                def.name,
+                other.source
+            );
         }
         if def.deferred {
             self.index.upsert(&def);
@@ -160,8 +173,7 @@ impl Registry {
         Ok(())
     }
 
-    pub fn unregister_source(&self, source: &str) {
-        let mut tools = self.tools.write().expect("registry lock");
+    fn remove_source(&self, tools: &mut BTreeMap<String, Entry>, source: &str) {
         tools.retain(|name, (d, _)| {
             let keep = d.source != source;
             if !keep {
@@ -169,6 +181,30 @@ impl Registry {
             }
             keep
         });
+    }
+
+    pub fn unregister_source(&self, source: &str) {
+        let mut tools = self.tools.write().expect("registry lock");
+        self.remove_source(&mut tools, source);
+    }
+
+    /// Put `tools` in place of the tools of `source`, all at once: no call sees the source with
+    /// some or none of its tools. Each tool takes `source` as its source; one with an invalid
+    /// name or the name of another source's tool is skipped with a warning. Returns how many
+    /// were registered.
+    pub fn replace_source(&self, source: &str, tools: Vec<Tool>) -> usize {
+        let mut registered = self.tools.write().expect("registry lock");
+        self.remove_source(&mut registered, source);
+        let mut count = 0;
+        for (mut def, handler) in tools {
+            def.source = source.to_string();
+            let name = def.name.clone();
+            match self.insert(&mut registered, def, handler) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::warn!("{source}: skipped tool {name}: {e:#}"),
+            }
+        }
+        count
     }
 
     /// Deferred tools matching a need, best first.
@@ -388,6 +424,28 @@ mod tests {
         r.unregister_source("up");
         assert!(r.deferred_names().is_empty());
         assert_eq!(r.visible().len(), 1);
+    }
+
+    #[test]
+    fn replace_source_swaps_its_tools_and_skips_clashes() {
+        let r = Registry::new();
+        let (d, h) = double(false, "taken");
+        r.register(d, h).unwrap();
+        let count = r.replace_source(
+            "up",
+            vec![
+                double(true, "up_a"),
+                double(true, "up_b"),
+                double(false, "taken"),
+            ],
+        );
+        assert_eq!(count, 2);
+        assert_eq!(r.get("up_a").unwrap().source, "up");
+        assert_eq!(r.get("taken").unwrap().source, "hub", "the first one stays");
+        let count = r.replace_source("up", vec![double(true, "up_c"), double(true, "Bad")]);
+        assert_eq!(count, 1);
+        assert_eq!(r.deferred_names(), ["up_c"]);
+        assert_eq!(r.search("double", 5).len(), 1, "the index follows");
     }
 
     #[test]
