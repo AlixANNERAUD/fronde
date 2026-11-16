@@ -15,7 +15,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(10);
-const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-le.";
+const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-la.";
 const GONE: &str = "Cette demande n'est plus active.";
 const FRESH: &str = "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";

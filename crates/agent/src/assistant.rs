@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-le.";
+const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-la.";
 const NOT_ACTIVE: &str = "Cette demande n'est plus active.";
 const NEW_CONVERSATION: &str =
     "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
