@@ -50,6 +50,23 @@ Builds are heavy: run one cargo command at a time, through `mise exec -- cargo â
 is ignored and runs only by hand, with `JARVIS_LIVE_AGENT` set to the adapter's path:
 `mise exec -- cargo nextest run -p jarvis --test live --run-ignored only --no-capture`.
 
+## Dioxus 0.7 usage
+
+Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-free model.
+
+- `rsx!` with `#[component]` functions; lists use `for` with a stable `key` (generation and seq,
+  never the row version, which would remount the node on each chunk).
+- Shared state is `Signal`s; the WebSocket lives in one `use_coroutine` (`socket.rs`) that owns the
+  socket and the retry timer. Connection logic stays in `jarvis-client`, native and tested.
+- Components and pages take plain props (no context needed to render) so `dioxus-ssr` and
+  VirtualDom tests drive them natively.
+- Browser-only code (sockets, timers, `web_sys`) sits behind `cfg(target_arch = "wasm32")`, with a
+  native stub for tests.
+- Vendored rust-ui components keep upstream classes; changes carry a `// jarvis:` marker.
+- Tailwind is built by `mise run web-css`, not by `dx`; `dx` only bundles the wasm.
+- Dev: `mise run web-dev` for the UI (proxies `/ws` and `/auth` to the backend), plus the backend
+  running alongside. Release: `mise run web-build`.
+
 ## Rules
 
 - Keep it as simple as possible: add a mechanism only when its absence hurts.
