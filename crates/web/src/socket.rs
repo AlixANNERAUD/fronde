@@ -1,0 +1,231 @@
+//! The chat's WebSocket to `/ws`, run by `jarvis_client::Connection`: it says hello with what the
+//! chat has, applies what the server sends, sends what the page asks while it is open, retries
+//! after 1 s then up to every 30 s (at once when the page comes back to the foreground), and goes
+//! to the sign-in page when the server closes with 4401.
+//!
+//! One coroutine owns the socket and the retry timer, so there is never more than one of each:
+//! a retry drops the timer it replaces, and a closed socket is dropped before the next opens, so
+//! no stale timer or socket can act on the chat.
+
+use dioxus::prelude::*;
+use jarvis_client::Chat;
+use jarvis_protocol::ClientMsg;
+
+/// What the page shows of the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// The first connection, before it opened.
+    Connecting,
+    Open,
+    /// Closed, or opening again after a failure.
+    Reconnecting,
+}
+
+/// Connects the chat. Messages sent to the returned coroutine go to the server while the socket
+/// is open and are dropped otherwise, so the page only sends while [`Status::Open`].
+pub fn use_chat_socket(chat: Signal<Chat>, status: Signal<Status>) -> Coroutine<ClientMsg> {
+    use_coroutine(move |commands: UnboundedReceiver<ClientMsg>| imp::run(chat, status, commands))
+}
+
+#[cfg(target_arch = "wasm32")]
+mod imp {
+    use dioxus::prelude::*;
+    use futures::{FutureExt, SinkExt, StreamExt, future::poll_fn, select};
+    use gloo_net::websocket::{Message, State, WebSocketError, futures::WebSocket};
+    use gloo_timers::future::TimeoutFuture;
+    use jarvis_client::{Action, Chat, Connection};
+    use jarvis_protocol::{ClientMsg, ServerMsg};
+    use wasm_bindgen::{JsCast, closure::Closure};
+
+    use super::Status;
+
+    /// What a socket that closed without saying why (or never opened) reports.
+    const ABNORMAL_CLOSURE: u16 = 1006;
+
+    pub async fn run(
+        chat: Signal<Chat>,
+        mut status: Signal<Status>,
+        mut commands: UnboundedReceiver<ClientMsg>,
+    ) {
+        let mut connection = Connection::default();
+        let mut visible = visibility_changes();
+        loop {
+            let code = match ws_url().and_then(|url| WebSocket::open(&url).ok()) {
+                Some(socket) => {
+                    talk(
+                        socket,
+                        &mut connection,
+                        chat,
+                        status,
+                        &mut commands,
+                        &mut visible,
+                    )
+                    .await
+                }
+                None => ABNORMAL_CLOSURE,
+            };
+            match connection.on_close(code) {
+                Action::GoToSignIn => {
+                    // The session expired, or the server restarted and forgot it.
+                    go_to("/sign-in");
+                    return;
+                }
+                Action::Retry(delay) => {
+                    status.set(Status::Reconnecting);
+                    if !wait(delay, &mut connection, &mut commands, &mut visible).await {
+                        return;
+                    }
+                }
+                // A close never asks to retry at once.
+                Action::RetryNow => {}
+            }
+        }
+    }
+
+    /// Runs one socket until it closes; returns its close code.
+    async fn talk(
+        mut socket: WebSocket,
+        connection: &mut Connection,
+        mut chat: Signal<Chat>,
+        mut status: Signal<Status>,
+        commands: &mut UnboundedReceiver<ClientMsg>,
+        visible: &mut UnboundedReceiver<()>,
+    ) -> u16 {
+        // The socket is ready to send once it opened, or once it failed to.
+        loop {
+            select! {
+                _ = poll_fn(|cx| socket.poll_ready_unpin(cx)).fuse() => break,
+                _ = commands.next() => {}
+                _ = visible.next() => {
+                    connection.on_visible();
+                }
+            }
+        }
+        if !matches!(socket.state(), State::Open) {
+            return close_code(socket).await;
+        }
+        let hello = connection.on_open(&chat.peek());
+        status.set(Status::Open);
+        send(&mut socket, &hello).await;
+        loop {
+            select! {
+                incoming = socket.next().fuse() => match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(message) = serde_json::from_str::<ServerMsg>(&text) {
+                            chat.write().apply(&message);
+                        }
+                    }
+                    Some(Err(WebSocketError::ConnectionClose(event))) => return event.code,
+                    // An error event comes before the close.
+                    Some(Ok(Message::Bytes(_))) | Some(Err(_)) => {}
+                    None => return ABNORMAL_CLOSURE,
+                },
+                command = commands.next() => {
+                    if let Some(command) = command {
+                        send(&mut socket, &command).await;
+                    }
+                }
+                _ = visible.next() => {
+                    connection.on_visible();
+                }
+            }
+        }
+    }
+
+    /// Waits before the next attempt: until the delay ends or the page becomes visible. False when
+    /// no attempt should follow.
+    async fn wait(
+        delay: u32,
+        connection: &mut Connection,
+        commands: &mut UnboundedReceiver<ClientMsg>,
+        visible: &mut UnboundedReceiver<()>,
+    ) -> bool {
+        let mut timer = TimeoutFuture::new(delay).fuse();
+        loop {
+            select! {
+                () = timer => return connection.on_retry(),
+                _ = visible.next() => {
+                    if connection.on_visible() == Some(Action::RetryNow) {
+                        return true;
+                    }
+                }
+                // Nothing is sent while the socket is closed.
+                _ = commands.next() => {}
+            }
+        }
+    }
+
+    async fn close_code(mut socket: WebSocket) -> u16 {
+        while let Some(event) = socket.next().await {
+            if let Err(WebSocketError::ConnectionClose(event)) = event {
+                return event.code;
+            }
+        }
+        ABNORMAL_CLOSURE
+    }
+
+    async fn send(socket: &mut WebSocket, message: &ClientMsg) {
+        if let Ok(json) = serde_json::to_string(message) {
+            // A failed send shows as the socket closing.
+            let _ = socket.send(Message::Text(json)).await;
+        }
+    }
+
+    /// `ws://` or `wss://` to this site's `/ws`.
+    fn ws_url() -> Option<String> {
+        let location = web_sys::window()?.location();
+        let scheme = if location.protocol().ok()? == "https:" {
+            "wss"
+        } else {
+            "ws"
+        };
+        Some(format!("{scheme}://{}/ws", location.host().ok()?))
+    }
+
+    fn go_to(path: &str) {
+        if let Some(window) = web_sys::window() {
+            let _ = window.location().set_href(path);
+        }
+    }
+
+    /// One message each time the page becomes visible again.
+    fn visibility_changes() -> UnboundedReceiver<()> {
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+        let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+            return receiver;
+        };
+        let listener = Closure::<dyn Fn()>::new({
+            let document = document.clone();
+            move || {
+                if document.visibility_state() == web_sys::VisibilityState::Visible {
+                    let _ = sender.unbounded_send(());
+                }
+            }
+        });
+        let _ = document.add_event_listener_with_callback(
+            "visibilitychange",
+            listener.as_ref().unchecked_ref(),
+        );
+        // Listens for as long as the page is open.
+        listener.forget();
+        receiver
+    }
+}
+
+/// Natively there is no socket: the page is only rendered, in tests.
+#[cfg(not(target_arch = "wasm32"))]
+mod imp {
+    use dioxus::prelude::*;
+    use jarvis_client::Chat;
+    use jarvis_protocol::ClientMsg;
+
+    use super::Status;
+
+    pub async fn run(
+        chat: Signal<Chat>,
+        status: Signal<Status>,
+        commands: UnboundedReceiver<ClientMsg>,
+    ) {
+        let _ = (chat, status, commands);
+    }
+}

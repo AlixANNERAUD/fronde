@@ -13,6 +13,7 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | `crates/client` (`jarvis-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
 | `crates/app` (`jarvis-app`) | The Leptos web chat: sign-in and chat pages, the `ChatPanel` island and its WebSocket; `chat_model.rs` turns log entries into what the chat shows |
 | `crates/frontend` (`jarvis-frontend`) | The browser bundle (wasm32): hydrates the app's island |
+| `crates/web` (`jarvis-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `jarvis-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
 | `crates/server` | The `jarvis` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the chat pages and `/ws` |
 
 `jarvis-app` builds with `ssr` for the server and with `hydrate` for the browser, never both:
@@ -60,6 +61,9 @@ is ignored and runs only by hand, with `JARVIS_LIVE_AGENT` set to the adapter's 
 - Never rewrite calendar data the tools do not model: edit stored iCalendar in place.
 - Tests never touch a real calendar, model or MCP server: use `wiremock`, in-process fakes and
   temporary directories.
+- Rust/UI components are vendored by hand in `crates/web/src/components/ui/`, with
+  `crates/web/src/components/LICENSE-rust-ui` (MIT) beside them: keep their classes and
+  structure, and mark any change to them in place.
 - Comments explain why, never restate the code. Docs are plain, concise English with no em dashes.
 - Work and push directly on `main`. Commits follow Conventional Commits (`feat:`, `fix:`, `test:`,
   `build:`, `ci:`, `docs:`, `chore:`), imperative, in English. Do not mention AI tools and add no
