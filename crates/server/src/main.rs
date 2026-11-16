@@ -27,7 +27,7 @@ enum Command {
 }
 
 fn check(path: &std::path::Path) -> anyhow::Result<()> {
-    let config = hub::config::load(path)?;
+    let config = jarvis_hub::config::load(path)?;
     jarvis::check_token(&config.server.token.resolve()?)?;
     if let Some(c) = &config.calendar {
         c.password.resolve()?;
@@ -41,7 +41,7 @@ fn check(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
-    let config = hub::config::load(path)?;
+    let config = jarvis_hub::config::load(path)?;
     let (addr, server) = jarvis::start(config).await?;
     tracing::info!("listening on http://{addr} (MCP at /mcp)");
     tokio::select! {

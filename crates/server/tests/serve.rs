@@ -4,7 +4,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
-fn config(dir: &std::path::Path, token: &str) -> hub::config::Config {
+fn config(dir: &std::path::Path, token: &str) -> jarvis_hub::config::Config {
     let token_file = dir.join("token");
     std::fs::write(&token_file, token).unwrap();
     let toml = format!(

@@ -7,8 +7,8 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 
 | Crate | Role |
 | --- | --- |
-| `crates/hub` | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
-| `crates/jarvis` | The `jarvis` binary and library: configuration check, HTTP routes, `/mcp` behind a bearer token |
+| `crates/hub` (`jarvis-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
+| `crates/server` | The `jarvis` binary and library: configuration check, HTTP routes, `/mcp` behind a bearer token |
 
 ## Commands
 

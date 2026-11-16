@@ -1,7 +1,7 @@
-use hub::config::{Secret, load};
+use jarvis_hub::config::{Secret, load};
 use std::io::Write;
 
-fn load_str(s: &str) -> anyhow::Result<hub::config::Config> {
+fn load_str(s: &str) -> anyhow::Result<jarvis_hub::config::Config> {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(s.as_bytes()).unwrap();
     load(f.path())
@@ -64,14 +64,10 @@ fn rejects_bad_tool_prefix_name() {
 
 #[test]
 fn secret_from_env_and_file() {
-    unsafe { std::env::set_var("HUB_TEST_SECRET", "abc") };
+    // Setting a variable is unsafe in edition 2024, so read one every process already has.
     assert_eq!(
-        Secret::Env {
-            env: "HUB_TEST_SECRET".into()
-        }
-        .resolve()
-        .unwrap(),
-        "abc"
+        Secret::Env { env: "PATH".into() }.resolve().unwrap(),
+        std::env::var("PATH").unwrap()
     );
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(b"s3cret\n").unwrap();

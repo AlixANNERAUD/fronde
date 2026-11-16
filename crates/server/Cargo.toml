@@ -10,7 +10,7 @@ version.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
-hub = { path = "../hub" }
+jarvis-hub = { path = "../hub" }
 rmcp.workspace = true
 subtle.workspace = true
 tokio.workspace = true
@@ -21,3 +21,6 @@ tracing-subscriber.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+
+[lints]
+workspace = true
