@@ -7,6 +7,19 @@
 
 ---
 
+## Why “Fronde”
+
+A *fronde* is a sling, the small one's weapon against giants, and *la Fronde* was the
+17th-century French revolt against central power. Fronde runs at home as one binary and drives the
+big models (Claude, Codex, Gemini) through your own subscriptions instead of locking you into their
+platforms. It is pronounced the French way, /fʁɔ̃d/.
+
+> One binary. Every agent. No masters.
+>
+> « La petite arme qui fait plier les géants. »
+
+## What it is
+
 Fronde is a small self-hosted server. It drives Claude Code through its
 [ACP adapter](https://github.com/agentclientprotocol/claude-agent-acp), signed in with your own
 Claude subscription, and gives it one set of tools: a memory kept in Markdown files, your CalDAV
@@ -19,7 +32,7 @@ phone or computer. Other agents, such as Claude Code, Codex or T3 Code, reach th
 - **Chat** from any browser, behind a password: answers stream in, the tools Fronde uses show as
   they run, any turn can be stopped, and the conversation survives restarts.
 - **Your subscription**: Claude Code runs through its ACP adapter, with its built-in tools turned
-  off. Fronde only uses its own tools.
+  off except web search and fetch. Fronde otherwise only uses its own tools.
 - **Memory** in plain Markdown files (`USER.md`, `MEMORY.md` and a dated journal), searchable and
   versioned with git.
 - **Calendar and reminders** on any CalDAV server (Nextcloud, Radicale, Fastmail and others).
@@ -106,6 +119,8 @@ secure_cookie = false
 command = ["claude-agent-acp"]
 # Extra environment for the agent, written in plain text: never put a secret here.
 env = {}
+# Claude Code's own tools Fronde may use besides the hub's; only these two are allowed, [] for none.
+builtin_tools = ["WebSearch", "WebFetch"]
 ```
 
 [`fronde.example.toml`](fronde.example.toml) also shows the memory caps, the CalDAV calendar and
@@ -115,7 +130,7 @@ upstream MCP servers. `fronde check --config fronde.toml` validates the file and
 
 The agent uses Claude Code's own sign-in and inherits Fronde's environment. It reads none of
 Claude Code's settings: your plugins, MCP servers, hooks and permission rules do not apply to
-Fronde, which only has the hub's tools.
+Fronde, which only has the hub's tools plus web search and fetch.
 
 - **Native**: nothing to do. The agent uses your Claude Code sign-in in `~/.claude`. To run your
   installed Claude Code rather than the one bundled with the adapter, set
