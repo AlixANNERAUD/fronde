@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, bail};
 use chrono::{DateTime, Utc};
+use fronde_component::http::{Request, Transport};
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,48 +28,6 @@ pub struct Resource {
     pub href: String,
     pub etag: Option<String>,
     pub ics: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Request {
-    pub method: &'static str,
-    pub url: Url,
-    pub headers: Vec<(&'static str, String)>,
-    pub body: String,
-}
-
-impl Request {
-    fn new(method: &'static str, url: Url) -> Self {
-        Self {
-            method,
-            url,
-            headers: Vec::new(),
-            body: String::new(),
-        }
-    }
-
-    fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.headers.push((name, value.into()));
-        self
-    }
-
-    fn with_body(mut self, body: impl Into<String>) -> Self {
-        self.body = body.into();
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Response {
-    pub status: u16,
-    pub body: String,
-}
-
-/// Sends one HTTP request; an error means no response came back.
-// The component is single-threaded, so the futures need not be `Send`.
-#[allow(async_fn_in_trait)]
-pub trait Transport {
-    async fn send(&self, req: Request) -> anyhow::Result<Response>;
 }
 
 pub struct CalDav<T> {
@@ -138,13 +97,13 @@ impl<T: Transport> CalDav<T> {
             .await
             .map_err(|e| anyhow!("CalDAV server unreachable: {e:#}"))?;
         match resp.status {
-            200..=299 => Ok(resp.body),
+            200..=299 => Ok(resp.text()),
             401 | 403 => {
                 bail!("CalDAV refused the credentials (check calendar.username/password)")
             }
             412 => bail!("the item changed meanwhile; read it again and retry"),
             s => {
-                let body: String = resp.body.chars().take(200).collect();
+                let body: String = resp.text().chars().take(200).collect();
                 bail!("CalDAV error {}: {body}", status_text(s))
             }
         }
@@ -287,11 +246,11 @@ mod tests {
             "the host adds credentials"
         );
         assert!(
-            req.body
+            req.text()
                 .contains(r#"time-range start="20261116T000000Z" end="20261123T000000Z""#)
         );
-        assert!(req.body.contains(r#"name="VEVENT""#));
-        assert!(req.body.contains("expand"));
+        assert!(req.text().contains(r#"name="VEVENT""#));
+        assert!(req.text().contains("expand"));
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].href, "/cal/alix/personal/a.ics");
         assert_eq!(res[0].etag.as_deref(), Some("\"etag-a\""));
@@ -312,9 +271,9 @@ mod tests {
         let [req] = &server.requests("REPORT")[..] else {
             panic!("expected one REPORT")
         };
-        assert!(req.body.contains(r#"prop-filter name="UID""#));
-        assert!(req.body.contains(">a&amp;b<"));
-        assert!(req.body.contains(r#"name="VTODO""#));
+        assert!(req.text().contains(r#"prop-filter name="UID""#));
+        assert!(req.text().contains(">a&amp;b<"));
+        assert!(req.text().contains(r#"name="VTODO""#));
     }
 
     #[test]
@@ -344,13 +303,16 @@ mod tests {
         let [req] = &server.requests("PUT")[..] else {
             panic!("expected one PUT")
         };
-        assert_eq!(req.url.path(), "/cal/alix/personal/u1.ics");
+        assert_eq!(
+            Url::parse(&req.url).unwrap().path(),
+            "/cal/alix/personal/u1.ics"
+        );
         assert_eq!(req.header("if-none-match"), Some("*"));
         assert_eq!(
             req.header("content-type"),
             Some("text/calendar; charset=utf-8")
         );
-        assert_eq!(req.body, "BEGIN:VCALENDAR");
+        assert_eq!(req.text(), "BEGIN:VCALENDAR");
     }
 
     #[test]
@@ -370,7 +332,10 @@ mod tests {
             let [req] = &server.requests(method)[..] else {
                 panic!("expected one {method}")
             };
-            assert_eq!(req.url.path(), "/cal/alix/personal/a.ics");
+            assert_eq!(
+                Url::parse(&req.url).unwrap().path(),
+                "/cal/alix/personal/a.ics"
+            );
             assert_eq!(req.header("if-match"), Some("\"etag-a\""));
         }
     }

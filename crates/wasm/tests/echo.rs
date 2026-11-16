@@ -372,6 +372,28 @@ async fn rejects_component_without_tools() {
 }
 
 #[tokio::test]
+async fn rejects_unsupported_api_version() {
+    let host = ComponentHost::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for wat in [
+        r#"(component (instance $i) (export "fronde:component/tools@0.2.0" (instance $i)))"#,
+        r#"(component
+             (import "fronde:component/settings@1.0.0" (instance))
+             (instance $i) (export "fronde:component/tools@0.1.0" (instance $i)))"#,
+    ] {
+        let path = dir.path().join("future.wat");
+        std::fs::write(&path, wat).unwrap();
+        let e = LoadedComponent::load(&host, ComponentSpec { path, ..spec() })
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("this Fronde serves 0.1"), "{e}");
+        assert!(e.contains("fronde:component@"), "{e}");
+    }
+}
+
+#[tokio::test]
 async fn tools_register_in_the_hub_registry() {
     let registry = Arc::new(Registry::new());
     register_meta_tools(&registry).unwrap();

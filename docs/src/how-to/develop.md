@@ -15,11 +15,11 @@ mise run agent   # the Claude adapter, to chat with a real agent
 
 | Command | Does |
 | --- | --- |
-| `mise run format` | Formats the code, components included |
-| `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server, the web interface (native and wasm32) and the components (wasm32-wasip2) |
-| `mise run components` | Builds the Wasm components into `components/dist` |
+| `mise run format` | Formats the code, the component SDK and components included |
+| `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server, the web interface (native and wasm32), the component SDK and each component (wasm32-wasip2) |
+| `mise run components` | Builds each Wasm component project into `components/dist` |
 | `mise run test` | The test suite (nextest), after `components` |
-| `mise run deny` | cargo-deny: advisories, licences, bans, sources |
+| `mise run deny` | cargo-deny: advisories, licences, bans, sources, for the server, the component SDK and each component |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
 | `mise run dev` | The server on <http://127.0.0.1:8484>, password `fronde` |
 | `mise run web-dev` | The web interface with hot reload on <http://127.0.0.1:8080> |

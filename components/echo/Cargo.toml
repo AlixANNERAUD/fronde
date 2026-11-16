@@ -1,20 +1,32 @@
+# A standalone project: it depends on the guest SDK only and has its own lock file.
+# Its own workspace: not part of Fronde's.
+[workspace]
+
 [package]
 name = "echo"
 description = "Test component for fronde-wasm: echoes text and settings, fetches URLs, spins and sleeps"
-edition.workspace = true
-license.workspace = true
-publish.workspace = true
-rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-wit-bindgen.workspace = true
-wstd.workspace = true
+fronde-component = { path = "../../crates/component-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

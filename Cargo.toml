@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The guest SDK stands alone, as the components that depend on it do.
+exclude = ["crates/component-sdk"]
 
 [workspace.package]
 edition = "2024"

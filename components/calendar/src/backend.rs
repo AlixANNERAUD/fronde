@@ -1,9 +1,10 @@
 //! Calendar backend: events and reminders kept in two CalDAV collections.
 
-use crate::caldav::{CalDav, Kind, Resource, Transport};
+use crate::caldav::{CalDav, Kind, Resource};
 use crate::ics::{self, Event, Reminder};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
+use fronde_component::http::Transport;
 use url::Url;
 
 // The component is single-threaded, so the futures need not be `Send`.
@@ -250,7 +251,7 @@ END:VCALENDAR
         let [put] = &server.requests("PUT")[..] else {
             panic!("expected one PUT")
         };
-        assert_eq!(put.url.path(), "/c/x.ics");
+        assert_eq!(Url::parse(&put.url).unwrap().path(), "/c/x.ics");
         assert_eq!(put.header("if-match"), Some("\"e\""));
         for kept in [
             "BEGIN:VALARM",
@@ -258,7 +259,11 @@ END:VCALENDAR
             "DTSTART;TZID=Romance Standard Time:20261120T100000",
             "SUMMARY:Nouveau titre",
         ] {
-            assert!(put.body.contains(kept), "lost {kept:?} in\n{}", put.body);
+            assert!(
+                put.text().contains(kept),
+                "lost {kept:?} in\n{}",
+                put.text()
+            );
         }
     }
 
@@ -274,7 +279,7 @@ END:VCALENDAR
         let [put] = &server.requests("PUT")[..] else {
             panic!("expected one PUT")
         };
-        let body = &put.body;
+        let body = &put.text();
         assert!(
             body.contains("DUE;VALUE=DATE:20261118")
                 && body.contains("PRIORITY:1")
@@ -326,7 +331,7 @@ END:VCALENDAR
         };
         assert_eq!(put.url.as_str(), "http://cal.test/c/new-1.ics");
         assert_eq!(put.header("if-none-match"), Some("*"));
-        assert!(put.body.contains("UID:new-1"), "{}", put.body);
+        assert!(put.text().contains("UID:new-1"), "{}", put.text());
     }
 
     fn settings(pairs: &[(&str, &str)]) -> Result<Settings, String> {

@@ -16,6 +16,10 @@ mr-boxington = "latest"
 # commands leave it out.
 FRONDE_SERVER_PACKAGES = "--workspace --exclude fronde-web"
 DX_TELEMETRY_ENABLED = "false"
+# Tool components: standalone Cargo projects (own lock file and release profile), built for
+# wasm32-wasip2 against the guest SDK, which stands alone too.
+FRONDE_COMPONENTS = "components/echo components/calendar"
+FRONDE_COMPONENT_SDK = "crates/component-sdk"
 # The Claude ACP adapter installed by `mise run agent` (agent/package-lock.json).
 _.path = ["{{config_root}}/agent/node_modules/.bin"]
 
@@ -25,7 +29,10 @@ run = "npm ci --prefix agent --omit=dev"
 
 [tasks.format]
 description = "Format the code"
-run = ["cargo fmt --all", "cargo fmt --manifest-path components/Cargo.toml --all"]
+run = [
+  "cargo fmt --all",
+  "for p in $FRONDE_COMPONENT_SDK $FRONDE_COMPONENTS; do cargo fmt --manifest-path $p/Cargo.toml --all; done",
+]
 
 [tasks.lint]
 description = "Check formatting and run clippy on the server, web and component code"
@@ -35,9 +42,14 @@ run = [
   "cargo clippy $FRONDE_SERVER_PACKAGES --all-targets -- -D warnings",
   "cargo clippy --package fronde-web --all-targets -- -D warnings",
   "cargo clippy --package fronde-web --target wasm32-unknown-unknown -- -D warnings",
-  "cargo fmt --manifest-path components/Cargo.toml --all --check",
-  "cargo clippy --manifest-path components/Cargo.toml --target wasm32-wasip2 -- -D warnings",
-  "cargo clippy --manifest-path components/Cargo.toml --package fronde-calendar --all-targets -- -D warnings",
+  # The SDK carries a copy of the frozen WIT it targets.
+  "diff -r wit/v0.1 $FRONDE_COMPONENT_SDK/wit",
+  "cargo fmt --manifest-path $FRONDE_COMPONENT_SDK/Cargo.toml --all --check",
+  "cargo clippy --manifest-path $FRONDE_COMPONENT_SDK/Cargo.toml --all-targets --all-features -- -D warnings",
+  "cargo clippy --manifest-path $FRONDE_COMPONENT_SDK/Cargo.toml --target wasm32-wasip2 -- -D warnings",
+  "set -e; for p in $FRONDE_COMPONENTS; do cargo fmt --manifest-path $p/Cargo.toml --all --check; cargo clippy --manifest-path $p/Cargo.toml --target wasm32-wasip2 -- -D warnings; done",
+  # The calendar's logic and tests also build on the host.
+  "cargo clippy --manifest-path components/calendar/Cargo.toml --all-targets -- -D warnings",
 ]
 
 [tasks.test]
@@ -46,8 +58,10 @@ depends = ["web-css", "components"]
 run = [
   "cargo nextest run $FRONDE_SERVER_PACKAGES --no-tests=pass",
   "cargo nextest run --package fronde-web",
-  # The components' logic is tested on the host; their WIT glue only builds for wasm32.
-  "cargo nextest run --manifest-path components/Cargo.toml --package fronde-calendar",
+  "cargo nextest run --manifest-path $FRONDE_COMPONENT_SDK/Cargo.toml --all-features",
+  "cargo test --doc --manifest-path $FRONDE_COMPONENT_SDK/Cargo.toml",
+  # The calendar's logic is tested on the host; its export glue only builds for wasm32.
+  "cargo nextest run --manifest-path components/calendar/Cargo.toml",
 ]
 
 # The web crate embeds its stylesheet at compile time, so Cargo needs the file. It is built with
@@ -58,21 +72,24 @@ description = "Generate the web interface's stylesheet"
 hide = true
 run = "tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css"
 
-# Tool components are a workspace of their own, built for WASI. The .wasm files are copied to
+# Each tool component is built for WASI in its own project. The .wasm files are copied to
 # components/dist, where fronde-wasm's tests load them: mr-boxington prunes idle target directories.
 [tasks.components]
 description = "Build the tool components for wasm32-wasip2 into components/dist"
 run = [
-  "cargo build --manifest-path components/Cargo.toml --target wasm32-wasip2 --release",
   "mkdir -p components/dist",
-  "cp components/target/wasm32-wasip2/release/*.wasm components/dist/",
+  "set -e; for p in $FRONDE_COMPONENTS; do cargo build --manifest-path $p/Cargo.toml --target wasm32-wasip2 --release; cp $p/target/wasm32-wasip2/release/*.wasm components/dist/; done",
 ]
 
-# The components use the root deny.toml, which cargo-deny finds from components/ upwards. Passing
-# `--config deny.toml` instead breaks under mr-boxington, which reads it as Cargo's own `--config`.
+# The SDK and the components use the root deny.toml, which cargo-deny finds from their directories
+# upwards. Passing `--config deny.toml` instead breaks under mr-boxington, which reads it as
+# Cargo's own `--config`.
 [tasks.deny]
 description = "Check advisories, licences, bans and sources, components included"
-run = ["cargo deny check", "cargo deny --manifest-path components/Cargo.toml check"]
+run = [
+  "cargo deny check",
+  "set -e; for p in $FRONDE_COMPONENT_SDK $FRONDE_COMPONENTS; do cargo deny --manifest-path $p/Cargo.toml check; done",
+]
 
 [tasks.check]
 description = "Everything CI checks, except the release build"

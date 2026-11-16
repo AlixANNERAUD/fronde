@@ -1,26 +1,58 @@
 //! The `tool` world: components that bring tools to the hub's registry.
 
 use crate::ComponentSpec;
-use crate::host::{ComponentHost, Sandbox};
+use crate::api::Api;
+use crate::host::{ComponentHost, HostState, Sandbox};
+use crate::v0_1;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use fronde_hub::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
 use serde_json::Value;
 use std::sync::Arc;
-
-mod bindings {
-    wasmtime::component::bindgen!({
-        path: "../../wit",
-        world: "fronde:component/tool",
-        // Exports run guest code that waits on HTTP.
-        exports: { default: async },
-        with: { "fronde:component/settings": crate::host::bindings::fronde::component::settings },
-    });
-}
-
-use bindings::ToolPre;
+use wasmtime::Store;
 
 const TOOLS_EXPORT: &str = "fronde:component/tools@";
+
+/// A tool as a component declares it, whatever its interface version.
+pub(crate) struct DeclaredTool {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    /// JSON text.
+    pub(crate) input_schema: String,
+    pub(crate) deferred: bool,
+}
+
+/// What a tool call returns, whatever the interface version.
+pub(crate) struct CallOutput {
+    /// JSON text, or plain text.
+    pub(crate) value: String,
+    pub(crate) next: Option<String>,
+    pub(crate) is_error: bool,
+}
+
+/// The component's exports, through the bindings of the version it was built against.
+enum Tools {
+    V0_1(v0_1::tool::Tools),
+}
+
+impl Tools {
+    async fn list(&self, store: &mut Store<HostState>) -> wasmtime::Result<Vec<DeclaredTool>> {
+        match self {
+            Self::V0_1(tools) => tools.list(store).await,
+        }
+    }
+
+    async fn call(
+        &self,
+        store: &mut Store<HostState>,
+        name: &str,
+        arguments: &str,
+    ) -> wasmtime::Result<CallOutput> {
+        match self {
+            Self::V0_1(tools) => tools.call(store, name, arguments).await,
+        }
+    }
+}
 
 /// A compiled tool component and the tools it declared when it loaded.
 #[derive(Clone)]
@@ -30,7 +62,7 @@ pub struct LoadedComponent {
 
 struct Loaded {
     sandbox: Sandbox,
-    pre: ToolPre<crate::host::HostState>,
+    exports: Tools,
     tools: Vec<ToolDef>,
 }
 
@@ -38,28 +70,24 @@ impl LoadedComponent {
     /// Compile the component, check its imports and exports, and ask it for its tools.
     pub async fn load(host: &ComponentHost, spec: ComponentSpec) -> anyhow::Result<Self> {
         let component = host.compile(&spec).await?;
+        let api = Api::of(&component, host.engine(), &spec.name)?;
         let exports_tools = component
             .component_type()
             .exports(host.engine())
             .any(|(name, _)| name.starts_with(TOOLS_EXPORT));
-        if !exports_tools {
+        let (Some(api), true) = (api, exports_tools) else {
             bail!(
                 "component {} does not export fronde:component/tools: build it for the fronde:component/tool world",
                 spec.name
             );
-        }
-        let pre = ToolPre::new(host.linker().instantiate_pre(&component)?)?;
+        };
+        let exports = match api {
+            Api::V0_1 => Tools::V0_1(v0_1::tool::Tools::new(host.linker(), &component)?),
+        };
         let sandbox = Sandbox::new(host, spec)?;
         let (mut store, out_of_cpu) = sandbox.store();
-        let call = async {
-            let instance = pre.instantiate_async(&mut store).await?;
-            instance
-                .fronde_component_tools()
-                .call_list_tools(&mut store)
-                .await
-        };
         let declared = sandbox
-            .run(&out_of_cpu, call)
+            .run(&out_of_cpu, exports.list(&mut store))
             .await
             .map_err(anyhow::Error::msg)?;
         let tools = declared
@@ -83,7 +111,7 @@ impl LoadedComponent {
         Ok(Self {
             inner: Arc::new(Loaded {
                 sandbox,
-                pre,
+                exports,
                 tools,
             }),
         })
@@ -98,16 +126,12 @@ impl LoadedComponent {
     }
 
     pub async fn call(&self, name: &str, args: &Value) -> ToolOutput {
-        let Loaded { sandbox, pre, .. } = &*self.inner;
+        let Loaded {
+            sandbox, exports, ..
+        } = &*self.inner;
         let arguments = args.to_string();
         let (mut store, out_of_cpu) = sandbox.store();
-        let call = async {
-            let instance = pre.instantiate_async(&mut store).await?;
-            instance
-                .fronde_component_tools()
-                .call_call_tool(&mut store, name, &arguments)
-                .await
-        };
+        let call = exports.call(&mut store, name, &arguments);
         match sandbox.run(&out_of_cpu, call).await {
             Ok(out) => ToolOutput {
                 value: serde_json::from_str(&out.value).unwrap_or(Value::String(out.value)),

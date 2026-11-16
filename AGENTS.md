@@ -13,16 +13,17 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | `crates/agent` (`fronde-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/client` (`fronde-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
 | `crates/web` (`fronde-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `fronde-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
-| `crates/wasm` (`fronde-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `tool.rs` the `tool` world, whose tools join the hub's registry |
-| `wit/` | The components' WIT: package `fronde:component`, shared `settings` interface, `tool` world |
-| `components/` | Components, a Cargo workspace of its own built for `wasm32-wasip2` (`echo` is the test component); not part of the root workspace |
+| `crates/wasm` (`fronde-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `api.rs` which `fronde:component` version a component targets, `v0_1/` the bindings of version 0.1 (one module per served version), `tool.rs` the `tool` world, whose tools join the hub's registry |
+| `crates/component-sdk` (`fronde-component`) | The guest SDK components depend on: the WIT it targets (a copy of `wit/v0.1`), `export_tool!`, settings, HTTP over WASI, fakes for native tests (`testing` feature). Stands alone: not in the root workspace, no dependency on another Fronde crate, publishable |
+| `wit/` | The components' WIT, one frozen directory per released version of `fronde:component` (`v0.1`): shared `settings` interface, `tool` world |
+| `components/` | Tool components, each a standalone Cargo project built for `wasm32-wasip2` (`echo` is the host's test bench, `calendar` the CalDAV tools) |
 | `crates/server` | The `fronde` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
 
-Components are built by `mise run components`, which copies the `.wasm` files to
-`components/dist` (mr-boxington prunes idle target directories); `fronde-wasm`'s tests load them
-from there, and `mise run test` builds them first. A component may not import `wasi:filesystem` or
-`wasi:sockets`, and its bindings module is the only place allowed `unsafe` code (the generated
-export glue needs it).
+Components are built by `mise run components`, which builds each project listed in
+`$FRONDE_COMPONENTS` and copies the `.wasm` files to `components/dist` (mr-boxington prunes idle
+target directories); `fronde-wasm`'s tests load them from there, and `mise run test` builds them
+first. A component may not import `wasi:filesystem` or `wasi:sockets`. The SDK's `bindings` module
+is the only place allowed `unsafe` code (the generated glue needs it); components forbid it.
 
 The server has no Dioxus dependency: it serves the built interface as static files from
 `FRONDE_SITE_ROOT` (default `target/dx/fronde-web/release/web/public`, written by
@@ -83,6 +84,12 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
 ## Rules
 
 - Keep it as simple as possible: add a mechanism only when its absence hurts.
+- Components are independent projects that will move to their own repositories: each has its own
+  `Cargo.toml`, `Cargo.lock` and release profile, and depends only on `fronde-component` and
+  external crates, never on another Fronde crate. The SDK depends on no Fronde crate either.
+- A released WIT directory (`wit/v0.1`, …) is frozen: never edit it, not even to add a function or
+  an enum case. A change is a new directory with its own host module (`crates/wasm/src/v0_2/`),
+  and the host keeps serving the earlier versions.
 - Tool names match `^[a-z][a-z0-9_]{0,63}$`; tool descriptions are short imperative rules; a tool
   error always says how to fix it.
 - Secrets never appear in the configuration file, logs or tool output: `{ file = "…" }` or

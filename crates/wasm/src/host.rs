@@ -1,5 +1,6 @@
 //! What every component world shares: the engine and its epoch ticker, the linker (WASI without
-//! filesystem or sockets, gated HTTP, settings), and per-call stores with their limits.
+//! filesystem or sockets, gated HTTP, and each served version's own interfaces), and per-call
+//! stores with their limits.
 
 use crate::ComponentSpec;
 use crate::egress::{Egress, Grants};
@@ -9,19 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
-
-/// Bindings for the interfaces every world imports; each world's bindgen reuses them through `with`.
-pub(crate) mod bindings {
-    wasmtime::component::bindgen!({
-        path: "../../wit",
-        inline: "package fronde:host; world shared { import fronde:component/settings@0.1.0; }",
-        world: "fronde:host/shared",
-    });
-}
 
 /// How often the engine's epoch advances: the unit of `Limits::cpu_ticks`.
 const TICK: Duration = Duration::from_millis(100);
@@ -87,10 +79,8 @@ impl ComponentHost {
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-        bindings::fronde::component::settings::add_to_linker::<_, HasSelf<HostState>>(
-            &mut linker,
-            |s| s,
-        )?;
+        // Every version served, side by side: their interface names differ by version.
+        crate::v0_1::add_to_linker(&mut linker)?;
         // A thread rather than a task: a guest spinning on the runtime's only thread would
         // otherwise stop the clock that interrupts it.
         let (stop, stopped) = mpsc::channel::<()>();
@@ -170,9 +160,10 @@ impl WasiHttpView for HostState {
     }
 }
 
-impl bindings::fronde::component::settings::Host for HostState {
-    fn get(&mut self, key: String) -> Option<String> {
-        self.settings.get(&key).cloned()
+impl HostState {
+    /// What the guest reads through `settings.get`, whatever the interface version.
+    pub(crate) fn setting(&self, key: &str) -> Option<String> {
+        self.settings.get(key).cloned()
     }
 }
 

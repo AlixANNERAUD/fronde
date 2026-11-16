@@ -1,49 +1,20 @@
 //! Test component for `fronde-wasm`: each tool exercises one thing the host must get right.
 
-#![deny(unsafe_code)]
-
-// The generated export glue needs `unsafe`; nothing else in the crate may use it.
-#[allow(unsafe_code)]
-mod bindings {
-    wit_bindgen::generate!({ world: "tool", path: "../../wit" });
-    use crate::Component;
-    export!(Component with_types_in crate::bindings);
-}
-
-use bindings::exports::fronde::component::tools::{Guest, Tool, ToolOutput};
-use bindings::fronde::component::settings;
+use fronde_component::http::{Request, Transport, WasiHttp};
+use fronde_component::{Tool, ToolOutput, Tools, export_tool, settings, wstd};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use wstd::http::{Body, BodyExt, Client, Request};
 
-struct Component;
+struct Echo;
+
+export_tool!(Echo);
 
 fn tool(name: &str, description: &str, deferred: bool, schema: Value) -> Tool {
-    Tool {
-        name: name.into(),
-        description: description.into(),
-        input_schema: schema.to_string(),
-        deferred,
-    }
+    let tool = Tool::new(name, description, schema);
+    if deferred { tool.deferred() } else { tool }
 }
 
-fn ok(value: Value) -> ToolOutput {
-    ToolOutput {
-        value: value.to_string(),
-        next: None,
-        is_error: false,
-    }
-}
-
-fn error(message: String) -> ToolOutput {
-    ToolOutput {
-        value: Value::String(message).to_string(),
-        next: None,
-        is_error: true,
-    }
-}
-
-impl Guest for Component {
+impl Tools for Echo {
     fn list_tools() -> Vec<Tool> {
         vec![
             tool(
@@ -88,33 +59,33 @@ impl Guest for Component {
         ]
     }
 
-    fn call_tool(name: String, arguments: String) -> ToolOutput {
-        match name.as_str() {
-            "echo_text" => with_args(&arguments, |a: TextArgs| ok(json!(a.text))),
-            "echo_setting" => with_args(&arguments, |a: SettingArgs| {
-                ok(json!(settings::get(&a.key)))
+    fn call_tool(name: &str, arguments: &str) -> ToolOutput {
+        match name {
+            "echo_text" => with_args(arguments, |a: TextArgs| ToolOutput::ok(json!(a.text))),
+            "echo_setting" => with_args(arguments, |a: SettingArgs| {
+                ToolOutput::ok(json!(settings::get(&a.key)))
             }),
-            "echo_fetch" => with_args(&arguments, |a: FetchArgs| {
-                match wstd::runtime::block_on(fetch(a)) {
-                    Ok(v) => ok(v),
-                    Err(e) => error(format!("{e:#}")),
+            "echo_fetch" => with_args(arguments, |a: FetchArgs| {
+                match fronde_component::block_on(fetch(a)) {
+                    Ok(v) => ToolOutput::ok(v),
+                    Err(e) => ToolOutput::error(format!("{e:#}")),
                 }
             }),
             "echo_spin" => loop {
                 std::hint::black_box(());
             },
-            "echo_alloc" => with_args(&arguments, |a: AllocArgs| {
+            "echo_alloc" => with_args(arguments, |a: AllocArgs| {
                 let block = vec![1u8; a.mib << 20];
-                ok(json!(std::hint::black_box(&block).len()))
+                ToolOutput::ok(json!(std::hint::black_box(&block).len()))
             }),
-            "echo_sleep" => with_args(&arguments, |a: SleepArgs| {
+            "echo_sleep" => with_args(arguments, |a: SleepArgs| {
                 // The timer needs the runtime that block_on starts, so it is made inside it.
-                wstd::runtime::block_on(async {
+                fronde_component::block_on(async {
                     wstd::task::sleep(wstd::time::Duration::from_millis(a.ms)).await
                 });
-                ok(json!(a.ms))
+                ToolOutput::ok(json!(a.ms))
             }),
-            other => error(format!("unknown tool {other}")),
+            other => ToolOutput::error(format!("unknown tool {other}")),
         }
     }
 }
@@ -125,7 +96,7 @@ fn with_args<A: for<'de> Deserialize<'de>>(
 ) -> ToolOutput {
     match serde_json::from_str(arguments) {
         Ok(a) => f(a),
-        Err(e) => error(format!("invalid arguments: {e}")),
+        Err(e) => ToolOutput::error(format!("invalid arguments: {e}")),
     }
 }
 
@@ -157,27 +128,15 @@ struct FetchArgs {
 }
 
 /// The test server echoes the Authorization header it received in `x-echo-authorization`.
-async fn fetch(a: FetchArgs) -> wstd::http::Result<Value> {
-    let mut req = Request::get(a.url);
+async fn fetch(a: FetchArgs) -> Result<Value, fronde_component::http::Error> {
+    let mut req = Request::new("GET", a.url);
     if let Some(auth) = a.authorization {
-        req = req.header("authorization", auth);
+        req = req.with_header("authorization", auth);
     }
-    let resp = Client::new().send(req.body(Body::empty())?).await?;
-    let status = resp.status().as_u16();
-    let echoed = resp
-        .headers()
-        .get("x-echo-authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let body = resp
-        .into_body()
-        .into_boxed_body()
-        .collect()
-        .await?
-        .to_bytes();
+    let resp = WasiHttp.send(req).await?;
     Ok(json!({
-        "status": status,
-        "body": String::from_utf8_lossy(&body),
-        "authorization": echoed,
+        "status": resp.status,
+        "body": resp.text(),
+        "authorization": resp.header("x-echo-authorization"),
     }))
 }

@@ -1,14 +1,17 @@
-//! WebAssembly components (WASI 0.2, `wit/component.wit`) that extend the hub. Only the `tool`
-//! world exists so far: components that bring tools.
+//! WebAssembly components (WASI 0.2) that extend the hub, built against a version of the
+//! `fronde:component` WIT package (`wit/v0.1`, …), which the host checks when it loads them. Only
+//! the `tool` world exists so far: components that bring tools.
 //!
 //! A component gets no filesystem, sockets, environment or arguments, and may only reach the
 //! origins its spec allows; the host adds credentials to those requests itself. Every call runs in
 //! a fresh store with a memory cap, a CPU budget and a wall-clock timeout, so a failing component
 //! becomes a tool error, never a hub failure.
 
+mod api;
 mod egress;
 mod host;
 mod tool;
+mod v0_1;
 
 pub use egress::{Credential, Origin};
 pub use host::{ComponentHost, Limits};
