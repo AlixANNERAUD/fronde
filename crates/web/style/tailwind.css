@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-@source "./src/**/*.rs";
+@source "../src/**/*.rs";
 
 /* Rust/UI's theme (`ui init`, neutral base, MIT), without tw-animate-css, which no component here
    needs. The theme follows the device: the dark values apply under `prefers-color-scheme: dark`,

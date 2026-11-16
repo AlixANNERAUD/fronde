@@ -8,7 +8,7 @@ pub fn Textarea(
     #[props(into, default)] placeholder: Option<String>,
     #[props(default = false)] disabled: bool,
     #[props(default = 4)] rows: i64,
-    // Added to Rust/UI's component: the text and its changes.
+    // jarvis: the text and its changes.
     #[props(into, optional)] value: Option<String>,
     #[props(optional)] oninput: Option<EventHandler<FormEvent>>,
 ) -> Element {

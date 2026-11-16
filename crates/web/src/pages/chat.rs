@@ -1,11 +1,11 @@
 //! `/`: the chat. The server only serves it with a session; the conversation comes over `/ws`.
 
 use dioxus::prelude::*;
-use icons::{ArrowUp, Check, LogOut, Square, Wrench, X};
 use jarvis_client::{Chat, Item, PermissionStatus, ToolStatus};
 use jarvis_protocol::ClientMsg;
 
 use crate::{
+    components::icons::{ArrowUp, Check, LogOut, Square, Wrench, X},
     components::ui::{
         badge::{Badge, BadgeVariant},
         bubble::{Bubble, BubbleAlign, BubbleContent, BubbleVariant},
@@ -16,7 +16,7 @@ use crate::{
         scroll_area::ScrollAreaViewport,
         spinner::Spinner,
     },
-    socket::{Status, use_chat_socket},
+    socket::{Outgoing, Status, use_chat_socket},
 };
 
 #[component]
@@ -25,13 +25,13 @@ pub fn ChatPage() -> Element {
     let status = use_signal(|| Status::Connecting);
     let socket = use_chat_socket(chat, status);
     rsx! {
-        ChatView { chat: chat(), status: status(), on_send: move |message| socket.send(message) }
+        ChatView { chat: chat(), status: status(), on_send: move |outgoing| socket.send(outgoing) }
     }
 }
 
 /// The chat as drawn from its model: no socket, so it renders anywhere.
 #[component]
-pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<ClientMsg>) -> Element {
+pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> Element {
     let open = status == Status::Open;
     rsx! {
         div { class: "flex h-dvh flex-col",
@@ -43,6 +43,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<ClientMsg>) ->
                             variant: ButtonVariant::Ghost,
                             size: ButtonSize::Sm,
                             button_type: "submit",
+                            aria_label: "Se déconnecter",
                             LogOut {}
                             "Se déconnecter"
                         }
@@ -69,7 +70,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<ClientMsg>) ->
 }
 
 #[component]
-fn RowView(item: Item, open: bool, on_send: EventHandler<ClientMsg>) -> Element {
+fn RowView(item: Item, open: bool, on_send: EventHandler<Outgoing>) -> Element {
     match item {
         Item::User { text } => rsx! {
             Message { align: MessageAlign::End,
@@ -134,14 +135,17 @@ fn PermissionCard(
     title: String,
     status: PermissionStatus,
     open: bool,
-    on_send: EventHandler<ClientMsg>,
+    on_send: EventHandler<Outgoing>,
 ) -> Element {
     // Answered: the card changes when the server logs the answer.
     let mut sent = use_signal(|| false);
+    let answered = use_callback(move |()| sent.set(true));
     let disabled = sent() || !open;
-    let mut answer = move |allow: bool| {
-        sent.set(true);
-        on_send.call(ClientMsg::Answer { id, allow });
+    let answer = move |allow: bool| {
+        on_send.call(Outgoing {
+            message: ClientMsg::Answer { id, allow },
+            sent: Some(answered),
+        });
     };
     let footer = match status {
         PermissionStatus::Open => rsx! {
@@ -179,18 +183,22 @@ fn PermissionCard(
 
 /// The message box: Enter sends, Shift+Enter adds a line; Stop while a turn runs.
 #[component]
-fn Composer(running: bool, status: Status, on_send: EventHandler<ClientMsg>) -> Element {
+fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> Element {
     let mut draft = use_signal(String::new);
+    // The draft goes only once the message went out.
+    let delivered = use_callback(move |()| draft.set(String::new()));
     let open = status == Status::Open;
-    let mut submit = move || {
+    let submit = move || {
         // The server refuses a message while a turn runs: the draft stays for later.
         if running || !open {
             return;
         }
         let text = draft.peek().trim().to_owned();
         if !text.is_empty() {
-            on_send.call(ClientMsg::Send { text });
-            draft.set(String::new());
+            on_send.call(Outgoing {
+                message: ClientMsg::Send { text },
+                sent: Some(delivered),
+            });
         }
     };
     rsx! {
@@ -199,6 +207,7 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<ClientMsg>) -> 
                 InputPromptTextarea {
                     value: draft,
                     placeholder: "Écris à Jarvis…",
+                    aria_label: "Message",
                     // 16 px at least on phones, or iOS zooms in on focus.
                     class: "text-base md:text-sm",
                     on_submit: move |()| submit(),
@@ -219,16 +228,22 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<ClientMsg>) -> 
                             variant: ButtonVariant::Outline,
                             size: ButtonSize::Sm,
                             disabled: !open,
-                            onclick: move |_| on_send.call(ClientMsg::Cancel),
+                            aria_label: "Stop",
+                            onclick: move |_| {
+                                on_send.call(Outgoing {
+                                    message: ClientMsg::Cancel,
+                                    sent: None,
+                                })
+                            },
                             Square { class: "size-3 fill-current" }
                             "Stop"
                         }
                     } else {
                         InputPromptSubmit {
                             disabled: !open || draft().trim().is_empty(),
+                            aria_label: "Envoyer",
                             onclick: move |_| submit(),
                             ArrowUp {}
-                            span { class: "sr-only", "Envoyer" }
                         }
                     }
                 }
@@ -239,6 +254,16 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<ClientMsg>) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use dioxus::{
+        dioxus_core::{ElementId, Mutation, Mutations, NoOpMutations},
+        html::{
+            Code, Key, Location, Modifiers, PlatformEventData, SerializedFormData,
+            SerializedKeyboardData,
+        },
+    };
+
     use super::*;
 
     /// A chat that received these events, numbered from 1.
@@ -254,45 +279,140 @@ mod tests {
         chat
     }
 
-    fn render(chat: Chat, status: Status) -> String {
-        #[component]
-        fn Harness(chat: Chat, status: Status) -> Element {
-            rsx! { ChatView { chat, status, on_send: |_| {} } }
+    thread_local! {
+        /// What the page under test sent.
+        static SENT: RefCell<Vec<ClientMsg>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The chat page alone. `deliver`: whether the socket says each message went out.
+    #[component]
+    fn Harness(chat: Chat, status: Status, deliver: bool) -> Element {
+        rsx! {
+            ChatView {
+                chat,
+                status,
+                on_send: move |outgoing: Outgoing| {
+                    SENT.with_borrow_mut(|sent| sent.push(outgoing.message));
+                    if deliver && let Some(sent) = outgoing.sent {
+                        sent.call(());
+                    }
+                },
+            }
         }
-        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { chat, status });
+    }
+
+    fn render(chat: Chat, status: Status) -> String {
+        let props = HarnessProps {
+            chat,
+            status,
+            deliver: true,
+        };
+        let mut dom = VirtualDom::new_with_props(Harness, props);
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
 
-    /// The page's buttons: their text, and whether they are disabled.
+    /// The page's buttons: their accessible name, and whether they are disabled.
     fn buttons(page: &str) -> Vec<(String, bool)> {
         page.split("<button")
             .skip(1)
             .map(|button| {
                 let (attributes, rest) = button.split_once('>').unwrap();
+                let label = attributes
+                    .split_once(r#"aria-label=""#)
+                    .map(|(_, label)| label.split('"').next().unwrap().to_owned());
                 let mut content = rest.split("</button>").next().unwrap();
-                // The text only: no tags, and no icon titles.
                 let mut text = String::new();
                 while let Some((before, after)) = content.split_once('<') {
                     text.push_str(before);
-                    let tag_end = if after.starts_with("title>") {
-                        after.find("</title>").unwrap() + "</title>".len()
-                    } else {
-                        after.find('>').unwrap() + 1
-                    };
-                    content = &after[tag_end..];
+                    content = &after[after.find('>').unwrap() + 1..];
                 }
                 text.push_str(content);
-                (text.trim().to_owned(), attributes.contains("disabled=true"))
+                let name = label.unwrap_or_else(|| text.trim().to_owned());
+                (name, attributes.contains("disabled=true"))
             })
             .collect()
     }
 
-    fn button(page: &str, text: &str) -> Option<bool> {
+    fn button(page: &str, name: &str) -> Option<bool> {
         buttons(page)
             .into_iter()
-            .find(|(label, _)| label == text)
+            .find(|(label, _)| label == name)
             .map(|(_, disabled)| disabled)
+    }
+
+    /// The page under test, live: events can be sent to it.
+    struct Live {
+        dom: VirtualDom,
+        listeners: Vec<(String, ElementId)>,
+    }
+
+    impl Live {
+        fn new(chat: Chat, status: Status, deliver: bool) -> Self {
+            // Events are built from plain data, as they would be from a browser's.
+            dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
+            SENT.with_borrow_mut(Vec::clear);
+            let props = HarnessProps {
+                chat,
+                status,
+                deliver,
+            };
+            let mut dom = VirtualDom::new_with_props(Harness, props);
+            let mut mutations = Mutations::default();
+            dom.rebuild(&mut mutations);
+            let listeners = mutations
+                .edits
+                .into_iter()
+                .filter_map(|edit| match edit {
+                    Mutation::NewEventListener { name, id } => Some((name, id)),
+                    _ => None,
+                })
+                .collect();
+            Self { dom, listeners }
+        }
+
+        /// Sends the event to the one element that listens to it.
+        fn send(&mut self, name: &str, data: impl std::any::Any) {
+            let ids: Vec<ElementId> = self
+                .listeners
+                .iter()
+                .filter(|(listened, _)| listened == name)
+                .map(|(_, id)| *id)
+                .collect();
+            assert_eq!(ids.len(), 1, "listeners of {name}");
+            let data: Rc<dyn std::any::Any> = Rc::new(PlatformEventData::new(Box::new(data)));
+            self.dom
+                .runtime()
+                .handle_event(name, Event::new(data, true), ids[0]);
+            self.dom.render_immediate(&mut NoOpMutations);
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.send(
+                "input",
+                SerializedFormData::new(text.to_owned(), Vec::new()),
+            );
+        }
+
+        fn press_enter(&mut self, composing: bool) {
+            let key = SerializedKeyboardData::new(
+                Key::Enter,
+                Code::Enter,
+                Location::Standard,
+                false,
+                Modifiers::empty(),
+                composing,
+            );
+            self.send("keydown", key);
+        }
+
+        fn html(&self) -> String {
+            dioxus_ssr::render(&self.dom)
+        }
+    }
+
+    fn sent() -> Vec<ClientMsg> {
+        SENT.with_borrow(Clone::clone)
     }
 
     const USER: &str = r#"{"type":"user","text":"Salut\nça va ?"}"#;
@@ -370,5 +490,68 @@ mod tests {
         let page = render(running, Status::Reconnecting);
         assert!(page.contains("Reconnexion…"), "{page}");
         assert_eq!(button(&page, "Stop"), Some(true), "{page}");
+    }
+
+    #[test]
+    fn enter_sends_unless_composing() {
+        let mut page = Live::new(chat(&[USER, ENDED]), Status::Open, true);
+        page.type_text("  Bonjour  ");
+        // Enter that confirms an input method's text is not a send.
+        page.press_enter(true);
+        assert_eq!(sent(), []);
+        page.press_enter(false);
+        assert_eq!(
+            sent(),
+            [ClientMsg::Send {
+                text: "Bonjour".into()
+            }]
+        );
+        assert!(page.html().contains(r#"value="""#), "{}", page.html());
+    }
+
+    #[test]
+    fn draft_stays_until_sent() {
+        // The socket closed in between: nothing went out.
+        let mut page = Live::new(chat(&[USER, ENDED]), Status::Open, false);
+        page.type_text("Bonjour");
+        page.press_enter(false);
+        assert_eq!(sent().len(), 1);
+        assert!(
+            page.html().contains(r#"value="Bonjour""#),
+            "{}",
+            page.html()
+        );
+
+        // A turn runs: Enter keeps the draft and sends nothing.
+        let mut page = Live::new(chat(&[USER]), Status::Open, true);
+        page.type_text("Encore");
+        page.press_enter(false);
+        assert_eq!(sent(), []);
+        assert!(page.html().contains(r#"value="Encore""#), "{}", page.html());
+    }
+
+    #[test]
+    fn labels_are_french_without_icon_titles() {
+        let tools = [
+            r#"{"type":"tool","id":"a","title":"A","state":"running"}"#,
+            r#"{"type":"tool","id":"b","title":"B","state":"running"}"#,
+            r#"{"type":"tool","id":"b","title":"","state":"done"}"#,
+            r#"{"type":"tool","id":"c","title":"C","state":"running"}"#,
+            r#"{"type":"tool","id":"c","title":"","state":"failed"}"#,
+        ];
+        let mut events = vec![USER];
+        events.extend(tools);
+        let running = chat(&events);
+        events.push(ENDED);
+        for page in [
+            render(running.clone(), Status::Open),
+            render(running, Status::Reconnecting),
+            render(chat(&events), Status::Open),
+        ] {
+            assert!(!page.contains("Rust/UI Icons"), "{page}");
+            assert!(!page.contains("<title"), "{page}");
+            assert!(page.contains(r#"aria-label="Message""#), "{page}");
+            assert!(button(&page, "Se déconnecter").is_some(), "{page}");
+        }
     }
 }

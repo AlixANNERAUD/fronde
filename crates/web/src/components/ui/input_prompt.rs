@@ -36,6 +36,8 @@ pub fn InputPromptTextarea(
     #[props(into, optional)] placeholder: Option<String>,
     #[props(into, optional)] class: Option<String>,
     #[props(optional)] on_submit: Option<EventHandler<()>>,
+    // jarvis: the textarea's accessible name.
+    #[props(into, optional)] aria_label: Option<String>,
 ) -> Element {
     let placeholder = placeholder.unwrap_or_else(|| "Write a message...".to_string());
     let merged = tw_merge!(
@@ -50,10 +52,12 @@ pub fn InputPromptTextarea(
             "data-slot": "input-group-control",
             class: "{merged}",
             placeholder: "{placeholder}",
+            "aria-label": aria_label,
             value: "{value()}",
             oninput: move |ev| value.set(ev.value()),
             onkeydown: move |ev| {
-                if ev.key() == Key::Enter && !ev.modifiers().shift() {
+                // jarvis: Enter while an input method composes confirms the text; it does not send.
+                if ev.key() == Key::Enter && !ev.modifiers().shift() && !ev.is_composing() {
                     ev.prevent_default();
                     if let Some(cb) = on_submit {
                         cb.call(());
@@ -86,8 +90,9 @@ pub fn InputPromptFooter(
 pub fn InputPromptSubmit(
     #[props(optional)] disabled: bool,
     #[props(into, optional)] class: Option<String>,
-    // Added to Rust/UI's component: what a click does.
+    // jarvis: what a click does, and the button's accessible name.
     #[props(optional)] onclick: Option<EventHandler<MouseEvent>>,
+    #[props(into, optional)] aria_label: Option<String>,
     children: Element,
 ) -> Element {
     let merged = tw_merge!("size-8 rounded-full", class.as_deref().unwrap_or(""));
@@ -98,6 +103,7 @@ pub fn InputPromptSubmit(
             class: merged,
             button_type: "button",
             disabled: disabled,
+            aria_label,
             onclick: move |e| {
                 if let Some(handler) = &onclick {
                     handler.call(e);

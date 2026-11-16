@@ -21,10 +21,19 @@ pub enum Status {
     Reconnecting,
 }
 
-/// Connects the chat. Messages sent to the returned coroutine go to the server while the socket
-/// is open and are dropped otherwise, so the page only sends while [`Status::Open`].
-pub fn use_chat_socket(chat: Signal<Chat>, status: Signal<Status>) -> Coroutine<ClientMsg> {
-    use_coroutine(move |commands: UnboundedReceiver<ClientMsg>| imp::run(chat, status, commands))
+/// A message for the server, and what to do once it went out.
+// Natively only tests read it: there is no socket.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub struct Outgoing {
+    pub message: ClientMsg,
+    /// Called only if the message was sent: a message the page sends while the socket is not
+    /// open is dropped.
+    pub sent: Option<Callback<()>>,
+}
+
+/// Connects the chat; messages sent to the returned coroutine go to the server.
+pub fn use_chat_socket(chat: Signal<Chat>, status: Signal<Status>) -> Coroutine<Outgoing> {
+    use_coroutine(move |commands: UnboundedReceiver<Outgoing>| imp::run(chat, status, commands))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -37,7 +46,7 @@ mod imp {
     use jarvis_protocol::{ClientMsg, ServerMsg};
     use wasm_bindgen::{JsCast, closure::Closure};
 
-    use super::Status;
+    use super::{Outgoing, Status};
 
     /// What a socket that closed without saying why (or never opened) reports.
     const ABNORMAL_CLOSURE: u16 = 1006;
@@ -45,7 +54,7 @@ mod imp {
     pub async fn run(
         chat: Signal<Chat>,
         mut status: Signal<Status>,
-        mut commands: UnboundedReceiver<ClientMsg>,
+        mut commands: UnboundedReceiver<Outgoing>,
     ) {
         let mut connection = Connection::default();
         let mut visible = visibility_changes();
@@ -88,7 +97,7 @@ mod imp {
         connection: &mut Connection,
         mut chat: Signal<Chat>,
         mut status: Signal<Status>,
-        commands: &mut UnboundedReceiver<ClientMsg>,
+        commands: &mut UnboundedReceiver<Outgoing>,
         visible: &mut UnboundedReceiver<()>,
     ) -> u16 {
         // The socket is ready to send once it opened, or once it failed to.
@@ -120,9 +129,12 @@ mod imp {
                     Some(Ok(Message::Bytes(_))) | Some(Err(_)) => {}
                     None => return ABNORMAL_CLOSURE,
                 },
-                command = commands.next() => {
-                    if let Some(command) = command {
-                        send(&mut socket, &command).await;
+                outgoing = commands.next() => {
+                    if let Some(Outgoing { message, sent }) = outgoing
+                        && send(&mut socket, &message).await
+                        && let Some(sent) = sent
+                    {
+                        sent.call(());
                     }
                 }
                 _ = visible.next() => {
@@ -137,7 +149,7 @@ mod imp {
     async fn wait(
         delay: u32,
         connection: &mut Connection,
-        commands: &mut UnboundedReceiver<ClientMsg>,
+        commands: &mut UnboundedReceiver<Outgoing>,
         visible: &mut UnboundedReceiver<()>,
     ) -> bool {
         let mut timer = TimeoutFuture::new(delay).fuse();
@@ -164,11 +176,13 @@ mod imp {
         ABNORMAL_CLOSURE
     }
 
-    async fn send(socket: &mut WebSocket, message: &ClientMsg) {
-        if let Ok(json) = serde_json::to_string(message) {
-            // A failed send shows as the socket closing.
-            let _ = socket.send(Message::Text(json)).await;
-        }
+    /// False when the message did not go out; a failed send also shows as the socket closing.
+    async fn send(socket: &mut WebSocket, message: &ClientMsg) -> bool {
+        let Ok(json) = serde_json::to_string(message) else {
+            return false;
+        };
+        // Browsers drop, without an error, what is sent to a closing socket.
+        matches!(socket.state(), State::Open) && socket.send(Message::Text(json)).await.is_ok()
     }
 
     /// `ws://` or `wss://` to this site's `/ws`.
@@ -217,14 +231,13 @@ mod imp {
 mod imp {
     use dioxus::prelude::*;
     use jarvis_client::Chat;
-    use jarvis_protocol::ClientMsg;
 
-    use super::Status;
+    use super::{Outgoing, Status};
 
     pub async fn run(
         chat: Signal<Chat>,
         status: Signal<Status>,
-        commands: UnboundedReceiver<ClientMsg>,
+        commands: UnboundedReceiver<Outgoing>,
     ) {
         let _ = (chat, status, commands);
     }

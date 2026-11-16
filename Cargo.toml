@@ -16,12 +16,12 @@ axum = "0.8"
 async-trait = "0.1"
 console_error_panic_hook = "0.1"
 dioxus = { version = "0.7.10", features = ["router"] }
+dioxus-html = "0.7.10"
 dioxus-ssr = "0.7.10"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 gloo-net = { version = "0.6", default-features = false, features = ["websocket"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
-icons = { version = "0.19", features = ["dioxus"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

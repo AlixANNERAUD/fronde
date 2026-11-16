@@ -44,6 +44,8 @@ pub fn SignInPage(error: String) -> Element {
                                 r#type: InputType::Password,
                                 id: "password",
                                 name: "password",
+                                autocomplete: "current-password",
+                                autofocus: true,
                                 required: true,
                             }
                         }
@@ -69,6 +71,11 @@ mod tests {
         assert!(page.contains(r#"method="post""#), "{page}");
         assert!(page.contains(r#"action="/sign-in""#), "{page}");
         assert!(page.contains(r#"name="password""#), "{page}");
+        assert!(
+            page.contains(r#"autocomplete="current-password""#),
+            "{page}"
+        );
+        assert!(page.contains("autofocus=true"), "{page}");
         assert!(page.contains("Se connecter"), "{page}");
         assert!(!page.contains(r#"role="alert""#), "{page}");
 
@@ -77,7 +84,7 @@ mod tests {
         assert!(page.contains("Mot de passe incorrect."), "{page}");
 
         let page = render("2");
-        // The apostrophe comes out escaped.
+        // The apostrophe is escaped.
         assert!(page.contains("Trop d"), "{page}");
         assert!(page.contains("essais, réessaie dans une minute."), "{page}");
         assert!(!page.contains("Mot de passe incorrect."), "{page}");

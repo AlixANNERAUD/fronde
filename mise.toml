@@ -44,12 +44,13 @@ run = [
   "cargo nextest run --package jarvis-web",
 ]
 
-# The web crate embeds its stylesheet at compile time, so Cargo needs the file; dx writes it again
-# with its own Tailwind before each of its builds.
+# The web crate embeds its stylesheet at compile time, so Cargo needs the file. It is built with
+# the Tailwind pinned above for every use; dx would run its own Tailwind on `crates/web/tailwind.css`
+# and ignore its errors, hence the input under `style/`.
 [tasks.web-css]
 description = "Generate the web interface's stylesheet"
 hide = true
-run = "tailwindcss --input crates/web/tailwind.css --output crates/web/assets/tailwind.css"
+run = "tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css"
 
 [tasks.deny]
 description = "Check advisories, licences, bans and sources"
@@ -100,8 +101,15 @@ run = "cargo leptos build --release"
 
 [tasks.web-build]
 description = "Build the web interface into target/dx/jarvis-web/release/web/public"
+depends = ["web-css"]
 run = "dx build --package jarvis-web --platform web --release"
 
+# Tailwind rebuilds the stylesheet as classes change; dx reloads it in the page.
 [tasks.web-dev]
 description = "Serve the web interface with hot reload; a jarvis server on 127.0.0.1:8484 answers /ws and sign-in"
-run = "dx serve --package jarvis-web --platform web"
+depends = ["web-css"]
+run = '''
+tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css --watch=always &
+trap 'kill $!' EXIT
+dx serve --package jarvis-web --platform web
+'''

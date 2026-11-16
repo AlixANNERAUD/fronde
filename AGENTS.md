@@ -23,8 +23,9 @@ server-side Cargo commands leave out `jarvis-frontend` and `jarvis-web`
 server reads the built site from `JARVIS_SITE_ROOT` (default `target/site`).
 
 Lint and tests run `jarvis-web` on its own, natively and for wasm32. It embeds
-`crates/web/assets/tailwind.css` at compile time: dx generates it from `crates/web/tailwind.css`
-before its builds, and `lint` and `test` run the hidden `web-css` task first.
+`crates/web/assets/tailwind.css` at compile time: the hidden `web-css` task generates it from
+`crates/web/style/tailwind.css` with mise's Tailwind, and `lint`, `test`, `web-build` and
+`web-dev` run it first.
 
 ## Commands
 

@@ -9,7 +9,6 @@ version.workspace = true
 
 [dependencies]
 dioxus.workspace = true
-icons.workspace = true
 jarvis-client = { path = "../client" }
 jarvis-protocol = { path = "../protocol" }
 serde_json.workspace = true
@@ -26,6 +25,8 @@ wasm-bindgen.workspace = true
 web-sys = { workspace = true, features = ["Document", "Location", "VisibilityState", "Window"] }
 
 [dev-dependencies]
+# Events built from plain data, to send key presses natively in tests.
+dioxus-html.workspace = true
 dioxus-ssr.workspace = true
 
 [features]

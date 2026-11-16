@@ -1,6 +1,6 @@
 //! Components from Rust/UI (https://github.com/rust-ui/ui, MIT, see `../LICENSE-rust-ui`), copied
-//! as published. Changes are marked where they are made: `Textarea` takes `value` and `oninput`,
-//! `InputPromptSubmit` takes `onclick`, and paths to sibling modules use `super`.
+//! as published, then formatted. Changes are marked `// jarvis:` where they are made; paths to
+//! sibling modules use `super`.
 
 // Kept whole: variants and parts this interface does not use yet stay.
 #![allow(dead_code)]
