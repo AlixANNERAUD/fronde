@@ -43,14 +43,10 @@ phone or computer. Other agents, such as Claude Code, Codex or T3 Code, reach th
 
 ## Quick start
 
-Fronde needs a configuration file, a token for `/mcp` and a password for the chat. Copy
-[`fronde.example.toml`](fronde.example.toml) to `fronde.toml` and edit it (see
-[Configuration](#configuration)), then create the secrets it points to:
-
-```sh
-(umask 077 && openssl rand -hex 32 > fronde_token)
-(umask 077 && printf '%s' 'your chat password' > fronde_password)
-```
+Native installs run as your own user, with no root. `fronde init` writes a minimal
+`fronde.toml` and its two secrets (`fronde_token`, `fronde_password`, mode 0600) next to it. The
+data goes to `$XDG_DATA_HOME/fronde` (`~/.local/share/fronde`). For Docker, copy
+[`fronde.example.toml`](fronde.example.toml) (see [Docker](#docker)).
 
 ### Native, with mise
 
@@ -62,17 +58,23 @@ git clone https://github.com/AlixANNERAUD/fronde && cd fronde
 mise install
 mise run build
 mise run agent
+target/release/fronde init
 target/release/fronde check --config fronde.toml
-target/release/fronde serve --config fronde.toml
+mise exec -- target/release/fronde serve --config fronde.toml
 ```
 
-Open http://127.0.0.1:8484 and sign in with the chat password. The server reads the chat's files
+`fronde init` prints the chat password once; it is also in `fronde_password`. Open
+http://127.0.0.1:8484 and sign in with it. `mise exec` puts the adapter installed by
+`mise run agent` on the `PATH`; `init` also writes its path into the configuration when it runs
+from the checkout. The server reads the chat's files
 from `target/dx/fronde-web/release/web/public`, where `mise run build` puts them; run it from the
 checkout, or set `FRONDE_SITE_ROOT`.
 
 ### Docker
 
-The image has Fronde, Node.js and the Claude adapter. In the container, set
+The image has Fronde, Node.js and the Claude adapter. Copy
+`fronde.example.toml` to `fronde.toml`, create the secrets (`openssl rand -hex 32 > fronde_token`,
+and a password in `fronde_password`, both mode 0600), set
 `listen = "0.0.0.0:8484"` and `dir = "/data"`, and point the secrets to `/run/secrets/…`. Fronde
 runs as uid 65532, which must be able to read the secret files.
 
@@ -104,7 +106,7 @@ listen = "127.0.0.1:8484"
 token = { file = "/run/secrets/fronde_token" }
 
 [data]
-dir = "/var/lib/fronde"
+dir = "/data"
 timezone = "Europe/Paris"
 user = "alix"
 

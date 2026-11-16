@@ -99,7 +99,7 @@ impl std::fmt::Display for NotInstalled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cannot start the agent: {} is not installed; install it with npm i -g @agentclientprotocol/claude-agent-acp",
+            "cannot start the agent: {} is not installed or not on PATH; run `mise run agent` in the Fronde checkout and start Fronde with `mise exec -- fronde serve …`, or set [agent] command to the adapter's full path",
             self.0
         )
     }
@@ -109,7 +109,7 @@ impl std::error::Error for NotInstalled {}
 
 /// Whether `program` names an executable, looked up on the agent's `PATH` when it has no
 /// directory.
-fn installed(program: &str, env: &[(String, String)]) -> bool {
+pub fn installed(program: &str, env: &[(String, String)]) -> bool {
     let program = Path::new(program);
     if program.components().count() > 1 {
         return executable(program);

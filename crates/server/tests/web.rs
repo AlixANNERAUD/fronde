@@ -872,3 +872,40 @@ async fn hello_after_a_log_reset_replays_everything() {
         assert_eq!(&next_entry(&mut stale).await, entry);
     }
 }
+
+#[tokio::test]
+async fn relative_data_dir_gives_an_absolute_agent_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(dir.path().join("password"), PASSWORD).unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(
+        &path,
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = { file = \"token\" }\n[data]\ndir = \"./fronde\"\ntimezone = \"UTC\"\n[memory]\ngit = false\n[web]\npassword = { file = \"password\" }\n",
+    )
+    .unwrap();
+    let config = fronde_hub::config::load(&path).unwrap();
+    let (connector, seen) = fake_connector();
+    let addr = start_with(config, connector, &site(dir.path())).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+    )
+    .await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+        },
+    )
+    .await;
+    until_turn_ended(&mut socket).await;
+    let spec = seen.lock().unwrap().clone().unwrap();
+    assert!(spec.cwd.is_absolute(), "{}", spec.cwd.display());
+    assert_eq!(spec.cwd, dir.path().join("fronde").join("agent"));
+}

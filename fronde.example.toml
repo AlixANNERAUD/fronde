@@ -1,4 +1,7 @@
-# Fronde configuration. Secrets are never written here: use { file = "…" } or { env = "…" }.
+# Full reference configuration, oriented to Docker and infrastructure-as-code: /data for the data
+# directory and /run/secrets/… for secrets. For a native install, run `fronde init` instead: it
+# writes a minimal configuration with per-user defaults.
+# Secrets are never written here: use { file = "…" } or { env = "…" }.
 
 [server]
 # Use "0.0.0.0:8484" inside a container.
@@ -7,7 +10,7 @@ listen = "127.0.0.1:8484"
 token = { file = "/run/secrets/fronde_token" }
 
 [data]
-dir = "/var/lib/fronde"
+dir = "/data"
 timezone = "Europe/Paris"
 user = "alix"
 

@@ -6,7 +6,7 @@ spent compiling.
 
 ## What you need
 
-- Linux or macOS with `git` and `openssl`.
+- Linux or macOS with `git`.
 - [mise](https://mise.jdx.dev), which installs everything else at pinned versions: Rust, Node.js,
   the Dioxus CLI and Tailwind.
 - A Claude subscription, with [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
@@ -35,64 +35,51 @@ Fronde finds `claude-agent-acp` there.
 
 ## 3. Write a configuration
 
-Create two secrets: a token for `/mcp` (at least 32 characters) and a password for the chat.
-
 ```sh
-(umask 077 && openssl rand -hex 32 > fronde_token)
-(umask 077 && printf '%s' 'choose a password' > fronde_password)
+target/release/fronde init
 ```
 
-Then create `fronde.toml` next to them:
-
-```toml
-[server]
-listen = "127.0.0.1:8484"
-token = { file = "fronde_token" }
-
-[data]
-dir = "data"
-timezone = "Europe/Paris"
-user = "alex"
-
-[web]
-password = { file = "fronde_password" }
-```
-
-Use your own time zone and first name. Relative paths are read from the directory you start
-Fronde in. Check the file:
+This writes `fronde.toml`, `fronde_token` and `fronde_password` in the current directory, all
+mode 0600, using your user name and system time zone. It prints a chat password once (it is also
+in `fronde_password`): note it. It refuses to overwrite existing files unless you pass `--force`.
+Because you ran it in the checkout, it also wrote the full path of the adapter installed in step
+2 into `[agent] command`. Check the setup:
 
 ```sh
 target/release/fronde check --config fronde.toml
 ```
 
-It prints `config OK`, or says what is wrong.
+It prints `config OK`, or says what is wrong. Fronde keeps its data in
+`~/.local/share/fronde` (or `$XDG_DATA_HOME/fronde`); `check` creates the directory and proves it
+is writable.
 
 ## 4. Start Fronde
 
 ```sh
-target/release/fronde serve --config fronde.toml
+mise exec -- target/release/fronde serve --config fronde.toml
 ```
 
 The log says `listening on http://127.0.0.1:8484 (MCP at /mcp)`. Keep it running, and run it
-from the checkout: that is where it finds the interface's files and the adapter.
+from the checkout: that is where it finds the interface's files. `mise exec` puts the adapter on
+the `PATH`, in case `init` did not find it.
 
 ## 5. Sign in and chat
 
-Open <http://127.0.0.1:8484>. You land on the sign-in page (*Connexion*). Type the chat password
-and press *Se connecter*.
+Open <http://127.0.0.1:8484>. You land on the sign-in page (*Connexion*). Type the password
+`fronde init` printed and press *Se connecter*.
 
 Write a first message, for example *Retiens que je préfère le thé au café*, and send it. The
 first message starts the agent, which takes a few seconds. Then the answer streams in, and the
 tool Fronde uses to save the fact shows as a card while it runs. Press *Stop* to end a turn
 early.
 
-Now look at `data/memory/MEMORY.md`: the fact is there, as one line. Ask *Qu'est-ce que je
+Now look at `~/.local/share/fronde/memory/MEMORY.md`: the fact is there, as one line. Ask *Qu'est-ce que je
 préfère boire ?*, now or after a restart: the hub hands its core memory to every agent that
 connects to it.
 
 ## What you built
 
-A Fronde server with its memory in `data/`, a chat behind a password, and an MCP server at
+A Fronde server with its memory in `~/.local/share/fronde`, a chat behind a password, and an MCP server at
 `/mcp` behind the token. Next steps:
 
 - [Connect an agent over MCP](../how-to/connect-an-agent-over-mcp.md) so Claude Code in your

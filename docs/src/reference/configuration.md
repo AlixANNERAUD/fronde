@@ -6,13 +6,19 @@ never goes unnoticed. The file is read at start: restart Fronde after a change.
 [`fronde.example.toml`](https://github.com/AlixANNERAUD/fronde/blob/main/fronde.example.toml)
 shows every section.
 
+## Relative paths
+
+A relative path in the file (`[data] dir`, a secret `file`) is resolved from the directory
+containing the configuration file, whatever directory Fronde is started from, and becomes
+absolute. Earlier versions read relative secret paths from the working directory.
+
 ## Secrets
 
 A secret is never written in the file. It is one of:
 
 | Form | Meaning |
 | --- | --- |
-| `{ file = "/run/secrets/name" }` | The file's content, without its trailing line breaks. A relative path is read from Fronde's working directory. |
+| `{ file = "/run/secrets/name" }` | The file's content, without its trailing line breaks. A relative path is read from the directory of the configuration file, not from Fronde's working directory. |
 | `{ env = "NAME" }` | The value of the environment variable `NAME`. |
 
 The settings below marked *secret* take one of these forms.
@@ -38,7 +44,7 @@ Required.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `dir` | path | required | Where Fronde keeps its memory, index and conversation. Created if missing. See [Data directory](data-directory.md). |
+| `dir` | path | `$XDG_DATA_HOME/fronde`, else `~/.local/share/fronde` (macOS and Windows: the platform's per-user data directory) | Where Fronde keeps its memory, index and conversation. Created (mode 0700) if missing; it must be writable by the user running Fronde. A relative path is read from the configuration file's directory. See [Data directory](data-directory.md). |
 | `timezone` | IANA name | required | Time zone of the journal, the calendar and reminders, such as `"Europe/Paris"`. |
 | `user` | string | `"me"` | What the assistant calls you, in its instructions and its system prompt. |
 
@@ -102,7 +108,7 @@ started on the first message, and only when `[web]` is set.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `command` | array of strings | `["claude-agent-acp"]` | Program and arguments. A bare name is looked up on the `PATH`. |
+| `command` | array of strings | `["claude-agent-acp"]` | Program and arguments. A bare name is looked up on the `PATH`, which does not include `agent/node_modules/.bin` outside `mise exec`: use the adapter's full path (`fronde init` writes it when it finds it). `fronde check` warns when the program is not found. |
 | `env` | table of strings | `{}` | Extra environment variables, in plain text: never a secret. The agent also inherits Fronde's environment. |
 | `builtin_tools` | array of strings | `["WebSearch", "WebFetch"]` | Claude Code's own tools the agent may use besides the hub's. Only `WebSearch` and `WebFetch` are allowed; `[]` for none. |
 

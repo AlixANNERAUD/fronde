@@ -149,3 +149,88 @@ fn rejects_reserved_and_duplicate_upstream_names() {
     );
     assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("twice"));
 }
+
+#[test]
+fn xdg_data_dir_follows_the_spec() {
+    use fronde_hub::config::xdg_data_dir;
+    use std::path::PathBuf;
+    let p = |s: &str| Some(PathBuf::from(s));
+    assert_eq!(
+        xdg_data_dir(p("/x/data"), p("/home/a")),
+        p("/x/data/fronde")
+    );
+    assert_eq!(
+        xdg_data_dir(None, p("/home/a")),
+        p("/home/a/.local/share/fronde")
+    );
+    // A relative XDG_DATA_HOME is ignored, as the spec says.
+    assert_eq!(
+        xdg_data_dir(p("rel"), p("/home/a")),
+        p("/home/a/.local/share/fronde")
+    );
+    assert_eq!(xdg_data_dir(None, None), None);
+}
+
+#[test]
+fn data_dir_is_optional() {
+    let c = load_str("[server]\ntoken = { env = \"T\" }\n[data]\ntimezone = \"UTC\"\n").unwrap();
+    assert!(c.data.dir.is_absolute() && c.data.dir.ends_with("fronde"));
+}
+
+#[test]
+fn relative_secret_files_are_read_from_the_config_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    fronde_hub::private::write(dir.path().join("tok"), "from-config-dir\n").unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(
+        &path,
+        "[server]\ntoken = { file = \"tok\" }\n[data]\ndir = \"/tmp/x\"\ntimezone = \"UTC\"\n",
+    )
+    .unwrap();
+    let c = load(&path).unwrap();
+    assert_eq!(c.server.token.resolve().unwrap(), "from-config-dir");
+}
+
+#[test]
+fn rejects_unparsable_listen() {
+    let e = load_str(
+        "[server]\nlisten = \"nope\"\ntoken = { env = \"T\" }\n[data]\ntimezone = \"UTC\"\n",
+    )
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("listen"), "{e:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn prepare_data_dir_creates_it_private_and_reports_unwritable() {
+    use fronde_hub::private::prepare_data_dir;
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let ok = t.path().join("a/b");
+    prepare_data_dir(&ok).unwrap();
+    assert_eq!(
+        std::fs::metadata(&ok).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(std::fs::read_dir(&ok).unwrap().count(), 0, "probe removed");
+
+    let locked = t.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::File::create(locked.join("x")).is_ok() {
+        return; // running as root: permissions do not apply
+    }
+    let e = prepare_data_dir(&locked.join("data"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains(&locked.display().to_string()) && e.contains("set [data] dir"),
+        "{e}"
+    );
+    let e = prepare_data_dir(&locked).unwrap_err().to_string();
+    assert!(
+        e.contains("not writable") && e.contains("~/.local/share/fronde"),
+        "{e}"
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+}

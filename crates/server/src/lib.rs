@@ -1,5 +1,6 @@
 //! HTTP front: /mcp behind a bearer token, /health, and the chat with Fronde when `[web]` is set.
 
+pub mod init;
 mod web;
 mod ws;
 

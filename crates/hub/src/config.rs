@@ -67,6 +67,8 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataConfig {
+    /// Where Fronde keeps its files. Left out, [`default_data_dir`]; `load` fills it in.
+    #[serde(default)]
     pub dir: PathBuf,
     pub timezone: chrono_tz::Tz,
     #[serde(default = "default_user")]
@@ -117,7 +119,44 @@ pub enum Secret {
     Env { env: String },
 }
 
+/// Per-user data directory used when `[data] dir` is not set: `$XDG_DATA_HOME/fronde`, else
+/// `~/.local/share/fronde` on Linux and other Unixes, the platform's equivalent on macOS and
+/// Windows.
+pub fn default_data_dir() -> Option<PathBuf> {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        xdg_data_dir(
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        directories::ProjectDirs::from("", "", "fronde").map(|d| d.data_dir().to_path_buf())
+    }
+}
+
+/// The XDG rule: an absolute `XDG_DATA_HOME` wins, then `HOME/.local/share`.
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+pub fn xdg_data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    let base = match xdg_data_home {
+        Some(p) if p.is_absolute() => p,
+        _ => home.filter(|h| h.is_absolute())?.join(".local/share"),
+    };
+    Some(base.join("fronde"))
+}
+
 impl Secret {
+    /// Make a relative secret file path relative to `base`, the config file's directory, so it
+    /// does not depend on the directory Fronde was started from.
+    fn anchor(&mut self, base: &Path) {
+        if let Secret::File { file } = self
+            && file.is_relative()
+        {
+            *file = base.join(&*file);
+        }
+    }
+
     pub fn resolve(&self) -> anyhow::Result<String> {
         match self {
             Secret::File { file } => {
@@ -152,8 +191,38 @@ pub fn is_valid_name(name: &str) -> bool {
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config {}", path.display()))?;
-    let config: Config =
+    let mut config: Config =
         toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
+    if config.data.dir.as_os_str().is_empty() {
+        config.data.dir = default_data_dir().context(
+            "cannot work out the default data directory (no home directory); set [data] dir",
+        )?;
+    }
+    // Relative paths in the file are read from its directory, made absolute so that every path
+    // derived from them (agent cwd, memory, database) is absolute too.
+    let abs = std::path::absolute(path)
+        .with_context(|| format!("cannot resolve config path {}", path.display()))?;
+    let base: PathBuf = abs
+        .parent()
+        .unwrap_or(Path::new("/"))
+        .components()
+        .collect();
+    let base = base.as_path();
+    if config.data.dir.is_relative() {
+        config.data.dir = base.join(&config.data.dir).components().collect();
+    }
+    config.server.token.anchor(base);
+    if let Some(web) = &mut config.web {
+        web.password.anchor(base);
+    }
+    if let Some(c) = &mut config.calendar {
+        c.password.anchor(base);
+    }
+    for m in &mut config.mcp {
+        if let Some(t) = &mut m.token {
+            t.anchor(base);
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     for m in &config.mcp {
         if m.name == "hub" {

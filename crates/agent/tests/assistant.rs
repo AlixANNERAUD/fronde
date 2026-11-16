@@ -19,8 +19,7 @@ const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-la.";
 const GONE: &str = "Cette demande n'est plus active.";
 const FRESH: &str = "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
-const NOT_INSTALLED: &str =
-    "Impossible de démarrer l'agent : installe @agentclientprotocol/claude-agent-acp.";
+const NOT_INSTALLED: &str = "Impossible de démarrer l'agent : lance `mise run agent` ou indique son chemin dans [agent] command.";
 const SIGNED_OUT: &str =
     "L'agent n'est pas connecté à Claude : voir le README (claude setup-token).";
 const FAILED: &str = "L'agent a rencontré une erreur.";

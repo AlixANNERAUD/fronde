@@ -30,10 +30,7 @@ impl Hub {
     /// Open memory, register native tools and start upstream connections (in the background).
     pub async fn start(config: Config) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
-        private::create_dir_all(dir)
-            .with_context(|| format!("cannot create data dir {}", dir.display()))?;
-        private::tighten_dir(dir)
-            .with_context(|| format!("cannot restrict data dir {}", dir.display()))?;
+        private::prepare_data_dir(dir)?;
         let memory = Arc::new(MemoryStore::open(
             &dir.join("memory"),
             &config.memory,

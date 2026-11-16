@@ -334,10 +334,7 @@ async fn agent_start_failure_is_reported() {
     assert_eq!(Failure::of(&error), Failure::NotInstalled);
     let error = format!("{error:#}");
     assert!(error.contains("/nonexistent"), "{error}");
-    assert!(
-        error.contains("npm i -g @agentclientprotocol/claude-agent-acp"),
-        "{error}"
-    );
+    assert!(error.contains("mise run agent"), "{error}");
 }
 
 #[tokio::test]
