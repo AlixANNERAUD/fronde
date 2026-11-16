@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -233,6 +234,46 @@ async fn second_prompt_during_turn_is_refused() {
     jarvis.answer(id, false);
     let events = wait_for_turns(&jarvis, 2).await;
     assert!(events.contains(&user("Et demain ?")), "{events:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_right_after_turn_ended_is_accepted() {
+    const TURNS: usize = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let (jarvis, _fakes) = open(dir.path(), FakeScript::default());
+    let mut live = jarvis.log().subscribe();
+    let runtime = tokio::runtime::Handle::current();
+    // A client that sends its next message the moment it sees the previous turn end.
+    let client = std::thread::spawn({
+        let jarvis = jarvis.clone();
+        move || {
+            let _runtime = runtime.enter();
+            let mut sent = 1;
+            while sent < TURNS {
+                match live.try_recv() {
+                    Ok(entry) => match entry.event {
+                        Event::TurnEnded { .. } => {
+                            futures::executor::block_on(jarvis.send(format!("{sent}")));
+                            sent += 1;
+                        }
+                        Event::Notice { text } => return Err(text),
+                        _ => {}
+                    },
+                    Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok(())
+        }
+    });
+
+    jarvis.send("0".into()).await;
+    let refused = tokio::task::spawn_blocking(move || client.join().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(refused, Ok(()));
+    wait_for_turns(&jarvis, TURNS).await;
 }
 
 /// Waits for a permission request other than `previous`.

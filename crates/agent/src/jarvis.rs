@@ -121,16 +121,18 @@ impl Jarvis {
 
     /// Logs the message and runs the turn in the background; refused while a turn runs.
     pub async fn send(self: &Arc<Self>, text: String) {
+        // The turn is locked while its start or refusal is logged, as it is while its end is
+        // logged: a message sent on seeing `TurnEnded` finds the turn over. Locks are always
+        // taken turn first, then log.
         let cancel = {
             let mut turn = lock(&self.turn);
             if turn.is_some() {
-                drop(turn);
                 self.append(Event::Notice { text: BUSY.into() });
                 return;
             }
+            self.append(Event::User { text: text.clone() });
             turn.insert(CancellationToken::new()).clone()
         };
-        self.append(Event::User { text: text.clone() });
         let jarvis = self.clone();
         tokio::spawn(async move {
             let outcome = match jarvis.run_turn(&text, &cancel).await {
@@ -143,8 +145,9 @@ impl Jarvis {
                     TurnOutcome::Error
                 }
             };
+            let mut turn = lock(&jarvis.turn);
             jarvis.append(Event::TurnEnded { outcome });
-            *lock(&jarvis.turn) = None;
+            *turn = None;
         });
     }
 
