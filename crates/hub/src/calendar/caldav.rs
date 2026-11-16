@@ -119,13 +119,22 @@ impl CalDav {
         }
     }
 
+    /// The resource whose UID is exactly `uid` (servers match substrings, so results are re-checked).
     pub async fn find_uid(&self, kind: Kind, uid: &str) -> anyhow::Result<Option<Resource>> {
+        if uid.is_empty() {
+            return Ok(None);
+        }
         let filter = format!(
             r#"<C:comp-filter name="{}"><C:prop-filter name="UID"><C:text-match collation="i;octet">{}</C:text-match></C:prop-filter></C:comp-filter>"#,
             kind.component(),
             xml_escape(uid)
         );
-        Ok(self.report(&filter, "").await?.into_iter().next())
+        let mut exact: Vec<Resource> =
+            self.report(&filter, "").await?.into_iter().filter(|r| super::ics::has_uid(&r.ics, uid)).collect();
+        match exact.len() {
+            0 | 1 => Ok(exact.pop()),
+            n => bail!("{n} items share the uid {uid:?}; fix them in your calendar app"),
+        }
     }
 
     fn put(&self, url: Url, ics: &str) -> reqwest::RequestBuilder {
@@ -206,10 +215,24 @@ mod tests {
             .and(body_string_contains(">a&amp;b<"))
             .and(body_string_contains(r#"name="VTODO""#))
             .respond_with(ResponseTemplate::new(207).set_body_string(fixture("multistatus_events.xml")))
+            .expect(1)
             .mount(&server)
             .await;
-        let found = client(&server).await.find_uid(Kind::Todo, "a&b").await.unwrap().unwrap();
-        assert_eq!(found.href, "/cal/alix/personal/a.ics");
+        // The server matches substrings; none of the returned items has exactly this UID.
+        assert!(client(&server).await.find_uid(Kind::Todo, "a&b").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn find_uid_requires_exact_match() {
+        let server = MockServer::start().await;
+        Mock::given(method("REPORT"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(fixture("multistatus_events.xml")))
+            .mount(&server)
+            .await;
+        let c = client(&server).await;
+        // Both a.ics (UID:a) and b.ics (UID:b) come back; only b is exact.
+        assert_eq!(c.find_uid(Kind::Event, "b").await.unwrap().unwrap().href, "/cal/alix/personal/b.ics");
+        assert!(c.find_uid(Kind::Event, "").await.unwrap().is_none(), "empty uid never matches");
     }
 
     #[tokio::test]

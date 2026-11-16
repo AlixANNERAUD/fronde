@@ -63,6 +63,43 @@ fn to_dpt(w: &When) -> DatePerhapsTime {
     }
 }
 
+/// Content lines of an iCalendar text, unfolded, without line endings.
+pub fn unfold(ics: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for raw in ics.split('\n') {
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        match raw.strip_prefix([' ', '\t']) {
+            Some(rest) if !lines.is_empty() => lines.last_mut().expect("non-empty").push_str(rest),
+            _ if raw.is_empty() => {}
+            _ => lines.push(raw.to_string()),
+        }
+    }
+    lines
+}
+
+/// Property name of a content line, uppercased ("DTSTART" for "DTSTART;TZID=X:…").
+pub fn prop_name(line: &str) -> String {
+    line.split([';', ':']).next().unwrap_or_default().to_ascii_uppercase()
+}
+
+/// Value of a content line (after the first ':' outside parameter quotes).
+pub fn prop_value(line: &str) -> &str {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ':' if !quoted => return &line[i + 1..],
+            _ => {}
+        }
+    }
+    ""
+}
+
+/// True when the document has a component whose UID is exactly `uid`.
+pub fn has_uid(ics: &str, uid: &str) -> bool {
+    !uid.is_empty() && unfold(ics).iter().any(|l| prop_name(l) == "UID" && prop_value(l) == uid)
+}
+
 fn parse(ics: &str) -> anyhow::Result<Calendar> {
     ics.parse::<Calendar>().map_err(|e| anyhow!("invalid iCalendar data: {e}"))
 }
@@ -136,6 +173,125 @@ pub fn reminder_to_ics(r: &Reminder) -> String {
     let mut cal = calendar();
     cal.push(todo.done());
     cal.to_string()
+}
+
+fn escape_text(s: &str) -> String {
+    s.replace('\\', "\\\\").replace(';', "\\;").replace(',', "\\,").replace('\r', "").replace('\n', "\\n")
+}
+
+fn when_line(name: &str, w: &When) -> String {
+    match w {
+        When::Date(d) => format!("{name};VALUE=DATE:{}", d.format("%Y%m%d")),
+        When::At(t) => format!("{name}:{}", t.format("%Y%m%dT%H%M%SZ")),
+    }
+}
+
+/// Fold a content line at 75 octets (RFC 5545 §3.1), on character boundaries.
+fn fold(line: &str) -> String {
+    let mut out = String::new();
+    let mut width = 0;
+    for c in line.chars() {
+        let len = c.len_utf8();
+        if width + len > 75 {
+            out.push_str("\r\n ");
+            width = 1;
+        }
+        out.push(c);
+        width += len;
+    }
+    out
+}
+
+type Change = (&'static str, Option<String>);
+
+/// Edit one component in place: drop its own lines named in `changes`, add the new ones.
+/// Everything else (alarms, attendees, time zones, unknown properties) is kept as is.
+fn patch(ics: &str, comp: &str, uid: &str, changes: &[Change]) -> anyhow::Result<String> {
+    let lines = unfold(ics);
+    // Nesting depth after each line: a component's own properties sit at depth 1 relative to its BEGIN.
+    let depth_after = |slice: &[String]| -> Vec<usize> {
+        let mut d = 0usize;
+        slice
+            .iter()
+            .map(|l| {
+                match prop_name(l).as_str() {
+                    "BEGIN" => d += 1,
+                    "END" => d = d.saturating_sub(1),
+                    _ => {}
+                }
+                d
+            })
+            .collect()
+    };
+    let begin = format!("BEGIN:{comp}");
+    let mut start = 0;
+    while let Some(off) = lines[start..].iter().position(|l| l.eq_ignore_ascii_case(&begin)) {
+        let b = start + off;
+        let depths = depth_after(&lines[b..]);
+        let len = depths.iter().position(|&d| d == 0).unwrap_or(depths.len() - 1);
+        let block = &lines[b..=b + len];
+        let own = |k: usize| depths[k] == 1 && !matches!(prop_name(&block[k]).as_str(), "BEGIN" | "END");
+        if (0..block.len()).any(|k| own(k) && prop_name(&block[k]) == "UID" && prop_value(&block[k]) == uid) {
+            let mut out: Vec<String> = lines[..b].to_vec();
+            for (k, l) in block[..block.len() - 1].iter().enumerate() {
+                if !(own(k) && changes.iter().any(|(name, _)| prop_name(l) == *name)) {
+                    out.push(l.clone());
+                }
+            }
+            out.extend(changes.iter().filter_map(|(_, line)| line.clone()));
+            out.extend_from_slice(&lines[b + len..]);
+            return Ok(out.iter().map(|l| fold(l)).collect::<Vec<_>>().join("\r\n") + "\r\n");
+        }
+        start = b + len + 1;
+    }
+    anyhow::bail!("no {comp} with uid {uid:?} in the stored item")
+}
+
+fn stamp_line(name: &'static str) -> Option<String> {
+    Some(format!("{name}:{}", Utc::now().format("%Y%m%dT%H%M%SZ")))
+}
+
+/// The stored event text with only the fields that changed between `old` and `new` rewritten.
+pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Result<String> {
+    let mut changes: Vec<Change> = vec![("DTSTAMP", stamp_line("DTSTAMP"))];
+    if new.title != old.title {
+        changes.push(("SUMMARY", Some(format!("SUMMARY:{}", escape_text(&new.title)))));
+    }
+    if new.start != old.start {
+        changes.push(("DTSTART", Some(when_line("DTSTART", &new.start))));
+    }
+    if new.end != old.end {
+        changes.push(("DTEND", new.end.as_ref().map(|w| when_line("DTEND", w))));
+        changes.push(("DURATION", None));
+    }
+    if new.location != old.location {
+        changes.push(("LOCATION", new.location.as_deref().map(|l| format!("LOCATION:{}", escape_text(l)))));
+    }
+    if new.description != old.description {
+        changes.push(("DESCRIPTION", new.description.as_deref().map(|d| format!("DESCRIPTION:{}", escape_text(d)))));
+    }
+    patch(original, "VEVENT", &new.uid, &changes)
+}
+
+/// The stored task text with only the fields that changed rewritten.
+pub fn update_reminder_ics(original: &str, old: &Reminder, new: &Reminder) -> anyhow::Result<String> {
+    let mut changes: Vec<Change> = vec![("DTSTAMP", stamp_line("DTSTAMP"))];
+    if new.text != old.text {
+        changes.push(("SUMMARY", Some(format!("SUMMARY:{}", escape_text(&new.text)))));
+    }
+    if new.due != old.due {
+        changes.push(("DUE", Some(when_line("DUE", &When::At(new.due)))));
+    }
+    if new.done != old.done {
+        if new.done {
+            changes.push(("STATUS", Some("STATUS:COMPLETED".into())));
+            changes.push(("COMPLETED", stamp_line("COMPLETED")));
+        } else {
+            changes.push(("STATUS", Some("STATUS:NEEDS-ACTION".into())));
+            changes.push(("COMPLETED", None));
+        }
+    }
+    patch(original, "VTODO", &new.uid, &changes)
 }
 
 /// Parse a date or time given by an agent: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM" (local) or RFC 3339.
@@ -253,5 +409,70 @@ mod tests {
     fn format_local_forms() {
         assert_eq!(format_local(&utc(2026, 11, 16, 13, 30), Paris), "2026-11-16T14:30+01:00");
         assert_eq!(format_local(&When::Date(NaiveDate::from_ymd_opt(2026, 11, 16).unwrap()), Paris), "2026-11-16");
+    }
+
+    fn kept_lines(ics: &str) -> Vec<String> {
+        unfold(ics)
+    }
+
+    #[test]
+    fn update_event_keeps_unmodeled_properties() {
+        let original = fixture("rich.ics");
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event { title: "Point projet (déplacé, salle 2)".into(), ..old.clone() };
+        let out = update_event_ics(&original, &old, &new).unwrap();
+        let lines = kept_lines(&out);
+        for kept in [
+            "DTSTART;TZID=Romance Standard Time:20261120T100000",
+            "DURATION:PT1H",
+            "ORGANIZER;CN=Alix:mailto:alix@example.org",
+            "ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.org",
+            "ATTENDEE;CN=Eve:mailto:eve@example.org",
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            "DESCRIPTION:Rappel",
+            "TZID:Romance Standard Time",
+        ] {
+            assert!(lines.iter().any(|l| l == kept), "lost {kept:?} in\n{out}");
+        }
+        assert!(!lines.iter().any(|l| l == "SUMMARY:Point projet"));
+        assert_eq!(parse_events(&out, Paris).unwrap()[0].title, "Point projet (déplacé, salle 2)");
+        assert_eq!(parse_events(&out, Paris).unwrap()[0].start, old.start, "start untouched");
+    }
+
+    #[test]
+    fn update_event_end_replaces_duration() {
+        let original = fixture("rich.ics");
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event { end: Some(utc(2026, 11, 20, 11, 0)), ..old.clone() };
+        let out = update_event_ics(&original, &old, &new).unwrap();
+        let lines = kept_lines(&out);
+        assert!(!lines.iter().any(|l| prop_name(l) == "DURATION"));
+        assert!(lines.iter().any(|l| l == "DTEND:20261120T110000Z"));
+        assert!(lines.iter().any(|l| l == "TRIGGER:-PT15M"), "alarm kept");
+    }
+
+    #[test]
+    fn update_reminder_done_keeps_date_due() {
+        let original = fixture("daytodo.ics");
+        let old = parse_reminders(&original, Paris).unwrap().remove(0);
+        let new = Reminder { done: true, ..old.clone() };
+        let out = update_reminder_ics(&original, &old, &new).unwrap();
+        let lines = kept_lines(&out);
+        for kept in ["DUE;VALUE=DATE:20261118", "PRIORITY:1", "DESCRIPTION:Notes de la tache", "STATUS:COMPLETED"] {
+            assert!(lines.iter().any(|l| l == kept), "missing {kept:?} in\n{out}");
+        }
+        assert!(lines.iter().any(|l| prop_name(l) == "COMPLETED"));
+        assert!(parse_reminders(&out, Paris).unwrap()[0].done);
+    }
+
+    #[test]
+    fn patched_long_lines_are_folded() {
+        let original = fixture("rich.ics");
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let long = "é".repeat(100);
+        let new = Event { description: Some(long.clone()), ..old.clone() };
+        let out = update_event_ics(&original, &old, &new).unwrap();
+        assert!(out.split("\r\n").all(|l| l.len() <= 75), "{out}");
+        assert_eq!(parse_events(&out, Paris).unwrap()[0].description.as_deref(), Some(long.as_str()));
     }
 }

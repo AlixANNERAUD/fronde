@@ -54,7 +54,14 @@ impl CalendarBackend for CalDavBackend {
     async fn put_event(&self, e: &Event) -> anyhow::Result<()> {
         match self.events.find_uid(Kind::Event, &e.uid).await? {
             Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
-            Some(res) => self.events.update(&res, &ics::event_to_ics(e)).await,
+            Some(res) => {
+                let old = ics::parse_events(&res.ics, self.tz)?.into_iter().find(|x| x.uid == e.uid);
+                let text = match old {
+                    Some(old) => ics::update_event_ics(&res.ics, &old, e)?,
+                    None => ics::event_to_ics(e),
+                };
+                self.events.update(&res, &text).await
+            }
             None => self.events.create(&e.uid, &ics::event_to_ics(e)).await,
         }
     }
@@ -83,7 +90,14 @@ impl CalendarBackend for CalDavBackend {
     async fn put_reminder(&self, r: &Reminder) -> anyhow::Result<()> {
         match self.reminders.find_uid(Kind::Todo, &r.uid).await? {
             Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
-            Some(res) => self.reminders.update(&res, &ics::reminder_to_ics(r)).await,
+            Some(res) => {
+                let old = ics::parse_reminders(&res.ics, self.tz)?.into_iter().find(|x| x.uid == r.uid);
+                let text = match old {
+                    Some(old) => ics::update_reminder_ics(&res.ics, &old, r)?,
+                    None => ics::reminder_to_ics(r),
+                };
+                self.reminders.update(&res, &text).await
+            }
             None => self.reminders.create(&r.uid, &ics::reminder_to_ics(r)).await,
         }
     }
@@ -127,6 +141,53 @@ END:VCALENDAR
         let e = b.get_event("r").await.unwrap().unwrap();
         assert!(b.put_event(&e).await.unwrap_err().to_string().contains("recurring"));
         assert!(b.delete_event("r").await.unwrap_err().to_string().contains("recurring"));
+    }
+
+    fn multistatus(ics: &str) -> String {
+        format!(
+            r#"<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><response><href>/c/x.ics</href><propstat><prop><getetag>"e"</getetag><C:calendar-data><![CDATA[{ics}]]></C:calendar-data></prop></propstat></response></multistatus>"#
+        )
+    }
+
+    async fn backend_with(server: &MockServer) -> CalDavBackend {
+        let url: url::Url = format!("{}/c/", server.uri()).parse().unwrap();
+        CalDavBackend {
+            events: CalDav::new(url.clone(), "u".into(), "p".into()),
+            reminders: CalDav::new(url, "u".into(), "p".into()),
+            tz: chrono_tz::Europe::Paris,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_patches_existing_resource() {
+        let rich = std::fs::read_to_string(format!("{}/tests/fixtures/rich.ics", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("REPORT")).respond_with(ResponseTemplate::new(207).set_body_string(multistatus(&rich))).mount(&server).await;
+        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&server).await;
+        let b = backend_with(&server).await;
+        let mut e = b.get_event("rich-1").await.unwrap().unwrap();
+        e.title = "Nouveau titre".into();
+        b.put_event(&e).await.unwrap();
+        let put = server.received_requests().await.unwrap().into_iter().find(|r| r.method.as_str() == "PUT").unwrap();
+        let body = String::from_utf8(put.body).unwrap();
+        for kept in ["BEGIN:VALARM", "ATTENDEE;CN=Bob", "DTSTART;TZID=Romance Standard Time:20261120T100000", "SUMMARY:Nouveau titre"] {
+            assert!(body.contains(kept), "lost {kept:?} in\n{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn done_patches_existing_task() {
+        let todo = std::fs::read_to_string(format!("{}/tests/fixtures/daytodo.ics", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("REPORT")).respond_with(ResponseTemplate::new(207).set_body_string(multistatus(&todo))).mount(&server).await;
+        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&server).await;
+        let b = backend_with(&server).await;
+        let mut r = b.get_reminder("day-todo").await.unwrap().unwrap();
+        r.done = true;
+        b.put_reminder(&r).await.unwrap();
+        let put = server.received_requests().await.unwrap().into_iter().find(|r| r.method.as_str() == "PUT").unwrap();
+        let body = String::from_utf8(put.body).unwrap();
+        assert!(body.contains("DUE;VALUE=DATE:20261118") && body.contains("PRIORITY:1") && body.contains("STATUS:COMPLETED"), "{body}");
     }
 
     /// Live round trip against a real server: JARVIS_TEST_CALDAV_URL (+ _USER, _PASSWORD).
