@@ -74,11 +74,14 @@ impl Connection {
         Action::Retry((FIRST_DELAY_MS << doubling).min(MAX_DELAY_MS))
     }
 
-    /// The retry timer fired and the page opens a new socket.
-    pub fn on_retry(&mut self) {
-        if matches!(self.state, State::Retrying { .. }) {
+    /// The retry timer fired: true when the page should open a socket now, false when a retry
+    /// already started (see [`Connection::on_visible`]) or the session is gone.
+    pub fn on_retry(&mut self) -> bool {
+        let waiting = matches!(self.state, State::Retrying { .. });
+        if waiting {
             self.state = State::Connecting;
         }
+        waiting
     }
 
     /// The page became visible: a waiting retry happens now instead.
@@ -141,7 +144,7 @@ mod tests {
                 panic!("expected a retry");
             };
             delays.push(delay);
-            connection.on_retry();
+            assert!(connection.on_retry());
             assert_eq!(connection.state(), State::Connecting);
         }
         assert_eq!(
@@ -164,7 +167,16 @@ mod tests {
         assert_eq!(connection.on_visible(), Some(Action::RetryNow));
         assert_eq!(connection.state(), State::Connecting);
         // The pending timer finding the connection already retried does nothing.
-        connection.on_retry();
+        assert!(!connection.on_retry());
         assert_eq!(connection.state(), State::Connecting);
+    }
+
+    #[test]
+    fn retry_timer_does_nothing_once_signed_out() {
+        let mut connection = Connection::default();
+        connection.on_close(1006);
+        connection.on_close(4401);
+        assert!(!connection.on_retry());
+        assert_eq!(connection.state(), State::SignedOut);
     }
 }

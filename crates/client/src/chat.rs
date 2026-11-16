@@ -518,7 +518,7 @@ mod tests {
         );
         assert_eq!(chat.log_id(), Some("a"));
         // The server replays a log that restarted at 1: what the page had is gone.
-        chat.apply(&hello("b", 2));
+        chat.apply(&hello("b", 5));
         assert_eq!(chat.log_id(), Some("b"));
         assert_eq!(chat.last_seq(), 0);
         apply_all(&mut chat, [user(1, "Deux"), assistant(2, "B")]);
