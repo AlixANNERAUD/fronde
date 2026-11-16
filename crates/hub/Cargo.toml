@@ -9,6 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+icalendar.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true
