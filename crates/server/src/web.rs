@@ -24,7 +24,7 @@ use tower_sessions::cookie::time;
 use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 
 const SIGNED_IN: &str = "signed_in";
-/// How long a session survives without a request.
+/// How long a session survives without a request; each request renews it (`always_save`).
 const SESSION_IDLE: time::Duration = time::Duration::days(30);
 /// Wrong passwords in a row before sign-in is refused for [`LOCKOUT`].
 const MAX_FAILURES: u32 = 5;
@@ -89,7 +89,10 @@ pub fn router(web: Web, secure_cookie: bool, site_root: &Path) -> Router {
         .with_http_only(true)
         .with_same_site(SameSite::Lax)
         .with_secure(secure_cookie)
-        .with_expiry(Expiry::OnInactivity(SESSION_IDLE));
+        .with_expiry(Expiry::OnInactivity(SESSION_IDLE))
+        // Otherwise the session and its cookie are only renewed when the session changes, and
+        // it expires 30 days after sign-in however often it is used.
+        .with_always_save(true);
     Router::new()
         .route("/sign-in", post(sign_in))
         .route("/sign-out", post(sign_out))

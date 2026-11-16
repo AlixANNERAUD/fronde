@@ -250,6 +250,30 @@ async fn sign_in_sets_session_and_wrong_password_refused() {
 }
 
 #[tokio::test]
+async fn session_is_renewed_by_use() {
+    // Sessions expire after 30 days without a request, not 30 days after sign-in: each
+    // signed-in request sends the cookie again with a fresh lifetime.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+
+    let page = get(addr, "/", Some(&cookie)).await;
+
+    assert_eq!(page.status(), 200);
+    let renewed = page
+        .headers()
+        .get(SET_COOKIE)
+        .expect("the session cookie is not renewed")
+        .to_str()
+        .unwrap();
+    assert!(renewed.starts_with(&format!("{cookie};")), "{renewed}");
+    assert!(
+        renewed.contains(&format!("Max-Age={}", 30 * 24 * 3600)),
+        "{renewed}"
+    );
+}
+
+#[tokio::test]
 async fn ws_requires_session_and_same_origin() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, _) = start(dir.path()).await;
