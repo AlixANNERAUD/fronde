@@ -1,5 +1,7 @@
-target/
+/target
 .env
 *.secret
-.superpowers/
-docs/superpowers/
+mise.local.toml
+lcov.info
+/.superpowers
+/docs/superpowers
