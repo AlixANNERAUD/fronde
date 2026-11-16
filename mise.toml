@@ -73,12 +73,14 @@ hide = true
 run = "tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css"
 
 # Each tool component is built for WASI in its own project. The .wasm files are copied to
-# components/dist, where fronde-wasm's tests load them: mr-boxington prunes idle target directories.
+# components/dist, where fronde-wasm's tests load them (mr-boxington prunes idle target
+# directories), each with its manifest beside it under the same name (calendar.toml), where
+# Fronde looks for it.
 [tasks.components]
 description = "Build the tool components for wasm32-wasip2 into components/dist"
 run = [
   "mkdir -p components/dist",
-  "set -e; for p in $FRONDE_COMPONENTS; do cargo build --manifest-path $p/Cargo.toml --target wasm32-wasip2 --release; cp $p/target/wasm32-wasip2/release/*.wasm components/dist/; done",
+  "set -e; for p in $FRONDE_COMPONENTS; do cargo build --manifest-path $p/Cargo.toml --target wasm32-wasip2 --release; for w in $p/target/wasm32-wasip2/release/*.wasm; do cp $w components/dist/; cp $p/fronde-component.toml components/dist/$(basename $w .wasm).toml; done; done",
 ]
 
 # The SDK and the components use the root deny.toml, which cargo-deny finds from their directories

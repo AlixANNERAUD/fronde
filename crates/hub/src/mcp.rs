@@ -26,7 +26,7 @@ impl ServerHandler for HubServer {
     fn get_info(&self) -> ServerConfig {
         let text = instructions(
             &self.hub.config.data.user,
-            &self.hub.registry.deferred(),
+            &self.hub.registry.all(),
             &self.hub.memory.core_now(),
         );
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())

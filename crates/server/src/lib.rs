@@ -1,5 +1,6 @@
 //! HTTP front: /mcp behind a bearer token, /health, and the chat with Fronde when `[web]` is set.
 
+pub mod check;
 pub mod init;
 mod web;
 mod ws;
@@ -14,8 +15,10 @@ use axum::routing::get;
 use fronde_agent::acp::AgentSpec;
 use fronde_agent::assistant::{Assistant, Connector, process_connector};
 use fronde_hub::Hub;
-use fronde_hub::config::Config;
+use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::HubServer;
+use fronde_hub::source::ToolSource;
+use fronde_wasm::{ComponentHost, ComponentSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -118,6 +121,27 @@ fn site_root() -> PathBuf {
     )
 }
 
+/// The configured components, sharing one engine; each is checked and loaded by the hub.
+fn component_sources(config: &Config) -> anyhow::Result<Vec<Arc<dyn ToolSource>>> {
+    let entries: Vec<_> = config
+        .sources
+        .iter()
+        .filter_map(|s| match s {
+            SourceConfig::Component(c) => Some(c.clone()),
+            SourceConfig::Mcp(_) => None,
+        })
+        .collect();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let host = ComponentHost::new()?;
+    let timezone = config.data.timezone.name();
+    Ok(entries
+        .into_iter()
+        .map(|c| Arc::new(ComponentSource::new(c, timezone, host.clone())) as Arc<dyn ToolSource>)
+        .collect())
+}
+
 /// Resolve secrets, start the hub and serve HTTP in the background.
 pub async fn start(config: Config) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     start_with(config, process_connector(), &site_root()).await
@@ -144,7 +168,8 @@ pub async fn start_with(
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
     let agent = config.agent.clone();
-    let hub = Arc::new(Hub::start(config, vec![]).await?);
+    let components = component_sources(&config)?;
+    let hub = Arc::new(Hub::start(config, components).await?);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot listen on {listen}"))?;

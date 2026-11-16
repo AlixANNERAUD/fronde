@@ -66,8 +66,20 @@ address (loopback, private network, link-local, cloud metadata) is refused too, 
 origin is allowed as local: a public name cannot be pointed at the host, its network or its
 cloud's metadata service. The host adds the credentials for an allowed origin itself, so a
 component never holds a secret it could leak elsewhere. Each call has a memory cap, a CPU budget
-and a timeout. Loading components from the configuration is **planned**; see
-[Component interface](../reference/wit-interface.md).
+and a timeout. What a component writes to its standard error goes to Fronde's log, as warnings
+under its name, at most 100 lines a call.
+
+A credential travels only over https, or over plain http to this machine (`localhost`,
+`127.0.0.1`, `::1`). A CalDAV server on the local network served over plain http must move to
+https, or Fronde must run on the same machine, for the component to send it a password.
+
+A component asks and the configuration grants. Its manifest lists the origins and credentials it
+wants; its `[[sources]]` entry may grant only those, and never more (an origin or a credential
+the manifest does not ask for is refused). The grant is bound to the SHA-256 of the `.wasm` file
+and of the manifest, written in the entry: after an update, the component is skipped until you
+read the new manifest and copy the new hashes from `fronde check`. No tool can grant or approve
+anything, so the agent cannot widen what a component reaches. See
+[Configuration](../reference/configuration.md#kind--component).
 
 ## What is out of scope
 

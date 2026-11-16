@@ -5,13 +5,18 @@
 //! A component gets no filesystem, sockets, environment or arguments, and may only reach the
 //! origins its spec allows; the host adds credentials to those requests itself. Every call runs in
 //! a fresh store with a memory cap, a CPU budget and a wall-clock timeout, so a failing component
-//! becomes a tool error, never a hub failure.
+//! becomes a tool error, never a hub failure. Its standard error goes to the hub's log.
+//!
+//! A `[[sources]]` entry of kind `component` becomes a [`ComponentSource`]: [`prepare`] checks it
+//! against the component's manifest and approval before the component loads.
 
 mod api;
 mod dial;
 mod egress;
+mod guest_log;
 mod host;
 mod manifest;
+mod source;
 mod tool;
 mod v0_1;
 
@@ -19,6 +24,7 @@ pub use api::Api;
 pub use egress::{Allowed, Credential, Origin};
 pub use host::{ComponentHost, Limits};
 pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, NetworkRule, World};
+pub use source::{ComponentSource, Hashes, prepare};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 pub use tool::LoadedComponent;
@@ -34,4 +40,6 @@ pub struct ComponentSpec {
     pub credentials: Vec<(Origin, Credential)>,
     /// What the guest reads through `settings.get`: never secrets.
     pub settings: BTreeMap<String, String>,
+    /// When set, the SHA-256 (hex) the file must have: the approved build.
+    pub sha256: Option<String>,
 }

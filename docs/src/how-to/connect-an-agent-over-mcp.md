@@ -35,4 +35,4 @@ curl -i -X POST http://127.0.0.1:8484/mcp
 ```
 
 With the token, an MCP client lists `search_tools`, `use_tool` and the `memory_*` tools, plus the
-calendar tools when `[calendar]` is set. See [Tools](../reference/tools.md).
+calendar tools when the calendar component is configured. See [Tools](../reference/tools.md).

@@ -33,6 +33,7 @@ fn spec() -> ComponentSpec {
         allow: vec![],
         credentials: vec![],
         settings: BTreeMap::new(),
+        sha256: None,
     }
 }
 

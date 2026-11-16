@@ -98,9 +98,10 @@ impl<T: Transport> CalDav<T> {
             .map_err(|e| anyhow!("CalDAV server unreachable: {e:#}"))?;
         match resp.status {
             200..=299 => Ok(resp.text()),
-            401 | 403 => {
-                bail!("CalDAV refused the credentials (check calendar.username/password)")
-            }
+            401 | 403 => bail!(
+                "CalDAV refused the credentials; ask the user to check the user name and password \
+                 in this component's [[sources.credentials]] entry of the Fronde configuration"
+            ),
             412 => bail!("the item changed meanwhile; read it again and retry"),
             s => {
                 let body: String = resp.text().chars().take(200).collect();
@@ -340,7 +341,9 @@ mod tests {
         }
     }
 
-    /// The host enforces the time limits; a request it gives up on comes back as an error.
+    /// The host, not the component, enforces the HTTP timeouts (10 s to connect, 30 s in all):
+    /// a request it gives up on fails, as the fake transport fails it here, and the component
+    /// reports the server as unreachable.
     #[test]
     fn slow_server_times_out() {
         let server = FakeServer::default();
@@ -358,7 +361,7 @@ mod tests {
         let e = block_on(client(&server).query(Kind::Event, None))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("calendar.username"), "{e}");
+        assert!(e.contains("[[sources.credentials]]"), "{e}");
     }
 
     #[test]

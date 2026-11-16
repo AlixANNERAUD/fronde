@@ -45,8 +45,9 @@ first. See [Memory](../explanation/memory.md).
 
 ## Calendar
 
-Only with `[calendar]`. Dates and times are local, in `[data] timezone`: `YYYY-MM-DD` for a day,
-`YYYY-MM-DDTHH:MM` for a time.
+Brought by the calendar component, when it is configured (see
+[Configure the calendar](../how-to/configure-calendar.md)). Dates and times are local, in
+`[data] timezone`: `YYYY-MM-DD` for a day, `YYYY-MM-DDTHH:MM` for a time.
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
@@ -59,7 +60,7 @@ Events come back as `uid`, `title`, `start`, `end`, `location` and `description`
 
 ## Reminders
 
-Only with `[calendar]`. Reminders are tasks (`VTODO`) with a due time, in the reminders
+From the calendar component too. Reminders are tasks (`VTODO`) with a due time, in the reminders
 collection.
 
 | Tool | Arguments | Does |

@@ -4,10 +4,8 @@ Fronde can run WebAssembly components (WASI 0.2) that bring tools to the hub. Th
 the WIT package `fronde:component`, one frozen directory per released version: `wit/v0.1`
 (`fronde:component@0.1.0`) is the only one so far.
 
-> **Status.** The component runtime (`crates/wasm`) and this interface exist and are tested with
-> the `echo` test component. Loading components from the configuration is **planned**: no
-> configuration section declares a component yet, so a running Fronde serves no component tools
-> today.
+A component is enabled by a `[[sources]]` entry of kind `component` (see
+[Configuration](configuration.md#kind--component)). Fronde ships one, the calendar.
 
 ## Versions
 

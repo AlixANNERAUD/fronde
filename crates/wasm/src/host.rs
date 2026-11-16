@@ -4,6 +4,7 @@
 
 use crate::ComponentSpec;
 use crate::egress::{Egress, Grants};
+use crate::guest_log::GuestLog;
 use anyhow::{Context, bail};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -115,9 +116,22 @@ impl ComponentHost {
     pub(crate) async fn compile(&self, spec: &ComponentSpec) -> anyhow::Result<Component> {
         let engine = self.engine().clone();
         let (name, path) = (spec.name.clone(), spec.path.clone());
+        let approved = spec.sha256.clone();
         // Compiling takes CPU for a while: keep it off the runtime's worker threads.
         let compiled = tokio::task::spawn_blocking(move || {
-            Component::from_file(&engine, &path)
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("cannot read component {}", path.display()))?;
+            // The bytes compiled are the bytes checked, whatever happens to the file meanwhile.
+            if let Some(approved) = approved {
+                let sha256 = crate::source::sha256(&bytes);
+                if sha256 != approved {
+                    bail!(
+                        "{} changed since it was approved (its sha256 is now {sha256})",
+                        path.display()
+                    );
+                }
+            }
+            Component::new(&engine, &bytes)
                 .map(|component| (component, engine))
                 .map_err(|e| anyhow::anyhow!("cannot load component {}: {e:#}", path.display()))
         });
@@ -193,7 +207,9 @@ impl Sandbox {
         let mut store = Store::new(
             self.host.engine(),
             HostState {
-                wasi: WasiCtx::builder().build(),
+                wasi: WasiCtx::builder()
+                    .stderr(GuestLog(self.name.as_str().into()))
+                    .build(),
                 http: WasiHttpCtx::new(),
                 table,
                 egress: Egress {

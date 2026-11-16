@@ -6,6 +6,7 @@ use crate::host::{ComponentHost, HostState, Sandbox};
 use crate::v0_1;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use fronde_hub::source::Tool;
 use fronde_hub::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
 use serde_json::Value;
 use std::sync::Arc;
@@ -142,14 +143,24 @@ impl LoadedComponent {
         }
     }
 
-    /// Add the component's tools to the registry, each calling the component.
+    /// The component's tools, each calling the component.
+    pub fn tools(&self) -> Vec<Tool> {
+        self.list_tools()
+            .iter()
+            .map(|def| {
+                let handler: Arc<dyn ToolHandler> = Arc::new(Handler {
+                    component: self.clone(),
+                    tool: def.name.clone(),
+                });
+                (def.clone(), handler)
+            })
+            .collect()
+    }
+
+    /// Add the component's tools to the registry.
     pub fn register(&self, registry: &Registry) -> anyhow::Result<()> {
-        for def in self.list_tools() {
-            let handler = Arc::new(Handler {
-                component: self.clone(),
-                tool: def.name.clone(),
-            });
-            registry.register(def.clone(), handler)?;
+        for (def, handler) in self.tools() {
+            registry.register(def, handler)?;
         }
         Ok(())
     }

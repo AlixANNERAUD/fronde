@@ -12,16 +12,22 @@ browser ──── /, /ws, /auth ───┐
                   │  assistant ── ACP ───────┼──▶ claude-agent-acp ──▶ Claude
                   │                          │          │           (your subscription)
 other agents ─────┼─▶ /mcp: the hub ◀── MCP ─┼──────────┘
-                  │    memory, calendar,     │
+                  │    memory, components,   │
                   │    tool registry ── MCP ─┼──▶ upstream MCP servers
                   └──────────────────────────┘
 ```
 
 ## The hub
 
-The hub (`crates/hub`) is a registry of tools. Native tools are written in Rust: memory, the
-calendar and reminders, and the two tool-search tools. Upstream MCP servers add theirs, prefixed
-with the server's name. The hub serves the registry at `/mcp` to any client with the token.
+The hub (`crates/hub`) is a registry of tools. Its own tools are written in Rust: memory and the
+two tool-search tools. The others come from the `[[sources]]` of the configuration: tool
+components, such as the calendar and reminders, and upstream MCP servers, whose tools are
+prefixed with the server's name. The hub serves the registry at `/mcp` to any client with the
+token.
+
+One supervisor starts every source. A component that fails to load is skipped with a warning; an
+upstream server that is down is retried, 2 seconds after the first failure and up to a minute
+apart. While a source is down, its tools stay listed and answer that it is unreachable.
 
 The hub is useful alone: without `[web]`, Fronde is only the hub, and agents you already use,
 such as Claude Code in a terminal, get one shared memory and one calendar.
@@ -52,8 +58,10 @@ and is tested natively.
 ## Wasm components
 
 `crates/wasm` runs WebAssembly components that bring tools, sandboxed and with a deny-by-default
-HTTP gate. The runtime exists; loading components from the configuration is **planned**, and the
-CalDAV calendar is to be the first one. See [Component interface](../reference/wit-interface.md).
+HTTP gate. Integrations with outside services are components, the CalDAV calendar first: each is
+a `.wasm` file with a manifest saying what it asks for, and a `[[sources]]` entry granting part
+of it, approved by the files' hashes. See [Component interface](../reference/wit-interface.md)
+and [Security model](security.md#wasm-components).
 
 ## Planned
 

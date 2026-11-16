@@ -190,3 +190,123 @@ fn healthcheck_command_fails_without_a_server() {
             .contains(&format!("cannot reach http://{free}/health"))
     );
 }
+
+fn dist(file: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../components/dist"
+    ))
+    .join(file);
+    assert!(
+        p.exists(),
+        "{} is missing: run `mise run components`",
+        p.display()
+    );
+    p
+}
+
+/// A `[[sources]]` component entry for `wasm` and its manifest, approved as they are now.
+fn component_entry(name: &str, wasm: &std::path::Path, manifest: &std::path::Path) -> String {
+    let mut config: fronde_hub::config::ComponentConfig = toml::from_str(&format!(
+        "name = {name:?}\npath = {:?}\nmanifest = {:?}\n",
+        wasm.display().to_string(),
+        manifest.display().to_string()
+    ))
+    .unwrap();
+    let hashes = fronde_wasm::Hashes::of(&config).unwrap();
+    config.sha256 = Some(hashes.sha256);
+    config.manifest_sha256 = Some(hashes.manifest_sha256);
+    format!(
+        "[[sources]]\nkind = \"component\"\nname = {name:?}\npath = {:?}\nmanifest = {:?}\nsha256 = {:?}\nmanifest_sha256 = {:?}\n",
+        config.path.display().to_string(),
+        config.manifest_path().display().to_string(),
+        config.sha256.unwrap(),
+        config.manifest_sha256.unwrap()
+    )
+}
+
+#[tokio::test]
+async fn broken_component_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    // Approved, but not WebAssembly: it fails to compile.
+    let broken = dir.path().join("broken.wasm");
+    std::fs::write(&broken, b"not a component").unwrap();
+    let base = config(dir.path(), TOKEN);
+    let token_file = dir.path().join("token");
+    let toml = format!(
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n{}{}",
+        token_file.display().to_string(),
+        base.data.dir.display().to_string(),
+        component_entry("broken", &broken, &dist("echo.toml")),
+        component_entry("echo", &dist("echo.wasm"), &dist("echo.toml")),
+    );
+    let (addr, _h) = fronde::start(toml::from_str(&toml).unwrap()).await.unwrap();
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(TOKEN),
+    );
+    let client = ().serve(transport).await.unwrap();
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    // The working component loaded beside it, and the hub's own tools are there.
+    assert!(
+        names.contains(&"memory_add".to_string()) && names.contains(&"echo_text".to_string()),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn check_prints_component_hashes_and_resolves_its_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
+    let wasm = dir.path().join("calendar.wasm");
+    std::fs::write(&wasm, b"not compiled by check").unwrap();
+    std::fs::copy(dist("calendar.toml"), dir.path().join("calendar.toml")).unwrap();
+    let entry = component_entry("calendar", &wasm, &dir.path().join("calendar.toml"));
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = \"/tmp/x\"\ntimezone = \"Europe/Paris\"\n\
+             {entry}allow = [\"https://cloud.example\"]\n[sources.settings]\n\
+             events_url = \"https://cloud.example/e/\"\nreminders_url = \"https://cloud.example/r/\"\n\
+             [[sources.credentials]]\norigin = \"https://cloud.example\"\n\
+             basic = {{ username = \"alix\", password = {{ env = \"FRONDE_TEST_CALDAV_PASSWORD\" }} }}\n"
+        ),
+    )
+    .unwrap();
+    let run = |password: Option<&str>| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"));
+        cmd.args(["check", "--config"]).arg(&path);
+        cmd.env_remove("FRONDE_TEST_CALDAV_PASSWORD");
+        if let Some(p) = password {
+            cmd.env("FRONDE_TEST_CALDAV_PASSWORD", p);
+        }
+        cmd.output().unwrap()
+    };
+    let out = run(None);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("source calendar: sha256 = \""), "{stdout}");
+    assert!(
+        stdout.contains("source calendar: manifest_sha256 = \""),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("source calendar") && stderr.contains("FRONDE_TEST_CALDAV_PASSWORD"),
+        "{stderr}"
+    );
+    let out = run(Some("s3cret"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

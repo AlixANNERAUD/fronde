@@ -102,10 +102,12 @@ impl<T: Transport> CalendarBackend for CalDavBackend<T> {
         to: DateTime<Utc>,
     ) -> anyhow::Result<Vec<Event>> {
         let mut out = Vec::new();
-        // An item no parser can read is skipped: one bad item must not hide the others.
+        // An item no parser can read is skipped: one bad item must not hide the others. The
+        // host logs the component's standard error.
         for res in self.events.query(Kind::Event, Some((from, to))).await? {
-            if let Ok(events) = ics::parse_events(&res.ics, self.tz) {
-                out.extend(events);
+            match ics::parse_events(&res.ics, self.tz) {
+                Ok(events) => out.extend(events),
+                Err(e) => eprintln!("skipping unreadable event {}: {e:#}", res.href),
             }
         }
         Ok(out)
@@ -144,8 +146,9 @@ impl<T: Transport> CalendarBackend for CalDavBackend<T> {
     async fn list_reminders(&self) -> anyhow::Result<Vec<Reminder>> {
         let mut out = Vec::new();
         for res in self.reminders.query(Kind::Todo, None).await? {
-            if let Ok(rs) = ics::parse_reminders(&res.ics, self.tz) {
-                out.extend(rs);
+            match ics::parse_reminders(&res.ics, self.tz) {
+                Ok(rs) => out.extend(rs),
+                Err(e) => eprintln!("skipping unreadable task {}: {e:#}", res.href),
             }
         }
         Ok(out)
