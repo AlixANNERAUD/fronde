@@ -8,6 +8,8 @@ mr-boxington = "latest"
 # The Dioxus CLI builds the web interface. It downloads the tools it needs itself (wasm-bindgen
 # matching Cargo.lock, wasm-opt, esbuild) into ~/.local/share/.dx, or $DX_HOME when set.
 "github:DioxusLabs/dioxus" = "0.7.10"
+# Builds the documentation in docs/ (mise run docs).
+"github:rust-lang/mdBook" = { version = "0.5.4", bin = "mdbook" }
 
 [env]
 # The web interface has wasm-only dependencies and its own lint and test runs, so server-side
@@ -126,3 +128,7 @@ tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tai
 trap 'kill $!' EXIT
 dx serve --package fronde-web --platform web
 '''
+
+[tasks.docs]
+description = "Build the documentation into docs/book"
+run = "mdbook build docs"

@@ -1,0 +1,17 @@
+[book]
+title = "Fronde"
+description = "Guide to Fronde, the personal assistant that runs on your own Claude subscription: a web chat with Claude, and your memory, calendar and tools served over MCP."
+authors = ["Alix ANNERAUD"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+# A page listed in SUMMARY.md but missing is an error, not a new empty page.
+create-missing = false
+
+[output.html]
+# The path GitHub Pages serves the repository's site under.
+site-url = "/fronde/"
+git-repository-url = "https://github.com/AlixANNERAUD/fronde"
+edit-url-template = "https://github.com/AlixANNERAUD/fronde/edit/main/docs/{path}"

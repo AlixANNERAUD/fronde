@@ -212,3 +212,8 @@ interface alone, into `target/dx/fronde-web/release/web/public`. On its first bu
 the tools it needs (wasm-bindgen, wasm-opt, esbuild) into `~/.local/share/.dx`.
 
 See [`AGENTS.md`](AGENTS.md) for the layout and the rules.
+
+## Documentation
+
+The user guide is an mdBook in [`docs/`](docs/src/SUMMARY.md): a tutorial, how-to guides, the
+reference and explanations. `mise run docs` builds it into `docs/book`.

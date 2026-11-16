@@ -54,6 +54,7 @@ through mr-boxington.
 | `mise run web-dev` | The Dioxus interface with hot reload on http://127.0.0.1:8080 (dx serve); `/ws` and `/auth` go to `mise run dev` |
 | `mise run web-build` | Release build of the Dioxus interface into `target/dx/fronde-web/release/web/public` |
 | `mise run build` | Release build: `web-build`, then `target/release/fronde` |
+| `mise run docs` | Builds the user guide (mdBook, `docs/`) into `docs/book` |
 
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 
@@ -96,6 +97,8 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
   `crates/web/src/components/icons.rs`; add one there from Lucide's paths rather than adding an
   icon crate.
 - Comments explain why, never restate the code. Docs are plain, concise English with no em dashes.
+- The user guide in `docs/src` follows Diátaxis (tutorials, how-to guides, reference, explanation).
+  A change to settings, endpoints, tools or behaviour updates the matching pages in the same commit.
 - Work and push directly on `main`. Commits follow Conventional Commits (`feat:`, `fix:`, `test:`,
   `build:`, `ci:`, `docs:`, `chore:`), imperative, in English. Do not mention AI tools and add no
   `Co-Authored-By` or "Generated with" lines.
