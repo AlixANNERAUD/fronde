@@ -10,11 +10,13 @@
 mod api;
 mod egress;
 mod host;
+mod manifest;
 mod tool;
 mod v0_1;
 
 pub use egress::{Credential, Origin};
 pub use host::{ComponentHost, Limits};
+pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, NetworkRule, World};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 pub use tool::LoadedComponent;

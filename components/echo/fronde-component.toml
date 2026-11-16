@@ -1,0 +1,17 @@
+# The host's test bench: the tests grant it what each case needs, so it requests no network.
+schema = 1
+id = "fronde/echo"
+version = "0.1.0"
+kind = "component"
+world = "tool"
+api = "0.1"
+description = "Test component: echoes text and settings, fetches URLs, spins and sleeps."
+license = "Apache-2.0"
+
+[settings]
+type = "object"
+additionalProperties = false
+
+[settings.properties.greeting]
+type = "string"
+description = "Any text, read back by echo_setting."

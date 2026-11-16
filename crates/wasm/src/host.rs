@@ -16,7 +16,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 /// How often the engine's epoch advances: the unit of `Limits::cpu_ticks`.
-const TICK: Duration = Duration::from_millis(100);
+pub(crate) const TICK: Duration = Duration::from_millis(100);
 
 /// Per store: enough for a Rust component (a few core instances, one memory, small tables).
 const MAX_INSTANCES: usize = 32;

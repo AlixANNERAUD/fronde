@@ -26,9 +26,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `scheme://host[:port]`, compared on its parsed parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
-    https: bool,
-    host: String,
-    port: u16,
+    pub(crate) https: bool,
+    pub(crate) host: String,
+    pub(crate) port: u16,
 }
 
 impl Origin {

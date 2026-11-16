@@ -119,6 +119,9 @@ The SDK also brings `http`, a transport over WASI HTTP (`WasiHttp`, through the 
 with its `testing` feature, an in-memory HTTP server, settings and a runner to test a component
 natively. The crate needs no `unsafe` of its own: `#![forbid(unsafe_code)]` holds.
 
+Beside its `Cargo.toml`, a component has a [manifest](component-manifest.md),
+`fronde-component.toml`, which names the interface version it targets and what it asks for.
+
 In this repository, `components/echo` (the host's test bench) and `components/calendar` are such
 projects. `mise run components` builds each one and copies the `.wasm` files to `components/dist`.
 See [Develop and contribute](../how-to/develop.md).

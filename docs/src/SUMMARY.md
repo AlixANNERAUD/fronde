@@ -24,6 +24,7 @@
 - [Tools](reference/tools.md)
 - [Data directory](reference/data-directory.md)
 - [Component interface (WIT)](reference/wit-interface.md)
+- [Component manifest](reference/component-manifest.md)
 - [Container image](reference/container-image.md)
 
 # Explanation

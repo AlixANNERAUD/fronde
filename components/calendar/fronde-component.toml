@@ -1,0 +1,40 @@
+# What this component is and what it asks for. The host grants, in its configuration, at most
+# what is requested here.
+schema = 1
+id = "fronde/calendar"
+version = "0.1.0"
+kind = "component"
+world = "tool"
+api = "0.1"
+description = "Calendar and reminder tools over CalDAV."
+license = "Apache-2.0"
+repository = "https://github.com/AlixANNERAUD/fronde"
+
+[permissions]
+# The origins of the two collections, wherever the user's server is.
+network = ["{{ events_url }}", "{{ reminders_url }}"]
+
+# The CalDAV account, added by the host as Basic authorization.
+[[credentials]]
+name = "caldav"
+injection = "basic"
+origins = ["{{ events_url }}", "{{ reminders_url }}"]
+
+[settings]
+type = "object"
+additionalProperties = false
+required = ["events_url", "reminders_url"]
+
+[settings.properties.events_url]
+type = "string"
+format = "uri"
+description = "The CalDAV collection that holds the events."
+
+[settings.properties.reminders_url]
+type = "string"
+format = "uri"
+description = "The CalDAV collection that holds the reminders (tasks)."
+
+[settings.properties.timezone]
+type = "string"
+description = "IANA time zone of the user, such as Europe/Paris; UTC when unset."
