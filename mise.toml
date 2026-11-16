@@ -86,10 +86,15 @@ description = "Build the release binary and the web interface"
 depends = ["web-build"]
 run = "cargo build --release --package jarvis"
 
+# dx leaves the assets of earlier builds in place; the output starts empty so that only the
+# current ones are served and copied into the image.
 [tasks.web-build]
 description = "Build the web interface into target/dx/jarvis-web/release/web/public"
 depends = ["web-css"]
-run = "dx build --package jarvis-web --platform web --release"
+run = [
+  "rm -rf target/dx/jarvis-web/release/web/public",
+  "dx build --package jarvis-web --platform web --release",
+]
 
 # Tailwind rebuilds the stylesheet as classes change; dx reloads it in the page.
 [tasks.web-dev]

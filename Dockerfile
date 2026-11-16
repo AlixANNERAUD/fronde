@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-# The build uses the toolchain pinned in mise.toml (Rust, cargo-leptos, wasm-bindgen), like CI.
+# The build uses the toolchain pinned in mise.toml (Rust, the Dioxus CLI, Tailwind), like CI.
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS builder
 
 # Updating mise means updating the checksums below (SHASUMS256.txt of its release).
@@ -31,7 +31,8 @@ ENV MISE_ENV=ci \
     PATH=/opt/mise/shims:$PATH \
     CARGO_HOME=/opt/cargo \
     CARGO_TERM_COLOR=never \
-    CARGO_INCREMENTAL=0
+    CARGO_INCREMENTAL=0 \
+    DX_HOME=/opt/dx
 
 WORKDIR /src
 
@@ -39,14 +40,17 @@ WORKDIR /src
 COPY mise.toml mise.ci.toml ./
 RUN mise trust --all && mise install
 
+# dx downloads the tools it builds the web interface with (wasm-bindgen, wasm-opt, esbuild) into
+# DX_HOME, cached like Cargo's downloads.
 COPY . .
 RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
+    --mount=type=cache,target=/opt/dx,id=jarvis-dx-${TARGETARCH} \
     --mount=type=cache,target=/src/target,id=jarvis-target-${TARGETARCH} \
     mise run build \
     && mkdir -p /out \
     && cp target/release/jarvis /out/jarvis \
-    && cp -r target/site /out/site
+    && cp -r target/dx/jarvis-web/release/web/public /out/site
 
 # The Claude ACP adapter needs Node.js 22 or later, newer than Debian's. It brings its own Claude
 # Code.
