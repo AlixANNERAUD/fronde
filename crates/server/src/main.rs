@@ -25,6 +25,11 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Exit successfully when the server configured in `config` answers on /health.
+    Healthcheck {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn check(path: &std::path::Path) -> anyhow::Result<()> {
@@ -42,6 +47,11 @@ fn check(path: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn healthcheck(path: &std::path::Path) -> anyhow::Result<()> {
+    let config = jarvis_hub::config::load(path)?;
+    jarvis::healthcheck(config.server.listen).await
 }
 
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
@@ -67,6 +77,7 @@ async fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Check { config } => check(config).map(|()| println!("config OK")),
         Command::Serve { config } => serve(config).await,
+        Command::Healthcheck { config } => healthcheck(config).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

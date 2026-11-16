@@ -17,9 +17,10 @@ use jarvis_hub::config::Config;
 use jarvis_hub::mcp::HubServer;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 pub fn check_token(token: &str) -> anyhow::Result<()> {
@@ -65,6 +66,28 @@ pub fn router(hub: Arc<Hub>, token: String) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .merge(protected)
+}
+
+/// Succeeds when the server listening on `address` answers `/health` with a success.
+pub async fn healthcheck(address: SocketAddr) -> anyhow::Result<()> {
+    // A server bound to every interface is reached over loopback.
+    let ip = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    let url = format!("http://{}/health", SocketAddr::new(ip, address.port()));
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {url}"))?;
+    if !response.status().is_success() {
+        bail!("{url} answered {}", response.status());
+    }
+    Ok(())
 }
 
 pub fn check_password(password: &str) -> anyhow::Result<()> {

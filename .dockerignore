@@ -1,3 +1,6 @@
-target/
-.git/
-.superpowers/
+target
+.git
+.superpowers
+docs/superpowers
+mise.local.toml
+.env

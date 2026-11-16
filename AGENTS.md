@@ -12,7 +12,7 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | `crates/agent` (`jarvis-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/app` (`jarvis-app`) | The Leptos web chat: sign-in and chat pages, the `ChatPanel` island and its WebSocket; `chat_model.rs` turns log entries into what the chat shows |
 | `crates/frontend` (`jarvis-frontend`) | The browser bundle (wasm32): hydrates the app's island |
-| `crates/server` | The `jarvis` binary and library: configuration check, HTTP routes, `/mcp` behind a bearer token, the chat pages and `/ws` |
+| `crates/server` | The `jarvis` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the chat pages and `/ws` |
 
 `jarvis-app` builds with `ssr` for the server and with `hydrate` for the browser, never both:
 server-side Cargo commands leave out `jarvis-frontend` (`$JARVIS_SERVER_PACKAGES`). UI classes

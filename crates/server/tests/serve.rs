@@ -125,3 +125,40 @@ fn check_accepts_valid_config() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("config OK"));
 }
+
+#[tokio::test]
+async fn healthcheck_reaches_a_running_server_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _h) = jarvis::start(config(dir.path(), TOKEN)).await.unwrap();
+    jarvis::healthcheck(addr).await.unwrap();
+    // A server listening on every interface is checked over loopback.
+    let unspecified = std::net::SocketAddr::from(([0, 0, 0, 0], addr.port()));
+    jarvis::healthcheck(unspecified).await.unwrap();
+
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    assert!(jarvis::healthcheck(free).await.is_err());
+}
+
+#[test]
+fn healthcheck_command_fails_without_a_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let path = dir.path().join("jarvis.toml");
+    std::fs::write(&path, format!("[server]\nlisten = \"{free}\"\ntoken = {{ env = \"UNSET\" }}\n[data]\ndir = \"/tmp/x\"\ntimezone = \"Europe/Paris\"\n")).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jarvis"))
+        .args(["healthcheck", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains(&format!("cannot reach http://{free}/health"))
+    );
+}
