@@ -45,12 +45,12 @@ RUN mise trust --all && mise install
 COPY . .
 RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
-    --mount=type=cache,target=/opt/dx,id=jarvis-dx-${TARGETARCH} \
-    --mount=type=cache,target=/src/target,id=jarvis-target-${TARGETARCH} \
+    --mount=type=cache,target=/opt/dx,id=fronde-dx-${TARGETARCH} \
+    --mount=type=cache,target=/src/target,id=fronde-target-${TARGETARCH} \
     mise run build \
     && mkdir -p /out \
-    && cp target/release/jarvis /out/jarvis \
-    && cp -r target/dx/jarvis-web/release/web/public /out/site
+    && cp target/release/fronde /out/fronde \
+    && cp -r target/dx/fronde-web/release/web/public /out/site
 
 # The Claude ACP adapter needs Node.js 22 or later, newer than Debian's. It brings its own Claude
 # Code.
@@ -63,12 +63,12 @@ RUN npm ci --omit=dev
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
-LABEL org.opencontainers.image.title="jarvis" \
+LABEL org.opencontainers.image.title="fronde" \
       org.opencontainers.image.description="A personal agent: a web chat with Claude, and memory, calendar and tools over MCP." \
-      org.opencontainers.image.source="https://github.com/AlixANNERAUD/jarvis"
+      org.opencontainers.image.source="https://github.com/AlixANNERAUD/fronde"
 
 # git versions the memory; the agent reaches Claude over https. tini runs as PID 1: it passes
-# docker stop's SIGTERM on to Jarvis, which a PID 1 without a handler ignores, and reaps the
+# docker stop's SIGTERM on to Fronde, which a PID 1 without a handler ignores, and reaps the
 # agent's processes left behind when an agent is stopped.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git tini \
@@ -76,15 +76,15 @@ RUN apt-get update \
 
 COPY --from=agent /usr/local/bin/node /usr/local/bin/node
 COPY --from=agent /opt/agent /opt/agent
-COPY --from=builder /out/jarvis /app/jarvis
+COPY --from=builder /out/fronde /app/fronde
 COPY --from=builder /out/site /app/site
 
 # HOME is on the volume so the agent's Claude sign-in and settings (~/.claude) survive restarts.
 ENV PATH=/opt/agent/node_modules/.bin:$PATH \
-    JARVIS_SITE_ROOT=/app/site \
+    FRONDE_SITE_ROOT=/app/site \
     HOME=/data/home
 
-# The data directory must exist in the image, owned by Jarvis's user; a new named volume mounted
+# The data directory must exist in the image, owned by Fronde's user; a new named volume mounted
 # on it takes this ownership.
 RUN mkdir -p /data/home /config && chown -R 65532:65532 /data
 
@@ -93,7 +93,7 @@ VOLUME /data
 EXPOSE 8484
 
 HEALTHCHECK --interval=30s --timeout=6s --start-period=20s --retries=3 \
-    CMD ["/app/jarvis", "healthcheck", "--config", "/config/jarvis.toml"]
+    CMD ["/app/fronde", "healthcheck", "--config", "/config/fronde.toml"]
 
-ENTRYPOINT ["tini", "--", "/app/jarvis"]
-CMD ["serve", "--config", "/config/jarvis.toml"]
+ENTRYPOINT ["tini", "--", "/app/fronde"]
+CMD ["serve", "--config", "/config/fronde.toml"]

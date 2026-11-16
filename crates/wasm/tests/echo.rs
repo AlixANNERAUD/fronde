@@ -1,8 +1,8 @@
 //! Runs the `echo` test component (components/echo), built into components/dist by
 //! `mise run components`.
 
-use jarvis_hub::tools::{Registry, register_meta_tools};
-use jarvis_wasm::{ComponentHost, ComponentSpec, Credential, Limits, LoadedComponent, Origin};
+use fronde_hub::tools::{Registry, register_meta_tools};
+use fronde_wasm::{ComponentHost, ComponentSpec, Credential, Limits, LoadedComponent, Origin};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -366,7 +366,7 @@ async fn rejects_component_without_tools() {
         .err()
         .unwrap();
     assert!(
-        e.to_string().contains("jarvis:component/tool world"),
+        e.to_string().contains("fronde:component/tool world"),
         "{e:#}"
     );
 }

@@ -316,16 +316,16 @@ END:VCALENDAR
         );
     }
 
-    /// Live round trip against a real server: JARVIS_TEST_CALDAV_URL (+ _USER, _PASSWORD).
+    /// Live round trip against a real server: FRONDE_TEST_CALDAV_URL (+ _USER, _PASSWORD).
     #[tokio::test]
     #[ignore]
     async fn caldav_roundtrip_live() {
-        let url: url::Url = std::env::var("JARVIS_TEST_CALDAV_URL")
-            .expect("JARVIS_TEST_CALDAV_URL")
+        let url: url::Url = std::env::var("FRONDE_TEST_CALDAV_URL")
+            .expect("FRONDE_TEST_CALDAV_URL")
             .parse()
             .unwrap();
-        let user = std::env::var("JARVIS_TEST_CALDAV_USER").unwrap_or_default();
-        let pw = std::env::var("JARVIS_TEST_CALDAV_PASSWORD").unwrap_or_default();
+        let user = std::env::var("FRONDE_TEST_CALDAV_USER").unwrap_or_default();
+        let pw = std::env::var("FRONDE_TEST_CALDAV_PASSWORD").unwrap_or_default();
         let tz = chrono_tz::Europe::Paris;
         let b = CalDavBackend {
             events: CalDav::new(url.clone(), user.clone(), pw.clone()),
@@ -335,7 +335,7 @@ END:VCALENDAR
         let start = Utc::now() + chrono::Duration::days(1);
         let e = Event {
             uid: uuid::Uuid::new_v4().to_string(),
-            title: "jarvis test".into(),
+            title: "fronde test".into(),
             start: ics::When::At(start),
             end: None,
             location: None,

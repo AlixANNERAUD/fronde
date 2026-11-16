@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-pub use jarvis_protocol::{Entry, Event, ToolState, TurnOutcome};
+pub use fronde_protocol::{Entry, Event, ToolState, TurnOutcome};
 
 const BROADCAST_CAPACITY: usize = 1024;
 

@@ -4,23 +4,23 @@ use crate::ComponentSpec;
 use crate::host::{ComponentHost, Sandbox};
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use jarvis_hub::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
+use fronde_hub::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
 use serde_json::Value;
 use std::sync::Arc;
 
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../../wit",
-        world: "jarvis:component/tool",
+        world: "fronde:component/tool",
         // Exports run guest code that waits on HTTP.
         exports: { default: async },
-        with: { "jarvis:component/settings": crate::host::bindings::jarvis::component::settings },
+        with: { "fronde:component/settings": crate::host::bindings::fronde::component::settings },
     });
 }
 
 use bindings::ToolPre;
 
-const TOOLS_EXPORT: &str = "jarvis:component/tools@";
+const TOOLS_EXPORT: &str = "fronde:component/tools@";
 
 /// A compiled tool component and the tools it declared when it loaded.
 #[derive(Clone)]
@@ -44,7 +44,7 @@ impl LoadedComponent {
             .any(|(name, _)| name.starts_with(TOOLS_EXPORT));
         if !exports_tools {
             bail!(
-                "component {} does not export jarvis:component/tools: build it for the jarvis:component/tool world",
+                "component {} does not export fronde:component/tools: build it for the fronde:component/tool world",
                 spec.name
             );
         }
@@ -54,7 +54,7 @@ impl LoadedComponent {
         let call = async {
             let instance = pre.instantiate_async(&mut store).await?;
             instance
-                .jarvis_component_tools()
+                .fronde_component_tools()
                 .call_list_tools(&mut store)
                 .await
         };
@@ -104,7 +104,7 @@ impl LoadedComponent {
         let call = async {
             let instance = pre.instantiate_async(&mut store).await?;
             instance
-                .jarvis_component_tools()
+                .fronde_component_tools()
                 .call_call_tool(&mut store, name, &arguments)
                 .await
         };

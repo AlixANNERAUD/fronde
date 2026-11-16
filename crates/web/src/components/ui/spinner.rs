@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-// jarvis: our icons, without the `icons` crate's English titles.
+// fronde: our icons, without the `icons` crate's English titles.
 use crate::components::icons::{Loader, LoaderCircle};
 use tw_merge::tw_merge;
 

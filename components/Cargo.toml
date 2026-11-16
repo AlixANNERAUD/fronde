@@ -1,4 +1,4 @@
-# Tool components, built for wasm32-wasip2 by `mise run components` and loaded by `jarvis-wasm`.
+# Tool components, built for wasm32-wasip2 by `mise run components` and loaded by `fronde-wasm`.
 # A workspace of their own: the guest bindings need `unsafe` (see each crate's `bindings` module),
 # and their dependencies stay out of the server's lock file, lints and test runs.
 [workspace]

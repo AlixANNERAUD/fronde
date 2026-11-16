@@ -7,7 +7,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
-use jarvis_agent::jarvis::Jarvis;
+use fronde_agent::assistant::Assistant;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::ErrorKind;
@@ -34,7 +34,7 @@ const CACHE_FOREVER: HeaderValue = HeaderValue::from_static("public, max-age=315
 const NOT_BUILT: &str = "Interface non construite : lance `mise run web-build`.";
 
 pub struct Web {
-    pub jarvis: Arc<Jarvis>,
+    pub assistant: Arc<Assistant>,
     pub password: String,
     pub throttle: Mutex<Throttle>,
 }
@@ -89,7 +89,7 @@ pub fn router(web: Web, secure_cookie: bool, site_root: &Path) -> Router {
     // Not `with_always_save`: that would store a session for any cookie a client makes up.
     // Signed-in requests renew theirs instead.
     let sessions = SessionManagerLayer::new(MemoryStore::default())
-        .with_name("jarvis_session")
+        .with_name("fronde_session")
         .with_http_only(true)
         .with_same_site(SameSite::Lax)
         .with_secure(secure_cookie)

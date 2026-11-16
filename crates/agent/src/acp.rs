@@ -1,4 +1,4 @@
-//! ACP client: starts the agent, opens Jarvis's session and runs prompt turns.
+//! ACP client: starts the agent, opens Fronde's session and runs prompt turns.
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
@@ -384,7 +384,7 @@ impl Connection {
             let response = connection
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1)
-                        .client_info(Implementation::new("jarvis", env!("CARGO_PKG_VERSION"))),
+                        .client_info(Implementation::new("fronde", env!("CARGO_PKG_VERSION"))),
                 )
                 .block_task()
                 .await?;
@@ -416,7 +416,7 @@ impl Connection {
             permissions,
             stop,
         } = self;
-        let hub = McpServer::Http(McpServerHttp::new("jarvis", &spec.hub_url).headers(vec![
+        let hub = McpServer::Http(McpServerHttp::new("fronde", &spec.hub_url).headers(vec![
             HttpHeader::new("Authorization", format!("Bearer {}", spec.hub_token)),
         ]));
         let system_prompt =
@@ -469,12 +469,12 @@ impl Connection {
     }
 }
 
-/// Jarvis's agent gets the hub's tools and the listed built-in ones, all allowed up front. The
+/// Fronde's agent gets the hub's tools and the listed built-in ones, all allowed up front. The
 /// Claude Code adapter loads the user's, project's and local settings unless told otherwise, and
 /// with them the owner's plugins, MCP servers, hooks and allow rules: none of them apply. The
 /// sign-in is not a setting and still works.
 fn session_meta(builtin_tools: &[String]) -> serde_json::Map<String, serde_json::Value> {
-    let allowed: Vec<&str> = std::iter::once("mcp__jarvis")
+    let allowed: Vec<&str> = std::iter::once("mcp__fronde")
         .chain(builtin_tools.iter().map(String::as_str))
         .collect();
     // The adapter prefers `tools` over `disableBuiltInTools`; the flag stays so that an adapter

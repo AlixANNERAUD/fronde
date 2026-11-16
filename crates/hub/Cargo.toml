@@ -1,5 +1,5 @@
 [package]
-name = "jarvis-hub"
+name = "fronde-hub"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

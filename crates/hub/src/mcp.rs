@@ -30,7 +30,7 @@ impl ServerHandler for HubServer {
             &self.hub.memory.core_now(),
         );
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("jarvis-hub", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("fronde-hub", env!("CARGO_PKG_VERSION")))
             .with_instructions(text)
     }
 
@@ -129,7 +129,7 @@ mod tests {
         let text = info.instructions.clone().unwrap();
         assert!(text.contains("mcphub: mcphub_secret_tool"), "{text}");
         assert!(text.contains("- likes tea"), "{text}");
-        assert_eq!(info.server_info.as_ref().unwrap().name, "jarvis-hub");
+        assert_eq!(info.server_info.as_ref().unwrap().name, "fronde-hub");
     }
 
     #[tokio::test]

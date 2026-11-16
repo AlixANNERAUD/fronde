@@ -36,7 +36,7 @@ pub fn InputPromptTextarea(
     #[props(into, optional)] placeholder: Option<String>,
     #[props(into, optional)] class: Option<String>,
     #[props(optional)] on_submit: Option<EventHandler<()>>,
-    // jarvis: the textarea's accessible name.
+    // fronde: the textarea's accessible name.
     #[props(into, optional)] aria_label: Option<String>,
 ) -> Element {
     let placeholder = placeholder.unwrap_or_else(|| "Write a message...".to_string());
@@ -56,7 +56,7 @@ pub fn InputPromptTextarea(
             value: "{value()}",
             oninput: move |ev| value.set(ev.value()),
             onkeydown: move |ev| {
-                // jarvis: Enter while an input method composes confirms the text; it does not send.
+                // fronde: Enter while an input method composes confirms the text; it does not send.
                 if ev.key() == Key::Enter && !ev.modifiers().shift() && !ev.is_composing() {
                     ev.prevent_default();
                     if let Some(cb) = on_submit {
@@ -90,7 +90,7 @@ pub fn InputPromptFooter(
 pub fn InputPromptSubmit(
     #[props(optional)] disabled: bool,
     #[props(into, optional)] class: Option<String>,
-    // jarvis: what a click does, and the button's accessible name.
+    // fronde: what a click does, and the button's accessible name.
     #[props(optional)] onclick: Option<EventHandler<MouseEvent>>,
     #[props(into, optional)] aria_label: Option<String>,
     children: Element,

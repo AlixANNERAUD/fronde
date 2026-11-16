@@ -1,6 +1,6 @@
 [package]
 name = "echo"
-description = "Test component for jarvis-wasm: echoes text and settings, fetches URLs, spins and sleeps"
+description = "Test component for fronde-wasm: echoes text and settings, fetches URLs, spins and sleeps"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

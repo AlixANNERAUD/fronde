@@ -1,5 +1,5 @@
 [package]
-name = "jarvis-protocol"
+name = "fronde-protocol"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

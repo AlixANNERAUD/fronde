@@ -2,8 +2,8 @@ use agent_client_protocol::v1::schema::{
     ContentBlock, McpServer, RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate,
     SystemPromptMode, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
-use jarvis_agent::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
-use jarvis_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
+use fronde_agent::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
+use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,10 +17,10 @@ fn spec() -> AgentSpec {
     AgentSpec {
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
-        cwd: "/srv/jarvis/agent".into(),
+        cwd: "/srv/fronde/agent".into(),
         hub_url: "http://127.0.0.1:7878/mcp".into(),
         hub_token: "hub-token".into(),
-        system_prompt: "You are Jarvis.".into(),
+        system_prompt: "You are Fronde.".into(),
         builtin_tools: vec!["WebSearch".into(), "WebFetch".into()],
     }
 }
@@ -89,7 +89,7 @@ fn expected_meta() -> serde_json::Value {
         "disableBuiltInTools": true,
         "claudeCode": {"options": {
             "tools": ["WebSearch", "WebFetch"],
-            "allowedTools": ["mcp__jarvis", "WebSearch", "WebFetch"],
+            "allowedTools": ["mcp__fronde", "WebSearch", "WebFetch"],
             "settingSources": [],
             "strictMcpConfig": true,
             "allowDangerouslySkipPermissions": false,
@@ -105,11 +105,11 @@ async fn new_session_sends_hub_and_meta() {
     let record = handle.record();
     assert_eq!(record.new_sessions.len(), 1);
     let new = &record.new_sessions[0];
-    assert_eq!(new.cwd, PathBuf::from("/srv/jarvis/agent"));
+    assert_eq!(new.cwd, PathBuf::from("/srv/fronde/agent"));
     let [McpServer::Http(hub)] = new.mcp_servers.as_slice() else {
         panic!("expected only the hub, got {:?}", new.mcp_servers);
     };
-    assert_eq!(hub.name, "jarvis");
+    assert_eq!(hub.name, "fronde");
     assert_eq!(hub.url, "http://127.0.0.1:7878/mcp");
     assert_eq!(hub.headers.len(), 1);
     assert_eq!(hub.headers[0].name, "Authorization");
@@ -120,7 +120,7 @@ async fn new_session_sends_hub_and_meta() {
     assert_eq!(system_prompt.mode, SystemPromptMode::Append);
     assert_eq!(
         system_prompt.content,
-        vec![ContentBlock::from("You are Jarvis.")]
+        vec![ContentBlock::from("You are Fronde.")]
     );
     assert_eq!(record.modes, vec!["default"]);
     assert!(record.resumes.is_empty());
@@ -142,7 +142,7 @@ async fn no_builtin_tools_leaves_only_the_hub() {
             "disableBuiltInTools": true,
             "claudeCode": {"options": {
                 "tools": [],
-                "allowedTools": ["mcp__jarvis"],
+                "allowedTools": ["mcp__fronde"],
                 "settingSources": [],
                 "strictMcpConfig": true,
                 "allowDangerouslySkipPermissions": false,
@@ -286,10 +286,10 @@ async fn resume_used_when_given() {
     assert_eq!(record.resumes.len(), 1);
     let resume = &record.resumes[0];
     assert_eq!(&*resume.session_id.0, "earlier-session");
-    assert_eq!(resume.cwd, PathBuf::from("/srv/jarvis/agent"));
+    assert_eq!(resume.cwd, PathBuf::from("/srv/fronde/agent"));
     assert!(matches!(
         resume.mcp_servers.as_slice(),
-        [McpServer::Http(hub)] if hub.name == "jarvis"
+        [McpServer::Http(hub)] if hub.name == "fronde"
     ));
     let meta = serde_json::Value::Object(resume.meta.clone().expect("no _meta"));
     assert_eq!(meta, expected_meta());

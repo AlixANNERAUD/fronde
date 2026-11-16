@@ -1,12 +1,12 @@
-//! The chat WebSocket: the conversation log streamed to the page, its messages passed to Jarvis.
+//! The chat WebSocket: the conversation log streamed to the page, its messages passed to Fronde.
 
 use crate::web::{Web, is_signed_in, renew};
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use jarvis_agent::jarvis::Jarvis;
-use jarvis_protocol::{CLOSE_SIGNED_OUT, ClientMsg, Entry, ServerMsg};
+use fronde_agent::assistant::Assistant;
+use fronde_protocol::{CLOSE_SIGNED_OUT, ClientMsg, Entry, ServerMsg};
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tower_sessions::Session;
@@ -31,8 +31,8 @@ pub async fn upgrade(
         });
     }
     renew(&session);
-    let jarvis = web.jarvis.clone();
-    upgrade.on_upgrade(move |socket| chat(socket, jarvis))
+    let assistant = web.assistant.clone();
+    upgrade.on_upgrade(move |socket| chat(socket, assistant))
 }
 
 /// True when `Origin` names the host the request was sent to.
@@ -45,8 +45,8 @@ fn same_origin(headers: &HeaderMap) -> bool {
     }
 }
 
-/// Streams the log once the page said hello, and passes the page's messages to Jarvis.
-async fn chat(mut socket: WebSocket, jarvis: Arc<Jarvis>) {
+/// Streams the log once the page said hello, and passes the page's messages to Fronde.
+async fn chat(mut socket: WebSocket, assistant: Arc<Assistant>) {
     let mut live: Option<broadcast::Receiver<Entry>> = None;
     let mut last_sent = 0;
     loop {
@@ -60,8 +60,8 @@ async fn chat(mut socket: WebSocket, jarvis: Arc<Jarvis>) {
                 match serde_json::from_str::<ClientMsg>(&text) {
                     Ok(ClientMsg::Hello { last_seq, log_id }) => {
                         // Subscribed first, so nothing falls between the replay and the stream.
-                        live = Some(jarvis.log().subscribe());
-                        let log = jarvis.log();
+                        live = Some(assistant.log().subscribe());
+                        let log = assistant.log();
                         let newest = log.last_seq();
                         // A page that saw another log, or one ahead of this log, saw a log since
                         // deleted: it gets the whole new one.
@@ -72,14 +72,14 @@ async fn chat(mut socket: WebSocket, jarvis: Arc<Jarvis>) {
                             last_seq: newest,
                         };
                         if send(&mut socket, &hello).await.is_err()
-                            || replay(&mut socket, &jarvis, &mut last_sent).await.is_err()
+                            || replay(&mut socket, &assistant, &mut last_sent).await.is_err()
                         {
                             return;
                         }
                     }
-                    Ok(ClientMsg::Send { text }) => jarvis.send(text).await,
-                    Ok(ClientMsg::Cancel) => jarvis.cancel(),
-                    Ok(ClientMsg::Answer { id, allow }) => jarvis.answer(id, allow),
+                    Ok(ClientMsg::Send { text }) => assistant.send(text).await,
+                    Ok(ClientMsg::Cancel) => assistant.cancel(),
+                    Ok(ClientMsg::Answer { id, allow }) => assistant.answer(id, allow),
                     Err(error) => tracing::debug!("ignoring a bad chat message: {error}"),
                 }
             }
@@ -90,7 +90,7 @@ async fn chat(mut socket: WebSocket, jarvis: Arc<Jarvis>) {
                         send(&mut socket, &ServerMsg::Entry(entry)).await
                     }
                     Ok(_) => Ok(()),
-                    Err(RecvError::Lagged(_)) => replay(&mut socket, &jarvis, &mut last_sent).await,
+                    Err(RecvError::Lagged(_)) => replay(&mut socket, &assistant, &mut last_sent).await,
                     Err(RecvError::Closed) => return,
                 };
                 if sent.is_err() {
@@ -110,8 +110,12 @@ async fn next_live(live: &mut Option<broadcast::Receiver<Entry>>) -> Result<Entr
 }
 
 /// Sends the entries after `last_sent`.
-async fn replay(socket: &mut WebSocket, jarvis: &Jarvis, last_sent: &mut u64) -> Result<(), ()> {
-    for entry in jarvis.log().since(*last_sent) {
+async fn replay(
+    socket: &mut WebSocket,
+    assistant: &Assistant,
+    last_sent: &mut u64,
+) -> Result<(), ()> {
+    for entry in assistant.log().since(*last_sent) {
         *last_sent = entry.seq;
         send(socket, &ServerMsg::Entry(entry)).await?;
     }

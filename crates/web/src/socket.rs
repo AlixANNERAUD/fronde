@@ -1,4 +1,4 @@
-//! The chat's WebSocket to `/ws`, run by `jarvis_client::Connection`: it says hello with what the
+//! The chat's WebSocket to `/ws`, run by `fronde_client::Connection`: it says hello with what the
 //! chat has, applies what the server sends, sends what the page asks while it is open, retries
 //! after 1 s then up to every 30 s (at once when the page comes back to the foreground), and goes
 //! to the sign-in page when the server closes with 4401.
@@ -8,8 +8,8 @@
 //! no stale timer or socket can act on the chat.
 
 use dioxus::prelude::*;
-use jarvis_client::Chat;
-use jarvis_protocol::ClientMsg;
+use fronde_client::Chat;
+use fronde_protocol::ClientMsg;
 
 /// What the page shows of the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +39,11 @@ pub fn use_chat_socket(chat: Signal<Chat>, status: Signal<Status>) -> Coroutine<
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use dioxus::prelude::*;
+    use fronde_client::{Action, Chat, Connection};
+    use fronde_protocol::{ClientMsg, ServerMsg};
     use futures::{FutureExt, SinkExt, StreamExt, future::poll_fn, select};
     use gloo_net::websocket::{Message, State, WebSocketError, futures::WebSocket};
     use gloo_timers::future::TimeoutFuture;
-    use jarvis_client::{Action, Chat, Connection};
-    use jarvis_protocol::{ClientMsg, ServerMsg};
     use wasm_bindgen::{JsCast, closure::Closure};
 
     use super::{Outgoing, Status};
@@ -233,7 +233,7 @@ mod imp {
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use dioxus::prelude::*;
-    use jarvis_client::Chat;
+    use fronde_client::Chat;
 
     use super::{Outgoing, Status};
 

@@ -1,5 +1,5 @@
 //! Components from Rust/UI (https://github.com/rust-ui/ui, MIT, see `../LICENSE-rust-ui`), copied
-//! as published, then formatted. Changes are marked `// jarvis:` where they are made; paths to
+//! as published, then formatted. Changes are marked `// fronde:` where they are made; paths to
 //! sibling modules use `super`.
 
 // Kept whole: variants and parts this interface does not use yet stay.

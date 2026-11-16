@@ -7,9 +7,9 @@ fn git(dir: &Path, args: &[&str]) -> bool {
     // Own identity; never wait on signing, never run the user's hooks, accept a volume owned by another uid.
     let fixed = [
         "-c",
-        "user.name=jarvis",
+        "user.name=fronde",
         "-c",
-        "user.email=jarvis@localhost",
+        "user.email=fronde@localhost",
         "-c",
         "commit.gpgsign=false",
         "-c",

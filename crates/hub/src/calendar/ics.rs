@@ -115,7 +115,7 @@ fn parse(ics: &str) -> anyhow::Result<Calendar> {
 fn calendar() -> Calendar {
     let mut cal = Calendar::empty();
     cal.append_property(("VERSION", "2.0"));
-    cal.append_property(("PRODID", "-//jarvis//hub//EN"));
+    cal.append_property(("PRODID", "-//fronde//hub//EN"));
     cal
 }
 
@@ -434,7 +434,7 @@ mod tests {
             description: Some("ligne 1\nligne 2".into()),
         };
         let ics = event_to_ics(&e);
-        assert!(ics.contains("PRODID:-//jarvis//hub//EN"));
+        assert!(ics.contains("PRODID:-//fronde//hub//EN"));
         assert!(ics.contains("DTSTART:20261120T090000Z"));
         assert_eq!(parse_events(&ics, Paris).unwrap(), vec![e]);
         let day = Event {

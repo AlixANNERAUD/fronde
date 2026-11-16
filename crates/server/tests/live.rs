@@ -2,14 +2,14 @@
 //! default; run it after `mise run agent`, with the adapter's path (`agent/node_modules/.bin`):
 //!
 //! ```sh
-//! JARVIS_LIVE_AGENT=$(which claude-agent-acp) \
-//!   mise exec -- cargo nextest run -p jarvis --test live --run-ignored only --no-capture
+//! FRONDE_LIVE_AGENT=$(which claude-agent-acp) \
+//!   mise exec -- cargo nextest run -p fronde --test live --run-ignored only --no-capture
 //! ```
 //!
-//! `JARVIS_LIVE_CLAUDE` optionally names the Claude Code to run instead of the adapter's own.
+//! `FRONDE_LIVE_CLAUDE` optionally names the Claude Code to run instead of the adapter's own.
 
+use fronde_protocol::{ClientMsg, Entry, Event, ServerMsg};
 use futures::{SinkExt, StreamExt};
-use jarvis_protocol::{ClientMsg, Entry, Event, ServerMsg};
 use reqwest::header::{CONTENT_TYPE, SET_COOKIE};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -26,10 +26,10 @@ const TURN: Duration = Duration::from_secs(180);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn config(dir: &Path, agent: &str) -> jarvis_hub::config::Config {
+fn config(dir: &Path, agent: &str) -> fronde_hub::config::Config {
     std::fs::write(dir.join("token"), TOKEN).unwrap();
     std::fs::write(dir.join("password"), PASSWORD).unwrap();
-    let env = match std::env::var("JARVIS_LIVE_CLAUDE") {
+    let env = match std::env::var("FRONDE_LIVE_CLAUDE") {
         Ok(claude) => format!("{{ CLAUDE_CODE_EXECUTABLE = {claude:?} }}"),
         Err(_) => "{}".to_owned(),
     };
@@ -80,7 +80,7 @@ async fn say(socket: &mut Socket, message: ClientMsg) {
 }
 
 /// Sends `text` and returns the entries of its turn, printed as they come. A permission request
-/// fails the test: Jarvis's tools are allowed up front.
+/// fails the test: Fronde's tools are allowed up front.
 async fn turn(socket: &mut Socket, text: &str) -> Vec<Event> {
     say(socket, ClientMsg::Send { text: text.into() }).await;
     let mut events = Vec::new();
@@ -111,14 +111,14 @@ async fn turn(socket: &mut Socket, text: &str) -> Vec<Event> {
 }
 
 #[tokio::test]
-#[ignore = "talks to the real Claude; set JARVIS_LIVE_AGENT to the adapter's path"]
+#[ignore = "talks to the real Claude; set FRONDE_LIVE_AGENT to the adapter's path"]
 async fn live_chat_with_claude() {
-    let Ok(agent) = std::env::var("JARVIS_LIVE_AGENT") else {
-        eprintln!("JARVIS_LIVE_AGENT is not set: skipped");
+    let Ok(agent) = std::env::var("FRONDE_LIVE_AGENT") else {
+        eprintln!("FRONDE_LIVE_AGENT is not set: skipped");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (addr, _server) = jarvis::start(config(dir.path(), &agent)).await.unwrap();
+    let (addr, _server) = fronde::start(config(dir.path(), &agent)).await.unwrap();
     let cookie = sign_in(addr).await;
     let mut socket = open_chat(addr, &cookie).await;
 
@@ -131,7 +131,7 @@ async fn live_chat_with_claude() {
     );
 
     turn(&mut socket, "Retiens que je préfère le thé au café.").await;
-    // A preference fits the core memory or what Jarvis knows about the user; either will do.
+    // A preference fits the core memory or what Fronde knows about the user; either will do.
     let memory = dir.path().join("data/memory");
     let files = ["MEMORY.md", "USER.md"].map(|file| {
         (
@@ -163,7 +163,7 @@ async fn live_chat_with_claude() {
         "no answer: {web:?}"
     );
 
-    // Besides the web, Jarvis has only the hub's tools: no shell, no file access, nothing from
+    // Besides the web, Fronde has only the hub's tools: no shell, no file access, nothing from
     // the owner's Claude settings or plugins.
     let listing = turn(
         &mut socket,
@@ -173,7 +173,7 @@ async fn live_chat_with_claude() {
     for event in web.iter().chain(&listing) {
         if let Event::Tool { title, .. } = event {
             assert!(
-                title.starts_with("mcp__jarvis__") || is_web(title),
+                title.starts_with("mcp__fronde__") || is_web(title),
                 "a tool from outside the hub and the web ran: {title}"
             );
         }

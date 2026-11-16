@@ -1,6 +1,6 @@
 [package]
-name = "jarvis-web"
-description = "Web interface of jarvis, built with Dioxus."
+name = "fronde-web"
+description = "Web interface of fronde, built with Dioxus."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -9,8 +9,8 @@ version.workspace = true
 
 [dependencies]
 dioxus.workspace = true
-jarvis-client = { path = "../client" }
-jarvis-protocol = { path = "../protocol" }
+fronde-client = { path = "../client" }
+fronde-protocol = { path = "../protocol" }
 serde_json.workspace = true
 strum.workspace = true
 tw_merge.workspace = true

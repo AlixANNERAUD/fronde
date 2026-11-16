@@ -33,10 +33,10 @@ enum Command {
 }
 
 fn check(path: &std::path::Path) -> anyhow::Result<()> {
-    let config = jarvis_hub::config::load(path)?;
-    jarvis::check_token(&config.server.token.resolve()?)?;
+    let config = fronde_hub::config::load(path)?;
+    fronde::check_token(&config.server.token.resolve()?)?;
     if let Some(web) = &config.web {
-        jarvis::check_password(&web.password.resolve().context("web.password")?)?;
+        fronde::check_password(&web.password.resolve().context("web.password")?)?;
     }
     if let Some(c) = &config.calendar {
         c.password.resolve()?;
@@ -50,13 +50,13 @@ fn check(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 async fn healthcheck(path: &std::path::Path) -> anyhow::Result<()> {
-    let config = jarvis_hub::config::load(path)?;
-    jarvis::healthcheck(config.server.listen).await
+    let config = fronde_hub::config::load(path)?;
+    fronde::healthcheck(config.server.listen).await
 }
 
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
-    let config = jarvis_hub::config::load(path)?;
-    let (addr, server) = jarvis::start(config).await?;
+    let config = fronde_hub::config::load(path)?;
+    let (addr, server) = fronde::start(config).await?;
     tracing::info!("listening on http://{addr} (MCP at /mcp)");
     tokio::select! {
         _ = server => {}

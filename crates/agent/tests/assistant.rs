@@ -2,10 +2,10 @@ use agent_client_protocol::v1::schema::{
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate, ToolCall, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields,
 };
-use jarvis_agent::acp::{AgentClient, AgentSpec};
-use jarvis_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
-use jarvis_agent::jarvis::{Connector, Jarvis, process_connector};
-use jarvis_agent::log::{Event, ToolState, TurnOutcome};
+use fronde_agent::acp::{AgentClient, AgentSpec};
+use fronde_agent::assistant::{Assistant, Connector, LOG_FILE, SESSION_FILE, process_connector};
+use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
+use fronde_agent::log::{Event, ToolState, TurnOutcome};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(10);
-const BUSY: &str = "Jarvis répond encore ; attends la fin ou arrête-le.";
+const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-le.";
 const GONE: &str = "Cette demande n'est plus active.";
 const FRESH: &str = "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
@@ -29,10 +29,10 @@ fn spec() -> AgentSpec {
     AgentSpec {
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
-        cwd: "/srv/jarvis/agent".into(),
+        cwd: "/srv/fronde/agent".into(),
         hub_url: "http://127.0.0.1:7878/mcp".into(),
         hub_token: "hub-token".into(),
-        system_prompt: "You are Jarvis.".into(),
+        system_prompt: "You are Fronde.".into(),
         builtin_tools: vec!["WebSearch".into(), "WebFetch".into()],
     }
 }
@@ -70,14 +70,14 @@ fn fake_connector(script: FakeScript, gate: Option<Arc<Notify>>) -> (Connector, 
     (connector, fakes)
 }
 
-fn open(dir: &Path, script: FakeScript) -> (Arc<Jarvis>, Arc<Fakes>) {
+fn open(dir: &Path, script: FakeScript) -> (Arc<Assistant>, Arc<Fakes>) {
     let (connector, fakes) = fake_connector(script, None);
-    let jarvis = Jarvis::open(spec(), dir, connector).expect("open");
-    (jarvis, fakes)
+    let assistant = Assistant::open(spec(), dir, connector).expect("open");
+    (assistant, fakes)
 }
 
-fn events(jarvis: &Jarvis) -> Vec<Event> {
-    jarvis
+fn events(assistant: &Assistant) -> Vec<Event> {
+    assistant
         .log()
         .since(0)
         .into_iter()
@@ -86,10 +86,10 @@ fn events(jarvis: &Jarvis) -> Vec<Event> {
 }
 
 /// Waits until the log satisfies `done`, then returns its events.
-async fn wait_until(jarvis: &Jarvis, done: impl Fn(&[Event]) -> bool) -> Vec<Event> {
+async fn wait_until(assistant: &Assistant, done: impl Fn(&[Event]) -> bool) -> Vec<Event> {
     let waited = timeout(WAIT, async {
         loop {
-            let events = events(jarvis);
+            let events = events(assistant);
             if done(&events) {
                 return events;
             }
@@ -97,11 +97,11 @@ async fn wait_until(jarvis: &Jarvis, done: impl Fn(&[Event]) -> bool) -> Vec<Eve
         }
     })
     .await;
-    waited.unwrap_or_else(|_| panic!("timed out; the log has {:?}", events(jarvis)))
+    waited.unwrap_or_else(|_| panic!("timed out; the log has {:?}", events(assistant)))
 }
 
-async fn wait_for_turns(jarvis: &Jarvis, count: usize) -> Vec<Event> {
-    wait_until(jarvis, |events| {
+async fn wait_for_turns(assistant: &Assistant, count: usize) -> Vec<Event> {
+    wait_until(assistant, |events| {
         events
             .iter()
             .filter(|event| matches!(event, Event::TurnEnded { .. }))
@@ -112,8 +112,8 @@ async fn wait_for_turns(jarvis: &Jarvis, count: usize) -> Vec<Event> {
 }
 
 /// Waits for a permission request and returns its id.
-async fn wait_for_permission(jarvis: &Jarvis) -> u64 {
-    let events = wait_until(jarvis, |events| {
+async fn wait_for_permission(assistant: &Assistant) -> u64 {
+    let events = wait_until(assistant, |events| {
         events
             .iter()
             .any(|event| matches!(event, Event::Permission { .. }))
@@ -177,12 +177,12 @@ async fn turn_is_logged_in_order() {
         ],
         ..FakeScript::default()
     };
-    let (jarvis, _fakes) = open(dir.path(), script);
+    let (assistant, _fakes) = open(dir.path(), script);
 
-    jarvis.send("Salut".into()).await;
+    assistant.send("Salut".into()).await;
 
     assert_eq!(
-        wait_for_turns(&jarvis, 1).await,
+        wait_for_turns(&assistant, 1).await,
         vec![
             user("Salut"),
             Event::Assistant { text: "Bon".into() },
@@ -207,30 +207,30 @@ async fn turn_is_logged_in_order() {
             ended(TurnOutcome::Done),
         ]
     );
-    let saved = std::fs::read_to_string(dir.path().join("jarvis.session")).unwrap();
+    let saved = std::fs::read_to_string(dir.path().join(SESSION_FILE)).unwrap();
     assert_eq!(saved, FAKE_SESSION_ID);
 }
 
 #[tokio::test]
 async fn second_prompt_during_turn_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let (jarvis, fakes) = open(dir.path(), asking());
+    let (assistant, fakes) = open(dir.path(), asking());
 
-    jarvis.send("Mon agenda ?".into()).await;
-    jarvis.send("Et demain ?".into()).await;
-    let id = wait_for_permission(&jarvis).await;
-    jarvis.answer(id, true);
-    let events = wait_for_turns(&jarvis, 1).await;
+    assistant.send("Mon agenda ?".into()).await;
+    assistant.send("Et demain ?".into()).await;
+    let id = wait_for_permission(&assistant).await;
+    assistant.answer(id, true);
+    let events = wait_for_turns(&assistant, 1).await;
 
     assert!(events.contains(&notice(BUSY)), "{events:?}");
     assert!(!events.contains(&user("Et demain ?")), "{events:?}");
     assert_eq!(fakes.handles()[0].record().permission_outcomes.len(), 1);
 
     // Once the turn is over, the next message goes through.
-    jarvis.send("Et demain ?".into()).await;
-    let id = wait_for_permission_after(&jarvis, id).await;
-    jarvis.answer(id, false);
-    let events = wait_for_turns(&jarvis, 2).await;
+    assistant.send("Et demain ?".into()).await;
+    let id = wait_for_permission_after(&assistant, id).await;
+    assistant.answer(id, false);
+    let events = wait_for_turns(&assistant, 2).await;
     assert!(events.contains(&user("Et demain ?")), "{events:?}");
 }
 
@@ -238,12 +238,12 @@ async fn second_prompt_during_turn_is_refused() {
 async fn send_right_after_turn_ended_is_accepted() {
     const TURNS: usize = 200;
     let dir = tempfile::tempdir().unwrap();
-    let (jarvis, _fakes) = open(dir.path(), FakeScript::default());
-    let mut live = jarvis.log().subscribe();
+    let (assistant, _fakes) = open(dir.path(), FakeScript::default());
+    let mut live = assistant.log().subscribe();
     let runtime = tokio::runtime::Handle::current();
     // A client that sends its next message the moment it sees the previous turn end.
     let client = std::thread::spawn({
-        let jarvis = jarvis.clone();
+        let assistant = assistant.clone();
         move || {
             let _runtime = runtime.enter();
             let mut sent = 1;
@@ -251,7 +251,7 @@ async fn send_right_after_turn_ended_is_accepted() {
                 match live.try_recv() {
                     Ok(entry) => match entry.event {
                         Event::TurnEnded { .. } => {
-                            futures::executor::block_on(jarvis.send(format!("{sent}")));
+                            futures::executor::block_on(assistant.send(format!("{sent}")));
                             sent += 1;
                         }
                         Event::Notice { text } => return Err(text),
@@ -265,18 +265,18 @@ async fn send_right_after_turn_ended_is_accepted() {
         }
     });
 
-    jarvis.send("0".into()).await;
+    assistant.send("0".into()).await;
     let refused = tokio::task::spawn_blocking(move || client.join().unwrap())
         .await
         .unwrap();
 
     assert_eq!(refused, Ok(()));
-    wait_for_turns(&jarvis, TURNS).await;
+    wait_for_turns(&assistant, TURNS).await;
 }
 
 /// Waits for a permission request other than `previous`.
-async fn wait_for_permission_after(jarvis: &Jarvis, previous: u64) -> u64 {
-    let events = wait_until(jarvis, |events| {
+async fn wait_for_permission_after(assistant: &Assistant, previous: u64) -> u64 {
+    let events = wait_until(assistant, |events| {
         events
             .iter()
             .any(|event| matches!(event, Event::Permission { id, .. } if *id != previous))
@@ -298,10 +298,10 @@ async fn prompt_error_becomes_error_event() {
         fail_prompt: true,
         ..FakeScript::default()
     };
-    let (jarvis, fakes) = open(dir.path(), script);
+    let (assistant, fakes) = open(dir.path(), script);
 
-    jarvis.send("Salut".into()).await;
-    let events = wait_for_turns(&jarvis, 1).await;
+    assistant.send("Salut".into()).await;
+    let events = wait_for_turns(&assistant, 1).await;
 
     assert_eq!(
         events,
@@ -309,8 +309,8 @@ async fn prompt_error_becomes_error_event() {
     );
 
     // The failed client was dropped: the next message reconnects.
-    jarvis.send("Encore".into()).await;
-    wait_for_turns(&jarvis, 2).await;
+    assistant.send("Encore".into()).await;
+    wait_for_turns(&assistant, 2).await;
     assert_eq!(fakes.handles().len(), 2);
 }
 
@@ -320,12 +320,12 @@ async fn connect_error_becomes_error_event() {
     let connector: Connector = Arc::new(|_: &AgentSpec, _, _| {
         Box::pin(async { Err(anyhow::anyhow!("cannot start the agent (claude-agent-acp)")) })
     });
-    let jarvis = Jarvis::open(spec(), dir.path(), connector).expect("open");
+    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
 
-    jarvis.send("Salut".into()).await;
+    assistant.send("Salut".into()).await;
 
     assert_eq!(
-        wait_for_turns(&jarvis, 1).await,
+        wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), notice(FAILED), ended(TurnOutcome::Error)]
     );
 }
@@ -337,12 +337,12 @@ async fn missing_agent_says_how_to_install_it() {
         command: vec!["/nonexistent/claude-agent-acp".into()],
         ..spec()
     };
-    let jarvis = Jarvis::open(spec, dir.path(), process_connector()).expect("open");
+    let assistant = Assistant::open(spec, dir.path(), process_connector()).expect("open");
 
-    jarvis.send("Salut".into()).await;
+    assistant.send("Salut".into()).await;
 
     assert_eq!(
-        wait_for_turns(&jarvis, 1).await,
+        wait_for_turns(&assistant, 1).await,
         vec![
             user("Salut"),
             notice(NOT_INSTALLED),
@@ -358,12 +358,12 @@ async fn signed_out_agent_points_to_the_readme() {
         signed_out: true,
         ..FakeScript::default()
     };
-    let (jarvis, _fakes) = open(dir.path(), script);
+    let (assistant, _fakes) = open(dir.path(), script);
 
-    jarvis.send("Salut".into()).await;
+    assistant.send("Salut".into()).await;
 
     assert_eq!(
-        wait_for_turns(&jarvis, 1).await,
+        wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), notice(SIGNED_OUT), ended(TurnOutcome::Error)]
     );
 }
@@ -377,13 +377,13 @@ async fn restart_resumes_or_starts_fresh() {
 
     // The saved session is resumed after a restart.
     let dir = tempfile::tempdir().unwrap();
-    let (jarvis, _fakes) = open(dir.path(), resumable.clone());
-    jarvis.send("Salut".into()).await;
-    wait_for_turns(&jarvis, 1).await;
-    drop(jarvis);
-    let (jarvis, fakes) = open(dir.path(), resumable.clone());
-    jarvis.send("Re".into()).await;
-    let events = wait_for_turns(&jarvis, 2).await;
+    let (assistant, _fakes) = open(dir.path(), resumable.clone());
+    assistant.send("Salut".into()).await;
+    wait_for_turns(&assistant, 1).await;
+    drop(assistant);
+    let (assistant, fakes) = open(dir.path(), resumable.clone());
+    assistant.send("Re".into()).await;
+    let events = wait_for_turns(&assistant, 2).await;
     let record = fakes.handles()[0].record();
     assert_eq!(record.resumes.len(), 1);
     assert_eq!(&*record.resumes[0].session_id.0, FAKE_SESSION_ID);
@@ -397,14 +397,14 @@ async fn restart_resumes_or_starts_fresh() {
 
     // An agent that cannot resume it starts a new conversation, and says so.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("jarvis.session"), "earlier-session").unwrap();
+    std::fs::write(dir.path().join(SESSION_FILE), "earlier-session").unwrap();
     let refusing = FakeScript {
         refuse_resume: true,
         ..resumable
     };
-    let (jarvis, fakes) = open(dir.path(), refusing);
-    jarvis.send("Salut".into()).await;
-    let events = wait_for_turns(&jarvis, 1).await;
+    let (assistant, fakes) = open(dir.path(), refusing);
+    assistant.send("Salut".into()).await;
+    let events = wait_for_turns(&assistant, 1).await;
     assert_eq!(
         &*fakes.handles()[0].record().resumes[0].session_id.0,
         "earlier-session"
@@ -413,23 +413,23 @@ async fn restart_resumes_or_starts_fresh() {
         events,
         vec![user("Salut"), notice(FRESH), ended(TurnOutcome::Done)]
     );
-    let saved = std::fs::read_to_string(dir.path().join("jarvis.session")).unwrap();
+    let saved = std::fs::read_to_string(dir.path().join(SESSION_FILE)).unwrap();
     assert_eq!(saved, FAKE_SESSION_ID);
 }
 
 #[tokio::test]
 async fn permission_answer_is_logged() {
     let dir = tempfile::tempdir().unwrap();
-    let (jarvis, fakes) = open(dir.path(), asking());
+    let (assistant, fakes) = open(dir.path(), asking());
 
-    jarvis.send("Mon agenda ?".into()).await;
-    let id = wait_for_permission(&jarvis).await;
-    jarvis.answer(id, true);
-    wait_for_turns(&jarvis, 1).await;
-    jarvis.answer(id, true);
+    assistant.send("Mon agenda ?".into()).await;
+    let id = wait_for_permission(&assistant).await;
+    assistant.answer(id, true);
+    wait_for_turns(&assistant, 1).await;
+    assistant.answer(id, true);
 
     assert_eq!(
-        events(&jarvis),
+        events(&assistant),
         vec![
             user("Mon agenda ?"),
             permission(2),
@@ -449,21 +449,21 @@ async fn permission_answer_is_logged() {
 #[tokio::test]
 async fn permission_ids_stay_unique_across_connections() {
     let dir = tempfile::tempdir().unwrap();
-    let (jarvis, _fakes) = open(dir.path(), asking());
-    jarvis.send("Mon agenda ?".into()).await;
-    let first = wait_for_permission(&jarvis).await;
-    jarvis.answer(first, true);
-    wait_for_turns(&jarvis, 1).await;
-    drop(jarvis);
+    let (assistant, _fakes) = open(dir.path(), asking());
+    assistant.send("Mon agenda ?".into()).await;
+    let first = wait_for_permission(&assistant).await;
+    assistant.answer(first, true);
+    wait_for_turns(&assistant, 1).await;
+    drop(assistant);
 
     // After a restart the agent numbers its requests from 1 again; the log's ids go on.
-    let (jarvis, fakes) = open(dir.path(), asking());
-    jarvis.send("Et demain ?".into()).await;
-    let second = wait_for_permission_after(&jarvis, first).await;
+    let (assistant, fakes) = open(dir.path(), asking());
+    assistant.send("Et demain ?".into()).await;
+    let second = wait_for_permission_after(&assistant, first).await;
     assert!(second > first, "{second} after {first}");
-    jarvis.answer(first, true);
-    jarvis.answer(second, false);
-    let events = wait_for_turns(&jarvis, 2).await;
+    assistant.answer(first, true);
+    assistant.answer(second, false);
+    let events = wait_for_turns(&assistant, 2).await;
 
     assert_eq!(events.iter().filter(|e| **e == notice(GONE)).count(), 1);
     assert!(events.contains(&answered(second, false)), "{events:?}");
@@ -478,17 +478,17 @@ async fn permission_ids_stay_unique_across_connections() {
 #[tokio::test]
 async fn cancel_ends_the_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let (jarvis, fakes) = open(dir.path(), asking());
+    let (assistant, fakes) = open(dir.path(), asking());
 
-    jarvis.send("Mon agenda ?".into()).await;
-    wait_for_permission(&jarvis).await;
-    jarvis.cancel();
-    wait_for_turns(&jarvis, 1).await;
+    assistant.send("Mon agenda ?".into()).await;
+    wait_for_permission(&assistant).await;
+    assistant.cancel();
+    wait_for_turns(&assistant, 1).await;
     // Idle: nothing to cancel.
-    jarvis.cancel();
+    assistant.cancel();
 
     assert_eq!(
-        events(&jarvis),
+        events(&assistant),
         vec![
             user("Mon agenda ?"),
             permission(2),
@@ -507,21 +507,21 @@ async fn stop_frees_a_turn_the_agent_never_ends() {
         ignore_cancel: true,
         ..FakeScript::default()
     };
-    let (jarvis, fakes) = open(dir.path(), script);
+    let (assistant, fakes) = open(dir.path(), script);
     let searching = Event::Assistant {
         text: "Je cherche".into(),
     };
 
-    jarvis.send("Salut".into()).await;
-    wait_until(&jarvis, |events| events.contains(&searching)).await;
-    jarvis.cancel();
+    assistant.send("Salut".into()).await;
+    wait_until(&assistant, |events| events.contains(&searching)).await;
+    assistant.cancel();
     // The agent gets a grace period to end the turn itself.
     tokio::time::sleep(Duration::from_secs(9)).await;
-    assert_eq!(events(&jarvis), vec![user("Salut"), searching.clone()]);
+    assert_eq!(events(&assistant), vec![user("Salut"), searching.clone()]);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     assert_eq!(
-        events(&jarvis),
+        events(&assistant),
         vec![user("Salut"), searching, ended(TurnOutcome::Cancelled)]
     );
     let record = fakes.handles()[0].record();
@@ -530,8 +530,8 @@ async fn stop_frees_a_turn_the_agent_never_ends() {
     assert!(record.closed);
 
     // The next message is accepted, on a new connection.
-    jarvis.send("Encore".into()).await;
-    let events = wait_until(&jarvis, |events| events.contains(&user("Encore"))).await;
+    assistant.send("Encore".into()).await;
+    let events = wait_until(&assistant, |events| events.contains(&user("Encore"))).await;
     assert!(!events.contains(&notice(BUSY)), "{events:?}");
     timeout(WAIT, async {
         while fakes.handles().len() < 2 {
@@ -551,14 +551,14 @@ async fn cancel_while_connecting_skips_the_prompt() {
         ..FakeScript::default()
     };
     let (connector, _fakes) = fake_connector(script, Some(gate.clone()));
-    let jarvis = Jarvis::open(spec(), dir.path(), connector).expect("open");
+    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
 
-    jarvis.send("Salut".into()).await;
-    jarvis.cancel();
+    assistant.send("Salut".into()).await;
+    assistant.cancel();
     gate.notify_one();
 
     assert_eq!(
-        wait_for_turns(&jarvis, 1).await,
+        wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), ended(TurnOutcome::Cancelled)]
     );
 }
@@ -570,14 +570,14 @@ async fn stale_permission_is_closed_in_the_log() {
         leave_permission_pending: true,
         ..asking()
     };
-    let (jarvis, _fakes) = open(dir.path(), script);
+    let (assistant, _fakes) = open(dir.path(), script);
 
-    jarvis.send("Mon agenda ?".into()).await;
-    wait_for_turns(&jarvis, 1).await;
-    jarvis.answer(2, true);
+    assistant.send("Mon agenda ?".into()).await;
+    wait_for_turns(&assistant, 1).await;
+    assistant.answer(2, true);
 
     assert_eq!(
-        events(&jarvis),
+        events(&assistant),
         vec![
             user("Mon agenda ?"),
             permission(2),
@@ -624,9 +624,9 @@ fn hanging_connector() -> (Connector, Arc<Hanging>) {
 async fn cancel_interrupts_a_hanging_connect() {
     let dir = tempfile::tempdir().unwrap();
     let (connector, hanging) = hanging_connector();
-    let jarvis = Jarvis::open(spec(), dir.path(), connector).expect("open");
+    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
 
-    jarvis.send("Salut".into()).await;
+    assistant.send("Salut".into()).await;
     timeout(WAIT, async {
         while hanging.started.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -634,18 +634,18 @@ async fn cancel_interrupts_a_hanging_connect() {
     })
     .await
     .expect("the connect never started");
-    jarvis.cancel();
+    assistant.cancel();
 
     assert_eq!(
-        wait_for_turns(&jarvis, 1).await,
+        wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), ended(TurnOutcome::Cancelled)]
     );
     assert_eq!(hanging.dropped.load(Ordering::SeqCst), 1);
 
-    // Jarvis is free again.
-    jarvis.send("Encore".into()).await;
-    jarvis.cancel();
-    let events = wait_for_turns(&jarvis, 2).await;
+    // Fronde is free again.
+    assistant.send("Encore".into()).await;
+    assistant.cancel();
+    let events = wait_for_turns(&assistant, 2).await;
     assert!(!events.contains(&notice(BUSY)), "{events:?}");
     assert!(events.contains(&user("Encore")), "{events:?}");
 }
@@ -654,15 +654,15 @@ async fn cancel_interrupts_a_hanging_connect() {
 async fn connect_timeout_ends_the_turn() {
     let dir = tempfile::tempdir().unwrap();
     let (connector, hanging) = hanging_connector();
-    let jarvis = Jarvis::open(spec(), dir.path(), connector).expect("open");
+    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
 
-    jarvis.send("Salut".into()).await;
+    assistant.send("Salut".into()).await;
     tokio::time::sleep(Duration::from_secs(59)).await;
-    assert_eq!(events(&jarvis), vec![user("Salut")]);
+    assert_eq!(events(&assistant), vec![user("Salut")]);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     assert_eq!(
-        events(&jarvis),
+        events(&assistant),
         vec![user("Salut"), notice(NO_START), ended(TurnOutcome::Error)]
     );
     assert_eq!(hanging.dropped.load(Ordering::SeqCst), 1);
@@ -673,8 +673,7 @@ async fn open_closes_a_turn_left_open() {
     let dir = tempfile::tempdir().unwrap();
     // The server stopped in the middle of a turn: its user message has no `turn_ended`.
     {
-        let log =
-            jarvis_agent::log::ConversationLog::open(&dir.path().join("jarvis.jsonl")).unwrap();
+        let log = fronde_agent::log::ConversationLog::open(&dir.path().join(LOG_FILE)).unwrap();
         log.append(user("Un")).unwrap();
         log.append(ended(TurnOutcome::Done)).unwrap();
         log.append(user("Deux")).unwrap();
@@ -683,7 +682,7 @@ async fn open_closes_a_turn_left_open() {
         })
         .unwrap();
     }
-    let (jarvis, _) = open(dir.path(), FakeScript::default());
+    let (assistant, _) = open(dir.path(), FakeScript::default());
     let closed = [
         user("Un"),
         ended(TurnOutcome::Done),
@@ -694,10 +693,33 @@ async fn open_closes_a_turn_left_open() {
         notice("La réponse précédente a été interrompue."),
         ended(TurnOutcome::Error),
     ];
-    assert_eq!(events(&jarvis), closed);
-    drop(jarvis);
+    assert_eq!(events(&assistant), closed);
+    drop(assistant);
 
     // A log whose last turn ended is left alone.
-    let (jarvis, _) = open(dir.path(), FakeScript::default());
-    assert_eq!(events(&jarvis), closed);
+    let (assistant, _) = open(dir.path(), FakeScript::default());
+    assert_eq!(events(&assistant), closed);
+}
+
+#[tokio::test]
+async fn open_renames_the_files_from_before_fronde() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let log =
+            fronde_agent::log::ConversationLog::open(&dir.path().join("jarvis.jsonl")).unwrap();
+        log.append(user("Un")).unwrap();
+        log.append(ended(TurnOutcome::Done)).unwrap();
+    }
+    std::fs::write(dir.path().join("jarvis.session"), "earlier-session").unwrap();
+
+    let (assistant, _) = open(dir.path(), FakeScript::default());
+
+    assert_eq!(
+        events(&assistant),
+        vec![user("Un"), ended(TurnOutcome::Done)]
+    );
+    let saved = std::fs::read_to_string(dir.path().join(SESSION_FILE)).unwrap();
+    assert_eq!(saved, "earlier-session");
+    assert!(!dir.path().join("jarvis.jsonl").exists());
+    assert!(!dir.path().join("jarvis.session").exists());
 }

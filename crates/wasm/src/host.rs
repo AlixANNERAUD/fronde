@@ -18,8 +18,8 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "../../wit",
-        inline: "package jarvis:host; world shared { import jarvis:component/settings@0.1.0; }",
-        world: "jarvis:host/shared",
+        inline: "package fronde:host; world shared { import fronde:component/settings@0.1.0; }",
+        world: "fronde:host/shared",
     });
 }
 
@@ -87,7 +87,7 @@ impl ComponentHost {
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-        bindings::jarvis::component::settings::add_to_linker::<_, HasSelf<HostState>>(
+        bindings::fronde::component::settings::add_to_linker::<_, HasSelf<HostState>>(
             &mut linker,
             |s| s,
         )?;
@@ -170,7 +170,7 @@ impl WasiHttpView for HostState {
     }
 }
 
-impl bindings::jarvis::component::settings::Host for HostState {
+impl bindings::fronde::component::settings::Host for HostState {
     fn get(&mut self, key: String) -> Option<String> {
         self.settings.get(&key).cloned()
     }

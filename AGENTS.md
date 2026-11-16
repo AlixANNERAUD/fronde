@@ -1,35 +1,35 @@
 # AGENTS.md
 
-jarvis (code name) is a personal agent hub written in Rust: it drives coding agents through their
+fronde (code name) is a personal agent hub written in Rust: it drives coding agents through their
 own subscriptions over ACP, serves its memory, calendar and tools over MCP, and offers a web chat.
 
 ## Layout
 
 | Crate | Role |
 | --- | --- |
-| `crates/hub` (`jarvis-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
-| `crates/protocol` (`jarvis-protocol`) | Types shared by the conversation log, the server and the web interface (`Event`, `Entry`); serde and chrono only |
-| `crates/agent` (`jarvis-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
-| `crates/client` (`jarvis-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
-| `crates/web` (`jarvis-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `jarvis-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
-| `crates/wasm` (`jarvis-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `tool.rs` the `tool` world, whose tools join the hub's registry |
-| `wit/` | The components' WIT: package `jarvis:component`, shared `settings` interface, `tool` world |
+| `crates/hub` (`fronde-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
+| `crates/protocol` (`fronde-protocol`) | Types shared by the conversation log, the server and the web interface (`Event`, `Entry`); serde and chrono only |
+| `crates/agent` (`fronde-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
+| `crates/client` (`fronde-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
+| `crates/web` (`fronde-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `fronde-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
+| `crates/wasm` (`fronde-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `tool.rs` the `tool` world, whose tools join the hub's registry |
+| `wit/` | The components' WIT: package `fronde:component`, shared `settings` interface, `tool` world |
 | `components/` | Components, a Cargo workspace of its own built for `wasm32-wasip2` (`echo` is the test component); not part of the root workspace |
-| `crates/server` | The `jarvis` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
+| `crates/server` | The `fronde` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
 
 Components are built by `mise run components`, which copies the `.wasm` files to
-`components/dist` (mr-boxington prunes idle target directories); `jarvis-wasm`'s tests load them
+`components/dist` (mr-boxington prunes idle target directories); `fronde-wasm`'s tests load them
 from there, and `mise run test` builds them first. A component may not import `wasi:filesystem` or
 `wasi:sockets`, and its bindings module is the only place allowed `unsafe` code (the generated
 export glue needs it).
 
 The server has no Dioxus dependency: it serves the built interface as static files from
-`JARVIS_SITE_ROOT` (default `target/dx/jarvis-web/release/web/public`, written by
+`FRONDE_SITE_ROOT` (default `target/dx/fronde-web/release/web/public`, written by
 `mise run web-build`). In development, `mise run web-dev` serves the pages itself and proxies
 `/ws` and `/auth` to `mise run dev` (`crates/web/Dioxus.toml`): keep every backend-only route
 under one of those.
 
-Server-side Cargo commands leave out `jarvis-web` (`$JARVIS_SERVER_PACKAGES`), whose
+Server-side Cargo commands leave out `fronde-web` (`$FRONDE_SERVER_PACKAGES`), whose
 dependencies are wasm-only. Lint and tests run it on its own, natively and for wasm32. It embeds
 `crates/web/assets/tailwind.css` at compile time: the hidden `web-css` task generates it from
 `crates/web/style/tailwind.css` with mise's Tailwind, and `lint`, `test`, `web-build` and
@@ -50,16 +50,16 @@ through mr-boxington.
 | `mise run agent` | Installs the locked Claude ACP adapter (`agent/package-lock.json`) into `agent/node_modules`; Node.js comes from mise, which puts the adapter on `PATH` |
 | `mise run deny` | cargo-deny: advisories, licences, bans, sources |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
-| `mise run dev` | The server on http://127.0.0.1:8484 for `web-dev` (password `jarvis`; config and data in `target/dev`) |
+| `mise run dev` | The server on http://127.0.0.1:8484 for `web-dev` (password `fronde`; config and data in `target/dev`) |
 | `mise run web-dev` | The Dioxus interface with hot reload on http://127.0.0.1:8080 (dx serve); `/ws` and `/auth` go to `mise run dev` |
-| `mise run web-build` | Release build of the Dioxus interface into `target/dx/jarvis-web/release/web/public` |
-| `mise run build` | Release build: `web-build`, then `target/release/jarvis` |
+| `mise run web-build` | Release build of the Dioxus interface into `target/dx/fronde-web/release/web/public` |
+| `mise run build` | Release build: `web-build`, then `target/release/fronde` |
 
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 
 `crates/server/tests/live.rs` chats with the real Claude adapter on the owner's subscription. It
-is ignored and runs only by hand, with `JARVIS_LIVE_AGENT` set to the adapter's path (`agent/node_modules/.bin/claude-agent-acp`, after `mise run agent`):
-`mise exec -- cargo nextest run -p jarvis --test live --run-ignored only --no-capture`.
+is ignored and runs only by hand, with `FRONDE_LIVE_AGENT` set to the adapter's path (`agent/node_modules/.bin/claude-agent-acp`, after `mise run agent`):
+`mise exec -- cargo nextest run -p fronde --test live --run-ignored only --no-capture`.
 
 ## Dioxus 0.7 usage
 
@@ -68,12 +68,12 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
 - `rsx!` with `#[component]` functions; lists use `for` with a stable `key` (generation and seq,
   never the row version, which would remount the node on each chunk).
 - Shared state is `Signal`s; the WebSocket lives in one `use_coroutine` (`socket.rs`) that owns the
-  socket and the retry timer. Connection logic stays in `jarvis-client`, native and tested.
+  socket and the retry timer. Connection logic stays in `fronde-client`, native and tested.
 - Components and pages take plain props (no context needed to render) so `dioxus-ssr` and
   VirtualDom tests drive them natively.
 - Browser-only code (sockets, timers, `web_sys`) sits behind `cfg(target_arch = "wasm32")`, with a
   native stub for tests.
-- Vendored rust-ui components keep upstream classes; changes carry a `// jarvis:` marker.
+- Vendored rust-ui components keep upstream classes; changes carry a `// fronde:` marker.
 - Tailwind is built by `mise run web-css`, not by `dx`; `dx` only bundles the wasm.
 - Dev: `mise run web-dev` for the UI (proxies `/ws` and `/auth` to the backend), plus `mise run dev` for the backend
   in another terminal. Release: `mise run web-build`.
@@ -91,7 +91,7 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
   temporary directories.
 - Rust/UI components are vendored by hand in `crates/web/src/components/ui/`, with
   `crates/web/src/components/LICENSE-rust-ui` (MIT) beside them: keep their classes and
-  structure, and mark any change to them in place with a `// jarvis:` comment. Icons are Lucide's
+  structure, and mark any change to them in place with a `// fronde:` comment. Icons are Lucide's
   (ISC, `crates/web/src/components/LICENSE-lucide`), drawn inline in
   `crates/web/src/components/icons.rs`; add one there from Lucide's paths rather than adding an
   icon crate.

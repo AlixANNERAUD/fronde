@@ -1,5 +1,5 @@
 [package]
-name = "jarvis-wasm"
+name = "fronde-wasm"
 description = "Runs tool components (WASI 0.2) for the hub, with no filesystem and an HTTP allowlist"
 edition.workspace = true
 license.workspace = true
@@ -15,7 +15,7 @@ bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-jarvis-hub = { path = "../hub" }
+fronde-hub = { path = "../hub" }
 serde_json.workspace = true
 tokio.workspace = true
 url.workspace = true

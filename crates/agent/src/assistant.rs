@@ -1,4 +1,4 @@
-//! Jarvis's conversation: one agent session, its turns recorded in the conversation log.
+//! Fronde's conversation: one agent session, its turns recorded in the conversation log.
 
 use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-const BUSY: &str = "Jarvis répond encore ; attends la fin ou arrête-le.";
+const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-le.";
 const NOT_ACTIVE: &str = "Cette demande n'est plus active.";
 const NEW_CONVERSATION: &str =
     "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
@@ -23,10 +23,23 @@ const SIGNED_OUT: &str =
     "L'agent n'est pas connecté à Claude : voir le README (claude setup-token).";
 const FAILED: &str = "L'agent a rencontré une erreur.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
+/// The conversation log and the agent's session id, in the data directory.
+pub const LOG_FILE: &str = "conversation.jsonl";
+pub const SESSION_FILE: &str = "agent.session";
 /// How long the agent gets to start and open its session.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the agent gets to end a cancelled turn before it is stopped.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// Renames `legacy` to `name` in `dir` when only the legacy file exists.
+fn migrate(dir: &Path, legacy: &str, name: &str) -> anyhow::Result<()> {
+    let (legacy, name) = (dir.join(legacy), dir.join(name));
+    if !name.exists() && legacy.exists() {
+        std::fs::rename(&legacy, &name)
+            .with_context(|| format!("renaming {} to {}", legacy.display(), name.display()))?;
+    }
+    Ok(())
+}
 
 /// Opens an agent session: `AgentClient::spawn` in production, a fake agent in tests.
 pub type Connector = Arc<
@@ -47,7 +60,7 @@ pub fn process_connector() -> Connector {
     })
 }
 
-pub struct Jarvis {
+pub struct Assistant {
     spec: AgentSpec,
     connector: Connector,
     log: ConversationLog,
@@ -77,43 +90,47 @@ impl Session {
     }
 }
 
-impl Jarvis {
+impl Assistant {
     /// Opens the conversation stored in `data_dir`; the agent is started on the first message.
     pub fn open(
         spec: AgentSpec,
         data_dir: &Path,
         connector: Connector,
     ) -> anyhow::Result<Arc<Self>> {
-        let log = ConversationLog::open(&data_dir.join("jarvis.jsonl"))?;
-        let jarvis = Arc::new(Self {
+        // Files from before the rename to Fronde keep their conversation.
+        migrate(data_dir, "jarvis.jsonl", LOG_FILE)?;
+        migrate(data_dir, "jarvis.session", SESSION_FILE)?;
+        let log = ConversationLog::open(&data_dir.join(LOG_FILE))?;
+        let assistant = Arc::new(Self {
             spec,
             connector,
             log,
-            session_file: data_dir.join("jarvis.session"),
+            session_file: data_dir.join(SESSION_FILE),
             session: Mutex::new(None),
             pending: Mutex::default(),
             turn: Mutex::new(None),
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
-        let last_turn = jarvis
-            .log
-            .since(0)
-            .into_iter()
-            .rev()
-            .find_map(|entry| match entry.event {
-                Event::User { .. } => Some(true),
-                Event::TurnEnded { .. } => Some(false),
-                _ => None,
-            });
+        let last_turn =
+            assistant
+                .log
+                .since(0)
+                .into_iter()
+                .rev()
+                .find_map(|entry| match entry.event {
+                    Event::User { .. } => Some(true),
+                    Event::TurnEnded { .. } => Some(false),
+                    _ => None,
+                });
         if last_turn == Some(true) {
-            jarvis.append(Event::Notice {
+            assistant.append(Event::Notice {
                 text: INTERRUPTED.into(),
             });
-            jarvis.append(Event::TurnEnded {
+            assistant.append(Event::TurnEnded {
                 outcome: TurnOutcome::Error,
             });
         }
-        Ok(jarvis)
+        Ok(assistant)
     }
 
     pub fn log(&self) -> &ConversationLog {
@@ -134,20 +151,20 @@ impl Jarvis {
             self.append(Event::User { text: text.clone() });
             turn.insert(CancellationToken::new()).clone()
         };
-        let jarvis = self.clone();
+        let assistant = self.clone();
         tokio::spawn(async move {
-            let outcome = match jarvis.run_turn(&text, &cancel).await {
+            let outcome = match assistant.run_turn(&text, &cancel).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::warn!("the turn failed: {error:#}");
-                    jarvis.append(Event::Notice {
+                    assistant.append(Event::Notice {
                         text: notice_for(&error).into(),
                     });
                     TurnOutcome::Error
                 }
             };
-            let mut turn = lock(&jarvis.turn);
-            jarvis.append(Event::TurnEnded { outcome });
+            let mut turn = lock(&assistant.turn);
+            assistant.append(Event::TurnEnded { outcome });
             *turn = None;
         });
     }
@@ -366,7 +383,7 @@ impl Recorder {
 
 /// Logs the agent's events for the lifetime of its client and answers flush requests.
 async fn record_events(
-    jarvis: Weak<Jarvis>,
+    assistant: Weak<Assistant>,
     mut recorder: Recorder,
     mut events: UnboundedReceiver<AgentEvent>,
     mut flush_requests: UnboundedReceiver<oneshot::Sender<()>>,
@@ -376,7 +393,7 @@ async fn record_events(
             // Events first: a flush is acknowledged only once those sent before it are logged.
             biased;
             event = events.recv() => {
-                let (Some(event), Some(owner)) = (event, jarvis.upgrade()) else {
+                let (Some(event), Some(owner)) = (event, assistant.upgrade()) else {
                     break;
                 };
                 owner.record(event, &mut recorder);

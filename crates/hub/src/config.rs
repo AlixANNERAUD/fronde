@@ -32,7 +32,7 @@ pub struct WebConfig {
     pub secure_cookie: bool,
 }
 
-/// The coding agent Jarvis talks to over ACP.
+/// The coding agent Fronde talks to over ACP.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AgentConfig {

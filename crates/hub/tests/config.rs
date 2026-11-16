@@ -1,7 +1,7 @@
-use jarvis_hub::config::{Secret, load};
+use fronde_hub::config::{Secret, load};
 use std::io::Write;
 
-fn load_str(s: &str) -> anyhow::Result<jarvis_hub::config::Config> {
+fn load_str(s: &str) -> anyhow::Result<fronde_hub::config::Config> {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(s.as_bytes()).unwrap();
     load(f.path())
@@ -17,7 +17,7 @@ timezone = "Europe/Paris"
 
 #[test]
 fn loads_example() {
-    let c = load(std::path::Path::new("../../jarvis.example.toml")).unwrap();
+    let c = load(std::path::Path::new("../../fronde.example.toml")).unwrap();
     assert_eq!(c.data.timezone, chrono_tz::Europe::Paris);
     assert_eq!(c.mcp.len(), 1);
     assert_eq!(c.data.user, "alix");

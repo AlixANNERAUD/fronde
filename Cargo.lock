@@ -1883,6 +1883,136 @@ dependencies = [
 ]
 
 [[package]]
+name = "fronde"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "fronde-agent",
+ "fronde-hub",
+ "fronde-protocol",
+ "futures",
+ "reqwest 0.13.5",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tower-http 0.7.1",
+ "tower-sessions",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "fronde-agent"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "chrono",
+ "fronde-agent",
+ "fronde-protocol",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "fronde-client"
+version = "0.1.0"
+dependencies = [
+ "fronde-protocol",
+]
+
+[[package]]
+name = "fronde-hub"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "chrono-tz",
+ "icalendar",
+ "reqwest 0.13.5",
+ "rmcp",
+ "roxmltree",
+ "rusqlite",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "fronde-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fronde-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "fronde-hub",
+ "http",
+ "http-body",
+ "http-body-util",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-http",
+ "wiremock",
+]
+
+[[package]]
+name = "fronde-web"
+version = "0.1.0"
+dependencies = [
+ "dioxus",
+ "dioxus-html",
+ "dioxus-ssr",
+ "fronde-client",
+ "fronde-protocol",
+ "futures",
+ "gloo-net",
+ "gloo-timers",
+ "serde_json",
+ "strum",
+ "tw_merge",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2576,136 +2706,6 @@ name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
-
-[[package]]
-name = "jarvis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "futures",
- "jarvis-agent",
- "jarvis-hub",
- "jarvis-protocol",
- "reqwest 0.13.5",
- "rmcp",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "tower-http 0.7.1",
- "tower-sessions",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "jarvis-agent"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "chrono",
- "futures",
- "jarvis-agent",
- "jarvis-protocol",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "jarvis-client"
-version = "0.1.0"
-dependencies = [
- "jarvis-protocol",
-]
-
-[[package]]
-name = "jarvis-hub"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "chrono-tz",
- "icalendar",
- "reqwest 0.13.5",
- "rmcp",
- "roxmltree",
- "rusqlite",
- "schemars 1.2.3",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "jarvis-protocol"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "jarvis-wasm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "http",
- "http-body",
- "http-body-util",
- "jarvis-hub",
- "serde_json",
- "tempfile",
- "tokio",
- "url",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-http",
- "wiremock",
-]
-
-[[package]]
-name = "jarvis-web"
-version = "0.1.0"
-dependencies = [
- "dioxus",
- "dioxus-html",
- "dioxus-ssr",
- "futures",
- "gloo-net",
- "gloo-timers",
- "jarvis-client",
- "jarvis-protocol",
- "serde_json",
- "strum",
- "tw_merge",
- "wasm-bindgen",
- "web-sys",
-]
 
 [[package]]
 name = "jiff"

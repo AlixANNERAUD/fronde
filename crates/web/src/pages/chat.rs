@@ -1,8 +1,8 @@
 //! `/`: the chat. The server only serves it with a session; the conversation comes over `/ws`.
 
 use dioxus::prelude::*;
-use jarvis_client::{Chat, Item, PermissionStatus, ToolStatus};
-use jarvis_protocol::ClientMsg;
+use fronde_client::{Chat, Item, PermissionStatus, ToolStatus};
+use fronde_protocol::ClientMsg;
 
 use crate::{
     components::icons::{ArrowUp, Check, LogOut, Square, Wrench, X},
@@ -37,7 +37,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
         div { class: "flex h-dvh flex-col",
             header { class: "shrink-0 border-b pt-[env(safe-area-inset-top)]",
                 div { class: "mx-auto flex h-12 max-w-3xl items-center gap-3 px-4",
-                    span { class: "font-semibold", "Jarvis" }
+                    span { class: "font-semibold", "Fronde" }
                     form { method: "post", action: "/auth/sign-out", class: "ml-auto",
                         Button {
                             variant: ButtonVariant::Ghost,
@@ -171,7 +171,7 @@ fn PermissionCard(
     rsx! {
         Card { size: CardSize::Sm, class: "max-w-[85%]",
             CardHeader {
-                CardDescription { class: "text-xs font-medium", "Jarvis demande l'autorisation" }
+                CardDescription { class: "text-xs font-medium", "Fronde demande l'autorisation" }
             }
             CardContent {
                 p { class: "text-sm wrap-break-word", "{title}" }
@@ -206,7 +206,7 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> E
             InputPrompt {
                 InputPromptTextarea {
                     value: draft,
-                    placeholder: "Écris à Jarvis…",
+                    placeholder: "Écris à Fronde…",
                     aria_label: "Message",
                     // 16 px at least on phones, or iOS zooms in on focus.
                     class: "text-base md:text-sm",
@@ -433,7 +433,7 @@ mod tests {
         );
         let messages: Vec<&str> = page.split(r#"data-name="Message""#).skip(1).collect();
         assert_eq!(messages.len(), 3, "{page}");
-        // The user on the right, Jarvis on the left.
+        // The user on the right, Fronde on the left.
         assert!(messages[0].contains(r#"data-align="End""#), "{page}");
         assert!(messages[0].contains("Salut\nça va ?"), "{page}");
         assert!(messages[1].contains(r#"data-align="Start""#), "{page}");

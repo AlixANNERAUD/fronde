@@ -1,4 +1,4 @@
-//! The web interface of jarvis: a single-page app built by dx and served by the jarvis server.
+//! The web interface of Fronde: a single-page app built by dx and served by the Fronde server.
 
 mod app;
 mod components;

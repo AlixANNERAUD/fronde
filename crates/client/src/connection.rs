@@ -1,7 +1,7 @@
 //! The WebSocket's life as a pure state machine: it says what to do, the page does it (timers,
 //! sockets, navigation).
 
-use jarvis_protocol::{CLOSE_SIGNED_OUT, ClientMsg};
+use fronde_protocol::{CLOSE_SIGNED_OUT, ClientMsg};
 
 use crate::Chat;
 
@@ -105,7 +105,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jarvis_protocol::ServerMsg;
+    use fronde_protocol::ServerMsg;
 
     #[test]
     fn open_sends_hello_with_what_the_chat_has() {

@@ -1,7 +1,7 @@
 //! What the chat shows, built from the conversation log's entries. Pure logic, without browser
 //! APIs, so it is tested natively.
 
-use jarvis_protocol::{Entry, Event, ServerMsg, ToolState, TurnOutcome};
+use fronde_protocol::{Entry, Event, ServerMsg, ToolState, TurnOutcome};
 
 /// How a tool call ended, as the chat shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +185,7 @@ impl Chat {
                 }
                 let notice = match outcome {
                     TurnOutcome::Cancelled => Some("Réponse interrompue."),
-                    TurnOutcome::Refused => Some("Jarvis a refusé de répondre."),
+                    TurnOutcome::Refused => Some("Fronde a refusé de répondre."),
                     TurnOutcome::Limit => Some("Limite d'utilisation atteinte."),
                     // An error is already explained by the notice logged before.
                     TurnOutcome::Done | TurnOutcome::Error => None,
@@ -594,7 +594,7 @@ mod tests {
             notices,
             [
                 Item::Notice {
-                    text: "Jarvis a refusé de répondre.".into()
+                    text: "Fronde a refusé de répondre.".into()
                 },
                 Item::Notice {
                     text: "Limite d'utilisation atteinte.".into()

@@ -1,5 +1,5 @@
 {
-  "name": "jarvis-agent-runtime",
+  "name": "fronde-agent-runtime",
   "private": true,
   "description": "The coding agent's ACP adapter, locked for native runs (mise run agent) and the Docker image",
   "dependencies": {

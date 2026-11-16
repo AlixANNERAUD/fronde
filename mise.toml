@@ -12,7 +12,7 @@ mr-boxington = "latest"
 [env]
 # The web interface has wasm-only dependencies and its own lint and test runs, so server-side
 # commands leave it out.
-JARVIS_SERVER_PACKAGES = "--workspace --exclude jarvis-web"
+FRONDE_SERVER_PACKAGES = "--workspace --exclude fronde-web"
 DX_TELEMETRY_ENABLED = "false"
 # The Claude ACP adapter installed by `mise run agent` (agent/package-lock.json).
 _.path = ["{{config_root}}/agent/node_modules/.bin"]
@@ -30,9 +30,9 @@ description = "Check formatting and run clippy on the server, web and component 
 depends = ["web-css"]
 run = [
   "cargo fmt --all --check",
-  "cargo clippy $JARVIS_SERVER_PACKAGES --all-targets -- -D warnings",
-  "cargo clippy --package jarvis-web --all-targets -- -D warnings",
-  "cargo clippy --package jarvis-web --target wasm32-unknown-unknown -- -D warnings",
+  "cargo clippy $FRONDE_SERVER_PACKAGES --all-targets -- -D warnings",
+  "cargo clippy --package fronde-web --all-targets -- -D warnings",
+  "cargo clippy --package fronde-web --target wasm32-unknown-unknown -- -D warnings",
   "cargo fmt --manifest-path components/Cargo.toml --all --check",
   "cargo clippy --manifest-path components/Cargo.toml --target wasm32-wasip2 -- -D warnings",
 ]
@@ -41,8 +41,8 @@ run = [
 description = "Run the test suite"
 depends = ["web-css", "components"]
 run = [
-  "cargo nextest run $JARVIS_SERVER_PACKAGES --no-tests=pass",
-  "cargo nextest run --package jarvis-web",
+  "cargo nextest run $FRONDE_SERVER_PACKAGES --no-tests=pass",
+  "cargo nextest run --package fronde-web",
 ]
 
 # The web crate embeds its stylesheet at compile time, so Cargo needs the file. It is built with
@@ -54,7 +54,7 @@ hide = true
 run = "tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css"
 
 # Tool components are a workspace of their own, built for WASI. The .wasm files are copied to
-# components/dist, where jarvis-wasm's tests load them: mr-boxington prunes idle target directories.
+# components/dist, where fronde-wasm's tests load them: mr-boxington prunes idle target directories.
 [tasks.components]
 description = "Build the tool components for wasm32-wasip2 into components/dist"
 run = [
@@ -72,17 +72,17 @@ description = "Everything CI checks, except the release build"
 depends = ["lint", "test", "deny"]
 
 # Writes a development configuration under target/dev at each run, so it follows this file: a
-# random token and the password `jarvis`, both made once, and a data directory of its own.
+# random token and the password `fronde`, both made once, and a data directory of its own.
 # `listen` is where `web-dev` sends /ws and the sign-in forms (crates/web/Dioxus.toml).
 [tasks.dev]
-description = "Run the server on http://127.0.0.1:8484 for `mise run web-dev` (password: jarvis)"
+description = "Run the server on http://127.0.0.1:8484 for `mise run web-dev` (password: fronde)"
 run = '''
 set -eu
 dev=target/dev
 mkdir -p "$dev/data"
 [ -f "$dev/token" ] || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$dev/token"
-[ -f "$dev/password" ] || printf jarvis > "$dev/password"
-cat > "$dev/jarvis.toml" <<EOF
+[ -f "$dev/password" ] || printf fronde > "$dev/password"
+cat > "$dev/fronde.toml" <<EOF
 [server]
 listen = "127.0.0.1:8484"
 token = { file = "$PWD/$dev/token" }
@@ -97,22 +97,22 @@ git = false
 [web]
 password = { file = "$PWD/$dev/password" }
 EOF
-cargo run --package jarvis -- serve --config "$dev/jarvis.toml"
+cargo run --package fronde -- serve --config "$dev/fronde.toml"
 '''
 
 [tasks.build]
 description = "Build the release binary and the web interface"
 depends = ["web-build"]
-run = "cargo build --release --package jarvis"
+run = "cargo build --release --package fronde"
 
 # dx leaves the assets of earlier builds in place; the output starts empty so that only the
 # current ones are served and copied into the image.
 [tasks.web-build]
-description = "Build the web interface into target/dx/jarvis-web/release/web/public"
+description = "Build the web interface into target/dx/fronde-web/release/web/public"
 depends = ["web-css"]
 run = [
-  "rm -rf target/dx/jarvis-web/release/web/public",
-  "dx build --package jarvis-web --platform web --release",
+  "rm -rf target/dx/fronde-web/release/web/public",
+  "dx build --package fronde-web --platform web --release",
 ]
 
 # Tailwind rebuilds the stylesheet as classes change; dx reloads it in the page.
@@ -122,5 +122,5 @@ depends = ["web-css"]
 run = '''
 tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css --watch=always &
 trap 'kill $!' EXIT
-dx serve --package jarvis-web --platform web
+dx serve --package fronde-web --platform web
 '''

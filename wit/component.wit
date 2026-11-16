@@ -1,4 +1,4 @@
-package jarvis:component@0.1.0;
+package fronde:component@0.1.0;
 
 /// Non-secret settings the host chooses for a component (URLs, user names, time zone). Credentials
 /// never go through here: the host adds them to outgoing requests itself.

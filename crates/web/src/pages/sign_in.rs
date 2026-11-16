@@ -22,9 +22,9 @@ fn refusal(error: &str) -> Option<&'static str> {
 #[component]
 pub fn SignInPage(error: String) -> Element {
     rsx! {
-        document::Title { "Connexion · Jarvis" }
+        document::Title { "Connexion · Fronde" }
         main { class: "mx-auto flex min-h-dvh w-full max-w-sm flex-col justify-center gap-6 p-4",
-            p { class: "text-center text-2xl font-semibold", "Jarvis" }
+            p { class: "text-center text-2xl font-semibold", "Fronde" }
             Card {
                 CardHeader {
                     CardTitle { "Connexion" }

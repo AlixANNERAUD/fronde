@@ -1,4 +1,4 @@
-//! Test component for `jarvis-wasm`: each tool exercises one thing the host must get right.
+//! Test component for `fronde-wasm`: each tool exercises one thing the host must get right.
 
 #![deny(unsafe_code)]
 
@@ -10,8 +10,8 @@ mod bindings {
     export!(Component with_types_in crate::bindings);
 }
 
-use bindings::exports::jarvis::component::tools::{Guest, Tool, ToolOutput};
-use bindings::jarvis::component::settings;
+use bindings::exports::fronde::component::tools::{Guest, Tool, ToolOutput};
+use bindings::fronde::component::settings;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use wstd::http::{Body, BodyExt, Client, Request};

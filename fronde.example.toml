@@ -1,13 +1,13 @@
-# Jarvis configuration. Secrets are never written here: use { file = "…" } or { env = "…" }.
+# Fronde configuration. Secrets are never written here: use { file = "…" } or { env = "…" }.
 
 [server]
 # Use "0.0.0.0:8484" inside a container.
 listen = "127.0.0.1:8484"
 # Bearer token required on /mcp (at least 32 characters).
-token = { file = "/run/secrets/jarvis_token" }
+token = { file = "/run/secrets/fronde_token" }
 
 [data]
-dir = "/var/lib/jarvis"
+dir = "/var/lib/fronde"
 timezone = "Europe/Paris"
 user = "alix"
 
@@ -22,7 +22,7 @@ git = true
 events_url = "https://cloud.example/remote.php/dav/calendars/alix/personal/"
 reminders_url = "https://cloud.example/remote.php/dav/calendars/alix/tasks/"
 username = "alix"
-password = { env = "JARVIS_CALDAV_PASSWORD" }
+password = { env = "FRONDE_CALDAV_PASSWORD" }
 
 # Upstream MCP servers, 0..n. Exactly one of url or command.
 [[mcp]]
@@ -30,21 +30,21 @@ name = "mcphub"
 url = "https://mcphub.example/mcp"
 token = { env = "MCPHUB_TOKEN" }
 
-# Optional: the chat with Jarvis at /, behind a password. Without it the server is only the hub.
+# Optional: the chat with Fronde at /, behind a password. Without it the server is only the hub.
 # Behind a reverse proxy, forward the Host header: the chat's WebSocket checks Origin against it.
 [web]
-password = { file = "/run/secrets/jarvis_password" }
+password = { file = "/run/secrets/fronde_password" }
 # Set to true when the page is served over https.
 secure_cookie = false
 
-# Optional: the agent Jarvis runs (ACP over stdio), started on the first message. It inherits
-# Jarvis's environment, so CLAUDE_CODE_OAUTH_TOKEN goes there, never here.
+# Optional: the agent Fronde runs (ACP over stdio), started on the first message. It inherits
+# Fronde's environment, so CLAUDE_CODE_OAUTH_TOKEN goes there, never here.
 [agent]
 command = ["claude-agent-acp"]
 # Extra environment for the agent, in plain text: no secrets. For example, to run the installed
 # Claude Code instead of the adapter's own:
 # env = { CLAUDE_CODE_EXECUTABLE = "/home/alix/.local/bin/claude" }
 env = {}
-# Claude Code's own tools Jarvis may use besides the hub's. Only the web ones are allowed; [] for
+# Claude Code's own tools Fronde may use besides the hub's. Only the web ones are allowed; [] for
 # none.
 builtin_tools = ["WebSearch", "WebFetch"]
