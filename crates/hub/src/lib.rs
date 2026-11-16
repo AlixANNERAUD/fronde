@@ -1,4 +1,5 @@
 //! Hub: tools, memory, calendar and MCP server.
 
 pub mod config;
+pub mod search;
 pub mod tools;

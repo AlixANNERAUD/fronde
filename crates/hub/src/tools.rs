@@ -1,6 +1,7 @@
 //! Tool registry: every tool (native, upstream, meta) goes through here.
 
 use crate::config::is_valid_name;
+use crate::search::ToolIndex;
 use anyhow::bail;
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -117,6 +118,7 @@ type Entry = (ToolDef, Arc<dyn ToolHandler>);
 #[derive(Default)]
 pub struct Registry {
     tools: RwLock<BTreeMap<String, Entry>>,
+    index: ToolIndex,
 }
 
 impl Registry {
@@ -132,12 +134,27 @@ impl Registry {
         if tools.contains_key(&def.name) {
             bail!("tool {:?} is already registered", def.name);
         }
+        if def.deferred {
+            self.index.upsert(&def);
+        }
         tools.insert(def.name.clone(), (def, handler));
         Ok(())
     }
 
     pub fn unregister_source(&self, source: &str) {
-        self.tools.write().expect("registry lock").retain(|_, (d, _)| d.source != source);
+        let mut tools = self.tools.write().expect("registry lock");
+        tools.retain(|name, (d, _)| {
+            let keep = d.source != source;
+            if !keep {
+                self.index.remove(name);
+            }
+            keep
+        });
+    }
+
+    /// Deferred tools matching a need, best first.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<ToolDef> {
+        self.index.search(query, limit).iter().filter_map(|n| self.get(n)).collect()
     }
 
     pub fn visible(&self) -> Vec<ToolDef> {
@@ -163,6 +180,63 @@ impl Registry {
             )),
         }
     }
+}
+
+#[derive(serde::Deserialize, JsonSchema)]
+struct SearchArgs {
+    /// What you need to do, in a few words.
+    need: String,
+    /// Maximum results (default 5, max 10).
+    limit: Option<u8>,
+}
+
+#[derive(serde::Deserialize, JsonSchema)]
+struct UseArgs {
+    /// Tool name returned by search_tools.
+    name: String,
+    /// Arguments matching that tool's input schema.
+    #[serde(default)]
+    arguments: Value,
+}
+
+/// Register `search_tools` and `use_tool`.
+pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
+    let r = Arc::downgrade(registry);
+    let (def, h) = typed_tool(
+        "search_tools",
+        "Find extra tools by need (e.g. 'add to shopping list'). Returns their schemas. Use before use_tool.",
+        false,
+        move |a: SearchArgs| {
+            let r = r.clone();
+            async move {
+                let Some(r) = r.upgrade() else { return ToolOutput::error("hub is shutting down") };
+                let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
+                let found: Vec<Value> = r
+                    .search(&a.need, limit)
+                    .into_iter()
+                    .map(|d| json!({"name": d.name, "description": d.description, "input_schema": d.input_schema}))
+                    .collect();
+                if found.is_empty() {
+                    ToolOutput::ok(found).with_next("No tool matches. Rephrase the need, or answer without a tool.")
+                } else {
+                    ToolOutput::ok(found).with_next("Call use_tool with one of these names.")
+                }
+            }
+        },
+    );
+    registry.register(def, h)?;
+    let r = Arc::downgrade(registry);
+    let (def, h) = typed_tool("use_tool", "Call a tool found with search_tools.", false, move |a: UseArgs| {
+        let r = r.clone();
+        async move {
+            let Some(r) = r.upgrade() else { return ToolOutput::error("hub is shutting down") };
+            if a.name == "use_tool" {
+                return ToolOutput::error("use_tool cannot call itself; pass the name of the tool you need");
+            }
+            r.call(&a.name, a.arguments).await
+        }
+    });
+    registry.register(def, h)
 }
 
 #[cfg(test)]
