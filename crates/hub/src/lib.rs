@@ -5,3 +5,4 @@ pub mod config;
 pub mod memory;
 pub mod search;
 pub mod tools;
+pub mod upstream;
