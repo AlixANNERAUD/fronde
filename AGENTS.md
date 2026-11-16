@@ -95,7 +95,7 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
 - Secrets never appear in the configuration file, logs or tool output: `{ file = "…" }` or
   `{ env = "…" }` only.
 - Nothing read from an external source (web, email, document) is saved to memory automatically.
-- Never rewrite calendar data the tools do not model: edit stored iCalendar in place.
+- Never lose calendar data the tools do not model: edits keep every property and parameter, though the formatting may change.
 - Tests never touch a real calendar, model or MCP server: use `wiremock`, in-process fakes and
   temporary directories.
 - Rust/UI components are vendored by hand in `crates/web/src/components/ui/`, with

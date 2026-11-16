@@ -1,9 +1,16 @@
 //! Events and reminders <-> iCalendar. Times are stored in UTC; input and output use the user's zone.
 
 use anyhow::anyhow;
-use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use calcard::common::PartialDateTime;
+use calcard::icalendar::timezone::TzResolver;
+use calcard::icalendar::{
+    ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarParameter,
+    ICalendarParameterName, ICalendarProperty, ICalendarStatus, ICalendarValueType,
+};
+use chrono::{
+    DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc,
+};
 use chrono_tz::Tz;
-use icalendar::{Calendar, CalendarDateTime, Component, DatePerhapsTime, EventLike, TodoStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum When {
@@ -46,91 +53,113 @@ fn lenient(ndt: NaiveDateTime, tz: Tz) -> DateTime<Utc> {
         .unwrap_or_else(|_| local_to_utc(ndt + Duration::hours(1), tz).unwrap_or(ndt.and_utc()))
 }
 
-fn to_when(d: DatePerhapsTime, tz: Tz) -> When {
-    match d {
-        DatePerhapsTime::Date(d) => When::Date(d),
-        DatePerhapsTime::DateTime(CalendarDateTime::Utc(t)) => When::At(t),
-        DatePerhapsTime::DateTime(CalendarDateTime::Floating(n)) => When::At(lenient(n, tz)),
-        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid }) => {
-            When::At(lenient(date_time, tzid.parse::<Tz>().unwrap_or(tz)))
-        }
+fn entry_to_when(
+    entry: &ICalendarEntry,
+    tz_resolver: &TzResolver<&str>,
+    default_tz: Tz,
+) -> Option<When> {
+    let dt = entry.values.first()?.as_partial_date_time()?;
+    if entry.is_type(&ICalendarValueType::Date) || !dt.has_time() {
+        let year = i32::from(dt.year?);
+        let month = u32::from(dt.month?);
+        let day = u32::from(dt.day?);
+        return NaiveDate::from_ymd_opt(year, month, day).map(When::Date);
+    }
+    let dtr = dt.to_date_time()?;
+    if let Some(offset) = dtr.offset {
+        return offset
+            .from_local_datetime(&dtr.date_time)
+            .single()
+            .map(|t| When::At(t.with_timezone(&Utc)));
+    }
+    let at = match tz_resolver.resolve_or_default(entry.tz_id()) {
+        calcard::common::timezone::Tz::Tz(tz) => lenient(dtr.date_time, tz),
+        calcard::common::timezone::Tz::Fixed(offset) => offset
+            .from_local_datetime(&dtr.date_time)
+            .single()?
+            .with_timezone(&Utc),
+        calcard::common::timezone::Tz::Floating => lenient(dtr.date_time, default_tz),
+    };
+    Some(When::At(at))
+}
+
+fn utc_pdt(t: DateTime<Utc>) -> PartialDateTime {
+    PartialDateTime {
+        year: u16::try_from(t.year()).ok(),
+        month: u8::try_from(t.month()).ok(),
+        day: u8::try_from(t.day()).ok(),
+        hour: u8::try_from(t.hour()).ok(),
+        minute: u8::try_from(t.minute()).ok(),
+        second: u8::try_from(t.second()).ok(),
+        tz_hour: Some(0),
+        tz_minute: Some(0),
+        tz_minus: false,
     }
 }
 
-fn to_dpt(w: &When) -> DatePerhapsTime {
+fn when_entry(name: ICalendarProperty, w: &When) -> ICalendarEntry {
     match w {
-        When::Date(d) => DatePerhapsTime::Date(*d),
-        When::At(t) => DatePerhapsTime::DateTime(CalendarDateTime::Utc(*t)),
+        When::Date(d) => ICalendarEntry::new(name)
+            .with_param(ICalendarParameter::new(
+                ICalendarParameterName::Value,
+                ICalendarValueType::Date,
+            ))
+            .with_value(PartialDateTime {
+                year: u16::try_from(d.year()).ok(),
+                month: u8::try_from(d.month()).ok(),
+                day: u8::try_from(d.day()).ok(),
+                ..Default::default()
+            }),
+        When::At(t) => ICalendarEntry::new(name).with_value(utc_pdt(*t)),
     }
 }
 
-/// Content lines of an iCalendar text, unfolded, without line endings.
-pub fn unfold(ics: &str) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for raw in ics.split('\n') {
-        let raw = raw.strip_suffix('\r').unwrap_or(raw);
-        match raw.strip_prefix([' ', '\t']) {
-            Some(rest) if !lines.is_empty() => lines.last_mut().expect("non-empty").push_str(rest),
-            _ if raw.is_empty() => {}
-            _ => lines.push(raw.to_string()),
-        }
-    }
-    lines
+fn prop_text<'a>(comp: &'a ICalendarComponent, prop: &ICalendarProperty) -> Option<&'a str> {
+    comp.property(prop)
+        .and_then(|e| e.values.first())
+        .and_then(|v| v.as_text())
 }
 
-/// Property name of a content line, uppercased ("DTSTART" for "DTSTART;TZID=X:…").
-pub fn prop_name(line: &str) -> String {
-    line.split([';', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase()
+fn parse(ics: &str) -> anyhow::Result<ICalendar> {
+    ICalendar::parse(ics).map_err(|e| anyhow!("invalid iCalendar data: {e:?}"))
 }
 
-/// Value of a content line (after the first ':' outside parameter quotes).
-pub fn prop_value(line: &str) -> &str {
-    let mut quoted = false;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => quoted = !quoted,
-            ':' if !quoted => return &line[i + 1..],
-            _ => {}
-        }
+fn calendar_with(component: ICalendarComponent) -> ICalendar {
+    let mut root = ICalendarComponent::new(ICalendarComponentType::VCalendar);
+    root.add_property(ICalendarProperty::Version, "2.0");
+    root.add_property(ICalendarProperty::Prodid, "-//fronde//hub//EN");
+    root.component_ids.push(1);
+    ICalendar {
+        components: vec![root, component],
     }
-    ""
 }
 
 /// True when the document has a component whose UID is exactly `uid`.
 pub fn has_uid(ics: &str, uid: &str) -> bool {
-    !uid.is_empty()
-        && unfold(ics)
-            .iter()
-            .any(|l| prop_name(l) == "UID" && prop_value(l) == uid)
-}
-
-fn parse(ics: &str) -> anyhow::Result<Calendar> {
-    ics.parse::<Calendar>()
-        .map_err(|e| anyhow!("invalid iCalendar data: {e}"))
-}
-
-fn calendar() -> Calendar {
-    let mut cal = Calendar::empty();
-    cal.append_property(("VERSION", "2.0"));
-    cal.append_property(("PRODID", "-//fronde//hub//EN"));
-    cal
+    !uid.is_empty() && ICalendar::parse(ics).is_ok_and(|cal| cal.uids().any(|u| u == uid))
 }
 
 pub fn parse_events(ics: &str, tz: Tz) -> anyhow::Result<Vec<Event>> {
     let cal = parse(ics)?;
+    let tz_resolver = cal
+        .build_tz_resolver()
+        .with_default(calcard::common::timezone::Tz::Tz(tz));
     Ok(cal
-        .events()
+        .components
+        .iter()
+        .filter(|c| c.component_type.is_event())
         .filter_map(|e| {
             Some(Event {
-                uid: e.get_uid()?.to_string(),
-                title: e.get_summary().unwrap_or_default().to_string(),
-                start: to_when(e.get_start()?, tz),
-                end: e.get_end().map(|d| to_when(d, tz)),
-                location: e.get_location().map(str::to_string),
-                description: e.get_description().map(str::to_string),
+                uid: e.uid()?.to_string(),
+                title: prop_text(e, &ICalendarProperty::Summary)
+                    .unwrap_or_default()
+                    .to_string(),
+                start: entry_to_when(e.property(&ICalendarProperty::Dtstart)?, &tz_resolver, tz)?,
+                end: e
+                    .property(&ICalendarProperty::Dtend)
+                    .and_then(|d| entry_to_when(d, &tz_resolver, tz)),
+                location: prop_text(e, &ICalendarProperty::Location).map(str::to_string),
+                description: prop_text(e, &ICalendarProperty::Description).map(str::to_string),
             })
         })
         .collect())
@@ -138,179 +167,135 @@ pub fn parse_events(ics: &str, tz: Tz) -> anyhow::Result<Vec<Event>> {
 
 pub fn parse_reminders(ics: &str, tz: Tz) -> anyhow::Result<Vec<Reminder>> {
     let cal = parse(ics)?;
+    let tz_resolver = cal
+        .build_tz_resolver()
+        .with_default(calcard::common::timezone::Tz::Tz(tz));
     Ok(cal
-        .todos()
+        .components
+        .iter()
+        .filter(|c| c.component_type.is_todo())
         .filter_map(|t| {
-            let due = match to_when(t.get_due()?, tz) {
+            let due = match entry_to_when(t.property(&ICalendarProperty::Due)?, &tz_resolver, tz)? {
                 When::At(at) => at,
                 When::Date(d) => lenient(d.and_hms_opt(9, 0, 0)?, tz),
             };
             Some(Reminder {
-                uid: t.get_uid()?.to_string(),
-                text: t.get_summary().unwrap_or_default().to_string(),
+                uid: t.uid()?.to_string(),
+                text: prop_text(t, &ICalendarProperty::Summary)
+                    .unwrap_or_default()
+                    .to_string(),
                 due,
-                done: t.get_status() == Some(TodoStatus::Completed) || t.get_completed().is_some(),
+                done: t.status() == Some(&ICalendarStatus::Completed)
+                    || t.has_property(&ICalendarProperty::Completed),
             })
         })
         .collect())
 }
 
 pub fn event_to_ics(e: &Event) -> String {
-    let mut ev = icalendar::Event::new();
-    ev.uid(&e.uid)
-        .timestamp(Utc::now())
-        .summary(&e.title)
-        .starts(to_dpt(&e.start));
+    let mut ev = ICalendarComponent::new(ICalendarComponentType::VEvent);
+    ev.add_uid(&e.uid);
+    ev.add_dtstamp(utc_pdt(Utc::now()));
+    ev.add_property(ICalendarProperty::Summary, e.title.as_str());
+    ev.entries
+        .push(when_entry(ICalendarProperty::Dtstart, &e.start));
     if let Some(end) = &e.end {
-        ev.ends(to_dpt(end));
+        ev.entries.push(when_entry(ICalendarProperty::Dtend, end));
     }
     if let Some(l) = &e.location {
-        ev.location(l);
+        ev.add_property(ICalendarProperty::Location, l.as_str());
     }
     if let Some(d) = &e.description {
-        ev.description(d);
+        ev.add_property(ICalendarProperty::Description, d.as_str());
     }
-    let mut cal = calendar();
-    cal.push(ev.done());
-    cal.to_string()
+    calendar_with(ev).to_string()
 }
 
 pub fn reminder_to_ics(r: &Reminder) -> String {
-    let mut todo = icalendar::Todo::new();
-    todo.uid(&r.uid)
-        .timestamp(Utc::now())
-        .summary(&r.text)
-        .due(CalendarDateTime::Utc(r.due));
+    let mut todo = ICalendarComponent::new(ICalendarComponentType::VTodo);
+    todo.add_uid(&r.uid);
+    todo.add_dtstamp(utc_pdt(Utc::now()));
+    todo.add_property(ICalendarProperty::Summary, r.text.as_str());
+    todo.entries
+        .push(when_entry(ICalendarProperty::Due, &When::At(r.due)));
     if r.done {
-        todo.status(TodoStatus::Completed);
+        todo.add_property(ICalendarProperty::Status, ICalendarStatus::Completed);
     }
-    let mut cal = calendar();
-    cal.push(todo.done());
-    cal.to_string()
+    calendar_with(todo).to_string()
 }
 
-fn escape_text(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace(';', "\\;")
-        .replace(',', "\\,")
-        .replace('\r', "")
-        .replace('\n', "\\n")
-}
-
-fn when_line(name: &str, w: &When) -> String {
-    match w {
-        When::Date(d) => format!("{name};VALUE=DATE:{}", d.format("%Y%m%d")),
-        When::At(t) => format!("{name}:{}", t.format("%Y%m%dT%H%M%SZ")),
-    }
-}
-
-/// Fold a content line at 75 octets (RFC 5545 §3.1), on character boundaries.
-fn fold(line: &str) -> String {
-    let mut out = String::new();
-    let mut width = 0;
-    for c in line.chars() {
-        let len = c.len_utf8();
-        if width + len > 75 {
-            out.push_str("\r\n ");
-            width = 1;
-        }
-        out.push(c);
-        width += len;
-    }
-    out
-}
-
-type Change = (&'static str, Option<String>);
-
-/// Edit one component in place: drop its own lines named in `changes`, add the new ones.
-/// Everything else (alarms, attendees, time zones, unknown properties) is kept as is.
-fn patch(ics: &str, comp: &str, uid: &str, changes: &[Change]) -> anyhow::Result<String> {
-    let lines = unfold(ics);
-    // Nesting depth after each line: a component's own properties sit at depth 1 relative to its BEGIN.
-    let depth_after = |slice: &[String]| -> Vec<usize> {
-        let mut d = 0usize;
-        slice
-            .iter()
-            .map(|l| {
-                match prop_name(l).as_str() {
-                    "BEGIN" => d += 1,
-                    "END" => d = d.saturating_sub(1),
-                    _ => {}
-                }
-                d
-            })
-            .collect()
-    };
-    let begin = format!("BEGIN:{comp}");
-    let mut start = 0;
-    while let Some(off) = lines[start..]
-        .iter()
-        .position(|l| l.eq_ignore_ascii_case(&begin))
-    {
-        let b = start + off;
-        let depths = depth_after(&lines[b..]);
-        let len = depths
-            .iter()
-            .position(|&d| d == 0)
-            .unwrap_or(depths.len() - 1);
-        let block = &lines[b..=b + len];
-        let own =
-            |k: usize| depths[k] == 1 && !matches!(prop_name(&block[k]).as_str(), "BEGIN" | "END");
-        if (0..block.len())
-            .any(|k| own(k) && prop_name(&block[k]) == "UID" && prop_value(&block[k]) == uid)
-        {
-            let mut out: Vec<String> = lines[..b].to_vec();
-            for (k, l) in block[..block.len() - 1].iter().enumerate() {
-                if !(own(k) && changes.iter().any(|(name, _)| prop_name(l) == *name)) {
-                    out.push(l.clone());
-                }
+fn set_property(comp: &mut ICalendarComponent, entry: ICalendarEntry) {
+    let mut replaced = false;
+    comp.entries.retain_mut(|e| {
+        if e.name == entry.name {
+            if !replaced {
+                *e = entry.clone();
+                replaced = true;
+                true
+            } else {
+                false
             }
-            out.extend(changes.iter().filter_map(|(_, line)| line.clone()));
-            out.extend_from_slice(&lines[b + len..]);
-            return Ok(out.iter().map(|l| fold(l)).collect::<Vec<_>>().join("\r\n") + "\r\n");
+        } else {
+            true
         }
-        start = b + len + 1;
+    });
+    if !replaced {
+        comp.entries.push(entry);
     }
-    anyhow::bail!("no {comp} with uid {uid:?} in the stored item")
 }
 
-fn stamp_line(name: &'static str) -> Option<String> {
-    Some(format!("{name}:{}", Utc::now().format("%Y%m%dT%H%M%SZ")))
+fn remove_property(comp: &mut ICalendarComponent, prop: &ICalendarProperty) {
+    comp.entries.retain(|e| &e.name != prop);
 }
 
 /// The stored event text with only the fields that changed between `old` and `new` rewritten.
 pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Result<String> {
-    let mut changes: Vec<Change> = vec![("DTSTAMP", stamp_line("DTSTAMP"))];
+    let mut cal = parse(original)?;
+    let comp = cal
+        .components
+        .iter_mut()
+        .find(|c| c.component_type.is_event() && c.uid() == Some(&new.uid))
+        .ok_or_else(|| anyhow!("no VEVENT with uid {:?} in the stored item", new.uid))?;
+
+    set_property(
+        comp,
+        ICalendarEntry::new(ICalendarProperty::Dtstamp).with_value(utc_pdt(Utc::now())),
+    );
     if new.title != old.title {
-        changes.push((
-            "SUMMARY",
-            Some(format!("SUMMARY:{}", escape_text(&new.title))),
-        ));
+        set_property(
+            comp,
+            ICalendarEntry::new(ICalendarProperty::Summary).with_value(new.title.as_str()),
+        );
     }
     if new.start != old.start {
-        changes.push(("DTSTART", Some(when_line("DTSTART", &new.start))));
+        set_property(comp, when_entry(ICalendarProperty::Dtstart, &new.start));
     }
     if new.end != old.end {
-        changes.push(("DTEND", new.end.as_ref().map(|w| when_line("DTEND", w))));
-        changes.push(("DURATION", None));
+        remove_property(comp, &ICalendarProperty::Duration);
+        match &new.end {
+            Some(end) => set_property(comp, when_entry(ICalendarProperty::Dtend, end)),
+            None => remove_property(comp, &ICalendarProperty::Dtend),
+        }
     }
     if new.location != old.location {
-        changes.push((
-            "LOCATION",
-            new.location
-                .as_deref()
-                .map(|l| format!("LOCATION:{}", escape_text(l))),
-        ));
+        match &new.location {
+            Some(l) => set_property(
+                comp,
+                ICalendarEntry::new(ICalendarProperty::Location).with_value(l.as_str()),
+            ),
+            None => remove_property(comp, &ICalendarProperty::Location),
+        }
     }
     if new.description != old.description {
-        changes.push((
-            "DESCRIPTION",
-            new.description
-                .as_deref()
-                .map(|d| format!("DESCRIPTION:{}", escape_text(d))),
-        ));
+        match &new.description {
+            Some(d) => set_property(
+                comp,
+                ICalendarEntry::new(ICalendarProperty::Description).with_value(d.as_str()),
+            ),
+            None => remove_property(comp, &ICalendarProperty::Description),
+        }
     }
-    patch(original, "VEVENT", &new.uid, &changes)
+    Ok(cal.to_string())
 }
 
 /// The stored task text with only the fields that changed rewritten.
@@ -319,26 +304,47 @@ pub fn update_reminder_ics(
     old: &Reminder,
     new: &Reminder,
 ) -> anyhow::Result<String> {
-    let mut changes: Vec<Change> = vec![("DTSTAMP", stamp_line("DTSTAMP"))];
+    let mut cal = parse(original)?;
+    let comp = cal
+        .components
+        .iter_mut()
+        .find(|c| c.component_type.is_todo() && c.uid() == Some(&new.uid))
+        .ok_or_else(|| anyhow!("no VTODO with uid {:?} in the stored item", new.uid))?;
+
+    set_property(
+        comp,
+        ICalendarEntry::new(ICalendarProperty::Dtstamp).with_value(utc_pdt(Utc::now())),
+    );
     if new.text != old.text {
-        changes.push((
-            "SUMMARY",
-            Some(format!("SUMMARY:{}", escape_text(&new.text))),
-        ));
+        set_property(
+            comp,
+            ICalendarEntry::new(ICalendarProperty::Summary).with_value(new.text.as_str()),
+        );
     }
     if new.due != old.due {
-        changes.push(("DUE", Some(when_line("DUE", &When::At(new.due)))));
+        set_property(comp, when_entry(ICalendarProperty::Due, &When::At(new.due)));
     }
     if new.done != old.done {
         if new.done {
-            changes.push(("STATUS", Some("STATUS:COMPLETED".into())));
-            changes.push(("COMPLETED", stamp_line("COMPLETED")));
+            set_property(
+                comp,
+                ICalendarEntry::new(ICalendarProperty::Status)
+                    .with_value(ICalendarStatus::Completed),
+            );
+            set_property(
+                comp,
+                ICalendarEntry::new(ICalendarProperty::Completed).with_value(utc_pdt(Utc::now())),
+            );
         } else {
-            changes.push(("STATUS", Some("STATUS:NEEDS-ACTION".into())));
-            changes.push(("COMPLETED", None));
+            set_property(
+                comp,
+                ICalendarEntry::new(ICalendarProperty::Status)
+                    .with_value(ICalendarStatus::NeedsAction),
+            );
+            remove_property(comp, &ICalendarProperty::Completed);
         }
     }
-    patch(original, "VTODO", &new.uid, &changes)
+    Ok(cal.to_string())
 }
 
 /// Parse a date or time given by an agent: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM" (local) or RFC 3339.
@@ -376,6 +382,7 @@ pub fn format_local(w: &When, tz: Tz) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use chrono_tz::America::New_York;
     use chrono_tz::Europe::Paris;
 
     fn fixture(name: &str) -> String {
@@ -406,8 +413,37 @@ mod tests {
 
         let es = parse_events(&fixture("floating.ics"), Paris).unwrap();
         assert_eq!(es[0].start, utc(2026, 11, 20, 9, 0));
-        // Unknown TZID (Outlook names) falls back to the user's zone.
         assert_eq!(es[1].start, utc(2026, 11, 20, 9, 0));
+    }
+
+    #[test]
+    fn resolves_windows_tzid_independently_of_user_zone() {
+        // floating.ics has a floating event and a Romance Standard Time event at 10:00.
+        // Parsed in America/New_York (EST = UTC-5 in November):
+        // - floating falls back to New_York -> 15:00Z
+        // - Romance Standard Time maps to Europe/Paris (CET = UTC+1) -> 09:00Z
+        let es = parse_events(&fixture("floating.ics"), New_York).unwrap();
+        assert_eq!(es[0].start, utc(2026, 11, 20, 15, 0));
+        assert_eq!(es[1].start, utc(2026, 11, 20, 9, 0));
+
+        // rich.ics also uses Romance Standard Time (with a VTIMEZONE) -> 09:00Z in New_York.
+        let rich = &parse_events(&fixture("rich.ics"), New_York).unwrap()[0];
+        assert_eq!(rich.start, utc(2026, 11, 20, 9, 0));
+
+        // An unknown TZID falls back to the user's zone.
+        let unknown = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:u-1\r\n\
+SUMMARY:Unknown zone\r\n\
+DTSTART;TZID=Mars/Olympus:20261120T100000\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        assert_eq!(
+            parse_events(unknown, New_York).unwrap()[0].start,
+            utc(2026, 11, 20, 15, 0)
+        );
     }
 
     #[test]
@@ -469,6 +505,32 @@ mod tests {
     }
 
     #[test]
+    fn creates_and_reads_back_items() {
+        let ev = Event {
+            uid: "ev-create-1".into(),
+            title: "Déjeuner; équipe".into(),
+            start: utc(2026, 11, 22, 11, 30),
+            end: Some(utc(2026, 11, 22, 13, 0)),
+            location: Some("Bistrot, Lyon".into()),
+            description: Some("Ligne A\nLigne B".into()),
+        };
+        let ev_ics = event_to_ics(&ev);
+        assert!(has_uid(&ev_ics, "ev-create-1"));
+        assert!(!has_uid(&ev_ics, "ev-create"));
+        assert_eq!(parse_events(&ev_ics, New_York).unwrap(), vec![ev]);
+
+        let rem = Reminder {
+            uid: "rem-create-1".into(),
+            text: "Acheter du pain".into(),
+            due: Utc.with_ymd_and_hms(2026, 11, 23, 8, 0, 0).unwrap(),
+            done: false,
+        };
+        let rem_ics = reminder_to_ics(&rem);
+        assert!(has_uid(&rem_ics, "rem-create-1"));
+        assert_eq!(parse_reminders(&rem_ics, New_York).unwrap(), vec![rem]);
+    }
+
+    #[test]
     fn parse_local_forms() {
         assert_eq!(
             parse_local("2026-11-16", Paris).unwrap(),
@@ -515,10 +577,6 @@ mod tests {
         );
     }
 
-    fn kept_lines(ics: &str) -> Vec<String> {
-        unfold(ics)
-    }
-
     #[test]
     fn update_event_keeps_unmodeled_properties() {
         let original = fixture("rich.ics");
@@ -528,28 +586,181 @@ mod tests {
             ..old.clone()
         };
         let out = update_event_ics(&original, &old, &new).unwrap();
-        let lines = kept_lines(&out);
-        for kept in [
-            "DTSTART;TZID=Romance Standard Time:20261120T100000",
-            "DURATION:PT1H",
-            "ORGANIZER;CN=Alix:mailto:alix@example.org",
-            "ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.org",
-            "ATTENDEE;CN=Eve:mailto:eve@example.org",
-            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
-            "DESCRIPTION:Rappel",
-            "TZID:Romance Standard Time",
-        ] {
-            assert!(lines.iter().any(|l| l == kept), "lost {kept:?} in\n{out}");
-        }
-        assert!(!lines.iter().any(|l| l == "SUMMARY:Point projet"));
+        let orig_cal = ICalendar::parse(&original).unwrap();
+        let out_cal = ICalendar::parse(&out).unwrap();
+
+        // VTIMEZONE survives with its TZID and STANDARD subcomponent.
+        let tz = out_cal
+            .timezones()
+            .next()
+            .expect("VTIMEZONE should survive");
         assert_eq!(
-            parse_events(&out, Paris).unwrap()[0].title,
-            "Point projet (déplacé, salle 2)"
+            prop_text(tz, &ICalendarProperty::Tzid),
+            Some("Romance Standard Time")
+        );
+        assert!(
+            out_cal
+                .components
+                .iter()
+                .any(|c| c.component_type == ICalendarComponentType::Standard)
+        );
+
+        let orig_ev = orig_cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_event())
+            .unwrap();
+        let out_ev = out_cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_event())
+            .unwrap();
+
+        assert_eq!(
+            prop_text(out_ev, &ICalendarProperty::Summary),
+            Some("Point projet (déplacé, salle 2)")
+        );
+        // Every other VEVENT property (DTSTART with TZID, DURATION, ORGANIZER, ATTENDEEs, X-*) survives unchanged.
+        for prop in [
+            ICalendarProperty::Uid,
+            ICalendarProperty::Dtstart,
+            ICalendarProperty::Duration,
+            ICalendarProperty::Organizer,
+            ICalendarProperty::Attendee,
+            ICalendarProperty::Other("X-APPLE-TRAVEL-ADVISORY-BEHAVIOR".into()),
+        ] {
+            let orig_vals: Vec<_> = orig_ev.properties(&prop).collect();
+            let out_vals: Vec<_> = out_ev.properties(&prop).collect();
+            assert_eq!(out_vals, orig_vals, "property {prop:?} changed in\n{out}");
+        }
+
+        // VALARM survives with all its entries.
+        let orig_alarms: Vec<_> = orig_cal
+            .components
+            .iter()
+            .filter(|c| c.component_type.is_alarm())
+            .collect();
+        let out_alarms: Vec<_> = out_cal
+            .components
+            .iter()
+            .filter(|c| c.component_type.is_alarm())
+            .collect();
+        assert_eq!(out_alarms.len(), 1);
+        assert_eq!(out_alarms[0].entries, orig_alarms[0].entries);
+
+        let parsed = parse_events(&out, Paris).unwrap();
+        assert_eq!(parsed[0].title, "Point projet (déplacé, salle 2)");
+        assert_eq!(parsed[0].start, old.start, "start untouched");
+    }
+
+    #[test]
+    fn update_summary_on_rich_item_keeps_x_properties_and_parameters() {
+        let original = fixture("rich.ics")
+            .replace(
+                "ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.org",
+                "ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED;X-ROLE=chair:mailto:bob@example.org\r\nX-CUSTOM-PROP;X-PARAM=yes:keep-value",
+            )
+            .replace(
+                "TRIGGER:-PT15M",
+                "TRIGGER:-PT15M\r\nX-ALARM-EXTRA:ring",
+            );
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Point projet mis à jour".into(),
+            ..old.clone()
+        };
+        let out = update_event_ics(&original, &old, &new).unwrap();
+
+        let orig_cal = ICalendar::parse(&original).unwrap();
+        let out_cal = ICalendar::parse(&out).unwrap();
+
+        let orig_ev = orig_cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_event())
+            .unwrap();
+        let out_ev = out_cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_event())
+            .unwrap();
+
+        // Only SUMMARY and DTSTAMP changed on VEVENT.
+        let non_edited = |e: &&ICalendarEntry| {
+            !matches!(
+                e.name,
+                ICalendarProperty::Summary | ICalendarProperty::Dtstamp
+            )
+        };
+        let orig_kept: Vec<_> = orig_ev.entries.iter().filter(non_edited).collect();
+        let out_kept: Vec<_> = out_ev.entries.iter().filter(non_edited).collect();
+        assert_eq!(out_kept, orig_kept);
+        assert_eq!(
+            prop_text(out_ev, &ICalendarProperty::Summary),
+            Some("Point projet mis à jour")
+        );
+
+        // Explicitly verify X- parameter on ATTENDEE, X- properties, VALARM, and VTIMEZONE.
+        let bob = out_ev
+            .properties(&ICalendarProperty::Attendee)
+            .find(|e| {
+                e.parameters(&ICalendarParameterName::Cn)
+                    .any(|v| v.as_text() == Some("Bob"))
+            })
+            .expect("Bob attendee kept");
+        assert!(
+            bob.parameters(&ICalendarParameterName::Other("X-ROLE".into()))
+                .any(|v| v.as_text() == Some("chair"))
+        );
+        let custom = out_ev
+            .property(&ICalendarProperty::Other("X-CUSTOM-PROP".into()))
+            .expect("X-CUSTOM-PROP kept");
+        assert!(
+            custom
+                .parameters(&ICalendarParameterName::Other("X-PARAM".into()))
+                .any(|v| v.as_text() == Some("yes"))
         );
         assert_eq!(
-            parse_events(&out, Paris).unwrap()[0].start,
-            old.start,
-            "start untouched"
+            custom.values.first().and_then(|v| v.as_text()),
+            Some("keep-value")
+        );
+
+        let orig_tz: Vec<_> = orig_cal
+            .components
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.component_type,
+                    ICalendarComponentType::VTimezone
+                        | ICalendarComponentType::Standard
+                        | ICalendarComponentType::Daylight
+                        | ICalendarComponentType::VAlarm
+                )
+            })
+            .map(|c| (&c.component_type, &c.entries))
+            .collect();
+        let out_tz: Vec<_> = out_cal
+            .components
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.component_type,
+                    ICalendarComponentType::VTimezone
+                        | ICalendarComponentType::Standard
+                        | ICalendarComponentType::Daylight
+                        | ICalendarComponentType::VAlarm
+                )
+            })
+            .map(|c| (&c.component_type, &c.entries))
+            .collect();
+        assert_eq!(out_tz, orig_tz);
+        assert!(
+            out_cal
+                .components
+                .iter()
+                .find(|c| c.component_type.is_alarm())
+                .unwrap()
+                .has_property(&ICalendarProperty::Other("X-ALARM-EXTRA".into()))
         );
     }
 
@@ -562,10 +773,25 @@ mod tests {
             ..old.clone()
         };
         let out = update_event_ics(&original, &old, &new).unwrap();
-        let lines = kept_lines(&out);
-        assert!(!lines.iter().any(|l| prop_name(l) == "DURATION"));
-        assert!(lines.iter().any(|l| l == "DTEND:20261120T110000Z"));
-        assert!(lines.iter().any(|l| l == "TRIGGER:-PT15M"), "alarm kept");
+        let out_cal = ICalendar::parse(&out).unwrap();
+        let ev = out_cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_event())
+            .unwrap();
+
+        assert!(!ev.has_property(&ICalendarProperty::Duration));
+        assert!(ev.has_property(&ICalendarProperty::Dtend));
+        assert_eq!(
+            parse_events(&out, Paris).unwrap()[0].end,
+            Some(utc(2026, 11, 20, 11, 0))
+        );
+        let alarm = out_cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_alarm())
+            .expect("alarm kept");
+        assert!(alarm.has_property(&ICalendarProperty::Trigger));
     }
 
     #[test]
@@ -577,20 +803,39 @@ mod tests {
             ..old.clone()
         };
         let out = update_reminder_ics(&original, &old, &new).unwrap();
-        let lines = kept_lines(&out);
-        for kept in [
-            "DUE;VALUE=DATE:20261118",
-            "PRIORITY:1",
-            "DESCRIPTION:Notes de la tache",
-            "STATUS:COMPLETED",
-        ] {
-            assert!(
-                lines.iter().any(|l| l == kept),
-                "missing {kept:?} in\n{out}"
-            );
-        }
-        assert!(lines.iter().any(|l| prop_name(l) == "COMPLETED"));
-        assert!(parse_reminders(&out, Paris).unwrap()[0].done);
+        let out_cal = ICalendar::parse(&out).unwrap();
+        let todo = out_cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_todo())
+            .unwrap();
+
+        let due = todo.property(&ICalendarProperty::Due).unwrap();
+        assert!(due.is_type(&ICalendarValueType::Date));
+        assert_eq!(
+            due.values
+                .first()
+                .and_then(|v| v.as_partial_date_time())
+                .and_then(|dt| dt.to_date_time())
+                .map(|d| d.date_time.date()),
+            NaiveDate::from_ymd_opt(2026, 11, 18)
+        );
+        assert_eq!(
+            todo.property(&ICalendarProperty::Priority)
+                .and_then(|e| e.values.first())
+                .and_then(|v| v.as_integer()),
+            Some(1)
+        );
+        assert_eq!(
+            prop_text(todo, &ICalendarProperty::Description),
+            Some("Notes de la tache")
+        );
+        assert_eq!(todo.status(), Some(&ICalendarStatus::Completed));
+        assert!(todo.has_property(&ICalendarProperty::Completed));
+
+        let parsed = parse_reminders(&out, Paris).unwrap();
+        assert!(parsed[0].done);
+        assert_eq!(parsed[0].due, old.due);
     }
 
     #[test]

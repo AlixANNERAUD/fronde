@@ -253,18 +253,28 @@ END:VCALENDAR
         };
         assert_eq!(Url::parse(&put.url).unwrap().path(), "/c/x.ics");
         assert_eq!(put.header("if-match"), Some("\"e\""));
-        for kept in [
-            "BEGIN:VALARM",
-            "ATTENDEE;CN=Bob",
-            "DTSTART;TZID=Romance Standard Time:20261120T100000",
-            "SUMMARY:Nouveau titre",
-        ] {
-            assert!(
-                put.text().contains(kept),
-                "lost {kept:?} in\n{}",
-                put.text()
-            );
-        }
+        let body = put.text();
+        let cal = calcard::icalendar::ICalendar::parse(&body).unwrap();
+        assert!(cal.components.iter().any(|c| c.component_type.is_alarm()));
+        let ev = cal
+            .components
+            .iter()
+            .find(|c| c.component_type.is_event())
+            .unwrap();
+        assert!(
+            ev.properties(&calcard::icalendar::ICalendarProperty::Attendee)
+                .any(|a| {
+                    a.parameters(&calcard::icalendar::ICalendarParameterName::Cn)
+                        .any(|v| v.as_text() == Some("Bob"))
+                })
+        );
+        let dtstart = ev
+            .property(&calcard::icalendar::ICalendarProperty::Dtstart)
+            .unwrap();
+        assert_eq!(dtstart.tz_id(), Some("Romance Standard Time"));
+        let parsed = ics::parse_events(&body, chrono_tz::Europe::Paris).unwrap();
+        assert_eq!(parsed[0].title, "Nouveau titre");
+        assert_eq!(parsed[0].start, e.start);
     }
 
     #[test]
