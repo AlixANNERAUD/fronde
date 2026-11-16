@@ -47,10 +47,14 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
     --mount=type=cache,target=/opt/dx,id=fronde-dx-${TARGETARCH} \
     --mount=type=cache,target=/src/target,id=fronde-target-${TARGETARCH} \
+    --mount=type=cache,target=/src/components/echo/target,id=fronde-echo-${TARGETARCH} \
+    --mount=type=cache,target=/src/components/calendar/target,id=fronde-calendar-${TARGETARCH} \
     mise run build \
-    && mkdir -p /out \
+    && mise run components \
+    && mkdir -p /out/components \
     && cp target/release/fronde /out/fronde \
-    && cp -r target/dx/fronde-web/release/web/public /out/site
+    && cp -r target/dx/fronde-web/release/web/public /out/site \
+    && cp components/dist/calendar.wasm components/dist/calendar.toml /out/components/
 
 # The Claude ACP adapter needs Node.js 22 or later, newer than Debian's. It brings its own Claude
 # Code.
@@ -78,6 +82,8 @@ COPY --from=agent /usr/local/bin/node /usr/local/bin/node
 COPY --from=agent /opt/agent /opt/agent
 COPY --from=builder /out/fronde /app/fronde
 COPY --from=builder /out/site /app/site
+# Tool components, each with its manifest beside it; a [[sources]] entry enables one.
+COPY --from=builder /out/components /app/components
 
 # HOME is on the volume so the agent's Claude sign-in and settings (~/.claude) survive restarts.
 ENV PATH=/opt/agent/node_modules/.bin:$PATH \

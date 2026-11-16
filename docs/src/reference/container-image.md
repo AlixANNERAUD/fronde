@@ -9,6 +9,7 @@ The `Dockerfile` at the root of the repository builds the image. See
 | --- | --- |
 | `/app/fronde` | The server. |
 | `/app/site` | The built web interface (`FRONDE_SITE_ROOT`). |
+| `/app/components` | Tool components with their manifests: `calendar.wasm` and `calendar.toml`. A `[[sources]]` entry enables one. |
 | `/opt/agent` | The Claude ACP adapter, installed from `agent/package-lock.json`. It brings its own Claude Code. |
 | `/usr/local/bin/node` | Node.js 22, for the adapter. |
 
@@ -40,6 +41,7 @@ and `tini`.
 ## Build
 
 The builder stage installs mise at a pinned version, checked against its release checksums, then
-the toolchain pinned in `mise.toml`, and runs `mise run build`. Cargo's registry, the Dioxus CLI's
-downloads and the target directory are cache mounts, per architecture. The image builds for
+the toolchain pinned in `mise.toml`, and runs `mise run build` and `mise run components`. Cargo's registry, the Dioxus CLI's
+downloads and the target directories, the components' included, are cache mounts, per
+architecture. The image builds for
 `amd64` and `arm64`.
