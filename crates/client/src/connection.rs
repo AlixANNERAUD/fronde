@@ -53,11 +53,16 @@ impl Connection {
     /// The socket opened: the hello to send, naming what the chat already has.
     pub fn on_open(&mut self, chat: &Chat) -> ClientMsg {
         self.state = State::Open;
-        self.failures = 0;
         ClientMsg::Hello {
             last_seq: chat.last_seq(),
             log_id: chat.log_id().map(str::to_owned),
         }
+    }
+
+    /// The server's hello arrived: only now is the connection healthy, so the backoff starts
+    /// over. Opening alone proves nothing behind a proxy or a backend that closes at once.
+    pub fn on_hello(&mut self) {
+        self.failures = 0;
     }
 
     /// The socket closed, or never opened, with this close code.
@@ -153,8 +158,9 @@ mod tests {
             delays,
             [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
         );
-        // A successful open starts the backoff over.
+        // A server that said hello starts the backoff over.
         connection.on_open(&Chat::default());
+        connection.on_hello();
         assert_eq!(connection.on_close(1006), Action::Retry(1_000));
         assert_eq!(connection.state(), State::Retrying { attempt: 1 });
     }
@@ -171,6 +177,20 @@ mod tests {
         // The pending timer finding the connection already retried does nothing.
         assert!(!connection.on_retry());
         assert_eq!(connection.state(), State::Connecting);
+    }
+
+    #[test]
+    fn opening_without_a_hello_keeps_the_backoff() {
+        let mut connection = Connection::default();
+        // A backend that accepts the socket then closes it, or a proxy with the backend down.
+        for expected in [1_000, 2_000, 4_000] {
+            connection.on_open(&Chat::default());
+            assert_eq!(connection.on_close(1006), Action::Retry(expected));
+            assert!(connection.on_retry());
+        }
+        connection.on_open(&Chat::default());
+        connection.on_hello();
+        assert_eq!(connection.on_close(1006), Action::Retry(1_000));
     }
 
     #[test]

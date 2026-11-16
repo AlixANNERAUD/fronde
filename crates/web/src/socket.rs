@@ -121,6 +121,9 @@ mod imp {
                 incoming = socket.next().fuse() => match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(message) = serde_json::from_str::<ServerMsg>(&text) {
+                            if matches!(message, ServerMsg::Hello { .. }) {
+                                connection.on_hello();
+                            }
                             chat.write().apply(&message);
                         }
                     }
