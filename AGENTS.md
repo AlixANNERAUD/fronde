@@ -64,8 +64,8 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
   native stub for tests.
 - Vendored rust-ui components keep upstream classes; changes carry a `// jarvis:` marker.
 - Tailwind is built by `mise run web-css`, not by `dx`; `dx` only bundles the wasm.
-- Dev: `mise run web-dev` for the UI (proxies `/ws` and `/auth` to the backend), plus the backend
-  running alongside. Release: `mise run web-build`.
+- Dev: `mise run web-dev` for the UI (proxies `/ws` and `/auth` to the backend), plus `mise run dev` for the backend
+  in another terminal. Release: `mise run web-build`.
 
 ## Rules
 
