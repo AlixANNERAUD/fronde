@@ -1,6 +1,7 @@
 //! Events and reminders <-> iCalendar. Times are stored in UTC; input and output use the user's zone.
 
-use anyhow::anyhow;
+use crate::raw;
+use anyhow::{anyhow, bail};
 use calcard::common::PartialDateTime;
 use calcard::icalendar::timezone::TzResolver;
 use calcard::icalendar::{
@@ -121,7 +122,40 @@ fn prop_text<'a>(comp: &'a ICalendarComponent, prop: &ICalendarProperty) -> Opti
 }
 
 fn parse(ics: &str) -> anyhow::Result<ICalendar> {
-    ICalendar::parse(ics).map_err(|e| anyhow!("invalid iCalendar data: {e:?}"))
+    ICalendar::parse(ics)
+        .map_err(|e| anyhow!("invalid iCalendar data: {}", excerpt(&format!("{e:?}"))))
+}
+
+/// The start of `s`: a parse error can carry the whole input (a vCard, say), which has no place
+/// in a tool error.
+fn excerpt(s: &str) -> String {
+    const MAX: usize = 120;
+    match s.char_indices().nth(MAX) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_string(),
+    }
+}
+
+/// The components directly under VCALENDAR, with their index: events, tasks and time zones, not
+/// their alarms or time-zone rules.
+fn top_level(cal: &ICalendar) -> impl Iterator<Item = (usize, &ICalendarComponent)> {
+    cal.components
+        .first()
+        .into_iter()
+        .flat_map(|root| root.component_ids.iter())
+        .filter_map(|id| {
+            let id = *id as usize;
+            cal.components.get(id).map(|c| (id, c))
+        })
+}
+
+fn is_item(c: &ICalendarComponent) -> bool {
+    c.component_type.is_event() || c.component_type.is_todo()
+}
+
+/// Text from an agent with every line break as `\n`, the only one iCalendar text keeps.
+fn text(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn calendar_with(component: ICalendarComponent) -> ICalendar {
@@ -134,9 +168,101 @@ fn calendar_with(component: ICalendarComponent) -> ICalendar {
     }
 }
 
-/// True when the document has a component whose UID is exactly `uid`.
+/// `uid` as it appears in iCalendar text.
+fn escape_text(uid: &str) -> String {
+    let mut out = String::with_capacity(uid.len());
+    for ch in uid.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            ';' => out.push_str("\\;"),
+            ',' => out.push_str("\\,"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// True when a top-level VEVENT or VTODO has exactly this UID (an alarm's UID does not count).
+/// Text the parser rejects is scanned line by line instead, so that a stored item it cannot read
+/// is not taken for absent and written over by a new one.
 pub fn has_uid(ics: &str, uid: &str) -> bool {
-    !uid.is_empty() && ICalendar::parse(ics).is_ok_and(|cal| cal.uids().any(|u| u == uid))
+    if uid.is_empty() {
+        return false;
+    }
+    let unfolded = raw::unfold(ics);
+    let escaped = escape_text(uid);
+    if !unfolded.contains(uid) && !unfolded.contains(&escaped) {
+        return false;
+    }
+    match ICalendar::parse(ics) {
+        Ok(cal) => top_level(&cal).any(|(_, c)| is_item(c) && c.uid() == Some(uid)),
+        Err(_) => scan_uid(&unfolded, uid, &escaped),
+    }
+}
+
+/// Whether a UID line outside an alarm has this value, without parsing the rest.
+fn scan_uid(unfolded: &str, uid: &str, escaped: &str) -> bool {
+    let mut in_alarm = false;
+    for line in unfolded.lines().map(|l| l.trim_end_matches('\r')) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.split(';').next().unwrap_or_default();
+        if name.eq_ignore_ascii_case("BEGIN") || name.eq_ignore_ascii_case("END") {
+            if value.trim().eq_ignore_ascii_case("VALARM") {
+                in_alarm = name.eq_ignore_ascii_case("BEGIN");
+            }
+        } else if !in_alarm
+            && name.eq_ignore_ascii_case("UID")
+            && (value == uid || value == escaped)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the top-level VEVENT or VTODO with this UID belongs to a series: it repeats (RRULE,
+/// RDATE) or overrides one occurrence (RECURRENCE-ID). Time-zone rules do not count.
+pub fn is_recurring(ics: &str, uid: &str) -> anyhow::Result<bool> {
+    let cal = parse(ics)?;
+    Ok(top_level(&cal).any(|(_, c)| {
+        is_item(c)
+            && c.uid() == Some(uid)
+            && [
+                ICalendarProperty::Rrule,
+                ICalendarProperty::Rdate,
+                ICalendarProperty::RecurrenceId,
+            ]
+            .iter()
+            .any(|p| c.has_property(p))
+    }))
+}
+
+/// The one top-level component of this type and UID that is not an occurrence override.
+fn master<'a>(
+    cal: &'a mut ICalendar,
+    kind: ICalendarComponentType,
+    uid: &str,
+) -> anyhow::Result<&'a mut ICalendarComponent> {
+    let ids: Vec<usize> = top_level(cal)
+        .filter(|(_, c)| {
+            c.component_type == kind
+                && c.uid() == Some(uid)
+                && !c.has_property(&ICalendarProperty::RecurrenceId)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    let name = kind.as_str().to_string();
+    match ids[..] {
+        [id] => Ok(&mut cal.components[id]),
+        [] => bail!("no {name} with uid {uid:?} outside an occurrence override in the stored item"),
+        _ => bail!(
+            "{} {name} components share the uid {uid:?} in the stored item; fix them in your calendar app",
+            ids.len()
+        ),
+    }
 }
 
 pub fn parse_events(ics: &str, tz: Tz) -> anyhow::Result<Vec<Event>> {
@@ -196,17 +322,17 @@ pub fn event_to_ics(e: &Event) -> String {
     let mut ev = ICalendarComponent::new(ICalendarComponentType::VEvent);
     ev.add_uid(&e.uid);
     ev.add_dtstamp(utc_pdt(Utc::now()));
-    ev.add_property(ICalendarProperty::Summary, e.title.as_str());
+    ev.add_property(ICalendarProperty::Summary, text(&e.title));
     ev.entries
         .push(when_entry(ICalendarProperty::Dtstart, &e.start));
     if let Some(end) = &e.end {
         ev.entries.push(when_entry(ICalendarProperty::Dtend, end));
     }
     if let Some(l) = &e.location {
-        ev.add_property(ICalendarProperty::Location, l.as_str());
+        ev.add_property(ICalendarProperty::Location, text(l));
     }
     if let Some(d) = &e.description {
-        ev.add_property(ICalendarProperty::Description, d.as_str());
+        ev.add_property(ICalendarProperty::Description, text(d));
     }
     calendar_with(ev).to_string()
 }
@@ -215,7 +341,7 @@ pub fn reminder_to_ics(r: &Reminder) -> String {
     let mut todo = ICalendarComponent::new(ICalendarComponentType::VTodo);
     todo.add_uid(&r.uid);
     todo.add_dtstamp(utc_pdt(Utc::now()));
-    todo.add_property(ICalendarProperty::Summary, r.text.as_str());
+    todo.add_property(ICalendarProperty::Summary, text(&r.text));
     todo.entries
         .push(when_entry(ICalendarProperty::Due, &When::At(r.due)));
     if r.done {
@@ -251,11 +377,7 @@ fn remove_property(comp: &mut ICalendarComponent, prop: &ICalendarProperty) {
 /// The stored event text with only the fields that changed between `old` and `new` rewritten.
 pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Result<String> {
     let mut cal = parse(original)?;
-    let comp = cal
-        .components
-        .iter_mut()
-        .find(|c| c.component_type.is_event() && c.uid() == Some(&new.uid))
-        .ok_or_else(|| anyhow!("no VEVENT with uid {:?} in the stored item", new.uid))?;
+    let comp = master(&mut cal, ICalendarComponentType::VEvent, &new.uid)?;
 
     set_property(
         comp,
@@ -264,7 +386,7 @@ pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Res
     if new.title != old.title {
         set_property(
             comp,
-            ICalendarEntry::new(ICalendarProperty::Summary).with_value(new.title.as_str()),
+            ICalendarEntry::new(ICalendarProperty::Summary).with_value(text(&new.title)),
         );
     }
     if new.start != old.start {
@@ -281,7 +403,7 @@ pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Res
         match &new.location {
             Some(l) => set_property(
                 comp,
-                ICalendarEntry::new(ICalendarProperty::Location).with_value(l.as_str()),
+                ICalendarEntry::new(ICalendarProperty::Location).with_value(text(l)),
             ),
             None => remove_property(comp, &ICalendarProperty::Location),
         }
@@ -290,12 +412,12 @@ pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Res
         match &new.description {
             Some(d) => set_property(
                 comp,
-                ICalendarEntry::new(ICalendarProperty::Description).with_value(d.as_str()),
+                ICalendarEntry::new(ICalendarProperty::Description).with_value(text(d)),
             ),
             None => remove_property(comp, &ICalendarProperty::Description),
         }
     }
-    Ok(cal.to_string())
+    raw::write(cal, original)
 }
 
 /// The stored task text with only the fields that changed rewritten.
@@ -305,11 +427,7 @@ pub fn update_reminder_ics(
     new: &Reminder,
 ) -> anyhow::Result<String> {
     let mut cal = parse(original)?;
-    let comp = cal
-        .components
-        .iter_mut()
-        .find(|c| c.component_type.is_todo() && c.uid() == Some(&new.uid))
-        .ok_or_else(|| anyhow!("no VTODO with uid {:?} in the stored item", new.uid))?;
+    let comp = master(&mut cal, ICalendarComponentType::VTodo, &new.uid)?;
 
     set_property(
         comp,
@@ -318,7 +436,7 @@ pub fn update_reminder_ics(
     if new.text != old.text {
         set_property(
             comp,
-            ICalendarEntry::new(ICalendarProperty::Summary).with_value(new.text.as_str()),
+            ICalendarEntry::new(ICalendarProperty::Summary).with_value(text(&new.text)),
         );
     }
     if new.due != old.due {
@@ -344,7 +462,7 @@ pub fn update_reminder_ics(
             remove_property(comp, &ICalendarProperty::Completed);
         }
     }
-    Ok(cal.to_string())
+    raw::write(cal, original)
 }
 
 /// Parse a date or time given by an agent: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM" (local) or RFC 3339.
@@ -381,6 +499,7 @@ pub fn format_local(w: &When, tz: Tz) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use calcard::icalendar::ICalendarValue;
     use chrono::TimeZone;
     use chrono_tz::America::New_York;
     use chrono_tz::Europe::Paris;
@@ -620,6 +739,11 @@ END:VCALENDAR\r\n";
             prop_text(out_ev, &ICalendarProperty::Summary),
             Some("Point projet (déplacé, salle 2)")
         );
+        assert_eq!(
+            out_ev.properties(&ICalendarProperty::Summary).count(),
+            1,
+            "the SUMMARY is replaced, not added"
+        );
         // Every other VEVENT property (DTSTART with TZID, DURATION, ORGANIZER, ATTENDEEs, X-*) survives unchanged.
         for prop in [
             ICalendarProperty::Uid,
@@ -699,6 +823,7 @@ END:VCALENDAR\r\n";
             prop_text(out_ev, &ICalendarProperty::Summary),
             Some("Point projet mis à jour")
         );
+        assert_eq!(out_ev.properties(&ICalendarProperty::Summary).count(), 1);
 
         // Explicitly verify X- parameter on ATTENDEE, X- properties, VALARM, and VTIMEZONE.
         let bob = out_ev
@@ -791,7 +916,17 @@ END:VCALENDAR\r\n";
             .iter()
             .find(|c| c.component_type.is_alarm())
             .expect("alarm kept");
-        assert!(alarm.has_property(&ICalendarProperty::Trigger));
+        let trigger = alarm
+            .property(&ICalendarProperty::Trigger)
+            .and_then(|t| t.values.first());
+        assert!(
+            matches!(trigger, Some(ICalendarValue::Duration(d)) if d.to_string() == "-PT15M"),
+            "{trigger:?}"
+        );
+        assert!(
+            raw::unfold(&out).lines().any(|l| l == "TRIGGER:-PT15M"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -839,7 +974,7 @@ END:VCALENDAR\r\n";
     }
 
     #[test]
-    fn patched_long_lines_are_folded() {
+    fn edited_long_lines_are_folded() {
         let original = fixture("rich.ics");
         let old = parse_events(&original, Paris).unwrap().remove(0);
         let long = "é".repeat(100);
@@ -852,6 +987,448 @@ END:VCALENDAR\r\n";
         assert_eq!(
             parse_events(&out, Paris).unwrap()[0].description.as_deref(),
             Some(long.as_str())
+        );
+    }
+
+    /// Content lines as text, with what may change on a write undone: folding, CRLF, parameter
+    /// order and quoting, and the order of RRULE parts (calcard writes them in its own order).
+    fn normalised(ics: &str) -> Vec<String> {
+        raw::unfold(ics)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|line| {
+                let mut in_quote = false;
+                let split = line
+                    .char_indices()
+                    .find(|&(_, ch)| {
+                        if ch == '"' {
+                            in_quote = !in_quote;
+                        }
+                        ch == ':' && !in_quote
+                    })
+                    .map_or(line.len(), |(i, _)| i);
+                let (head, value) = (&line[..split], line.get(split + 1..).unwrap_or_default());
+                let mut parts = vec![String::new()];
+                let mut in_quote = false;
+                for ch in head.chars() {
+                    match ch {
+                        '"' => in_quote = !in_quote,
+                        ';' if !in_quote => parts.push(String::new()),
+                        _ => parts.last_mut().unwrap().push(ch),
+                    }
+                }
+                let name = parts.remove(0);
+                parts.sort();
+                let value = match name.as_str() {
+                    "RRULE" => {
+                        let mut rule: Vec<&str> = value.split(';').collect();
+                        rule.sort();
+                        rule.join(";")
+                    }
+                    "DTSTAMP" => "(now)".to_string(),
+                    _ => value.to_string(),
+                };
+                format!("{name};{}:{value}", parts.join(";"))
+            })
+            .collect()
+    }
+
+    fn edit_apple_summary() -> String {
+        let original = fixture("apple.ics");
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Visite guidée".into(),
+            ..old.clone()
+        };
+        update_event_ics(&original, &old, &new).unwrap()
+    }
+
+    /// The whole edited text against lines written by hand from apple.ics: anything the parser
+    /// dropped, or the writer changed beyond formatting, shows as a difference.
+    #[test]
+    fn edit_matches_an_independent_expectation() {
+        let expected = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Apple Inc.//macOS 15.1//EN",
+            "CALSCALE:GREGORIAN",
+            "BEGIN:VTIMEZONE",
+            "TZID:Europe/Paris",
+            "BEGIN:DAYLIGHT",
+            "TZOFFSETFROM:+0100",
+            "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU",
+            "DTSTART:19810329T020000",
+            "TZNAME:CEST",
+            "TZOFFSETTO:+0200",
+            "END:DAYLIGHT",
+            "BEGIN:STANDARD",
+            "TZOFFSETFROM:+0200",
+            "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+            "DTSTART:19961027T030000",
+            "TZNAME:CET",
+            "TZOFFSETTO:+0100",
+            "END:STANDARD",
+            "END:VTIMEZONE",
+            "BEGIN:VEVENT",
+            "CREATED:20261101T090000Z",
+            "DTEND;TZID=Europe/Paris:20261120T110000",
+            "DTSTAMP:20261101T090000Z",
+            "DTSTART;TZID=Europe/Paris:20261120T100000",
+            "LAST-MODIFIED:20261101T090000Z",
+            r"LOCATION:Tour Eiffel\nChamp de Mars\, 5 Av. Anatole France\, 75007 Paris",
+            "SEQUENCE:0",
+            "SUMMARY:Visite guidée",
+            "TRANSP:OPAQUE",
+            "UID:6B3C1F4E-2D1A-4F7E-9C3B-1A2B3C4D5E6F",
+            "URL;VALUE=URI:https://example.org/search?q=a,b;c=d",
+            "ATTACH;FMTTYPE=text/plain:data:text/plain;base64,SGVsbG8sIHdvcmxkIQ==",
+            "ATTACH;ENCODING=BASE64;VALUE=BINARY;FMTTYPE=text/plain;X-APPLE-FILENAME=note.txt:SGVsbG8=",
+            "X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS=\"Champ de Mars, 5 Av. Anatole France, 75007 Paris\";X-APPLE-RADIUS=141.2;X-TITLE=Tour Eiffel:geo:48.858370,2.294481",
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            "DESCRIPTION:Rappel",
+            "TRIGGER:-PT15M",
+            "UID:3F1E2D4C-ALARM",
+            "X-WR-ALARMUID:3F1E2D4C-ALARM",
+            "END:VALARM",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]
+        .join("\r\n");
+        let out = edit_apple_summary();
+        assert_eq!(normalised(&out), normalised(&expected), "{out}");
+    }
+
+    /// The line of `out` with this name whose parameters include all of `params`, unfolded.
+    fn raw_line(out: &str, name: &str, params: &[&str]) -> Vec<String> {
+        raw::unfold(out)
+            .lines()
+            .filter(|l| {
+                l.split([':', ';']).next() == Some(name)
+                    && params
+                        .iter()
+                        .all(|p| l.split(':').next().unwrap().contains(p))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn edit_writes_uri_values_unescaped() {
+        let out = edit_apple_summary();
+        assert!(!out.contains("\\,2.294481"), "{out}");
+        assert!(out.split("\r\n").all(|l| l.len() <= 75), "folded:\n{out}");
+        let [geo] = &raw_line(&out, "X-APPLE-STRUCTURED-LOCATION", &[])[..] else {
+            panic!("one structured location in\n{out}")
+        };
+        assert!(geo.ends_with(":geo:48.858370,2.294481"), "{geo}");
+        assert_eq!(
+            raw_line(&out, "URL", &[]),
+            ["URL;VALUE=URI:https://example.org/search?q=a,b;c=d"]
+        );
+        assert_eq!(
+            raw_line(&out, "ATTACH", &["FMTTYPE=text/plain"])
+                .iter()
+                .filter(|l| l.contains("data:"))
+                .collect::<Vec<_>>(),
+            ["ATTACH;FMTTYPE=text/plain:data:text/plain;base64,SGVsbG8sIHdvcmxkIQ=="]
+        );
+        // A plain geo: URL too, and ORGANIZER, a CAL-ADDRESS, keeps its form.
+        let original = fixture("rich.ics").replace(
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            "URL:geo:48.85,2.35\r\nX-LINKS;VALUE=URI:https://a.test/x,y;https://b.test/z\r\n\
+             X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+        );
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Autre".into(),
+            ..old.clone()
+        };
+        let out = update_event_ics(&original, &old, &new).unwrap();
+        assert_eq!(raw_line(&out, "URL", &[]), ["URL:geo:48.85,2.35"]);
+        // Several URIs in one X- property keep the separator the parser split them at.
+        assert_eq!(
+            raw_line(&out, "X-LINKS", &[]),
+            ["X-LINKS;VALUE=URI:https://a.test/x,y;https://b.test/z"]
+        );
+        assert_eq!(
+            raw_line(&out, "ORGANIZER", &[]),
+            ["ORGANIZER;CN=Alix:mailto:alix@example.org"]
+        );
+    }
+
+    #[test]
+    fn edit_keeps_inline_binary_attachment_encoded() {
+        let out = edit_apple_summary();
+        let [line] = &raw_line(&out, "ATTACH", &["VALUE=BINARY"])[..] else {
+            panic!("one binary attachment in\n{out}")
+        };
+        assert!(line.contains(";ENCODING=BASE64"), "{line}");
+        assert!(line.contains(";X-APPLE-FILENAME=note.txt"), "{line}");
+        assert!(line.ends_with(":SGVsbG8="), "{line}");
+        assert!(!out.contains(":Hello"), "{out}");
+
+        // Bytes that are not UTF-8 stay binary as well.
+        let original = fixture("rich.ics").replace(
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            "ATTACH;FMTTYPE=image/png;ENCODING=BASE64;VALUE=BINARY:iVBORw0KGgo=\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+        );
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Autre".into(),
+            ..old.clone()
+        };
+        let out = update_event_ics(&original, &old, &new).unwrap();
+        let [line] = &raw_line(&out, "ATTACH", &["VALUE=BINARY"])[..] else {
+            panic!("one binary attachment in\n{out}")
+        };
+        assert!(
+            line.contains(";ENCODING=BASE64") && line.ends_with(":iVBORw0KGgo="),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn edit_refuses_attachments_it_cannot_keep_exactly() {
+        for attach in [
+            // calcard keeps neither the charset nor the percent-encoded form.
+            "ATTACH:data:text/plain;charset=utf-8;base64,SGVsbG8=",
+            "ATTACH:data:text/plain,Hello%2C%20world",
+            // Not base64: the parser keeps the payload as text.
+            "ATTACH;ENCODING=BASE64;VALUE=BINARY:not*base64",
+        ] {
+            let original = fixture("rich.ics").replace(
+                "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+                &format!("{attach}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
+            );
+            let old = parse_events(&original, Paris).unwrap().remove(0);
+            let new = Event {
+                title: "Autre".into(),
+                ..old.clone()
+            };
+            let e = update_event_ics(&original, &old, &new)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("calendar app"), "{attach}: {e}");
+        }
+    }
+
+    #[test]
+    fn recurring_looks_only_at_the_item() {
+        // Apple's Europe/Paris VTIMEZONE has RRULEs in DAYLIGHT and STANDARD.
+        let apple = fixture("apple.ics");
+        let uid = "6B3C1F4E-2D1A-4F7E-9C3B-1A2B3C4D5E6F";
+        assert!(!is_recurring(&apple, uid).unwrap());
+
+        let item = |kind: &str, line: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:{kind}\r\nUID:s-1\r\n\
+                 DTSTART:20261120T090000Z\r\n{line}\r\nEND:{kind}\r\nEND:VCALENDAR\r\n"
+            )
+        };
+        for (kind, line) in [
+            ("VEVENT", "RRULE:FREQ=WEEKLY"),
+            ("VEVENT", "RDATE:20261127T090000Z,20261204T090000Z"),
+            ("VEVENT", "RECURRENCE-ID:20261127T090000Z"),
+            ("VEVENT", "rrule:FREQ=DAILY"),
+            ("VTODO", "RRULE:FREQ=MONTHLY"),
+        ] {
+            let ics = item(kind, line);
+            assert!(is_recurring(&ics, "s-1").unwrap(), "{line}");
+            assert!(!is_recurring(&ics, "other").unwrap(), "{line}");
+        }
+        assert!(!is_recurring(&item("VEVENT", "SUMMARY:Once"), "s-1").unwrap());
+        assert!(is_recurring("not iCalendar", "s-1").is_err());
+    }
+
+    fn with_override(ics: &str, kind: &str) -> String {
+        // The override comes first, as some servers store it.
+        let override_item = format!(
+            "BEGIN:{kind}\r\nUID:dup\r\nRECURRENCE-ID:20261127T090000Z\r\nSUMMARY:Exception\r\n\
+             DTSTART:20261127T100000Z\r\nDUE:20261127T100000Z\r\nEND:{kind}\r\n"
+        );
+        ics.replacen(
+            &format!("BEGIN:{kind}\r\n"),
+            &format!("{override_item}BEGIN:{kind}\r\n"),
+            1,
+        )
+    }
+
+    #[test]
+    fn edit_picks_the_item_without_recurrence_id() {
+        let master = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:dup\r\n\
+                      SUMMARY:Main\r\nDTSTART:20261120T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let original = with_override(master, "VEVENT");
+        let old = Event {
+            uid: "dup".into(),
+            title: "Main".into(),
+            start: utc(2026, 11, 20, 9, 0),
+            end: None,
+            location: None,
+            description: None,
+        };
+        let new = Event {
+            title: "Main renamed".into(),
+            ..old.clone()
+        };
+        let out = update_event_ics(&original, &old, &new).unwrap();
+        let summaries: Vec<_> = raw::unfold(&out)
+            .lines()
+            .filter(|l| l.starts_with("SUMMARY"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(summaries, ["SUMMARY:Exception", "SUMMARY:Main renamed"]);
+
+        // Only the override: nothing to edit.
+        let only_override = original.replace(
+            "BEGIN:VEVENT\r\nUID:dup\r\nSUMMARY:Main\r\nDTSTART:20261120T090000Z\r\nEND:VEVENT\r\n",
+            "",
+        );
+        assert!(
+            update_event_ics(&only_override, &old, &new)
+                .unwrap_err()
+                .to_string()
+                .contains("no VEVENT")
+        );
+        // Two items claim to be the series.
+        let twice = master.replace(
+            "END:VEVENT\r\n",
+            "END:VEVENT\r\nBEGIN:VEVENT\r\nUID:dup\r\nSUMMARY:Twin\r\nDTSTART:20261121T090000Z\r\nEND:VEVENT\r\n",
+        );
+        assert!(
+            update_event_ics(&twice, &old, &new)
+                .unwrap_err()
+                .to_string()
+                .contains("2 VEVENT components")
+        );
+    }
+
+    #[test]
+    fn reminder_edit_picks_the_item_without_recurrence_id() {
+        let master = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:dup\r\n\
+                      SUMMARY:Main\r\nDUE:20261120T090000Z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let original = with_override(master, "VTODO");
+        let old = Reminder {
+            uid: "dup".into(),
+            text: "Main".into(),
+            due: Utc.with_ymd_and_hms(2026, 11, 20, 9, 0, 0).unwrap(),
+            done: false,
+        };
+        let new = Reminder {
+            done: true,
+            ..old.clone()
+        };
+        let out = update_reminder_ics(&original, &old, &new).unwrap();
+        let cal = ICalendar::parse(&out).unwrap();
+        let todos: Vec<_> = cal
+            .components
+            .iter()
+            .filter(|c| c.component_type.is_todo())
+            .collect();
+        assert_eq!(todos.len(), 2);
+        assert!(todos[0].has_property(&ICalendarProperty::RecurrenceId));
+        assert_eq!(todos[0].status(), None, "the override is untouched");
+        assert_eq!(todos[1].status(), Some(&ICalendarStatus::Completed));
+
+        let twice = master.replace(
+            "END:VTODO\r\n",
+            "END:VTODO\r\nBEGIN:VTODO\r\nUID:dup\r\nSUMMARY:Twin\r\nEND:VTODO\r\n",
+        );
+        assert!(
+            update_reminder_ics(&twice, &old, &new)
+                .unwrap_err()
+                .to_string()
+                .contains("2 VTODO components")
+        );
+    }
+
+    #[test]
+    fn has_uid_checks_items_only() {
+        let apple = fixture("apple.ics");
+        assert!(has_uid(&apple, "6B3C1F4E-2D1A-4F7E-9C3B-1A2B3C4D5E6F"));
+        assert!(
+            !has_uid(&apple, "3F1E2D4C-ALARM"),
+            "an alarm's UID is not the item's"
+        );
+        assert!(!has_uid(&apple, "Europe/Paris"));
+
+        // A long UID, folded as Outlook writes it.
+        let long =
+            "040000008200E00074C5B7101A82E00800000000D0F5C1E0B9A2DA01000000000000000010000000";
+        let folded = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{}\r\n {}\r\nDTSTART:20261120T090000Z\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n",
+            &long[..60],
+            &long[60..]
+        );
+        assert!(has_uid(&folded, long));
+
+        // A UID with characters iCalendar text escapes.
+        let escaped =
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:a\\,b\\;c\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        assert!(has_uid(escaped, "a,b;c"));
+    }
+
+    #[test]
+    fn has_uid_scans_text_it_cannot_parse() {
+        let broken = "UID:lost-1\r\nthis is not iCalendar\r\n";
+        assert!(ICalendar::parse(broken).is_err());
+        assert!(has_uid(broken, "lost-1"));
+        assert!(!has_uid(broken, "lost"));
+        let alarm_only = "not iCalendar\r\nBEGIN:VALARM\r\nUID:lost-2\r\nEND:VALARM\r\n";
+        assert!(ICalendar::parse(alarm_only).is_err());
+        assert!(!has_uid(alarm_only, "lost-2"));
+    }
+
+    #[test]
+    fn parse_error_is_short() {
+        let card = format!(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:{}\r\nEND:VCARD\r\n",
+            "x".repeat(5000)
+        );
+        let e = parse_events(&card, Paris).unwrap_err().to_string();
+        assert!(e.starts_with("invalid iCalendar data: "), "{e}");
+        assert!(e.chars().count() < 200, "{e}");
+    }
+
+    #[test]
+    fn text_line_breaks_become_newlines() {
+        let e = Event {
+            uid: "nl".into(),
+            title: "Un\r\ndeux".into(),
+            start: utc(2026, 11, 20, 9, 0),
+            end: None,
+            location: Some("A\rB".into()),
+            description: Some("x\r\ny\rz\nw".into()),
+        };
+        let ics = event_to_ics(&e);
+        assert!(!ics.contains("\\r"), "{ics}");
+        let back = parse_events(&ics, Paris).unwrap().remove(0);
+        assert_eq!(back.title, "Un\ndeux");
+        assert_eq!(back.location.as_deref(), Some("A\nB"));
+        assert_eq!(back.description.as_deref(), Some("x\ny\nz\nw"));
+
+        let new = Event {
+            title: "Trois\r\nquatre".into(),
+            description: Some("p\rq".into()),
+            ..back.clone()
+        };
+        let out = update_event_ics(&ics, &back, &new).unwrap();
+        assert!(!out.contains("\\r"), "{out}");
+        let edited = parse_events(&out, Paris).unwrap().remove(0);
+        assert_eq!(edited.title, "Trois\nquatre");
+        assert_eq!(edited.description.as_deref(), Some("p\nq"));
+
+        let r = Reminder {
+            uid: "nl-r".into(),
+            text: "a\r\nb".into(),
+            due: Utc.with_ymd_and_hms(2026, 11, 18, 19, 0, 0).unwrap(),
+            done: false,
+        };
+        assert_eq!(
+            parse_reminders(&reminder_to_ics(&r), Paris).unwrap()[0].text,
+            "a\nb"
         );
     }
 }

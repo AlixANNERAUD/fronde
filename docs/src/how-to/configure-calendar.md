@@ -38,10 +38,14 @@ garage demain à 10 h*. The calendar tools appear only when `[calendar]` is set.
 ## What to expect
 
 - Times are read and written in `[data] timezone`.
+- Windows time-zone names, which Outlook and Exchange write (`Romance Standard Time`,
+  `Pacific Standard Time`), are understood as the matching IANA zone.
 - Recurring events and tasks show in lists, but Fronde does not change or delete them: it says to
   do it in your calendar app.
 - Edits keep every property and parameter Fronde does not model (alarms, attendees, time zones,
-  custom fields), though line wrapping or quoting may change.
+  attachments, custom fields), though line wrapping, parameter order or quoting may change. An
+  item with an inline attachment in a form Fronde cannot write back exactly is not edited: it
+  says to do it in your calendar app.
 - Fronde does not notify you of reminders itself: your task app does, from the due time.
 
 ## Planned: CalDAV as a Wasm component

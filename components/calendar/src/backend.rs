@@ -80,10 +80,19 @@ pub struct CalDavBackend<T> {
 const RECURRING: &str =
     "this is a recurring series; change it in your calendar app (not supported here yet)";
 
-fn is_recurring(res: &Resource) -> bool {
-    res.ics
-        .lines()
-        .any(|l| l.starts_with("RRULE") || l.starts_with("RECURRENCE-ID"))
+fn refuse_series(res: &Resource, uid: &str) -> anyhow::Result<()> {
+    if ics::is_recurring(&res.ics, uid)? {
+        anyhow::bail!(RECURRING);
+    }
+    Ok(())
+}
+
+/// The stored resource has the UID but no item this tool can read: writing a new one over it
+/// would lose it.
+fn unreadable(uid: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the stored item with uid {uid:?} cannot be read by this tool; change it in your calendar app"
+    )
 }
 
 impl<T: Transport> CalendarBackend for CalDavBackend<T> {
@@ -112,28 +121,24 @@ impl<T: Transport> CalendarBackend for CalDavBackend<T> {
     }
 
     async fn put_event(&self, e: &Event) -> anyhow::Result<()> {
-        match self.events.find_uid(Kind::Event, &e.uid).await? {
-            Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
-            Some(res) => {
-                let old = ics::parse_events(&res.ics, self.tz)?
-                    .into_iter()
-                    .find(|x| x.uid == e.uid);
-                let text = match old {
-                    Some(old) => ics::update_event_ics(&res.ics, &old, e)?,
-                    None => ics::event_to_ics(e),
-                };
-                self.events.update(&res, &text).await
-            }
-            None => self.events.create(&e.uid, &ics::event_to_ics(e)).await,
-        }
+        let Some(res) = self.events.find_uid(Kind::Event, &e.uid).await? else {
+            return self.events.create(&e.uid, &ics::event_to_ics(e)).await;
+        };
+        refuse_series(&res, &e.uid)?;
+        let old = ics::parse_events(&res.ics, self.tz)?
+            .into_iter()
+            .find(|x| x.uid == e.uid)
+            .ok_or_else(|| unreadable(&e.uid))?;
+        let text = ics::update_event_ics(&res.ics, &old, e)?;
+        self.events.update(&res, &text).await
     }
 
     async fn delete_event(&self, uid: &str) -> anyhow::Result<bool> {
-        match self.events.find_uid(Kind::Event, uid).await? {
-            Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
-            Some(res) => self.events.delete(&res).await.map(|_| true),
-            None => Ok(false),
-        }
+        let Some(res) = self.events.find_uid(Kind::Event, uid).await? else {
+            return Ok(false);
+        };
+        refuse_series(&res, uid)?;
+        self.events.delete(&res).await.map(|_| true)
     }
 
     async fn list_reminders(&self) -> anyhow::Result<Vec<Reminder>> {
@@ -156,32 +161,27 @@ impl<T: Transport> CalendarBackend for CalDavBackend<T> {
     }
 
     async fn put_reminder(&self, r: &Reminder) -> anyhow::Result<()> {
-        match self.reminders.find_uid(Kind::Todo, &r.uid).await? {
-            Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
-            Some(res) => {
-                let old = ics::parse_reminders(&res.ics, self.tz)?
-                    .into_iter()
-                    .find(|x| x.uid == r.uid);
-                let text = match old {
-                    Some(old) => ics::update_reminder_ics(&res.ics, &old, r)?,
-                    None => ics::reminder_to_ics(r),
-                };
-                self.reminders.update(&res, &text).await
-            }
-            None => {
-                self.reminders
-                    .create(&r.uid, &ics::reminder_to_ics(r))
-                    .await
-            }
-        }
+        let Some(res) = self.reminders.find_uid(Kind::Todo, &r.uid).await? else {
+            return self
+                .reminders
+                .create(&r.uid, &ics::reminder_to_ics(r))
+                .await;
+        };
+        refuse_series(&res, &r.uid)?;
+        let old = ics::parse_reminders(&res.ics, self.tz)?
+            .into_iter()
+            .find(|x| x.uid == r.uid)
+            .ok_or_else(|| unreadable(&r.uid))?;
+        let text = ics::update_reminder_ics(&res.ics, &old, r)?;
+        self.reminders.update(&res, &text).await
     }
 
     async fn delete_reminder(&self, uid: &str) -> anyhow::Result<bool> {
-        match self.reminders.find_uid(Kind::Todo, uid).await? {
-            Some(res) if is_recurring(&res) => anyhow::bail!(RECURRING),
-            Some(res) => self.reminders.delete(&res).await.map(|_| true),
-            None => Ok(false),
-        }
+        let Some(res) = self.reminders.find_uid(Kind::Todo, uid).await? else {
+            return Ok(false);
+        };
+        refuse_series(&res, uid)?;
+        self.reminders.delete(&res).await.map(|_| true)
     }
 }
 
@@ -240,7 +240,7 @@ END:VCALENDAR
     }
 
     #[test]
-    fn update_patches_existing_resource() {
+    fn update_rewrites_existing_resource() {
         let server = FakeServer::default();
         server.respond("REPORT", 207, multistatus(&fixture("rich.ics")));
         server.respond("PUT", 204, "");
@@ -278,7 +278,83 @@ END:VCALENDAR
     }
 
     #[test]
-    fn done_patches_existing_task() {
+    fn time_zone_rules_do_not_make_an_event_recurring() {
+        // Apple, Outlook and Thunderbird write RRULEs inside VTIMEZONE.
+        let server = FakeServer::default();
+        server.respond("REPORT", 207, multistatus(&fixture("apple.ics")));
+        server.respond("PUT", 204, "");
+        let b = backend_with(&server);
+        let uid = "6B3C1F4E-2D1A-4F7E-9C3B-1A2B3C4D5E6F";
+        let mut e = block_on(b.get_event(uid)).unwrap().unwrap();
+        e.title = "Visite guidée".into();
+        block_on(b.put_event(&e)).unwrap();
+        let [put] = &server.requests("PUT")[..] else {
+            panic!("expected one PUT")
+        };
+        let body = put.text();
+        assert!(body.contains("RRULE:FREQ=YEARLY"), "{body}");
+        assert!(body.contains("SUMMARY:Visite guidée"), "{body}");
+    }
+
+    #[test]
+    fn rdate_series_is_not_modified() {
+        let server = FakeServer::default();
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:rd\r\nSUMMARY:Cours\r\n\
+                   DTSTART:20261116T180000Z\r\nRDATE:20261123T180000Z\r\nEND:VEVENT\r\n\
+                   END:VCALENDAR\r\n";
+        server.respond("REPORT", 207, multistatus(ics));
+        server.respond("PUT", 204, "");
+        server.respond("DELETE", 204, "");
+        let b = backend_with(&server);
+        let e = block_on(b.get_event("rd")).unwrap().unwrap();
+        let err = block_on(b.put_event(&e)).unwrap_err().to_string();
+        assert!(err.contains("recurring"), "{err}");
+        let err = block_on(b.delete_event("rd")).unwrap_err().to_string();
+        assert!(err.contains("recurring"), "{err}");
+        assert!(server.requests("PUT").is_empty());
+        assert!(server.requests("DELETE").is_empty());
+    }
+
+    #[test]
+    fn unreadable_item_is_not_overwritten() {
+        // The resource has the UID, but its event has no DTSTART, so no event is read from it.
+        let server = FakeServer::default();
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:odd\r\nSUMMARY:Sans date\r\n\
+                   X-KEEP:me\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        server.respond("REPORT", 207, multistatus(ics));
+        server.respond("PUT", 204, "");
+        let b = backend_with(&server);
+        let e = Event {
+            uid: "odd".into(),
+            title: "Nouveau".into(),
+            start: ics::When::At(Utc::now()),
+            end: None,
+            location: None,
+            description: None,
+        };
+        let err = block_on(b.put_event(&e)).unwrap_err().to_string();
+        assert!(err.contains("cannot be read"), "{err}");
+        assert!(server.requests("PUT").is_empty());
+
+        let todo = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:odd-t\r\nSUMMARY:Sans echeance\r\n\
+                    END:VTODO\r\nEND:VCALENDAR\r\n";
+        let server = FakeServer::default();
+        server.respond("REPORT", 207, multistatus(todo));
+        server.respond("PUT", 204, "");
+        let b = backend_with(&server);
+        let r = Reminder {
+            uid: "odd-t".into(),
+            text: "Nouveau".into(),
+            due: Utc::now(),
+            done: true,
+        };
+        let err = block_on(b.put_reminder(&r)).unwrap_err().to_string();
+        assert!(err.contains("cannot be read"), "{err}");
+        assert!(server.requests("PUT").is_empty());
+    }
+
+    #[test]
+    fn done_rewrites_existing_task() {
         let server = FakeServer::default();
         server.respond("REPORT", 207, multistatus(&fixture("daytodo.ics")));
         server.respond("PUT", 204, "");
