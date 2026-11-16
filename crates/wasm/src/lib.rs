@@ -8,6 +8,7 @@
 //! becomes a tool error, never a hub failure.
 
 mod api;
+mod dial;
 mod egress;
 mod host;
 mod manifest;
@@ -28,6 +29,9 @@ pub struct ComponentSpec {
     pub name: String,
     pub path: PathBuf,
     pub allow: Vec<Origin>,
+    /// Whether the allowed origins may resolve to loopback, link-local or cloud metadata
+    /// addresses, which are refused otherwise: only for a service on the host itself.
+    pub allow_local: bool,
     /// Added by the host to requests for that origin, which must also be allowed.
     pub credentials: Vec<(Origin, Credential)>,
     /// What the guest reads through `settings.get`: never secrets.

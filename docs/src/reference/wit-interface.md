@@ -76,7 +76,7 @@ Every call runs in a fresh instance: nothing is kept from one call to the next.
 | Resource | Rule |
 | --- | --- |
 | Filesystem, sockets, environment, arguments | None. |
-| Outgoing HTTP | Only to the origins (`scheme://host:port`) the host allows for this component. Anything else is refused. Redirects are not followed: the new location is a new request, checked again. |
+| Outgoing HTTP | Only to the origins (`scheme://host:port`) the host allows for this component. Anything else is refused. Redirects are not followed: the new location is a new request, checked again. The host resolves the name itself and connects to the address it checked: loopback, link-local and cloud metadata addresses (such as 169.254.169.254) are refused unless the component is allowed local services. |
 | Credentials | Added by the host to requests for their origin, as `Authorization` (Basic or Bearer). The component cannot set `Authorization` or `Cookie` itself, and never sees the secret. A credential needs an https origin, or a loopback one. |
 | Wall-clock time | 60 seconds per call, waiting on HTTP included. |
 | Running time | 10 seconds per call (100 ticks of 100 ms during which guest code runs). Time spent waiting is free. |

@@ -29,6 +29,7 @@ fn spec() -> ComponentSpec {
         name: "echo".into(),
         path: echo_wasm(),
         allow: vec![],
+        allow_local: false,
         credentials: vec![],
         settings: BTreeMap::new(),
     }
@@ -112,6 +113,8 @@ async fn allowed_origin_gets_host_credential() {
         .await;
     let mut spec = spec();
     spec.allow = vec![origin(&server)];
+    // The test servers listen on 127.0.0.1.
+    spec.allow_local = true;
     spec.credentials = vec![(
         origin(&server),
         Credential::Basic {
@@ -145,6 +148,8 @@ async fn each_credential_reaches_only_its_origin() {
     }
     let mut spec = spec();
     spec.allow = vec![origin(&a), origin(&b)];
+    // The test servers listen on 127.0.0.1.
+    spec.allow_local = true;
     spec.credentials = vec![
         (origin(&a), Credential::Bearer("token-a".into())),
         (origin(&b), Credential::Bearer("token-b".into())),
@@ -171,6 +176,8 @@ async fn waiting_on_http_is_not_charged() {
     .unwrap();
     let mut spec = spec();
     spec.allow = vec![origin(&server)];
+    // The test servers listen on 127.0.0.1.
+    spec.allow_local = true;
     let echo = LoadedComponent::load(&host, spec).await.unwrap();
     let out = echo.call("echo_fetch", &json!({"url": server.uri()})).await;
     assert!(!out.is_error, "{}", out.to_text());
@@ -224,6 +231,8 @@ async fn slow_responses_time_out() {
     let dripping = dripping_server().await;
     let mut spec = spec();
     spec.allow = vec![origin(&late), dripping.parse().unwrap()];
+    // The test servers listen on 127.0.0.1.
+    spec.allow_local = true;
     let echo = LoadedComponent::load(&host, spec).await.unwrap();
     for url in [late.uri(), dripping] {
         let started = Instant::now();
@@ -281,6 +290,34 @@ async fn denies_unlisted_origin() {
 }
 
 #[tokio::test]
+async fn local_addresses_need_allow_local() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("local"))
+        .mount(&server)
+        .await;
+    // An allowed name that resolves to a loopback address.
+    let url = format!("http://localhost:{}/", server.address().port());
+    let mut spec = spec();
+    spec.allow = vec![url.trim_end_matches('/').parse().unwrap()];
+    let echo = load(spec.clone()).await;
+    let out = echo.call("echo_fetch", &json!({ "url": url })).await;
+    assert!(out.is_error, "{}", out.to_text());
+    assert!(
+        out.to_text().to_lowercase().contains("prohibited"),
+        "{}",
+        out.to_text()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    spec.allow_local = true;
+    let echo = load(spec).await;
+    let out = echo.call("echo_fetch", &json!({ "url": url })).await;
+    assert!(!out.is_error, "{}", out.to_text());
+    assert_eq!(out.value["body"], "local");
+}
+
+#[tokio::test]
 async fn guest_cannot_set_authorization() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -289,6 +326,8 @@ async fn guest_cannot_set_authorization() {
         .await;
     let mut spec = spec();
     spec.allow = vec![origin(&server)];
+    // The test servers listen on 127.0.0.1.
+    spec.allow_local = true;
     let echo = load(spec).await;
     let out = echo
         .call(

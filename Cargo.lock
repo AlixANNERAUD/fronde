@@ -2030,16 +2030,20 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "semver",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "url",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "webpki-roots",
  "wiremock",
 ]
 
@@ -5871,14 +5875,11 @@ dependencies = [
  "hyper",
  "pin-project-lite",
  "rustix",
- "rustls",
  "tokio",
- "tokio-rustls",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-io",
- "webpki-roots",
 ]
 
 [[package]]

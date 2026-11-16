@@ -15,16 +15,20 @@ bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 fronde-hub = { path = "../hub" }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 toml.workspace = true
 url.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 wasmtime-wasi-http.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -30,6 +30,9 @@ http = "1"
 http-body = "1"
 getrandom = "0.4"
 http-body-util = "0.1"
+# The component gate's HTTP client (crates/wasm/src/dial.rs): the crates wasmtime-wasi-http uses.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 iana-time-zone = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
@@ -49,6 +52,7 @@ subtle = "2"
 tempfile = "3"
 tokio = { version = "1.54", features = ["full"] }
 tokio-tungstenite = "0.29"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = "0.7"
 tower-http = { version = "0.7.1", features = ["fs"] }
 tower-sessions = { version = "0.14", default-features = false, features = ["axum-core", "memory-store"] }
@@ -59,11 +63,13 @@ tw_merge = "0.1"
 wiremock = "0.6"
 uuid = { version = "1", features = ["v4"] }
 wasm-bindgen = "0.2"
+webpki-roots = "1"
 web-sys = "0.3"
 # Only what a host of tool components uses: no GC, threads, cache or debugging support.
 wasmtime = { version = "50.0.1", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"] }
 wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2"] }
-wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2", "default-send-request"] }
+# Without its default sender: the gate sends requests itself (crates/wasm/src/dial.rs).
+wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2"] }
 url = { version = "2", features = ["serde"] }
 
 [workspace.lints.rust]

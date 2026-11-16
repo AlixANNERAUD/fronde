@@ -1,6 +1,8 @@
 //! Outgoing HTTP from components: denied unless the origin is allowed, with credentials added by
-//! the host so that they never enter a component.
+//! the host so that they never enter a component, and sent to an address checked after the name
+//! is resolved (`dial`).
 
+use crate::dial;
 use anyhow::{Context, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -177,6 +179,8 @@ pub(crate) struct Egress {
     pub(crate) grants: Grants,
     /// For each request, from sending it to the end of the response body.
     pub(crate) request_timeout: Duration,
+    /// Whether allowed names may resolve to loopback, link-local or metadata addresses.
+    pub(crate) allow_local: bool,
 }
 
 impl WasiHttpHooks for Egress {
@@ -213,14 +217,10 @@ impl WasiHttpHooks for Egress {
         }
         // The host's timeouts replace the guest's. Redirects are not followed: a new location is
         // a new request, checked again here.
-        let options = RequestOptions {
-            connect_timeout: Some(CONNECT_TIMEOUT),
-            first_byte_timeout: Some(self.request_timeout),
-            between_bytes_timeout: Some(self.request_timeout),
-        };
         let deadline = Instant::now() + self.request_timeout;
+        let allow_local = self.allow_local;
         Box::new(async move {
-            let send = wasmtime_wasi_http::default_send_request(request, Some(options));
+            let send = dial::send(request, CONNECT_TIMEOUT, allow_local);
             let (response, io) = tokio::time::timeout_at(deadline, send)
                 .await
                 .map_err(|_| Error::HttpResponseTimeout)??;
@@ -232,7 +232,7 @@ impl WasiHttpHooks for Egress {
             Ok((
                 response.map(|body| {
                     Deadline {
-                        body: body.boxed_unsync(),
+                        body,
                         sleep: Box::pin(tokio::time::sleep_until(deadline)),
                     }
                     .boxed_unsync()
