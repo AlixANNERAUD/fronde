@@ -4,16 +4,11 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  # Unmaintained, not vulnerable: a compile-time macro pulled in by Leptos.
-  { id = "RUSTSEC-2024-0436", reason = "build-time dependency of Leptos, no known vulnerability" },
-]
 
 [licenses]
 version = 2
 confidence-threshold = 0.9
 allow = [
-  "0BSD",
   "MIT",
   "ISC",
   "CDLA-Permissive-2.0",

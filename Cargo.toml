@@ -14,7 +14,6 @@ agent-client-protocol = { version = "5.3", features = ["process"] }
 anyhow = "1"
 axum = "0.8"
 async-trait = "0.1"
-console_error_panic_hook = "0.1"
 dioxus = { version = "0.7.10", features = ["router"] }
 dioxus-html = "0.7.10"
 dioxus-ssr = "0.7.10"
@@ -26,9 +25,6 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 icalendar = "0.17"
-leptos = { version = "0.8.23", features = ["islands"] }
-leptos_meta = "0.8.7"
-leptos_router = "0.8.17"
 reqwest = "0.13"
 roxmltree = "0.21"
 rmcp = { version = "=3.10.0", features = ["server", "client", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest", "transport-child-process"] }
@@ -65,34 +61,16 @@ all = { level = "warn", priority = -1 }
 [profile.dev.package."*"]
 debug = false
 
-# Leptos views are nested generic types; their full debug information makes linking the test
-# binaries need gigabytes. Line tables keep backtraces readable.
-[profile.dev.package.jarvis-app]
-debug = "line-tables-only"
-
 [profile.release]
 codegen-units = 1
 lto = true
 strip = true
 
-# dx builds the web interface with this profile too. Stripping would remove the custom sections
-# wasm-bindgen reads; wasm-bindgen and wasm-opt shrink the output afterwards anyway.
+# `dx build --release --platform web` builds with this profile; without it dx would make one up
+# with `opt-level = "s"`. dx turns stripping off itself: wasm-bindgen reads the custom sections and
+# wasm-opt shrinks the output afterwards.
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
 panic = "abort"
-strip = false
 
-[[workspace.metadata.leptos]]
-name = "jarvis"
-bin-package = "jarvis"
-lib-package = "jarvis-frontend"
-output-name = "jarvis"
-site-root = "target/site"
-site-pkg-dir = "pkg"
-tailwind-input-file = "style/main.css"
-site-addr = "127.0.0.1:3000"
-reload-port = 3001
-browserquery = "defaults"
-env = "DEV"
-lib-profile-release = "wasm-release"
