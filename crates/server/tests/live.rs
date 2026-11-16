@@ -1,5 +1,5 @@
 //! A chat with the real Claude adapter, signed in with the owner's subscription. Ignored by
-//! default; run it with the adapter's path:
+//! default; run it after `mise run agent`, with the adapter's path (`agent/node_modules/.bin`):
 //!
 //! ```sh
 //! JARVIS_LIVE_AGENT=$(which claude-agent-acp) \

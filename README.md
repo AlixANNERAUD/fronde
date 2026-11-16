@@ -41,14 +41,14 @@ Jarvis needs a configuration file, a token for `/mcp` and a password for the cha
 
 ### Native, with mise
 
-You need [mise](https://mise.jdx.dev), Node.js 22 or later, and Claude Code signed in to your
-subscription (`claude` works in your terminal).
+You need [mise](https://mise.jdx.dev) and Claude Code signed in to your
+subscription (`claude` works in your terminal). Node.js comes from mise.
 
 ```sh
 git clone https://github.com/AlixANNERAUD/jarvis && cd jarvis
 mise install
 mise run build
-npm install --global @agentclientprotocol/claude-agent-acp@0.107.0
+mise run agent
 target/release/jarvis check --config jarvis.toml
 target/release/jarvis serve --config jarvis.toml
 ```

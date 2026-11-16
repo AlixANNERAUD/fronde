@@ -47,6 +47,7 @@ through mr-boxington.
 | `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server code, the web interface (native and wasm32) and the components (wasm32-wasip2) |
 | `mise run components` | Release build of the components for wasm32-wasip2 into `components/dist` |
 | `mise run test` | The test suite (nextest), after `components` |
+| `mise run agent` | Installs the locked Claude ACP adapter (`agent/package-lock.json`) into `agent/node_modules`; Node.js comes from mise, which puts the adapter on `PATH` |
 | `mise run deny` | cargo-deny: advisories, licences, bans, sources |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
 | `mise run dev` | The server on http://127.0.0.1:8484 for `web-dev` (password `jarvis`; config and data in `target/dev`) |
@@ -57,7 +58,7 @@ through mr-boxington.
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 
 `crates/server/tests/live.rs` chats with the real Claude adapter on the owner's subscription. It
-is ignored and runs only by hand, with `JARVIS_LIVE_AGENT` set to the adapter's path:
+is ignored and runs only by hand, with `JARVIS_LIVE_AGENT` set to the adapter's path (`agent/node_modules/.bin/claude-agent-acp`, after `mise run agent`):
 `mise exec -- cargo nextest run -p jarvis --test live --run-ignored only --no-capture`.
 
 ## Dioxus 0.7 usage

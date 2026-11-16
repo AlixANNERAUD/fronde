@@ -56,7 +56,10 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
 # Code.
 FROM node:22-trixie-slim@sha256:68c76cfad89921b927eae28ba21407475e29d0ce450afcdbe70c1532db042b64 AS agent
 
-RUN npm install --global --prefix /opt/agent @agentclientprotocol/claude-agent-acp@0.107.0
+# The adapter and its dependencies are locked in agent/package-lock.json, as for `mise run agent`.
+WORKDIR /opt/agent
+COPY agent/package.json agent/package-lock.json ./
+RUN npm ci --omit=dev
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
@@ -77,7 +80,7 @@ COPY --from=builder /out/jarvis /app/jarvis
 COPY --from=builder /out/site /app/site
 
 # HOME is on the volume so the agent's Claude sign-in and settings (~/.claude) survive restarts.
-ENV PATH=/opt/agent/bin:$PATH \
+ENV PATH=/opt/agent/node_modules/.bin:$PATH \
     JARVIS_SITE_ROOT=/app/site \
     HOME=/data/home
 

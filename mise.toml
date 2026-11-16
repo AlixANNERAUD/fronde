@@ -1,4 +1,5 @@
 [tools]
+node = "22.23.5"
 rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools", targets = "wasm32-unknown-unknown,wasm32-wasip2", mr_boxington = true }
 mr-boxington = "latest"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.149"
@@ -13,6 +14,12 @@ mr-boxington = "latest"
 # commands leave it out.
 JARVIS_SERVER_PACKAGES = "--workspace --exclude jarvis-web"
 DX_TELEMETRY_ENABLED = "false"
+# The Claude ACP adapter installed by `mise run agent` (agent/package-lock.json).
+_.path = ["{{config_root}}/agent/node_modules/.bin"]
+
+[tasks.agent]
+description = "Install the Claude ACP adapter from agent/package-lock.json into agent/node_modules"
+run = "npm ci --prefix agent --omit=dev"
 
 [tasks.format]
 description = "Format the code"

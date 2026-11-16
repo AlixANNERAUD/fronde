@@ -1,4 +1,5 @@
 target
+agent/node_modules
 .git
 .superpowers
 docs/superpowers

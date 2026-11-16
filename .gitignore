@@ -9,3 +9,4 @@ lcov.info
 /crates/web/assets/tailwind.css
 /components/target
 /components/dist
+/agent/node_modules

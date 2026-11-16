@@ -1,0 +1,8 @@
+{
+  "name": "jarvis-agent-runtime",
+  "private": true,
+  "description": "The coding agent's ACP adapter, locked for native runs (mise run agent) and the Docker image",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.107.0"
+  }
+}
