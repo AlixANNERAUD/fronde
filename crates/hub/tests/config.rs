@@ -151,27 +151,6 @@ fn rejects_reserved_and_duplicate_upstream_names() {
 }
 
 #[test]
-fn xdg_data_dir_follows_the_spec() {
-    use fronde_hub::config::xdg_data_dir;
-    use std::path::PathBuf;
-    let p = |s: &str| Some(PathBuf::from(s));
-    assert_eq!(
-        xdg_data_dir(p("/x/data"), p("/home/a")),
-        p("/x/data/fronde")
-    );
-    assert_eq!(
-        xdg_data_dir(None, p("/home/a")),
-        p("/home/a/.local/share/fronde")
-    );
-    // A relative XDG_DATA_HOME is ignored, as the spec says.
-    assert_eq!(
-        xdg_data_dir(p("rel"), p("/home/a")),
-        p("/home/a/.local/share/fronde")
-    );
-    assert_eq!(xdg_data_dir(None, None), None);
-}
-
-#[test]
 fn data_dir_is_optional() {
     let c = load_str("[server]\ntoken = { env = \"T\" }\n[data]\ntimezone = \"UTC\"\n").unwrap();
     assert!(c.data.dir.is_absolute() && c.data.dir.ends_with("fronde"));

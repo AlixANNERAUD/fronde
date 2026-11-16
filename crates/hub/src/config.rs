@@ -123,27 +123,10 @@ pub enum Secret {
 /// `~/.local/share/fronde` on Linux and other Unixes, the platform's equivalent on macOS and
 /// Windows.
 pub fn default_data_dir() -> Option<PathBuf> {
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        xdg_data_dir(
-            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
-            std::env::var_os("HOME").map(PathBuf::from),
-        )
-    }
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        directories::ProjectDirs::from("", "", "fronde").map(|d| d.data_dir().to_path_buf())
-    }
-}
-
-/// The XDG rule: an absolute `XDG_DATA_HOME` wins, then `HOME/.local/share`.
-#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
-pub fn xdg_data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
-    let base = match xdg_data_home {
-        Some(p) if p.is_absolute() => p,
-        _ => home.filter(|h| h.is_absolute())?.join(".local/share"),
-    };
-    Some(base.join("fronde"))
+    use etcetera::BaseStrategy as _;
+    etcetera::base_strategy::choose_native_strategy()
+        .ok()
+        .map(|d| d.data_dir().join("fronde"))
 }
 
 impl Secret {
