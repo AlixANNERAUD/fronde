@@ -54,8 +54,8 @@ target/release/jarvis serve --config jarvis.toml
 ```
 
 Open http://127.0.0.1:8484 and sign in with the chat password. The server reads the chat's files
-from `target/dx/jarvis-web/release/web/public` (`mise run web-build`); run it from the checkout, or
-set `JARVIS_SITE_ROOT`.
+from `target/dx/jarvis-web/release/web/public`, where `mise run build` puts them; run it from the
+checkout, or set `JARVIS_SITE_ROOT`.
 
 ### Docker
 
@@ -75,7 +75,8 @@ docker run -d --name jarvis -p 8484:8484 \
   jarvis
 ```
 
-The `jarvis-data` volume holds the memory, the conversation and the agent's home, where Claude
+The image builds the web interface and the server as `mise run build` does. The
+`jarvis-data` volume holds the memory, the conversation and the agent's home, where Claude
 keeps its settings. Then [sign Jarvis in to Claude](#signing-jarvis-in-to-claude). The image
 checks itself with `jarvis healthcheck`, which reads the address from `/config/jarvis.toml`.
 
@@ -176,10 +177,23 @@ You need [mise](https://mise.jdx.dev).
 
 ```sh
 mise install
-mise run dev     # http://127.0.0.1:3000 with live reload, password `jarvis`
 mise run check   # what CI runs: rustfmt, clippy, tests, cargo-deny
-mise run build   # target/release/jarvis and the site in target/site
+mise run build   # target/release/jarvis and the web interface
 ```
 
-`mise run dev` needs the Claude adapter on the `PATH` to chat. See [`AGENTS.md`](AGENTS.md) for
-the layout and the rules.
+The web interface is a [Dioxus](https://dioxuslabs.com) app in `crates/web`. The Dioxus CLI
+(`dx`, pinned by mise) builds it into static files that the server serves. To work on it, run
+the server and the interface side by side:
+
+```sh
+mise run dev       # the server on http://127.0.0.1:8484, password `jarvis`
+mise run web-dev   # the interface with hot reload on http://127.0.0.1:8080
+```
+
+Open http://127.0.0.1:8080. dx serves the pages and passes the chat's WebSocket (`/ws`) and the
+sign-in forms (`/auth/…`) to the server. `mise run dev` keeps its configuration and data in
+`target/dev`, and needs the Claude adapter on the `PATH` to chat. `mise run web-build` builds the
+interface alone, into `target/dx/jarvis-web/release/web/public`. On its first build dx downloads
+the tools it needs (wasm-bindgen, wasm-opt, esbuild) into `~/.local/share/.dx`.
+
+See [`AGENTS.md`](AGENTS.md) for the layout and the rules.

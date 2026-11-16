@@ -8,22 +8,20 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | Crate | Role |
 | --- | --- |
 | `crates/hub` (`jarvis-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
-| `crates/protocol` (`jarvis-protocol`) | Types shared by the conversation log, the server and the frontend (`Event`, `Entry`); serde and chrono only |
+| `crates/protocol` (`jarvis-protocol`) | Types shared by the conversation log, the server and the web interface (`Event`, `Entry`); serde and chrono only |
 | `crates/agent` (`jarvis-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/client` (`jarvis-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
-| `crates/app` (`jarvis-app`) | The Leptos web chat: sign-in and chat pages, the `ChatPanel` island and its WebSocket; `chat_model.rs` turns log entries into what the chat shows |
-| `crates/frontend` (`jarvis-frontend`) | The browser bundle (wasm32): hydrates the app's island |
 | `crates/web` (`jarvis-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `jarvis-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
-| `crates/server` | The `jarvis` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the chat pages and `/ws` |
+| `crates/server` | The `jarvis` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
 
-`jarvis-app` builds with `ssr` for the server and with `hydrate` for the browser, never both:
-server-side Cargo commands leave out `jarvis-frontend` and `jarvis-web`
-(`$JARVIS_SERVER_PACKAGES`). UI classes come from Rust/UI
-(`crates/app/src/components/LICENSE-rust-ui`); styles are Tailwind in `style/main.css`. The
-server reads the built interface from `JARVIS_SITE_ROOT` (default
-`target/dx/jarvis-web/release/web/public`, written by `mise run web-build`).
+The server has no Dioxus dependency: it serves the built interface as static files from
+`JARVIS_SITE_ROOT` (default `target/dx/jarvis-web/release/web/public`, written by
+`mise run web-build`). In development, `mise run web-dev` serves the pages itself and proxies
+`/ws` and `/auth` to `mise run dev` (`crates/web/Dioxus.toml`): keep every backend-only route
+under one of those.
 
-Lint and tests run `jarvis-web` on its own, natively and for wasm32. It embeds
+Server-side Cargo commands leave out `jarvis-web` (`$JARVIS_SERVER_PACKAGES`), whose
+dependencies are wasm-only. Lint and tests run it on its own, natively and for wasm32. It embeds
 `crates/web/assets/tailwind.css` at compile time: the hidden `web-css` task generates it from
 `crates/web/style/tailwind.css` with mise's Tailwind, and `lint`, `test`, `web-build` and
 `web-dev` run it first.
@@ -37,14 +35,14 @@ through mr-boxington.
 | --- | --- |
 | `mise install` | Installs the pinned tools |
 | `mise run format` | Formats the code |
-| `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server code and the wasm bundle |
+| `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server code and the web interface (native and wasm32) |
 | `mise run test` | The test suite (nextest) |
 | `mise run deny` | cargo-deny: advisories, licences, bans, sources |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
-| `mise run dev` | The server with live reload on http://127.0.0.1:3000 (password `jarvis`; config in `target/dev`) |
-| `mise run build` | Release build: `target/release/jarvis` and the site in `target/site` |
+| `mise run dev` | The server on http://127.0.0.1:8484 for `web-dev` (password `jarvis`; config and data in `target/dev`) |
+| `mise run web-dev` | The Dioxus interface with hot reload on http://127.0.0.1:8080 (dx serve); `/ws` and `/auth` go to `mise run dev` |
 | `mise run web-build` | Release build of the Dioxus interface into `target/dx/jarvis-web/release/web/public` |
-| `mise run web-dev` | The Dioxus interface with hot reload (dx serve); `/ws`, `/sign-in` and `/sign-out` go to a jarvis server on 127.0.0.1:8484 |
+| `mise run build` | Release build: `web-build`, then `target/release/jarvis` |
 
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 
@@ -65,7 +63,10 @@ is ignored and runs only by hand, with `JARVIS_LIVE_AGENT` set to the adapter's 
   temporary directories.
 - Rust/UI components are vendored by hand in `crates/web/src/components/ui/`, with
   `crates/web/src/components/LICENSE-rust-ui` (MIT) beside them: keep their classes and
-  structure, and mark any change to them in place.
+  structure, and mark any change to them in place with a `// jarvis:` comment. Icons are Lucide's
+  (ISC, `crates/web/src/components/LICENSE-lucide`), drawn inline in
+  `crates/web/src/components/icons.rs`; add one there from Lucide's paths rather than adding an
+  icon crate.
 - Comments explain why, never restate the code. Docs are plain, concise English with no em dashes.
 - Work and push directly on `main`. Commits follow Conventional Commits (`feat:`, `fix:`, `test:`,
   `build:`, `ci:`, `docs:`, `chore:`), imperative, in English. Do not mention AI tools and add no

@@ -1,6 +1,6 @@
-//! Line icons drawn in the current text color: Lucide's (ISC) as Rust/UI's `icons` crate draws
-//! them, without the English `<title>` that crate puts in every icon. They are decorative: each
-//! sits next to a visible label or inside a control with an accessible name.
+//! Line icons drawn in the current text color: Lucide's (ISC, see `LICENSE-lucide`) as Rust/UI's
+//! `icons` crate draws them, without the English `<title>` that crate puts in every icon. They are
+//! decorative: each sits next to a visible label or inside a control with an accessible name.
 
 use dioxus::prelude::*;
 
