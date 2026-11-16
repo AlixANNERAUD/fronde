@@ -7,6 +7,7 @@ use jarvis_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, te
 use jarvis_agent::jarvis::{Connector, Jarvis};
 use jarvis_agent::log::{Event, ToolState, TurnOutcome};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -16,6 +17,7 @@ const WAIT: Duration = Duration::from_secs(10);
 const BUSY: &str = "Jarvis répond encore ; attends la fin ou arrête-le.";
 const GONE: &str = "Cette demande n'est plus active.";
 const FRESH: &str = "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
+const NO_START: &str = "L'agent ne répond pas au démarrage.";
 
 fn spec() -> AgentSpec {
     AgentSpec {
@@ -437,4 +439,84 @@ async fn stale_permission_is_closed_in_the_log() {
             notice(GONE),
         ]
     );
+}
+
+/// Counts the connects started and the connect futures dropped.
+#[derive(Default)]
+struct Hanging {
+    started: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+struct DropCounter(Arc<Hanging>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A connector whose agent never answers.
+fn hanging_connector() -> (Connector, Arc<Hanging>) {
+    let hanging = Arc::new(Hanging::default());
+    let connector: Connector = Arc::new({
+        let hanging = hanging.clone();
+        move |_: &AgentSpec, _, _| {
+            let hanging = hanging.clone();
+            Box::pin(async move {
+                let _counter = DropCounter(hanging.clone());
+                hanging.started.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            })
+        }
+    });
+    (connector, hanging)
+}
+
+#[tokio::test]
+async fn cancel_interrupts_a_hanging_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, hanging) = hanging_connector();
+    let jarvis = Jarvis::open(spec(), dir.path(), connector).expect("open");
+
+    jarvis.send("Salut".into()).await;
+    timeout(WAIT, async {
+        while hanging.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the connect never started");
+    jarvis.cancel();
+
+    assert_eq!(
+        wait_for_turns(&jarvis, 1).await,
+        vec![user("Salut"), ended(TurnOutcome::Cancelled)]
+    );
+    assert_eq!(hanging.dropped.load(Ordering::SeqCst), 1);
+
+    // Jarvis is free again.
+    jarvis.send("Encore".into()).await;
+    jarvis.cancel();
+    let events = wait_for_turns(&jarvis, 2).await;
+    assert!(!events.contains(&notice(BUSY)), "{events:?}");
+    assert!(events.contains(&user("Encore")), "{events:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_timeout_ends_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, hanging) = hanging_connector();
+    let jarvis = Jarvis::open(spec(), dir.path(), connector).expect("open");
+
+    jarvis.send("Salut".into()).await;
+    tokio::time::sleep(Duration::from_secs(59)).await;
+    assert_eq!(events(&jarvis), vec![user("Salut")]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        events(&jarvis),
+        vec![user("Salut"), notice(NO_START), ended(TurnOutcome::Error)]
+    );
+    assert_eq!(hanging.dropped.load(Ordering::SeqCst), 1);
 }

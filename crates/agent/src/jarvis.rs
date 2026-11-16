@@ -2,19 +2,23 @@
 
 use crate::acp::{AgentClient, AgentEvent, AgentSpec, TurnEnd};
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 const BUSY: &str = "Jarvis répond encore ; attends la fin ou arrête-le.";
 const NOT_ACTIVE: &str = "Cette demande n'est plus active.";
 const NEW_CONVERSATION: &str =
     "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
+const NO_START: &str = "L'agent ne répond pas au démarrage.";
+/// How long the agent gets to start and open its session.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Opens an agent session: `AgentClient::spawn` in production, a fake agent in tests.
 pub type Connector = Arc<
@@ -43,9 +47,8 @@ pub struct Jarvis {
     session: Mutex<Option<Session>>,
     /// Permission requests shown in the log and not answered yet.
     pending: Mutex<HashSet<u64>>,
-    busy: AtomicBool,
-    /// Set by `cancel` during a turn, checked before the prompt is sent.
-    cancel_requested: AtomicBool,
+    /// Cancels the running turn; `None` when idle.
+    turn: Mutex<Option<CancellationToken>>,
 }
 
 /// A connected agent and the task recording its events.
@@ -80,8 +83,7 @@ impl Jarvis {
             session_file: data_dir.join("jarvis.session"),
             session: Mutex::new(None),
             pending: Mutex::default(),
-            busy: AtomicBool::new(false),
-            cancel_requested: AtomicBool::new(false),
+            turn: Mutex::new(None),
         }))
     }
 
@@ -91,15 +93,19 @@ impl Jarvis {
 
     /// Logs the message and runs the turn in the background; refused while a turn runs.
     pub async fn send(self: &Arc<Self>, text: String) {
-        if self.busy.swap(true, Ordering::SeqCst) {
-            self.append(Event::Notice { text: BUSY.into() });
-            return;
-        }
-        self.cancel_requested.store(false, Ordering::SeqCst);
+        let cancel = {
+            let mut turn = lock(&self.turn);
+            if turn.is_some() {
+                drop(turn);
+                self.append(Event::Notice { text: BUSY.into() });
+                return;
+            }
+            turn.insert(CancellationToken::new()).clone()
+        };
         self.append(Event::User { text: text.clone() });
         let jarvis = self.clone();
         tokio::spawn(async move {
-            let outcome = match jarvis.run_turn(&text).await {
+            let outcome = match jarvis.run_turn(&text, &cancel).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     jarvis.append(Event::Notice {
@@ -109,21 +115,14 @@ impl Jarvis {
                 }
             };
             jarvis.append(Event::TurnEnded { outcome });
-            jarvis.busy.store(false, Ordering::SeqCst);
+            *lock(&jarvis.turn) = None;
         });
     }
 
     /// Stops the running turn, if any.
     pub fn cancel(&self) {
-        if !self.busy.load(Ordering::SeqCst) {
-            return;
-        }
-        self.cancel_requested.store(true, Ordering::SeqCst);
-        let session = self.session_slot().clone();
-        if let Some(session) = session
-            && let Err(error) = session.client.cancel()
-        {
-            tracing::warn!("cannot cancel the turn: {error:#}");
+        if let Some(cancel) = lock(&self.turn).as_ref() {
+            cancel.cancel();
         }
     }
 
@@ -147,12 +146,32 @@ impl Jarvis {
         }
     }
 
-    async fn run_turn(self: &Arc<Self>, text: &str) -> anyhow::Result<TurnOutcome> {
-        let session = self.connect().await?;
-        if self.cancel_requested.load(Ordering::SeqCst) {
-            return Ok(TurnOutcome::Cancelled);
-        }
-        let end = session.client.prompt(text).await;
+    async fn run_turn(
+        self: &Arc<Self>,
+        text: &str,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<TurnOutcome> {
+        // Dropping the connect future stops an agent that is still starting.
+        let session = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
+            connected = tokio::time::timeout(START_TIMEOUT, self.connect()) => {
+                connected.map_err(|_| anyhow!(NO_START))??
+            }
+        };
+        let prompt = session.client.prompt(text);
+        tokio::pin!(prompt);
+        let end = tokio::select! {
+            // The prompt is polled first so the cancel always reaches the agent after it.
+            biased;
+            end = &mut prompt => end,
+            () = cancel.cancelled() => {
+                if let Err(error) = session.client.cancel() {
+                    tracing::warn!("cannot cancel the turn: {error:#}");
+                }
+                prompt.await
+            }
+        };
         session.flush().await;
         if end.is_err() {
             // A failed turn may leave the connection broken: the next message reconnects.

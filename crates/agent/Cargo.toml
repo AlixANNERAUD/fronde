@@ -19,10 +19,12 @@ jarvis-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 jarvis-agent = { path = ".", features = ["testing"] }
 
 [lints]
