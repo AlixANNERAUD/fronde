@@ -1754,6 +1754,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-client"
+version = "0.1.0"
+dependencies = [
+ "jarvis-protocol",
+]
+
+[[package]]
 name = "jarvis-frontend"
 version = "0.1.0"
 dependencies = [
