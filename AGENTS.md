@@ -48,7 +48,7 @@ through mr-boxington.
 | `mise run components` | Release build of the components for wasm32-wasip2 into `components/dist` |
 | `mise run test` | The test suite (nextest), after `components` |
 | `mise run agent` | Installs the locked Claude ACP adapter (`agent/package-lock.json`) into `agent/node_modules`; Node.js comes from mise, which puts the adapter on `PATH` |
-| `mise run deny` | cargo-deny: advisories, licences, bans, sources |
+| `mise run deny` | cargo-deny: advisories, licences, bans, sources, for the root workspace and the components |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
 | `mise run dev` | The server on http://127.0.0.1:8484 for `web-dev` (password `fronde`; config and data in `target/dev`) |
 | `mise run web-dev` | The Dioxus interface with hot reload on http://127.0.0.1:8080 (dx serve); `/ws` and `/auth` go to `mise run dev` |

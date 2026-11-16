@@ -63,9 +63,11 @@ run = [
   "cp components/target/wasm32-wasip2/release/*.wasm components/dist/",
 ]
 
+# The components use the root deny.toml, which cargo-deny finds from components/ upwards. Passing
+# `--config deny.toml` instead breaks under mr-boxington, which reads it as Cargo's own `--config`.
 [tasks.deny]
-description = "Check advisories, licences, bans and sources"
-run = "cargo deny check"
+description = "Check advisories, licences, bans and sources, components included"
+run = ["cargo deny check", "cargo deny --manifest-path components/Cargo.toml check"]
 
 [tasks.check]
 description = "Everything CI checks, except the release build"
