@@ -10,3 +10,9 @@ lcov.info
 /components/target
 /components/dist
 /agent/node_modules
+
+# Local configuration and secrets (never commit)
+/fronde.toml
+/fronde_token
+/fronde_password
+/secrets/
