@@ -123,10 +123,36 @@ pub enum Secret {
 /// `~/.local/share/fronde` on Linux and other Unixes, the platform's equivalent on macOS and
 /// Windows.
 pub fn default_data_dir() -> Option<PathBuf> {
-    use etcetera::BaseStrategy as _;
-    etcetera::base_strategy::choose_native_strategy()
-        .ok()
-        .map(|d| d.data_dir().join("fronde"))
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        xdg_data_dir(
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            etcetera::home_dir().ok(),
+        )
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        use etcetera::BaseStrategy as _;
+        let dir = etcetera::base_strategy::choose_native_strategy()
+            .ok()
+            .filter(|d| d.home_dir().is_absolute())?
+            .data_dir()
+            .join("fronde");
+        // Same layout as before the switch from `directories`: %APPDATA%\fronde\data on Windows.
+        #[cfg(windows)]
+        let dir = dir.join("data");
+        Some(dir)
+    }
+}
+
+/// The XDG rule: an absolute `XDG_DATA_HOME` wins, then `HOME/.local/share` (an absolute home only).
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+pub fn xdg_data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    let base = match xdg_data_home {
+        Some(p) if p.is_absolute() => p,
+        _ => home.filter(|h| h.is_absolute())?.join(".local/share"),
+    };
+    Some(base.join("fronde"))
 }
 
 impl Secret {

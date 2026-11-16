@@ -213,3 +213,26 @@ fn prepare_data_dir_creates_it_private_and_reports_unwritable() {
     );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[test]
+fn xdg_data_dir_follows_the_spec() {
+    use fronde_hub::config::xdg_data_dir;
+    use std::path::PathBuf;
+    let p = |s: &str| Some(PathBuf::from(s));
+    assert_eq!(
+        xdg_data_dir(p("/x/data"), p("/home/a")),
+        p("/x/data/fronde")
+    );
+    assert_eq!(
+        xdg_data_dir(None, p("/home/a")),
+        p("/home/a/.local/share/fronde")
+    );
+    // A relative XDG_DATA_HOME is ignored, as the spec says.
+    assert_eq!(
+        xdg_data_dir(p("rel"), p("/home/a")),
+        p("/home/a/.local/share/fronde")
+    );
+    // A relative or missing home gives no default rather than a relative directory.
+    assert_eq!(xdg_data_dir(None, p("home")), None);
+    assert_eq!(xdg_data_dir(None, None), None);
+}
