@@ -8,6 +8,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
+pub mod git;
+pub mod index;
+pub mod tools;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryFile {
