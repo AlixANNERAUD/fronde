@@ -4,8 +4,6 @@ Agent personnel généraliste en Rust + Wasm : pilote Claude Code, Codex et Gemi
 
 Le nom définitif reste à trouver.
 
-Conception : [docs/superpowers/specs/2026-11-16-jarvis-design.md](docs/superpowers/specs/2026-11-16-jarvis-design.md)
-
 ## Démarrer (étape 1a : le hub MCP)
 
 Le hub expose en MCP la mémoire, l'agenda et les rappels CalDAV, et les outils d'autres serveurs MCP (MCPHub…) derrière `search_tools`.

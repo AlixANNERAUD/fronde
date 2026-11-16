@@ -2,3 +2,4 @@ target/
 .env
 *.secret
 .superpowers/
+docs/superpowers/
