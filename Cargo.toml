@@ -67,10 +67,11 @@ lto = true
 strip = true
 
 # `dx build --release --platform web` builds with this profile; without it dx would make one up
-# with `opt-level = "s"`. dx turns stripping off itself: wasm-bindgen reads the custom sections and
-# wasm-opt shrinks the output afterwards.
+# with `opt-level = "s"`. Stripping would remove the custom sections wasm-bindgen reads, and dx
+# does not turn it off for a profile defined here; wasm-opt shrinks the output afterwards anyway.
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
 panic = "abort"
+strip = false
 
