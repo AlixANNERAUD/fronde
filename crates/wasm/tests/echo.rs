@@ -436,14 +436,23 @@ async fn rejects_component_without_tools() {
 async fn rejects_unsupported_api_version() {
     let host = ComponentHost::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    for wat in [
-        r#"(component (instance $i) (export "fronde:component/tools@0.2.0" (instance $i)))"#,
-        r#"(component
+    for (wat, named) in [
+        (
+            r#"(component (instance $i) (export "fronde:component/tools@0.2.0" (instance $i)))"#,
+            "built for fronde:component@0.2.0",
+        ),
+        (
+            r#"(component
              (import "fronde:component/settings@1.0.0" (instance))
              (instance $i) (export "fronde:component/tools@0.1.0" (instance $i)))"#,
-        r#"(component
+            "built for fronde:component@1.0.0",
+        ),
+        (
+            r#"(component
              (import "fronde:component/settings" (instance))
              (instance $i) (export "fronde:component/tools@0.1.0" (instance $i)))"#,
+            "without a version",
+        ),
     ] {
         let path = dir.path().join("future.wat");
         std::fs::write(&path, wat).unwrap();
@@ -453,8 +462,7 @@ async fn rejects_unsupported_api_version() {
             .unwrap()
             .to_string();
         assert!(e.contains("this Fronde serves 0.1"), "{e}");
-        // An unversioned name reads "without a version", not an empty one.
-        assert!(!e.contains("@,"), "{e}");
+        assert!(e.contains(named), "{e}");
     }
 }
 

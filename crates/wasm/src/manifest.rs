@@ -276,7 +276,11 @@ impl NetworkRule {
 /// A manifest names public hosts: an address or a local name is the user's to allow, through a
 /// URL setting and an origin the configuration declares local.
 fn check_public_name(entry: &str, host: &str) -> anyhow::Result<()> {
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    // A fully qualified name ("localhost.") is the same host.
+    let bare = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
     ensure!(
         bare.parse::<std::net::IpAddr>().is_err(),
         "{entry:?}: name a host, not an address; for a server of the user's, use a URL setting \
@@ -676,9 +680,15 @@ mod tests {
             "http://localhost:5232",
             "https://cal.localhost",
             "https://*.dev.localhost",
+            "http://localhost.:5232",
+            "https://cal.localhost.",
         ] {
             let e = refused(&with(&format!("[permissions]\nnetwork = [{bad:?}]")));
             assert!(e.contains("permissions.network"), "{bad}: {e}");
+            assert!(
+                e.contains("not an address") || e.contains("localhost is the user's"),
+                "{bad}: {e}"
+            );
         }
     }
 
