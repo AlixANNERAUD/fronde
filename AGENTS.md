@@ -1,27 +1,29 @@
 # AGENTS.md
 
 fronde (code name) is a personal agent hub written in Rust: it drives coding agents through their
-own subscriptions over ACP, serves its memory, calendar and tools over MCP, and offers a web chat.
+own subscriptions over ACP, serves its memory and tools (a calendar component among them) over MCP,
+and offers a web chat.
 
 ## Layout
 
 | Crate | Role |
 | --- | --- |
-| `crates/hub` (`fronde-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
+| `crates/hub` (`fronde-hub`) | Tools registry and search, memory, upstream MCP servers, the MCP server; `source.rs` is where tools come from: the `ToolSource` trait and the one supervisor that starts every source (the hub's own tools, upstream servers, components), registers its tools and restarts it with backoff |
 | `crates/fs` (`fronde-fs`) | Private-file helpers shared by the hub and the agent: 0700 directories, 0600 files, durable atomic replacement (`atomic-write-file`: sync of file and directory) |
 | `crates/protocol` (`fronde-protocol`) | Types shared by the conversation log, the server and the web interface (`Event`, `Entry`); serde and chrono only |
 | `crates/agent` (`fronde-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/client` (`fronde-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
 | `crates/web` (`fronde-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `fronde-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
-| `crates/wasm` (`fronde-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `dial.rs` its client (resolves the name, refuses local addresses, private ranges and metadata included, unless the origin is allowed as local, connects to the checked address), `api.rs` which `fronde:component` version a component targets, `manifest.rs` the strict parser of a component's `fronde-component.toml`, `v0_1/` the bindings of version 0.1 (one module per served version), `tool.rs` the `tool` world, whose tools join the hub's registry |
+| `crates/wasm` (`fronde-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `dial.rs` its client (resolves the name, refuses local addresses, private ranges and metadata included, unless the origin is allowed as local, connects to the checked address), `api.rs` which `fronde:component` version a component targets, `manifest.rs` the strict parser of a component's `fronde-component.toml`, `v0_1/` the bindings of version 0.1 (one module per served version), `tool.rs` the `tool` world, whose tools join the hub's registry, `source.rs` a `[[sources]]` component entry checked against its manifest and approval hashes (`prepare`) and run as a `ToolSource`, `guest_log.rs` a component's standard error as warnings in the log |
 | `crates/component-sdk` (`fronde-component`) | The guest SDK components depend on: the WIT it targets (a copy of `wit/v0.1`), `export_tool!`, settings, HTTP over WASI, fakes for native tests (`testing` feature). Stands alone: not in the root workspace, no dependency on another Fronde crate, publishable |
 | `wit/` | The components' WIT, one frozen directory per released version of `fronde:component` (`v0.1`): shared `settings` interface, `tool` world |
 | `components/` | Tool components, each a standalone Cargo project built for `wasm32-wasip2`, with its manifest `fronde-component.toml` beside `Cargo.toml` (`echo` is the host's test bench, `calendar` the CalDAV tools) |
-| `crates/server` | The `fronde` binary and library: configuration check, healthcheck, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
+| `crates/server` | The `fronde` binary and library: configuration check (`check.rs`, which prints the components' hashes), healthcheck, the component sources it hands the hub, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
 
 Components are built by `mise run components`, which builds each project listed in
-`$FRONDE_COMPONENTS` and copies the `.wasm` files to `components/dist` (mr-boxington prunes idle
-target directories); `fronde-wasm`'s tests load them from there, and `mise run test` builds them
+`$FRONDE_COMPONENTS` and copies the `.wasm` files to `components/dist`, each with its manifest
+beside it as `<name>.toml` (mr-boxington prunes idle target directories); the container image
+ships them in `/app/components`; `fronde-wasm`'s tests load them from there, and `mise run test` builds them
 first. A component may not import `wasi:filesystem` or `wasi:sockets`. The SDK's `bindings` module
 is the only place allowed `unsafe` code (the generated glue needs it); components forbid it.
 
@@ -84,6 +86,10 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
 ## Rules
 
 - Keep it as simple as possible: add a mechanism only when its absence hurts.
+- Integrations with outside services (a REST API, CalDAV, any standard) are components, not
+  hub code; an upstream MCP server is used as it is when a good one exists. Native Rust is for
+  the core: memory, scheduling, the hub itself. Every source of tools is a `ToolSource` under the
+  supervisor, configured as a `[[sources]]` entry.
 - Components are independent projects that will move to their own repositories: each has its own
   `Cargo.toml`, `Cargo.lock` and release profile, and depends only on `fronde-component` and
   external crates, never on another Fronde crate. The SDK depends on no Fronde crate either.

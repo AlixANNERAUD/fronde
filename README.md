@@ -125,8 +125,37 @@ env = {}
 builtin_tools = ["WebSearch", "WebFetch"]
 ```
 
-[`fronde.example.toml`](fronde.example.toml) also shows the memory caps, the CalDAV calendar and
-upstream MCP servers. `fronde check --config fronde.toml` validates the file and its secrets.
+[`fronde.example.toml`](fronde.example.toml) also shows the memory caps and the `[[sources]]` of
+tools: the calendar component and upstream MCP servers. `fronde check --config fronde.toml`
+validates the file and its secrets, and prints the hashes that approve each component.
+
+### Migrating from `[calendar]` and `[[mcp]]`
+
+Both sections are gone, and Fronde refuses them with a message saying what to write. An `[[mcp]]`
+section becomes a `[[sources]]` entry with `kind = "mcp"` and the same keys. The calendar is now a
+WebAssembly component, `calendar.wasm`, shipped in the image under `/app/components` (from a
+checkout, `mise run components` builds it into `components/dist`):
+
+```toml
+[[sources]]
+kind = "component"
+name = "calendar"
+path = "/app/components/calendar.wasm"
+sha256 = "…"            # both printed by `fronde check`
+manifest_sha256 = "…"
+allow = ["https://cloud.example"]   # the origin of the two URLs
+
+[sources.settings]
+events_url = "https://cloud.example/remote.php/dav/calendars/alix/personal/"
+reminders_url = "https://cloud.example/remote.php/dav/calendars/alix/tasks/"
+
+[[sources.credentials]]
+origin = "https://cloud.example"
+basic = { username = "alix", password = { env = "FRONDE_CALDAV_PASSWORD" } }
+```
+
+The component never sees the password: Fronde adds it to requests for that origin, over https
+only (or plain http to `localhost`). See the "Configure the calendar" guide in `docs/`.
 
 ## Signing Fronde in to Claude
 
