@@ -1,0 +1,31 @@
+# Jarvis configuration. Secrets are never written here: use { file = "…" } or { env = "…" }.
+
+[server]
+# Use "0.0.0.0:8484" inside a container.
+listen = "127.0.0.1:8484"
+# Bearer token required on /mcp (at least 32 characters).
+token = { file = "/run/secrets/jarvis_token" }
+
+[data]
+dir = "/var/lib/jarvis"
+timezone = "Europe/Paris"
+user = "alix"
+
+# Optional: caps for the core memory, in characters.
+[memory]
+memory_limit = 4000
+user_limit = 2000
+git = true
+
+# Optional: CalDAV calendar (events) and task list (reminders).
+[calendar]
+events_url = "https://cloud.example/remote.php/dav/calendars/alix/personal/"
+reminders_url = "https://cloud.example/remote.php/dav/calendars/alix/tasks/"
+username = "alix"
+password = { env = "JARVIS_CALDAV_PASSWORD" }
+
+# Upstream MCP servers, 0..n. Exactly one of url or command.
+[[mcp]]
+name = "mcphub"
+url = "https://mcphub.example/mcp"
+token = { env = "MCPHUB_TOKEN" }

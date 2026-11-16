@@ -1,0 +1,15 @@
+[package]
+name = "hub"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono-tz.workspace = true
+serde.workspace = true
+toml.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
