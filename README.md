@@ -128,7 +128,8 @@ Jarvis, which only has the hub's tools.
   `-v ./claude:/data/home/.claude` after `cp -r ~/.claude ./claude && sudo chown -R 65532:65532 ./claude`.
   The copy and the original share one sign-in; if one of them stops working, use a token.
 
-When the agent is not signed in, the first message ends with its error in the chat.
+When the agent is not signed in, the chat answers « L'agent n'est pas connecté à Claude » and the
+server's log has the details. When the adapter is missing, it asks to install it.
 
 ## Behind a reverse proxy
 

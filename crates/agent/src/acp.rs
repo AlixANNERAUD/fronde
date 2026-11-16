@@ -10,11 +10,12 @@ use agent_client_protocol::v1::schema::{
     SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason, SystemPrompt,
     SystemPromptMode, ToolCallStatus,
 };
-use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ErrorCode};
 use anyhow::{Context, anyhow};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{mpsc, oneshot};
@@ -62,6 +63,70 @@ pub enum TurnEnd {
     Limit,
 }
 
+/// What went wrong with the agent, as far as its owner can do something about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The agent's program is not installed.
+    NotInstalled,
+    /// The agent is not signed in to its model provider.
+    SignedOut,
+    Other,
+}
+
+impl Failure {
+    pub fn of(error: &anyhow::Error) -> Self {
+        if error.chain().any(|cause| cause.is::<NotInstalled>()) {
+            Self::NotInstalled
+        } else if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<agent_client_protocol::Error>()
+                .is_some_and(|error| error.code == ErrorCode::AUTH_REQUIRED)
+        }) {
+            Self::SignedOut
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// The agent's program is neither a path to an executable nor found on the `PATH`.
+#[derive(Debug)]
+struct NotInstalled(String);
+
+impl std::fmt::Display for NotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot start the agent: {} is not installed; install it with npm i -g @agentclientprotocol/claude-agent-acp",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotInstalled {}
+
+/// Whether `program` names an executable, looked up on the agent's `PATH` when it has no
+/// directory.
+fn installed(program: &str, env: &[(String, String)]) -> bool {
+    let program = Path::new(program);
+    if program.components().count() > 1 {
+        return executable(program);
+    }
+    let path = env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"));
+    path.is_some_and(|path| std::env::split_paths(&path).any(|dir| executable(&dir.join(program))))
+}
+
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
 /// One ACP session with the agent. Dropping it closes the connection and stops a spawned agent.
 pub struct AgentClient {
     connection: ConnectionTo<Agent>,
@@ -83,16 +148,16 @@ impl AgentClient {
             .command
             .split_first()
             .context("the agent command is empty; set it to claude-agent-acp")?;
+        // The ACP crate reports a failed spawn without its cause: look for the program first.
+        if !installed(program, &spec.env) {
+            return Err(NotInstalled(program.clone()).into());
+        }
         let config = AcpAgentConfig::new(program)
             .args(args.iter().cloned())
             .envs(spec.env.iter().cloned());
         let connection = Connection::start(AcpAgent::new(config), events)
             .await
-            .map_err(|e| {
-                anyhow!(
-                    "cannot start the agent ({command}): {e:#}; install it with npm i -g @agentclientprotocol/claude-agent-acp"
-                )
-            })?;
+            .with_context(|| format!("cannot start the agent ({command})"))?;
         connection.open_session(spec, resume).await
     }
 

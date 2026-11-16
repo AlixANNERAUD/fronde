@@ -35,6 +35,8 @@ pub struct FakeScript {
     pub leave_permission_pending: bool,
     /// Answer each prompt with an error, after the updates.
     pub fail_prompt: bool,
+    /// Answer each prompt with ACP's `auth_required` error, as a signed-out Claude does.
+    pub signed_out: bool,
 }
 
 impl Default for FakeScript {
@@ -48,6 +50,7 @@ impl Default for FakeScript {
             wait_for_cancel: false,
             leave_permission_pending: false,
             fail_prompt: false,
+            signed_out: false,
         }
     }
 }
@@ -184,6 +187,9 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
                         }
                         if script.fail_prompt {
                             return responder.respond_with_error(Error::internal_error());
+                        }
+                        if script.signed_out {
+                            return responder.respond_with_error(Error::auth_required());
                         }
                         let mut stop = script.stop;
                         if script.ask_permission {

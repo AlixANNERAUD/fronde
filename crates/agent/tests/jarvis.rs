@@ -4,7 +4,7 @@ use agent_client_protocol::v1::schema::{
 };
 use jarvis_agent::acp::{AgentClient, AgentSpec};
 use jarvis_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
-use jarvis_agent::jarvis::{Connector, Jarvis};
+use jarvis_agent::jarvis::{Connector, Jarvis, process_connector};
 use jarvis_agent::log::{Event, ToolState, TurnOutcome};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +18,11 @@ const BUSY: &str = "Jarvis répond encore ; attends la fin ou arrête-le.";
 const GONE: &str = "Cette demande n'est plus active.";
 const FRESH: &str = "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
+const NOT_INSTALLED: &str =
+    "Impossible de démarrer l'agent : installe @agentclientprotocol/claude-agent-acp.";
+const SIGNED_OUT: &str =
+    "L'agent n'est pas connecté à Claude : voir le README (claude setup-token).";
+const FAILED: &str = "L'agent a rencontré une erreur.";
 
 fn spec() -> AgentSpec {
     AgentSpec {
@@ -260,12 +265,10 @@ async fn prompt_error_becomes_error_event() {
     jarvis.send("Salut".into()).await;
     let events = wait_for_turns(&jarvis, 1).await;
 
-    let [first, Event::Notice { text }, last] = events.as_slice() else {
-        panic!("expected user, notice, end; got {events:?}");
-    };
-    assert_eq!(first, &user("Salut"));
-    assert!(text.contains("the agent failed the turn"), "{text}");
-    assert_eq!(last, &ended(TurnOutcome::Error));
+    assert_eq!(
+        events,
+        vec![user("Salut"), notice(FAILED), ended(TurnOutcome::Error)]
+    );
 
     // The failed client was dropped: the next message reconnects.
     jarvis.send("Encore".into()).await;
@@ -285,11 +288,45 @@ async fn connect_error_becomes_error_event() {
 
     assert_eq!(
         wait_for_turns(&jarvis, 1).await,
+        vec![user("Salut"), notice(FAILED), ended(TurnOutcome::Error)]
+    );
+}
+
+#[tokio::test]
+async fn missing_agent_says_how_to_install_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = AgentSpec {
+        command: vec!["/nonexistent/claude-agent-acp".into()],
+        ..spec()
+    };
+    let jarvis = Jarvis::open(spec, dir.path(), process_connector()).expect("open");
+
+    jarvis.send("Salut".into()).await;
+
+    assert_eq!(
+        wait_for_turns(&jarvis, 1).await,
         vec![
             user("Salut"),
-            notice("cannot start the agent (claude-agent-acp)"),
-            ended(TurnOutcome::Error),
+            notice(NOT_INSTALLED),
+            ended(TurnOutcome::Error)
         ]
+    );
+}
+
+#[tokio::test]
+async fn signed_out_agent_points_to_the_readme() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = FakeScript {
+        signed_out: true,
+        ..FakeScript::default()
+    };
+    let (jarvis, _fakes) = open(dir.path(), script);
+
+    jarvis.send("Salut".into()).await;
+
+    assert_eq!(
+        wait_for_turns(&jarvis, 1).await,
+        vec![user("Salut"), notice(SIGNED_OUT), ended(TurnOutcome::Error)]
     );
 }
 

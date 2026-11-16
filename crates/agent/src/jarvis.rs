@@ -1,6 +1,6 @@
 //! Jarvis's conversation: one agent session, its turns recorded in the conversation log.
 
-use crate::acp::{AgentClient, AgentEvent, AgentSpec, TurnEnd};
+use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use anyhow::{Context, anyhow};
 use futures::future::BoxFuture;
@@ -17,6 +17,11 @@ const NOT_ACTIVE: &str = "Cette demande n'est plus active.";
 const NEW_CONVERSATION: &str =
     "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
+const NOT_INSTALLED: &str =
+    "Impossible de démarrer l'agent : installe @agentclientprotocol/claude-agent-acp.";
+const SIGNED_OUT: &str =
+    "L'agent n'est pas connecté à Claude : voir le README (claude setup-token).";
+const FAILED: &str = "L'agent a rencontré une erreur.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
 /// How long the agent gets to start and open its session.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -129,8 +134,9 @@ impl Jarvis {
             let outcome = match jarvis.run_turn(&text, &cancel).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    tracing::warn!("the turn failed: {error:#}");
                     jarvis.append(Event::Notice {
-                        text: format!("{error:#}"),
+                        text: notice_for(&error).into(),
                     });
                     TurnOutcome::Error
                 }
@@ -177,7 +183,7 @@ impl Jarvis {
             biased;
             () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
             connected = tokio::time::timeout(START_TIMEOUT, self.connect()) => {
-                connected.map_err(|_| anyhow!(NO_START))??
+                connected.map_err(|_| anyhow!(StartTimeout))??
             }
         };
         let prompt = session.client.prompt(text);
@@ -335,6 +341,30 @@ async fn record_events(
                 let _ = done.send(());
             }
         }
+    }
+}
+
+/// The agent did not start within [`START_TIMEOUT`].
+#[derive(Debug)]
+struct StartTimeout;
+
+impl std::fmt::Display for StartTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the agent did not start within {START_TIMEOUT:?}")
+    }
+}
+
+impl std::error::Error for StartTimeout {}
+
+/// What the page says about a failed turn; the details go to the server's log.
+fn notice_for(error: &anyhow::Error) -> &'static str {
+    if error.is::<StartTimeout>() {
+        return NO_START;
+    }
+    match Failure::of(error) {
+        Failure::NotInstalled => NOT_INSTALLED,
+        Failure::SignedOut => SIGNED_OUT,
+        Failure::Other => FAILED,
     }
 }
 

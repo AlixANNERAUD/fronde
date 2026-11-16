@@ -2,7 +2,7 @@ use agent_client_protocol::v1::schema::{
     ContentBlock, McpServer, RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate,
     SystemPromptMode, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
-use jarvis_agent::acp::{AgentClient, AgentEvent, AgentSpec, TurnEnd};
+use jarvis_agent::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
 use jarvis_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use serde_json::json;
 use std::path::PathBuf;
@@ -295,12 +295,64 @@ async fn agent_start_failure_is_reported() {
         .await
         .expect("spawn timed out");
 
-    let error = format!("{:#}", result.err().expect("spawn should fail"));
+    let error = result.err().expect("spawn should fail");
+    assert_eq!(Failure::of(&error), Failure::NotInstalled);
+    let error = format!("{error:#}");
     assert!(error.contains("/nonexistent"), "{error}");
     assert!(
         error.contains("npm i -g @agentclientprotocol/claude-agent-acp"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn installed_agent_that_fails_to_start_gets_no_install_hint() {
+    // Found on the PATH, but not an ACP agent: it exits at once.
+    let spec = AgentSpec {
+        command: vec!["true".into()],
+        ..spec()
+    };
+    let (events, _rx) = mpsc::unbounded_channel();
+
+    let result = timeout(WAIT, AgentClient::spawn(&spec, None, events))
+        .await
+        .expect("spawn timed out");
+
+    let error = result.err().expect("spawn should fail");
+    assert_eq!(Failure::of(&error), Failure::Other);
+    let error = format!("{error:#}");
+    assert!(error.contains("cannot start the agent (true)"), "{error}");
+    assert!(!error.contains("npm"), "{error}");
+}
+
+#[tokio::test]
+async fn signed_out_agent_is_recognised() {
+    let script = FakeScript {
+        signed_out: true,
+        ..FakeScript::default()
+    };
+    let (client, _handle, _rx) = connect(script, None).await;
+
+    let error = timeout(WAIT, client.prompt("Salut"))
+        .await
+        .expect("prompt timed out")
+        .expect_err("the prompt should fail");
+
+    assert_eq!(Failure::of(&error), Failure::SignedOut);
+    let failed = connect(
+        FakeScript {
+            fail_prompt: true,
+            ..FakeScript::default()
+        },
+        None,
+    )
+    .await
+    .0;
+    let error = failed
+        .prompt("Salut")
+        .await
+        .expect_err("the prompt should fail");
+    assert_eq!(Failure::of(&error), Failure::Other);
 }
 
 #[tokio::test]
