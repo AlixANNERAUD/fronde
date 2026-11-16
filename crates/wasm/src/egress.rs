@@ -6,18 +6,22 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use http::HeaderValue;
 use http::header::{AUTHORIZATION, COOKIE};
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use std::fmt;
+use std::net::IpAddr;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
+use tokio::time::{Instant, Sleep};
 use wasmtime_wasi_http::{
-    DEFAULT_FORBIDDEN_HEADERS, ForbiddenHeaderFilter, RequestOptions, WasiBody, WasiHttpHooks,
+    DEFAULT_FORBIDDEN_HEADERS, Error, ForbiddenHeaderFilter, RequestOptions, WasiBody,
+    WasiHttpHooks,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Time allowed for the response headers, and then between two chunks of the body.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `scheme://host[:port]`, compared on its parsed parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,10 +38,24 @@ impl Origin {
             "http" => false,
             _ => return None,
         };
-        // host() and port_u16(), never the raw authority, which may carry user information.
+        // The connection goes to the raw authority: refuse user information rather than trust
+        // host() to agree with it.
+        if uri.authority()?.as_str().contains('@') {
+            return None;
+        }
         let host = uri.host()?.to_ascii_lowercase();
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
         Some(Self { https, host, port })
+    }
+
+    fn is_loopback(&self) -> bool {
+        self.host == "localhost"
+            || self
+                .host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
     }
 }
 
@@ -137,6 +155,12 @@ impl Grants {
             let Some(grant) = grants.iter_mut().find(|g| g.origin == *origin) else {
                 bail!("credential for {origin}, which is not in the allowed origins");
             };
+            if !origin.https && !origin.is_loopback() {
+                bail!(
+                    "credential for {origin} would travel unencrypted: use https (plain http is \
+                     accepted only for localhost)"
+                );
+            }
             grant.authorization = Some(credential.header()?);
         }
         Ok(Self(grants.into()))
@@ -151,6 +175,8 @@ impl Grants {
 /// The store's HTTP hooks: one per call.
 pub(crate) struct Egress {
     pub(crate) grants: Grants,
+    /// For each request, from sending it to the end of the response body.
+    pub(crate) request_timeout: Duration,
 }
 
 impl WasiHttpHooks for Egress {
@@ -189,17 +215,60 @@ impl WasiHttpHooks for Egress {
         // a new request, checked again here.
         let options = RequestOptions {
             connect_timeout: Some(CONNECT_TIMEOUT),
-            first_byte_timeout: Some(RESPONSE_TIMEOUT),
-            between_bytes_timeout: Some(RESPONSE_TIMEOUT),
+            first_byte_timeout: Some(self.request_timeout),
+            between_bytes_timeout: Some(self.request_timeout),
         };
+        let deadline = Instant::now() + self.request_timeout;
         Box::new(async move {
-            let (response, io) =
-                wasmtime_wasi_http::default_send_request(request, Some(options)).await?;
+            let send = wasmtime_wasi_http::default_send_request(request, Some(options));
+            let (response, io) = tokio::time::timeout_at(deadline, send)
+                .await
+                .map_err(|_| Error::HttpResponseTimeout)??;
+            let io = async move {
+                tokio::time::timeout_at(deadline, io)
+                    .await
+                    .map_err(|_| Error::HttpResponseTimeout)?
+            };
             Ok((
-                response.map(BodyExt::boxed_unsync),
+                response.map(|body| {
+                    Deadline {
+                        body: body.boxed_unsync(),
+                        sleep: Box::pin(tokio::time::sleep_until(deadline)),
+                    }
+                    .boxed_unsync()
+                }),
                 Box::new(io) as Box<dyn Future<Output = _> + Send>,
             ))
         })
+    }
+}
+
+/// A response body that fails once the request's deadline has passed, however slowly it drips.
+struct Deadline {
+    body: WasiBody,
+    sleep: Pin<Box<Sleep>>,
+}
+
+impl Body for Deadline {
+    type Data = bytes::Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(Error::HttpResponseTimeout)));
+        }
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -248,6 +317,7 @@ mod tests {
         let g = grants(&["https://cal.example"]);
         assert!(!allowed(&g, "https://cal.example@evil.test/"));
         assert!(!allowed(&g, "https://cal.example:443@evil.test/"));
+        assert!(!allowed(&g, "https://x@cal.example/"));
     }
 
     #[test]
@@ -258,6 +328,31 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("not in the allowed origins"), "{e}");
+    }
+
+    #[test]
+    fn credentials_need_https_unless_loopback() {
+        let cred = || Credential::Bearer("t".into());
+        for origin in ["http://cal.example", "http://10.0.0.2:8080"] {
+            let o: Origin = origin.parse().unwrap();
+            let e = Grants::new(std::slice::from_ref(&o), &[(o.clone(), cred())])
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains("unencrypted"), "{e}");
+        }
+        for origin in [
+            "https://cal.example",
+            "http://localhost:8080",
+            "http://127.0.0.1:9",
+            "http://[::1]:9",
+        ] {
+            let o: Origin = origin.parse().unwrap();
+            assert!(
+                Grants::new(std::slice::from_ref(&o), &[(o.clone(), cred())]).is_ok(),
+                "{origin}"
+            );
+        }
     }
 
     #[test]

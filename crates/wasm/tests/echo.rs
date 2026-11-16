@@ -67,6 +67,7 @@ async fn lists_and_calls_tools() {
             "echo_setting",
             "echo_fetch",
             "echo_spin",
+            "echo_alloc",
             "echo_sleep"
         ]
     );
@@ -132,6 +133,128 @@ async fn allowed_origin_gets_host_credential() {
 }
 
 #[tokio::test]
+async fn each_credential_reaches_only_its_origin() {
+    let (a, b) = (MockServer::start().await, MockServer::start().await);
+    for (server, expected) in [(&a, "Bearer token-a"), (&b, "Bearer token-b")] {
+        Mock::given(method("GET"))
+            .and(header("authorization", expected))
+            .respond_with(EchoAuthorization)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+    let mut spec = spec();
+    spec.allow = vec![origin(&a), origin(&b)];
+    spec.credentials = vec![
+        (origin(&a), Credential::Bearer("token-a".into())),
+        (origin(&b), Credential::Bearer("token-b".into())),
+    ];
+    let echo = load(spec).await;
+    for (server, expected) in [(&a, "Bearer token-a"), (&b, "Bearer token-b")] {
+        let out = echo.call("echo_fetch", &json!({"url": server.uri()})).await;
+        assert_eq!(out.value["authorization"], expected, "{}", out.to_text());
+    }
+}
+
+#[tokio::test]
+async fn waiting_on_http_is_not_charged() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+        .mount(&server)
+        .await;
+    // 300 ms of running time, but a reply that takes 2 s: only the running time counts.
+    let host = ComponentHost::with_limits(Limits {
+        cpu_ticks: 3,
+        ..Limits::default()
+    })
+    .unwrap();
+    let mut spec = spec();
+    spec.allow = vec![origin(&server)];
+    let echo = LoadedComponent::load(&host, spec).await.unwrap();
+    let out = echo.call("echo_fetch", &json!({"url": server.uri()})).await;
+    assert!(!out.is_error, "{}", out.to_text());
+    assert_eq!(out.value["status"], 200);
+}
+
+/// Answers every request with headers at once, then one byte of the body every 100 ms.
+async fn dripping_server() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n";
+                if socket.write_all(head).await.is_err() {
+                    return;
+                }
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if socket.write_all(b"x").await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn slow_responses_time_out() {
+    let host = ComponentHost::with_limits(Limits {
+        request_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    })
+    .unwrap();
+    let late = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+        .mount(&late)
+        .await;
+    let dripping = dripping_server().await;
+    let mut spec = spec();
+    spec.allow = vec![origin(&late), dripping.parse().unwrap()];
+    let echo = LoadedComponent::load(&host, spec).await.unwrap();
+    for url in [late.uri(), dripping] {
+        let started = Instant::now();
+        let out = echo.call("echo_fetch", &json!({ "url": url })).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "{url}");
+        assert!(out.is_error, "{url}: {}", out.to_text());
+        assert!(
+            out.to_text().to_lowercase().contains("timeout"),
+            "{url}: {}",
+            out.to_text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_cap_becomes_a_tool_error() {
+    let echo = load(spec()).await;
+    let out = echo.call("echo_alloc", &json!({"mib": 8})).await;
+    assert_eq!(out.value, json!(8 << 20), "{}", out.to_text());
+    let out = echo.call("echo_alloc", &json!({"mib": 100})).await;
+    assert!(out.is_error);
+    assert!(
+        out.to_text().contains("echo component failed"),
+        "{}",
+        out.to_text()
+    );
+    let out = echo.call("echo_text", &json!({"text": "still here"})).await;
+    assert_eq!(out.value, json!("still here"));
+}
+
+#[tokio::test]
 async fn denies_unlisted_origin() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -190,7 +313,11 @@ async fn infinite_loop_is_interrupted() {
     let out = echo.call("echo_spin", &json!({})).await;
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(out.is_error);
-    assert!(out.to_text().contains("CPU"), "{}", out.to_text());
+    assert!(
+        out.to_text().contains("compute budget"),
+        "{}",
+        out.to_text()
+    );
     // Each call has its own store: the component still answers.
     let out = echo.call("echo_text", &json!({"text": "still here"})).await;
     assert_eq!(out.value, json!("still here"));

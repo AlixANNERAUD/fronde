@@ -74,6 +74,12 @@ impl Guest for Component {
                 json!({"type": "object"}),
             ),
             tool(
+                "echo_alloc",
+                "Allocate a number of mebibytes.",
+                true,
+                json!({"type": "object", "properties": {"mib": {"type": "integer"}}, "required": ["mib"]}),
+            ),
+            tool(
                 "echo_sleep",
                 "Wait for a number of milliseconds.",
                 true,
@@ -97,6 +103,10 @@ impl Guest for Component {
             "echo_spin" => loop {
                 std::hint::black_box(());
             },
+            "echo_alloc" => with_args(&arguments, |a: AllocArgs| {
+                let block = vec![1u8; a.mib << 20];
+                ok(json!(std::hint::black_box(&block).len()))
+            }),
             "echo_sleep" => with_args(&arguments, |a: SleepArgs| {
                 // The timer needs the runtime that block_on starts, so it is made inside it.
                 wstd::runtime::block_on(async {
@@ -127,6 +137,11 @@ struct TextArgs {
 #[derive(Deserialize)]
 struct SettingArgs {
     key: String,
+}
+
+#[derive(Deserialize)]
+struct AllocArgs {
+    mib: usize,
 }
 
 #[derive(Deserialize)]

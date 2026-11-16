@@ -37,7 +37,7 @@ struct Loaded {
 impl LoadedComponent {
     /// Compile the component, check its imports and exports, and ask it for its tools.
     pub async fn load(host: &ComponentHost, spec: ComponentSpec) -> anyhow::Result<Self> {
-        let component = host.compile(&spec)?;
+        let component = host.compile(&spec).await?;
         let exports_tools = component
             .component_type()
             .exports(host.engine())
