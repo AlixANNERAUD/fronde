@@ -228,6 +228,14 @@ fichiers, registre et signature : plus tard, si besoin.
 - **Mode admin** : threads, agents en cours (dont T3), validations en attente, navigateur, réglages.
 - Leptos épinglé + `AGENTS.md` avec les usages de cette version ; `leptos-use` pour les API du navigateur ;
   tests au clavier des composants interactifs.
+- **Liaison front ↔ back** : **une seule WebSocket** par onglet, messages typés partagés entre front et back
+  (une crate commune, JSON ; trames binaires pour l'image du navigateur). Requêtes avec identifiant et réponse,
+  plus événements poussés (texte qui s'écrit, validations, rappels). Chaque événement porte un numéro : à la
+  reconnexion (téléphone en veille), le client redonne le dernier vu et le serveur renvoie la suite.
+  **HTTP simple** pour le reste : fichiers de l'app, connexion, envoi et téléchargement de fichiers, et
+  l'endpoint `/mcp` (imposé par la spécification MCP). App fermée : notifications Web Push.
+  Pas de SSE (il faudrait de toute façon une WebSocket pour le navigateur et la voix) ; pas de server functions
+  Leptos (deux façons de faire au lieu d'une). La voix pourra demander WebRTC plus tard [Claude].
 
 ### 6.13 Permissions
 
