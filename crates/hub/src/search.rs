@@ -69,7 +69,7 @@ impl ToolIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{Registry, ToolDef, ToolOutput, register_meta_tools, typed_tool};
+    use crate::tools::{Registry, ToolDef, ToolOutput, meta_tools, typed_tool};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -116,7 +116,7 @@ mod tests {
 
     fn registry_with_echo() -> Arc<Registry> {
         let r = Arc::new(Registry::new());
-        register_meta_tools(&r).unwrap();
+        r.replace_source("hub", meta_tools(&r));
         let (mut d, h) = typed_tool(
             "mcphub_echo",
             "Echo text back to the caller",

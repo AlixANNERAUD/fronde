@@ -21,7 +21,7 @@ anyhow = "1"
 base64 = "0.22"
 chrono = "0.4"
 chrono-tz = "0.10"
-fronde-component = { path = "../../crates/component-sdk" }
+fronde-component = { version = "0.1", path = "../../crates/component-sdk" }
 http = "1"
 calcard = { version = "0.3", default-features = false }
 roxmltree = "0.21"
@@ -40,7 +40,7 @@ uuid = { version = "1", features = ["v4"] }
 calcard = { version = "0.3", default-features = false, features = ["wasm"] }
 
 [dev-dependencies]
-fronde-component = { path = "../../crates/component-sdk", features = ["testing"] }
+fronde-component = { version = "0.1", path = "../../crates/component-sdk", features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "forbid"

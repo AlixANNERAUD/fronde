@@ -72,10 +72,11 @@ description = "Generate the web interface's stylesheet"
 hide = true
 run = "tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css"
 
-# Each tool component is built for WASI in its own project. Its own .wasm (named after its directory;
-# stale files in the cached target directory are left behind) is copied to a fresh components/dist, where fronde-wasm's tests load them (mr-boxington prunes idle target
-# directories), each with its manifest beside it under the same name (calendar.toml), where
-# Fronde looks for it.
+# Each tool component is built for WASI in its own project. Its .wasm is named after its
+# directory and copied to a fresh components/dist (the cached target directory may hold stale
+# files, which are left behind). The tests of fronde-wasm load the components from there. Each
+# one's manifest goes beside it under the same name (calendar.toml), where Fronde looks for it.
+# mr-boxington prunes idle target directories, hence the copy.
 [tasks.components]
 description = "Build the tool components for wasm32-wasip2 into components/dist"
 run = [

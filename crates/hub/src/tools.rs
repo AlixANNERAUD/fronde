@@ -20,7 +20,8 @@ pub struct ToolDef {
     pub description: String,
     pub input_schema: Value,
     pub deferred: bool,
-    /// "hub" for native tools, otherwise the upstream server name.
+    /// Where the tool comes from: "hub" for native tools, the upstream server's name for its tools,
+    /// the component's name for a component's.
     pub source: String,
 }
 
@@ -183,11 +184,6 @@ impl Registry {
         });
     }
 
-    pub fn unregister_source(&self, source: &str) {
-        let mut tools = self.tools.write().expect("registry lock");
-        self.remove_source(&mut tools, source);
-    }
-
     /// Put `tools` in place of the tools of `source`, all at once: no call sees the source with
     /// some or none of its tools. Each tool takes `source` as its source; one with an invalid
     /// name or the name of another source's tool is skipped with a warning. Returns how many
@@ -288,14 +284,6 @@ struct UseArgs {
     /// Arguments matching that tool's input schema.
     #[serde(default)]
     arguments: Value,
-}
-
-/// Register `search_tools` and `use_tool`.
-pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
-    for (def, handler) in meta_tools(registry) {
-        registry.register(def, handler)?;
-    }
-    Ok(())
 }
 
 /// `search_tools` and `use_tool`, over `registry`.
@@ -414,14 +402,14 @@ mod tests {
     }
 
     #[test]
-    fn unregister_source_removes_only_that_source() {
+    fn replacing_a_source_with_nothing_removes_only_that_source() {
         let r = Registry::new();
         let (mut d, h) = double(true, "up_one");
         d.source = "up".into();
         r.register(d, h).unwrap();
         let (d, h) = double(false, "mine");
         r.register(d, h).unwrap();
-        r.unregister_source("up");
+        assert_eq!(r.replace_source("up", vec![]), 0);
         assert!(r.deferred_names().is_empty());
         assert_eq!(r.visible().len(), 1);
     }
