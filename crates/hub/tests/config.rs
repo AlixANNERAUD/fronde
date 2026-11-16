@@ -1,4 +1,4 @@
-use fronde_hub::config::{Secret, load};
+use fronde_hub::config::{Secret, SourceConfig, load};
 use std::io::Write;
 
 fn load_str(s: &str) -> anyhow::Result<fronde_hub::config::Config> {
@@ -19,7 +19,15 @@ timezone = "Europe/Paris"
 fn loads_example() {
     let c = load(std::path::Path::new("../../fronde.example.toml")).unwrap();
     assert_eq!(c.data.timezone, chrono_tz::Europe::Paris);
-    assert_eq!(c.mcp.len(), 1);
+    let kinds: Vec<_> = c
+        .sources
+        .iter()
+        .map(|s| match s {
+            SourceConfig::Mcp(m) => ("mcp", m.name.as_str()),
+            SourceConfig::Component(c) => ("component", c.name.as_str()),
+        })
+        .collect();
+    assert_eq!(kinds, [("component", "calendar"), ("mcp", "mcphub")]);
     assert_eq!(c.data.user, "alix");
     assert!(c.web.is_some());
 }
@@ -33,7 +41,7 @@ fn defaults_apply() {
         (c.memory.memory_limit, c.memory.user_limit, c.memory.git),
         (4000, 2000, true)
     );
-    assert!(c.calendar.is_none());
+    assert!(c.sources.is_empty());
     assert!(c.web.is_none());
     assert_eq!(c.agent.command, ["claude-agent-acp"]);
     assert!(c.agent.env.is_empty());
@@ -91,10 +99,12 @@ fn rejects_unknown_key() {
 
 #[test]
 fn rejects_url_and_command() {
-    let s = format!("{MIN}\n[[mcp]]\nname = \"a\"\nurl = \"http://x/mcp\"\ncommand = [\"x\"]\n");
+    let s = format!(
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"a\"\nurl = \"http://x/mcp\"\ncommand = [\"x\"]\n"
+    );
     let e = load_str(&s).unwrap_err();
     assert!(format!("{e:#}").contains("exactly one of"), "{e:#}");
-    let s = format!("{MIN}\n[[mcp]]\nname = \"a\"\n");
+    let s = format!("{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"a\"\n");
     assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("exactly one of"));
 }
 
@@ -105,7 +115,8 @@ fn rejects_bad_timezone() {
 
 #[test]
 fn rejects_bad_tool_prefix_name() {
-    let s = format!("{MIN}\n[[mcp]]\nname = \"MCP Hub\"\nurl = \"http://x/mcp\"\n");
+    let s =
+        format!("{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"MCP Hub\"\nurl = \"http://x/mcp\"\n");
     let e = load_str(&s).unwrap_err();
     assert!(format!("{e:#}").contains("^[a-z][a-z0-9_]"), "{e:#}");
 }
@@ -142,10 +153,11 @@ fn missing_secret_explains() {
 
 #[test]
 fn rejects_reserved_and_duplicate_upstream_names() {
-    let s = format!("{MIN}\n[[mcp]]\nname = \"hub\"\nurl = \"http://x/mcp\"\n");
+    let s = format!("{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"hub\"\nurl = \"http://x/mcp\"\n");
     assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("reserved"));
+    // Names are unique across kinds.
     let s = format!(
-        "{MIN}\n[[mcp]]\nname = \"a\"\nurl = \"http://x/mcp\"\n[[mcp]]\nname = \"a\"\nurl = \"http://y/mcp\"\n"
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"a\"\nurl = \"http://x/mcp\"\n[[sources]]\nkind = \"component\"\nname = \"a\"\npath = \"a.wasm\"\n"
     );
     assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("twice"));
 }
@@ -235,4 +247,132 @@ fn xdg_data_dir_follows_the_spec() {
     // A relative or missing home gives no default rather than a relative directory.
     assert_eq!(xdg_data_dir(None, p("home")), None);
     assert_eq!(xdg_data_dir(None, None), None);
+}
+
+/// A component entry for `allow`, `settings` and `credentials` to follow.
+fn component(rest: &str) -> String {
+    format!(
+        "{MIN}\n[[sources]]\nkind = \"component\"\nname = \"calendar\"\npath = \"calendar.wasm\"\n{rest}"
+    )
+}
+
+fn refused(s: &str) -> String {
+    format!("{:#}", load_str(s).unwrap_err())
+}
+
+#[test]
+fn loads_a_component_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fronde.toml");
+    let text = component(
+        "sha256 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
+         allow = [\"https://cloud.example\", { origin = \"http://192.168.1.10:5232\", local = true }]\n\
+         [sources.settings]\nevents_url = \"https://cloud.example/e/\"\n\
+         [[sources.credentials]]\norigin = \"https://cloud.example\"\n\
+         basic = { username = \"alix\", password = { file = \"caldav\" } }\n\
+         [[sources.credentials]]\norigin = \"http://192.168.1.10:5232\"\nbearer = { env = \"T\" }\n",
+    );
+    std::fs::write(&path, text).unwrap();
+    let c = load(&path).unwrap();
+    let [SourceConfig::Component(c)] = &c.sources[..] else {
+        panic!("{:?}", c.sources)
+    };
+    // Paths are read from the config file's directory.
+    assert_eq!(c.path, dir.path().join("calendar.wasm"));
+    assert_eq!(c.manifest_path(), dir.path().join("calendar.toml"));
+    assert_eq!(
+        (c.allow[0].origin.as_str(), c.allow[0].local),
+        ("https://cloud.example/", false)
+    );
+    assert_eq!(
+        (c.allow[1].origin.as_str(), c.allow[1].local),
+        ("http://192.168.1.10:5232/", true)
+    );
+    assert_eq!(c.settings["events_url"], "https://cloud.example/e/");
+    let basic = c.credentials[0].basic.as_ref().unwrap();
+    assert_eq!(basic.username, "alix");
+    assert!(matches!(&basic.password, Secret::File { file } if *file == dir.path().join("caldav")));
+    assert!(c.manifest_sha256.is_none());
+}
+
+#[test]
+fn component_rejects_unknown_key() {
+    let e = refused(&component("alow = []\n"));
+    assert!(e.contains("alow"), "{e}");
+    let e = refused(&component(
+        "allow = [{ origin = \"https://a.example\", locale = true }]\n",
+    ));
+    assert!(e.contains("locale"), "{e}");
+    let e = refused(&component(
+        "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbasic = { username = \"a\", pasword = { env = \"P\" } }\n",
+    ));
+    assert!(e.contains("pasword"), "{e}");
+}
+
+#[test]
+fn component_origins_are_bare() {
+    for bad in [
+        "https://a.example/dav/",
+        "ftp://a.example",
+        "https://u@a.example",
+    ] {
+        let e = refused(&component(&format!("allow = [{bad:?}]\n")));
+        assert!(e.contains("origin"), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn rejects_duplicate_allowed_origin() {
+    // The same origin spelled two ways.
+    let e = refused(&component(
+        "allow = [\"https://Cloud.example\", { origin = \"https://cloud.example:443\", local = true }]\n",
+    ));
+    assert!(e.contains("https://cloud.example is in allow twice"), "{e}");
+}
+
+#[test]
+fn credential_origin_must_be_allowed() {
+    let e = refused(&component(
+        "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://b.example\"\nbearer = { env = \"T\" }\n",
+    ));
+    assert!(
+        e.contains("https://b.example") && e.contains("not in allow"),
+        "{e}"
+    );
+}
+
+#[test]
+fn credential_needs_exactly_one_kind_and_no_plain_secret() {
+    let both = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"T\" }\nbasic = { username = \"a\", password = { env = \"P\" } }\n";
+    assert!(refused(&component(both)).contains("exactly one of basic or bearer"));
+    let none = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\n";
+    assert!(refused(&component(none)).contains("exactly one of basic or bearer"));
+    let plain = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = \"tok\"\n";
+    assert!(load_str(&component(plain)).is_err());
+    let twice = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"T\" }\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"U\" }\n";
+    assert!(refused(&component(twice)).contains("two credentials"));
+}
+
+#[test]
+fn component_hash_must_be_hex() {
+    let e = refused(&component("sha256 = \"abc\"\n"));
+    assert!(e.contains("64 lower-case hex digits"), "{e}");
+}
+
+#[test]
+fn old_sections_point_to_sources() {
+    let e = refused(&format!(
+        "{MIN}\n[calendar]\nevents_url = \"https://a.example/\"\n"
+    ));
+    assert!(
+        e.contains("[[sources]]") && e.contains("kind = \"component\""),
+        "{e}"
+    );
+    let e = refused(&format!(
+        "{MIN}\n[[mcp]]\nname = \"a\"\nurl = \"http://x/mcp\"\n"
+    ));
+    assert!(
+        e.contains("[[sources]]") && e.contains("kind = \"mcp\""),
+        "{e}"
+    );
 }

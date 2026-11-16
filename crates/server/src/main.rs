@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use fronde_hub::config::SourceConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -67,12 +68,25 @@ fn check(path: &std::path::Path) -> anyhow::Result<()> {
     if let Some(web) = &config.web {
         fronde::check_password(&web.password.resolve().context("web.password")?)?;
     }
-    if let Some(c) = &config.calendar {
-        c.password.resolve()?;
-    }
-    for m in &config.mcp {
-        if let Some(t) = &m.token {
-            t.resolve()?;
+    for source in &config.sources {
+        let name = source.name();
+        match source {
+            SourceConfig::Mcp(m) => {
+                if let Some(t) = &m.token {
+                    t.resolve()
+                        .with_context(|| format!("source {name}: token"))?;
+                }
+            }
+            SourceConfig::Component(c) => {
+                for credential in &c.credentials {
+                    let secret = credential.basic.as_ref().map(|b| &b.password);
+                    if let Some(s) = secret.or(credential.bearer.as_ref()) {
+                        s.resolve().with_context(|| {
+                            format!("source {name}: credential for {}", credential.origin)
+                        })?;
+                    }
+                }
+            }
         }
     }
     Ok(())

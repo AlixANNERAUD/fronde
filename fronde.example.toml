@@ -20,15 +20,34 @@ memory_limit = 4000
 user_limit = 2000
 git = true
 
-# Optional: CalDAV calendar (events) and task list (reminders).
-[calendar]
+# Where tools come from besides Fronde's own (memory, tool search), 0..n, each with a unique name.
+
+# A tool component: a .wasm file run in a sandbox, with its manifest beside it (calendar.toml)
+# saying what it asks for. It reaches only the origins in allow, each one its manifest asks for,
+# and never sees its credentials: Fronde adds them to its requests. Once you have read the
+# manifest, copy the two hashes `fronde check` prints here: a component whose files change is not
+# loaded until you approve the new ones the same way.
+[[sources]]
+kind = "component"
+name = "calendar"
+path = "/app/components/calendar.wasm"
+# sha256 = "…"
+# manifest_sha256 = "…"
+# A server on this machine or the local network needs { origin = "http://…", local = true }.
+allow = ["https://cloud.example"]
+
+# Fronde adds timezone from [data].
+[sources.settings]
 events_url = "https://cloud.example/remote.php/dav/calendars/alix/personal/"
 reminders_url = "https://cloud.example/remote.php/dav/calendars/alix/tasks/"
-username = "alix"
-password = { env = "FRONDE_CALDAV_PASSWORD" }
 
-# Upstream MCP servers, 0..n. Exactly one of url or command.
-[[mcp]]
+[[sources.credentials]]
+origin = "https://cloud.example"
+basic = { username = "alix", password = { env = "FRONDE_CALDAV_PASSWORD" } }
+
+# An upstream MCP server: exactly one of url or command. Its tools are named mcphub_….
+[[sources]]
+kind = "mcp"
 name = "mcphub"
 url = "https://mcphub.example/mcp"
 token = { env = "MCPHUB_TOKEN" }

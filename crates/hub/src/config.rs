@@ -14,9 +14,9 @@ pub struct Config {
     pub data: DataConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
-    pub calendar: Option<CalendarConfig>,
+    /// Where tools come from besides the hub's own: upstream MCP servers and components.
     #[serde(default)]
-    pub mcp: Vec<UpstreamConfig>,
+    pub sources: Vec<SourceConfig>,
     /// The chat page; without it the server is only the hub.
     pub web: Option<WebConfig>,
     #[serde(default)]
@@ -93,13 +93,23 @@ impl Default for MemoryConfig {
     }
 }
 
+/// One `[[sources]]` entry.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CalendarConfig {
-    pub events_url: Url,
-    pub reminders_url: Url,
-    pub username: String,
-    pub password: Secret,
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SourceConfig {
+    /// An upstream MCP server, whose tools become `{name}_{tool}`.
+    Mcp(UpstreamConfig),
+    /// A tool component (`.wasm`), run in the sandbox with what this entry grants it.
+    Component(ComponentConfig),
+}
+
+impl SourceConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Mcp(m) => &m.name,
+            Self::Component(c) => &c.name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +119,133 @@ pub struct UpstreamConfig {
     pub url: Option<Url>,
     pub command: Option<Vec<String>>,
     pub token: Option<Secret>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentConfig {
+    pub name: String,
+    /// The component's `.wasm` file.
+    pub path: PathBuf,
+    /// Its manifest; by default the `.toml` file beside `path` with the same name.
+    pub manifest: Option<PathBuf>,
+    /// SHA-256 of the `.wasm` file, as `fronde check` prints it: approves this build.
+    pub sha256: Option<String>,
+    /// SHA-256 of the manifest: approves what the component asks for.
+    pub manifest_sha256: Option<String>,
+    /// Origins the component may reach, each one its manifest asks for.
+    #[serde(default)]
+    pub allow: Vec<Allow>,
+    /// What the component reads through `settings.get`, checked against its manifest; never
+    /// secrets.
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+    /// Secrets the host adds to requests for an allowed origin.
+    #[serde(default)]
+    pub credentials: Vec<CredentialConfig>,
+}
+
+impl ComponentConfig {
+    /// The manifest's path: `manifest`, or `path` with a `.toml` extension.
+    pub fn manifest_path(&self) -> PathBuf {
+        self.manifest
+            .clone()
+            .unwrap_or_else(|| self.path.with_extension("toml"))
+    }
+}
+
+/// An origin a component may reach: `"https://cloud.example"`, or
+/// `{ origin = "http://192.168.1.10:5232", local = true }` for a server on the host or its
+/// network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allow {
+    /// `scheme://host[:port]`, with no path.
+    pub origin: Url,
+    /// Whether it may resolve to a local address (loopback, private, link-local).
+    pub local: bool,
+}
+
+impl<'de> Deserialize<'de> for Allow {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{self, MapAccess, Visitor, value::MapAccessDeserializer};
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            origin: String,
+            #[serde(default)]
+            local: bool,
+        }
+
+        struct AllowVisitor;
+
+        impl<'de> Visitor<'de> for AllowVisitor {
+            type Value = Allow;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "an origin such as \"https://cloud.example\", or { origin = \"…\", local = true }",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Allow, E> {
+                Ok(Allow {
+                    origin: parse_origin(s).map_err(E::custom)?,
+                    local: false,
+                })
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Allow, A::Error> {
+                let t = Table::deserialize(MapAccessDeserializer::new(map))?;
+                Ok(Allow {
+                    origin: parse_origin(&t.origin).map_err(de::Error::custom)?,
+                    local: t.local,
+                })
+            }
+        }
+
+        d.deserialize_any(AllowVisitor)
+    }
+}
+
+/// A secret the host sends to one origin: exactly one of `basic` or `bearer`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialConfig {
+    #[serde(deserialize_with = "origin")]
+    pub origin: Url,
+    pub basic: Option<BasicCredential>,
+    pub bearer: Option<Secret>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicCredential {
+    pub username: String,
+    pub password: Secret,
+}
+
+/// `scheme://host[:port]` over http or https, with nothing else.
+pub fn parse_origin(s: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(s).with_context(|| format!("origin {s:?} is not a URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("origin {s:?}: the scheme must be http or https");
+    }
+    if url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("origin {s:?} must be scheme://host[:port], with no path or user");
+    }
+    Ok(url)
+}
+
+fn origin<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
+    let s = String::deserialize(d)?;
+    parse_origin(&s).map_err(serde::de::Error::custom)
 }
 
 /// A secret is never written in the TOML: it points to a file or an environment variable.
@@ -200,6 +337,7 @@ pub fn is_valid_name(name: &str) -> bool {
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config {}", path.display()))?;
+    replaced_sections(&text).with_context(|| format!("invalid config {}", path.display()))?;
     let mut config: Config =
         toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
     if config.data.dir.as_os_str().is_empty() {
@@ -224,29 +362,30 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
     if let Some(web) = &mut config.web {
         web.password.anchor(base);
     }
-    if let Some(c) = &mut config.calendar {
-        c.password.anchor(base);
-    }
-    for m in &mut config.mcp {
-        if let Some(t) = &mut m.token {
-            t.anchor(base);
+    for source in &mut config.sources {
+        match source {
+            SourceConfig::Mcp(m) => {
+                if let Some(t) = &mut m.token {
+                    t.anchor(base);
+                }
+            }
+            SourceConfig::Component(c) => {
+                c.path = base.join(&c.path);
+                if let Some(m) = &mut c.manifest {
+                    *m = base.join(&*m);
+                }
+                for credential in &mut c.credentials {
+                    if let Some(b) = &mut credential.basic {
+                        b.password.anchor(base);
+                    }
+                    if let Some(t) = &mut credential.bearer {
+                        t.anchor(base);
+                    }
+                }
+            }
         }
     }
-    let mut seen = std::collections::HashSet::new();
-    for m in &config.mcp {
-        if m.name == "hub" {
-            bail!("mcp name \"hub\" is reserved for the hub's own tools; pick another name");
-        }
-        if !seen.insert(&m.name) {
-            bail!("mcp name {:?} is used twice; names must be unique", m.name);
-        }
-        if !is_valid_name(&m.name) {
-            bail!("mcp name {:?} must match ^[a-z][a-z0-9_]{{0,63}}$", m.name);
-        }
-        if m.url.is_some() == m.command.is_some() {
-            bail!("mcp {:?}: set exactly one of url or command", m.name);
-        }
-    }
+    check_sources(&config.sources)?;
     for tool in &config.agent.builtin_tools {
         if !SAFE_BUILTIN_TOOLS.contains(&tool.as_str()) {
             bail!(
@@ -255,4 +394,100 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         }
     }
     Ok(config)
+}
+
+/// `[calendar]` and `[[mcp]]` became `[[sources]]` entries: say how, rather than "unknown field".
+fn replaced_sections(text: &str) -> anyhow::Result<()> {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Ok(()); // the full parse reports it
+    };
+    if table.contains_key("calendar") {
+        bail!(
+            "[calendar] is gone: the calendar is now a component. Replace it with a [[sources]] \
+             entry with kind = \"component\" and path = \"…/calendar.wasm\", its URLs under \
+             [sources.settings] and the account under [[sources.credentials]]; see \
+             fronde.example.toml and the \"Configure the calendar\" guide"
+        );
+    }
+    if table.contains_key("mcp") {
+        bail!(
+            "[[mcp]] is gone: write each server as a [[sources]] entry with kind = \"mcp\" and \
+             the same name, url or command, and token"
+        );
+    }
+    Ok(())
+}
+
+fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for source in sources {
+        let name = source.name();
+        if name == "hub" {
+            bail!("source name \"hub\" is reserved for the hub's own tools; pick another name");
+        }
+        if !seen.insert(name) {
+            bail!("source name {name:?} is used twice; names must be unique");
+        }
+        if !is_valid_name(name) {
+            bail!("source name {name:?} must match ^[a-z][a-z0-9_]{{0,63}}$");
+        }
+        match source {
+            SourceConfig::Mcp(m) => {
+                if m.url.is_some() == m.command.is_some() {
+                    bail!("source {name:?}: set exactly one of url or command");
+                }
+            }
+            SourceConfig::Component(c) => check_component(c)?,
+        }
+    }
+    Ok(())
+}
+
+fn check_component(c: &ComponentConfig) -> anyhow::Result<()> {
+    let name = &c.name;
+    for (key, hash) in [
+        ("sha256", &c.sha256),
+        ("manifest_sha256", &c.manifest_sha256),
+    ] {
+        if let Some(h) = hash
+            && !(h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        {
+            bail!(
+                "source {name:?}: {key} must be 64 lower-case hex digits, as `fronde check` prints it"
+            );
+        }
+    }
+    let mut origins = Vec::new();
+    for a in &c.allow {
+        let origin = a.origin.origin();
+        if origins.contains(&origin) {
+            bail!(
+                "source {name:?}: {} is in allow twice; list each origin once",
+                origin.ascii_serialization()
+            );
+        }
+        origins.push(origin);
+    }
+    let mut credited = Vec::new();
+    for credential in &c.credentials {
+        let origin = credential.origin.origin();
+        let shown = origin.ascii_serialization();
+        if !origins.contains(&origin) {
+            bail!(
+                "source {name:?}: the credential for {shown} is for an origin not in allow; add it to allow or remove the credential"
+            );
+        }
+        if credited.contains(&origin) {
+            bail!("source {name:?}: two credentials for {shown}; keep one");
+        }
+        if credential.basic.is_some() == credential.bearer.is_some() {
+            bail!(
+                "source {name:?}: the credential for {shown} needs exactly one of basic or bearer"
+            );
+        }
+        credited.push(origin);
+    }
+    Ok(())
 }

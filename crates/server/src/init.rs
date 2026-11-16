@@ -94,15 +94,25 @@ command = [{command}]
 env = {{}}
 builtin_tools = ["WebSearch", "WebFetch"]
 
-# Optional: CalDAV calendar (events) and task list (reminders).
-# [calendar]
+# Optional: where tools come from besides Fronde's own, 0..n. A calendar component (CalDAV
+# events and reminders); `fronde check` prints the two hashes that approve it.
+# [[sources]]
+# kind = "component"
+# name = "calendar"
+# path = "/path/to/fronde/components/dist/calendar.wasm"
+# sha256 = "…"
+# manifest_sha256 = "…"
+# allow = ["https://cloud.example"]
+# [sources.settings]
 # events_url = "https://cloud.example/remote.php/dav/calendars/you/personal/"
 # reminders_url = "https://cloud.example/remote.php/dav/calendars/you/tasks/"
-# username = "you"
-# password = {{ env = "FRONDE_CALDAV_PASSWORD" }}
+# [[sources.credentials]]
+# origin = "https://cloud.example"
+# basic = {{ username = "you", password = {{ env = "FRONDE_CALDAV_PASSWORD" }} }}
 
-# Optional: upstream MCP servers, 0..n. Exactly one of url or command.
-# [[mcp]]
+# An upstream MCP server: exactly one of url or command.
+# [[sources]]
+# kind = "mcp"
 # name = "mcphub"
 # url = "https://mcphub.example/mcp"
 # token = {{ env = "MCPHUB_TOKEN" }}

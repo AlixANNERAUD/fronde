@@ -11,10 +11,7 @@ pub mod source;
 pub mod tools;
 pub mod upstream;
 
-use anyhow::Context;
-use calendar::caldav::CalDav;
-use calendar::{CalDavBackend, tools::register_calendar_tools};
-use config::Config;
+use config::{Config, SourceConfig};
 use memory::index::MemoryIndex;
 use memory::{MemoryStore, tools::memory_tools};
 use source::{Native, Supervisor, ToolSource};
@@ -52,23 +49,16 @@ impl Hub {
         let mut own = meta_tools(&registry);
         own.extend(memory_tools(memory.clone(), index, config.memory.git));
         sources.start(Arc::new(Native::new("hub", own))).await?;
-        if let Some(c) = &config.calendar {
-            let password = c.password.resolve().context("calendar.password")?;
-            let backend = CalDavBackend {
-                events: CalDav::new(c.events_url.clone(), c.username.clone(), password.clone()),
-                reminders: CalDav::new(c.reminders_url.clone(), c.username.clone(), password),
-                tz: config.data.timezone,
-            };
-            register_calendar_tools(&registry, Arc::new(backend), config.data.timezone)?;
-        }
         for component in components {
             let name = component.name().to_string();
             if let Err(e) = sources.start(component).await {
                 tracing::warn!("{name}: skipped: {e:#}");
             }
         }
-        for m in &config.mcp {
-            sources.spawn(Arc::new(Upstream::new(m.clone())));
+        for source in &config.sources {
+            if let SourceConfig::Mcp(m) = source {
+                sources.spawn(Arc::new(Upstream::new(m.clone())));
+            }
         }
         Ok(Self {
             registry,

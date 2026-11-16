@@ -8,7 +8,7 @@ shows every section.
 
 ## Relative paths
 
-A relative path in the file (`[data] dir`, a secret `file`) is resolved from the directory
+A relative path in the file (`[data] dir`, a secret `file`, a component's `path`) is resolved from the directory
 containing the configuration file, whatever directory Fronde is started from, and becomes
 absolute. Earlier versions read relative secret paths from the working directory.
 
@@ -58,26 +58,25 @@ Optional.
 | `user_limit` | integer | `2000` | Maximum size of `USER.md`, in characters. |
 | `git` | boolean | `true` | Commit the memory directory with git after each change. Needs `git` on the `PATH`. |
 
-## `[calendar]`
+## `[[sources]]`
 
-Optional. Without it, the calendar and reminder tools do not exist. All four keys are required
-when the section is present. See [Configure the calendar](../how-to/configure-calendar.md).
+Zero or more sources of tools besides Fronde's own (memory and tool search), each an upstream
+MCP server or a tool component. `kind` says which. Every source has a `name`, unique among all
+sources, matching `^[a-z][a-z0-9_]{0,63}$`, and not `hub`, which is reserved for Fronde's own
+tools.
+
+Earlier versions had `[calendar]` and `[[mcp]]`: Fronde now refuses them and says what to write
+instead. The calendar is a component (see
+[Configure the calendar](../how-to/configure-calendar.md)); an `[[mcp]]` section becomes a
+`[[sources]]` entry with `kind = "mcp"` and the same keys.
+
+### `kind = "mcp"`
+
+An upstream MCP server. See [Add upstream MCP servers](../how-to/add-upstream-mcp-servers.md).
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `events_url` | URL | CalDAV collection for events. |
-| `reminders_url` | URL | CalDAV collection for reminders (tasks). |
-| `username` | string | CalDAV user name. |
-| `password` | secret | CalDAV password, sent with HTTP Basic authentication. |
-
-## `[[mcp]]`
-
-Zero or more upstream MCP servers. See
-[Add upstream MCP servers](../how-to/add-upstream-mcp-servers.md).
-
-| Key | Type | Meaning |
-| --- | --- | --- |
-| `name` | string | Required. Unique, matches `^[a-z][a-z0-9_]{0,63}$`, not `hub`. Prefixes the server's tools. |
+| `name` | string | Required. Prefixes the server's tools. |
 | `url` | URL | Streamable HTTP address of the server. |
 | `command` | array of strings | Program and arguments to run, talking MCP over standard input and output. |
 | `token` | secret | Optional, with `url` only: sent as `Authorization: Bearer <token>`. |
@@ -85,11 +84,70 @@ Zero or more upstream MCP servers. See
 Each server sets exactly one of `url` or `command`.
 
 ```toml
-[[mcp]]
+[[sources]]
+kind = "mcp"
 name = "mcphub"
 url = "https://mcphub.example/mcp"
 token = { env = "MCPHUB_TOKEN" }
 ```
+
+### `kind = "component"`
+
+A tool component: a WebAssembly file run in a sandbox, with no files and no network except the
+origins granted here. Its manifest says what it asks for (see
+[Component manifest](component-manifest.md)); this entry grants at most that.
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | Required. The source of its tools, which keep the names the component gives them. |
+| `path` | path | Required. The `.wasm` file. |
+| `manifest` | path | The manifest. Default: the `.toml` file beside `path` with the same name (`calendar.wasm`, `calendar.toml`). |
+| `sha256` | hex string | SHA-256 of the `.wasm` file. |
+| `manifest_sha256` | hex string | SHA-256 of the manifest. |
+| `allow` | array | Origins the component may reach: `"https://cloud.example"`, or `{ origin = "http://192.168.1.10:5232", local = true }` for a server on this machine or the local network. Each must be one the manifest asks for, and listed once. |
+| `settings` | table of strings | What the component reads, checked against the manifest's settings: unknown keys and missing required ones are errors. Never a secret. Fronde adds `timezone` from `[data]` when the manifest declares it and the table does not set it. |
+| `credentials` | array of tables | Secrets Fronde adds to the component's requests, one per origin; see below. |
+
+Paths are read from the configuration file's directory, like every relative path.
+
+**Approval.** A component loads only when `sha256` and `manifest_sha256` match its files.
+`fronde check` prints both: copy them into the entry once you have read the manifest. When a
+file changes, such as after an update, the component is skipped with a warning until you check
+the new manifest and copy the new hashes.
+
+**Credentials.** Each `[[sources.credentials]]` table names an `origin` from `allow` and exactly
+one of:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `basic` | `{ username = "…", password = secret }` | Sent as `Authorization: Basic …`. |
+| `bearer` | secret | Sent as `Authorization: Bearer …`. |
+
+The manifest must ask for a credential of that kind for that origin. A credential travels only
+over https, or plain http to this machine (`localhost`, `127.0.0.1`, `::1`): a server on the
+local network needs https.
+
+```toml
+[[sources]]
+kind = "component"
+name = "calendar"
+path = "/app/components/calendar.wasm"
+sha256 = "…"
+manifest_sha256 = "…"
+allow = ["https://cloud.example"]
+
+[sources.settings]
+events_url = "https://cloud.example/remote.php/dav/calendars/alex/personal/"
+reminders_url = "https://cloud.example/remote.php/dav/calendars/alex/tasks/"
+
+[[sources.credentials]]
+origin = "https://cloud.example"
+basic = { username = "alex", password = { env = "FRONDE_CALDAV_PASSWORD" } }
+```
+
+A component that fails to load (bad file, hashes that do not match, a grant its manifest does not
+ask for, a missing secret) is skipped with a warning, and the rest of Fronde starts.
+`fronde check` reports the same problems as errors.
 
 ## `[web]`
 
