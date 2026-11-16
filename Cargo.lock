@@ -1345,8 +1345,12 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "chrono",
  "jarvis-agent",
+ "jarvis-protocol",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1376,6 +1380,15 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "jarvis-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

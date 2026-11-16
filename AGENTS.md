@@ -8,6 +8,7 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | Crate | Role |
 | --- | --- |
 | `crates/hub` (`jarvis-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
+| `crates/protocol` (`jarvis-protocol`) | Types shared by the conversation log, the server and the frontend (`Event`, `Entry`); serde and chrono only |
 | `crates/agent` (`jarvis-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/server` | The `jarvis` binary and library: configuration check, HTTP routes, `/mcp` behind a bearer token |
 

@@ -3,3 +3,4 @@
 pub mod acp;
 #[cfg(feature = "testing")]
 pub mod fake;
+pub mod log;
