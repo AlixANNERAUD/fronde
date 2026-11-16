@@ -16,6 +16,7 @@ jarvis-protocol = { path = "../protocol" }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 tower-sessions.workspace = true
@@ -25,6 +26,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 futures.workspace = true
 jarvis-agent = { path = "../agent", features = ["testing"] }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true

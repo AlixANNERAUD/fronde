@@ -197,6 +197,10 @@ async fn sign_in_sets_session_and_wrong_password_refused() {
     assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
     assert!(set_cookie.contains("SameSite=Lax"), "{set_cookie}");
     assert!(!set_cookie.contains("Secure"), "{set_cookie}");
+    assert!(
+        set_cookie.contains(&format!("Max-Age={}", 30 * 24 * 3600)),
+        "{set_cookie}"
+    );
     let cookie = set_cookie.split(';').next().unwrap();
     assert_eq!(get(addr, "/", Some(cookie)).await.status(), 200);
 
@@ -350,6 +354,21 @@ async fn ws_hello_replays_then_streams() {
 
     // The first client streams the same live entries.
     assert_eq!(until_turn_ended(&mut first).await, live);
+}
+
+#[tokio::test]
+async fn secure_cookie_marks_the_session_cookie_secure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), true);
+    config.web.as_mut().unwrap().secure_cookie = true;
+    let (connector, _) = fake_connector();
+    let (addr, _server) = timeout(WAIT, jarvis::start_with(config, connector))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = post_password(addr, PASSWORD).await;
+    let set_cookie = response.headers()[SET_COOKIE].to_str().unwrap();
+    assert!(set_cookie.contains("Secure"), "{set_cookie}");
 }
 
 #[tokio::test]

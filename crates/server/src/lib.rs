@@ -122,7 +122,14 @@ pub async fn start_with(
             system_prompt: system_prompt(&user),
         };
         let jarvis = Jarvis::open(spec, &data_dir, connector)?;
-        app = app.merge(web::router(web::Web { jarvis, password }, secure_cookie));
+        app = app.merge(web::router(
+            web::Web {
+                jarvis,
+                password,
+                throttle: Default::default(),
+            },
+            secure_cookie,
+        ));
     }
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
