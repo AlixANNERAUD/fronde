@@ -1,0 +1,214 @@
+[
+  {
+    "name": "calendar_create",
+    "description": "Add an event: something with a time slot. For 'remind me', use reminders_create.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CreateArgs",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "start": {
+          "description": "YYYY-MM-DDTHH:MM (local) for a timed event, YYYY-MM-DD for a whole day.",
+          "type": "string"
+        },
+        "end": {
+          "description": "Same form as start; a date is the last day included. Default: start + 1 h, or the same day.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "title",
+        "start"
+      ]
+    }
+  },
+  {
+    "name": "calendar_delete",
+    "description": "Delete an event. Confirm with the user first unless they asked for it explicitly.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "UidArgs",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uid"
+      ]
+    }
+  },
+  {
+    "name": "calendar_list",
+    "description": "List events between two dates (local time). Defaults to the next 7 days.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ListArgs",
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Local date or time (YYYY-MM-DD or YYYY-MM-DDTHH:MM). Default: today.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "description": "Inclusive local date, or time. Default: from + 7 days.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "calendar_update",
+    "description": "Change an event. Get its uid from calendar_list.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "UpdateArgs",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start": {
+          "description": "Moving start alone keeps the duration.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "end": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "uid"
+      ]
+    }
+  },
+  {
+    "name": "reminders_create",
+    "description": "Remind the user of something at a given time.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "RemindArgs",
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "at": {
+          "description": "YYYY-MM-DDTHH:MM (local); a date alone means 09:00.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "at"
+      ]
+    }
+  },
+  {
+    "name": "reminders_delete",
+    "description": "Delete a reminder.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "UidArgs",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uid"
+      ]
+    }
+  },
+  {
+    "name": "reminders_done",
+    "description": "Mark a reminder as done.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "UidArgs",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uid"
+      ]
+    }
+  },
+  {
+    "name": "reminders_list",
+    "description": "List pending reminders, soonest first.",
+    "deferred": false,
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "RemindersListArgs",
+      "type": "object",
+      "properties": {
+        "include_done": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+]
