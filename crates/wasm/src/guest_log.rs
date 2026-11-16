@@ -3,6 +3,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
@@ -12,8 +13,22 @@ const MAX_LINE: usize = 1024;
 /// Per call: a component that writes more is cut short, so that it cannot flood the log.
 const MAX_LINES: usize = 100;
 
-/// The standard error of one call to the component `name`.
-pub(crate) struct GuestLog(pub(crate) Arc<str>);
+/// The standard error of one call to a component. WASI opens a new stream each time the guest
+/// asks for its standard error, so the line budget belongs to the call and every stream shares it.
+pub(crate) struct GuestLog {
+    component: Arc<str>,
+    lines_left: Arc<AtomicUsize>,
+}
+
+impl GuestLog {
+    /// For one call to the component `name`.
+    pub(crate) fn new(name: &str) -> Self {
+        Self {
+            component: name.into(),
+            lines_left: Arc::new(AtomicUsize::new(MAX_LINES)),
+        }
+    }
+}
 
 impl IsTerminal for GuestLog {
     fn is_terminal(&self) -> bool {
@@ -24,9 +39,9 @@ impl IsTerminal for GuestLog {
 impl StdoutStream for GuestLog {
     fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
         Box::new(Lines {
-            component: self.0.clone(),
+            component: self.component.clone(),
             line: Vec::new(),
-            lines_left: MAX_LINES,
+            lines_left: self.lines_left.clone(),
         })
     }
 }
@@ -34,7 +49,8 @@ impl StdoutStream for GuestLog {
 struct Lines {
     component: Arc<str>,
     line: Vec<u8>,
-    lines_left: usize,
+    /// Shared by every stream of the call.
+    lines_left: Arc<AtomicUsize>,
 }
 
 impl Lines {
@@ -52,7 +68,11 @@ impl Lines {
         if self.line.is_empty() {
             return;
         }
-        match self.lines_left {
+        let left = self
+            .lines_left
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .unwrap_or(0);
+        match left {
             0 => {}
             1 => tracing::warn!(component = %self.component, "more output dropped"),
             _ => {
@@ -62,7 +82,6 @@ impl Lines {
                 tracing::warn!(component = %self.component, "{}", text.trim_end());
             }
         }
-        self.lines_left = self.lines_left.saturating_sub(1);
         self.line.clear();
     }
 }
@@ -126,8 +145,15 @@ mod tests {
         Lines {
             component: "calendar".into(),
             line: Vec::new(),
-            lines_left: MAX_LINES,
+            lines_left: Arc::new(AtomicUsize::new(MAX_LINES)),
         }
+    }
+
+    /// Write `bytes` to a stream as WASI would.
+    fn write(stream: &mut Pin<Box<dyn AsyncWrite + Send + Sync>>, bytes: &[u8]) {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let written = stream.as_mut().poll_write(&mut cx, bytes);
+        assert!(matches!(written, Poll::Ready(Ok(n)) if n == bytes.len()));
     }
 
     #[test]
@@ -173,5 +199,34 @@ mod tests {
             lines[MAX_LINES - 1].contains("more output dropped"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_cap_is_per_call_whatever_the_streams() {
+        let text = logged(|| {
+            let log = GuestLog::new("calendar");
+            // The guest fetches its standard error again for each write.
+            for _ in 0..2 {
+                let mut stream = Box::into_pin(log.async_stream());
+                for _ in 0..MAX_LINES {
+                    write(&mut stream, b"y\n");
+                }
+            }
+            write(&mut Box::into_pin(log.async_stream()), b"later\n");
+        });
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), MAX_LINES, "{text}");
+        assert!(
+            lines[MAX_LINES - 1].contains("more output dropped"),
+            "{text}"
+        );
+        assert!(!text.contains("later"), "{text}");
+
+        // The next call starts with a full budget.
+        let text = logged(|| {
+            let mut stream = Box::into_pin(GuestLog::new("calendar").async_stream());
+            write(&mut stream, b"again\n");
+        });
+        assert!(text.contains("again component=calendar"), "{text}");
     }
 }

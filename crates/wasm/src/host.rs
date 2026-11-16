@@ -208,7 +208,7 @@ impl Sandbox {
             self.host.engine(),
             HostState {
                 wasi: WasiCtx::builder()
-                    .stderr(GuestLog(self.name.as_str().into()))
+                    .stderr(GuestLog::new(&self.name))
                     .build(),
                 http: WasiHttpCtx::new(),
                 table,
