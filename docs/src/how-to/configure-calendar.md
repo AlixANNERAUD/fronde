@@ -46,23 +46,31 @@ app password to your account password. The time zone comes from `[data] timezone
 A server on this machine or on your local network is refused unless its origin is allowed as
 local, `{ origin = "http://192.168.1.10:5232", local = true }`. Fronde sends the password over
 plain http only to this machine (`localhost`, `127.0.0.1`): a server elsewhere on the network
-needs https.
+needs https. In Docker, "this machine" is the container: a CalDAV server on the Docker host,
+reached over plain http as `host.docker.internal`, does not get the password, so use https
+there.
 
-## 3. Approve it
+## 3. Check it
 
-Run `fronde check --config fronde.toml`. It prints two lines:
+Run `fronde check --config fronde.toml`. For the calendar shipped with Fronde (the image's
+`/app/components`, or `components/dist` of the checkout Fronde was built from), it prints:
 
 ```text
 source calendar: sha256 = "…"
 source calendar: manifest_sha256 = "…"
+source calendar: approved: shipped with this build (calendar)
 ```
 
-and fails because the component is not approved yet. Read `calendar.toml`: it says which origins
-and credentials the component asks for. Then copy both lines' values into the entry, as
-`sha256 = "…"` and `manifest_sha256 = "…"`, and run `fronde check` again: it also fails if the
-password's file or variable is missing. After an update of Fronde or of the component, the
-hashes change and the calendar is skipped, with a warning in the log, until you approve the new
-ones the same way.
+Fronde knows the hashes of the components built with it, so an entry without hashes is approved
+when the files are exactly those. It fails if the password's file or variable is missing, or if
+the entry grants what the component cannot use (such as a password over plain http to another
+machine).
+
+A `calendar.wasm` from anywhere else is not approved: `fronde check` fails and prints its two
+hashes. Read its `calendar.toml`, which says which origins and credentials it asks for, then copy
+both values into the entry as `sha256 = "…"` and `manifest_sha256 = "…"`. Hashes in the entry
+always win: they pin the component to those files, shipped or not. When the files change, the
+calendar is skipped, with a warning in the log, until you approve the new ones the same way.
 
 ## 4. Restart and try
 
@@ -72,13 +80,19 @@ the log says why. See [Tools](../reference/tools.md) for what each one does.
 
 ## Coming from `[calendar]`
 
-Earlier versions had a `[calendar]` section, which Fronde now refuses. Move its values:
+Earlier versions had a `[calendar]` section, which Fronde now refuses with the `[[sources]]` entry
+to write in its place, filled with your values: paste it over the section. It moves them as
+follows:
 
 | `[calendar]` | `[[sources]]` entry |
 | --- | --- |
 | `events_url`, `reminders_url` | `[sources.settings]`, unchanged |
-| `username`, `password` | `[[sources.credentials]]`, `basic = { username = …, password = … }`, with the origin of the URLs |
-| (none) | `allow`: the origin of the URLs |
+| `username`, `password` | `[[sources.credentials]]`, `basic = { username = …, password = … }`, one per origin of the URLs |
+| (none) | `allow`: the origin of each URL, marked `local = true` for an address on your network |
+| (none) | `path`: the shipped `calendar.wasm`, approved without hashes |
+
+If the URLs use plain http to another machine, the entry says so: move the server to https,
+since Fronde sends the password over plain http only to this machine.
 
 ## What to expect
 

@@ -127,22 +127,22 @@ builtin_tools = ["WebSearch", "WebFetch"]
 
 [`fronde.example.toml`](fronde.example.toml) also shows the memory caps and the `[[sources]]` of
 tools: the calendar component and upstream MCP servers. `fronde check --config fronde.toml`
-validates the file and its secrets, and prints the hashes that approve each component.
+validates the file and its secrets, prints the hashes of each component and says which approval
+applied.
 
 ### Migrating from `[calendar]` and `[[mcp]]`
 
 Both sections are gone, and Fronde refuses them with a message saying what to write. An `[[mcp]]`
 section becomes a `[[sources]]` entry with `kind = "mcp"` and the same keys. The calendar is now a
 WebAssembly component, `calendar.wasm`, shipped in the image under `/app/components` (from a
-checkout, `mise run components` builds it into `components/dist`):
+checkout, `mise run build` builds it into `components/dist` first). For `[calendar]`, the message
+is the entry to paste in its place, filled with your values:
 
 ```toml
 [[sources]]
 kind = "component"
 name = "calendar"
 path = "/app/components/calendar.wasm"
-sha256 = "…"            # both printed by `fronde check`
-manifest_sha256 = "…"
 allow = ["https://cloud.example"]   # the origin of the two URLs
 
 [sources.settings]
@@ -154,8 +154,12 @@ origin = "https://cloud.example"
 basic = { username = "alix", password = { env = "FRONDE_CALDAV_PASSWORD" } }
 ```
 
-The component never sees the password: Fronde adds it to requests for that origin, over https
-only (or plain http to `localhost`). See the "Configure the calendar" guide in `docs/`.
+The calendar shipped with Fronde needs no hashes: the binary knows those of the components built
+with it, and `fronde check` says "approved: shipped with this build". A component from elsewhere
+needs the `sha256` and `manifest_sha256` that `fronde check` prints. The component never sees the
+password: Fronde adds it to requests for that origin, over https only (or plain http to
+`localhost`; in Docker, that is the container). See the "Configure the calendar" guide in
+`docs/`.
 
 ## Signing Fronde in to Claude
 

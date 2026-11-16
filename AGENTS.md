@@ -14,7 +14,7 @@ and offers a web chat.
 | `crates/agent` (`fronde-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/client` (`fronde-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
 | `crates/web` (`fronde-web`) | The Dioxus web interface, a single-page app built by dx: sign-in and chat pages; `socket.rs` runs the chat's WebSocket with `fronde-client`, behind `cfg(target_arch = "wasm32")` so the pages render natively in tests |
-| `crates/wasm` (`fronde-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `dial.rs` its client (resolves the name, refuses local addresses, private ranges and metadata included, unless the origin is allowed as local, connects to the checked address), `api.rs` which `fronde:component` version a component targets, `manifest.rs` the strict parser of a component's `fronde-component.toml`, `v0_1/` the bindings of version 0.1 (one module per served version), `tool.rs` the `tool` world, whose tools join the hub's registry, `source.rs` a `[[sources]]` component entry checked against its manifest and approval hashes (`prepare`) and run as a `ToolSource`, `guest_log.rs` a component's standard error as warnings in the log |
+| `crates/wasm` (`fronde-wasm`) | Runs WebAssembly components with wasmtime: `host.rs` is what every world shares (engine, epoch ticker, WASI with no filesystem or sockets, per-call limits), `egress.rs` the HTTP gate (allowed origins, credentials added by the host), `dial.rs` its client (resolves the name, refuses local addresses, private ranges and metadata included, unless the origin is allowed as local, connects to the checked address), `api.rs` which `fronde:component` version a component targets, `manifest.rs` the strict parser of a component's `fronde-component.toml`, `v0_1/` the bindings of version 0.1 (one module per served version), `tool.rs` the `tool` world, whose tools join the hub's registry, `source.rs` a `[[sources]]` component entry checked against its manifest, its approval (the hashes in the entry, or those of a component shipped with the build, which `build.rs` hashes from `components/dist` into the binary), the other sources' tool names and the sandbox's grants (`prepare`), and run as a `ToolSource`, `guest_log.rs` a component's standard error as warnings in the log |
 | `crates/component-sdk` (`fronde-component`) | The guest SDK components depend on: the WIT it targets (a copy of `wit/v0.1`), `export_tool!`, settings, HTTP over WASI, fakes for native tests (`testing` feature). Stands alone: not in the root workspace, no dependency on another Fronde crate, publishable |
 | `wit/` | The components' WIT, one frozen directory per released version of `fronde:component` (`v0.1`): shared `settings` interface, `tool` world |
 | `components/` | Tool components, each a standalone Cargo project built for `wasm32-wasip2`, with its manifest `fronde-component.toml` beside `Cargo.toml` (`echo` is the host's test bench, `calendar` the CalDAV tools) |
@@ -24,7 +24,7 @@ Components are built by `mise run components`, which builds each project listed 
 `$FRONDE_COMPONENTS` and copies the `.wasm` files to `components/dist`, each with its manifest
 beside it as `<name>.toml` (mr-boxington prunes idle target directories); the container image
 ships them in `/app/components`; `fronde-wasm`'s tests load them from there, and `mise run test` builds them
-first. A component may not import `wasi:filesystem` or `wasi:sockets`. The SDK's `bindings` module
+first. `mise run build` builds them before the binary, which approves exactly those files. A component may not import `wasi:filesystem` or `wasi:sockets`. The SDK's `bindings` module
 is the only place allowed `unsafe` code (the generated glue needs it); components forbid it.
 
 The server has no Dioxus dependency: it serves the built interface as static files from
@@ -97,7 +97,8 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
   an enum case. A change is a new directory with its own host module (`crates/wasm/src/v0_2/`),
   and the host keeps serving the earlier versions.
 - Tool names match `^[a-z][a-z0-9_]{0,63}$`; tool descriptions are short imperative rules; a tool
-  error always says how to fix it.
+  error always says how to fix it. A component's tools start with a prefix of its manifest's
+  `tool_prefixes`, which no other source uses.
 - Secrets never appear in the configuration file, logs or tool output: `{ file = "…" }` or
   `{ env = "…" }` only.
 - Nothing read from an external source (web, email, document) is saved to memory automatically.

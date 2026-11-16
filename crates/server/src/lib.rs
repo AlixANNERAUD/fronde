@@ -18,7 +18,7 @@ use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::HubServer;
 use fronde_hub::source::ToolSource;
-use fronde_wasm::{ComponentHost, ComponentSource};
+use fronde_wasm::{Checks, ComponentHost, ComponentSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -135,10 +135,12 @@ fn component_sources(config: &Config) -> anyhow::Result<Vec<Arc<dyn ToolSource>>
         return Ok(Vec::new());
     }
     let host = ComponentHost::new()?;
-    let timezone = config.data.timezone.name();
+    let checks = Checks::of(config);
     Ok(entries
         .into_iter()
-        .map(|c| Arc::new(ComponentSource::new(c, timezone, host.clone())) as Arc<dyn ToolSource>)
+        .map(|c| {
+            Arc::new(ComponentSource::new(c, checks.clone(), host.clone())) as Arc<dyn ToolSource>
+        })
         .collect())
 }
 

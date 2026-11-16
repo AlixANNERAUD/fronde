@@ -41,7 +41,8 @@ COPY mise.toml mise.ci.toml ./
 RUN mise trust --all && mise install
 
 # dx downloads the tools it builds the web interface with (wasm-bindgen, wasm-opt, esbuild) into
-# DX_HOME, cached like Cargo's downloads.
+# DX_HOME, cached like Cargo's downloads. `mise run build` builds the components before the
+# binary, which carries their hashes and approves the files copied to /app/components.
 COPY . .
 RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
@@ -50,7 +51,6 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/src/components/echo/target,id=fronde-echo-${TARGETARCH} \
     --mount=type=cache,target=/src/components/calendar/target,id=fronde-calendar-${TARGETARCH} \
     mise run build \
-    && mise run components \
     && mkdir -p /out/components \
     && cp target/release/fronde /out/fronde \
     && cp -r target/dx/fronde-web/release/web/public /out/site \

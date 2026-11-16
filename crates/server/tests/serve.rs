@@ -228,16 +228,28 @@ fn component_entry(name: &str, wasm: &std::path::Path, manifest: &std::path::Pat
 #[tokio::test]
 async fn broken_component_is_skipped() {
     let dir = tempfile::tempdir().unwrap();
-    // Approved, but not WebAssembly: it fails to compile.
+    // Approved, but not WebAssembly: it fails to compile. Its manifest is echo's, with tool
+    // names of its own.
     let broken = dir.path().join("broken.wasm");
     std::fs::write(&broken, b"not a component").unwrap();
+    let broken_manifest = dir.path().join("broken.toml");
+    let echo_manifest = std::fs::read_to_string(dist("echo.toml")).unwrap();
+    assert!(echo_manifest.contains("tool_prefixes = [\"echo_\"]"));
+    std::fs::write(
+        &broken_manifest,
+        echo_manifest.replace(
+            "tool_prefixes = [\"echo_\"]",
+            "tool_prefixes = [\"broken_\"]",
+        ),
+    )
+    .unwrap();
     let base = config(dir.path(), TOKEN);
     let token_file = dir.path().join("token");
     let toml = format!(
         "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n{}{}",
         token_file.display().to_string(),
         base.data.dir.display().to_string(),
-        component_entry("broken", &broken, &dist("echo.toml")),
+        component_entry("broken", &broken, &broken_manifest),
         component_entry("echo", &dist("echo.wasm"), &dist("echo.toml")),
     );
     let (addr, _h) = fronde::start(toml::from_str(&toml).unwrap()).await.unwrap();
@@ -308,5 +320,80 @@ fn check_prints_component_hashes_and_resolves_its_secrets() {
         Some(0),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("source calendar: approved: pinned by the hashes in its entry"),
+        "{stdout}"
+    );
+}
+
+/// `fronde check` on a configuration whose `[[sources]]` are `sources`.
+fn check_sources(dir: &std::path::Path, sources: &str) -> std::process::Output {
+    fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
+    let path = dir.join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = \"/tmp/x\"\ntimezone = \"Europe/Paris\"\n{sources}"
+        ),
+    )
+    .unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+        .args(["check", "--config"])
+        .arg(&path)
+        .env("FRONDE_TEST_CALDAV_PASSWORD", "s3cret")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn check_refuses_a_password_over_plain_http_to_the_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let wasm = dir.path().join("calendar.wasm");
+    std::fs::write(&wasm, b"not compiled by check").unwrap();
+    std::fs::copy(dist("calendar.toml"), dir.path().join("calendar.toml")).unwrap();
+    let entry = component_entry("calendar", &wasm, &dir.path().join("calendar.toml"));
+    let out = check_sources(
+        dir.path(),
+        &format!(
+            "{entry}allow = [{{ origin = \"http://192.168.1.10:5232\", local = true }}]\n\
+             [sources.settings]\nevents_url = \"http://192.168.1.10:5232/e/\"\n\
+             reminders_url = \"http://192.168.1.10:5232/r/\"\n[[sources.credentials]]\n\
+             origin = \"http://192.168.1.10:5232\"\n\
+             basic = {{ username = \"alix\", password = {{ env = \"FRONDE_TEST_CALDAV_PASSWORD\" }} }}\n"
+        ),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("source calendar") && stderr.contains("would travel unencrypted"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn check_approves_the_shipped_calendar_without_hashes() {
+    // This binary was built after `mise run components`, from the same components/dist.
+    let dir = tempfile::tempdir().unwrap();
+    let out = check_sources(
+        dir.path(),
+        &format!(
+            "[[sources]]\nkind = \"component\"\nname = \"calendar\"\npath = {:?}\n\
+             allow = [\"https://cloud.example\"]\n[sources.settings]\n\
+             events_url = \"https://cloud.example/e/\"\nreminders_url = \"https://cloud.example/r/\"\n",
+            dist("calendar.wasm").display().to_string()
+        ),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("source calendar: approved: shipped with this build (calendar)"),
+        "{stdout}"
     );
 }

@@ -99,19 +99,29 @@ origins granted here. Its manifest says what it asks for (see
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | Required. The source of its tools, which keep the names the component gives them. |
+| `name` | string | Required. The source of its tools, which keep the names the component gives them, each starting with one of its manifest's `tool_prefixes`. No other source's tools may use those prefixes: a component whose prefix is `<another source's name>_`, a prefix of the hub's own tools (`hub_`, `memory_`, `search_`, `use_`) or another component's is not loaded. |
 | `path` | path | Required. The `.wasm` file. |
 | `manifest` | path | The manifest. Default: the `.toml` file beside `path` with the same name (`calendar.wasm`, `calendar.toml`). |
-| `sha256` | hex string | SHA-256 of the `.wasm` file. |
+| `sha256` | hex string | SHA-256 of the `.wasm` file. Set it with `manifest_sha256`, or neither for a component shipped with Fronde. |
 | `manifest_sha256` | hex string | SHA-256 of the manifest. |
 | `allow` | array | Origins the component may reach: `"https://cloud.example"`, or `{ origin = "http://192.168.1.10:5232", local = true }` for a server on this machine or the local network. Each must be one the manifest asks for, and listed once. |
-| `settings` | table of strings | What the component reads, checked against the manifest's settings: unknown keys and missing required ones are errors. Never a secret. Fronde adds `timezone` from `[data]` when the manifest declares it and the table does not set it. |
+| `settings` | table of strings | What the component reads, checked against the manifest's settings: unknown keys and missing required ones are errors. Never a secret: a URL setting with a user name or password in it is refused (put them in `credentials`). Fronde adds `timezone` from `[data]` when the manifest declares it and the table does not set it. |
 | `credentials` | array of tables | Secrets Fronde adds to the component's requests, one per origin; see below. |
 
 Paths are read from the configuration file's directory, like every relative path.
 
-**Approval.** A component loads only when `sha256` and `manifest_sha256` match its files.
-`fronde check` prints both: copy them into the entry once you have read the manifest. When a
+**Approval.** A component loads only when its files are approved, by their SHA-256:
+
+- An entry with `sha256` and `manifest_sha256` is pinned to those files, whatever they are.
+  Hashes in the entry always win.
+- An entry with neither is approved when its files are exactly those of a component shipped
+  with this build of Fronde: the binary carries the hashes of the components built with it
+  (`/app/components` in the image, `components/dist` in a checkout). The log says
+  `approved: shipped with this build`.
+- Anything else is refused. A path never approves anything.
+
+`fronde check` prints both hashes of each component and which approval applied. For a component
+from elsewhere, copy the hashes into the entry once you have read the manifest. When a pinned
 file changes, such as after an update, the component is skipped with a warning until you check
 the new manifest and copy the new hashes.
 
@@ -125,15 +135,14 @@ one of:
 
 The manifest must ask for a credential of that kind for that origin. A credential travels only
 over https, or plain http to this machine (`localhost`, `127.0.0.1`, `::1`): a server on the
-local network needs https.
+local network needs https. In Docker, this machine is the container: a server on the Docker host
+(`host.docker.internal`) needs https too.
 
 ```toml
 [[sources]]
 kind = "component"
 name = "calendar"
 path = "/app/components/calendar.wasm"
-sha256 = "…"
-manifest_sha256 = "…"
 allow = ["https://cloud.example"]
 
 [sources.settings]
@@ -145,9 +154,11 @@ origin = "https://cloud.example"
 basic = { username = "alex", password = { env = "FRONDE_CALDAV_PASSWORD" } }
 ```
 
-A component that fails to load (bad file, hashes that do not match, a grant its manifest does not
-ask for, a missing secret) is skipped with a warning, and the rest of Fronde starts.
-`fronde check` reports the same problems as errors.
+A component that fails to load (bad file, files not approved, a grant its manifest does not ask
+for, a credential over plain http to another machine, a tool prefix another source uses, a
+missing secret) is skipped with a warning, and the rest of Fronde starts. `fronde check` reports
+the same problems as errors, except those only compiling the component finds (a file that is not
+a component, imports it may not have, tools outside its prefixes).
 
 ## `[web]`
 

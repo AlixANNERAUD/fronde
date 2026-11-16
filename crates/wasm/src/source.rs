@@ -1,22 +1,28 @@
-//! A `[[sources]]` entry of kind `component`: checked against the component's manifest and the
-//! approval in the configuration, then loaded as a source of tools.
+//! A `[[sources]]` entry of kind `component`: checked against the component's manifest and its
+//! approval, then loaded as a source of tools.
 //!
 //! The manifest asks; the configuration grants at most what it asks: each allowed origin and
 //! each credential must match a request of the manifest, and the settings must fit its schema.
-//! The approval is the SHA-256 of both files, so a changed manifest or build is not loaded until
-//! the configuration approves it again.
+//! The approval is the SHA-256 of both files: either the hashes written in the entry, or, for an
+//! entry without them, those of a component shipped with this build of Fronde. A changed manifest
+//! or build is not loaded until it is approved again. A path never approves anything.
 
-use crate::egress::{Allowed, Credential, Origin};
+use crate::egress::{Allowed, Credential, Grants, Origin};
 use crate::manifest::{Injection, Manifest, NetworkRule, World};
 use crate::{ComponentHost, ComponentSpec, LoadedComponent};
 use anyhow::{Context, bail, ensure};
 use async_trait::async_trait;
-use fronde_hub::config::ComponentConfig;
+use fronde_hub::config::{ComponentConfig, Config, RESERVED_TOOL_PREFIXES, SourceConfig};
 use fronde_hub::source::{Session, ToolSource};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
+
+/// `(name, sha256, manifest_sha256)` of each component in `components/dist` when this build was
+/// compiled (`build.rs`); empty if there was none.
+const SHIPPED: &[(&str, &str, &str)] = include!(concat!(env!("OUT_DIR"), "/shipped.rs"));
 
 /// Lower-case hex SHA-256.
 pub(crate) fn sha256(bytes: &[u8]) -> String {
@@ -48,10 +54,77 @@ impl Hashes {
     }
 }
 
-/// Check `config` against the component's approval and manifest, resolve its credentials, and
-/// return what to load. `timezone` is the user's, given to a component that declares a
-/// `timezone` setting left unset.
-pub fn prepare(config: &ComponentConfig, timezone: &str) -> anyhow::Result<ComponentSpec> {
+/// A component built from this repository and shipped with this build of Fronde: its files are
+/// approved by their hashes alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shipped {
+    pub name: String,
+    pub sha256: String,
+    pub manifest_sha256: String,
+}
+
+/// The components shipped with this build: those of `components/dist` when it was compiled.
+pub fn shipped() -> Vec<Shipped> {
+    SHIPPED
+        .iter()
+        .map(|(name, sha256, manifest_sha256)| Shipped {
+            name: name.to_string(),
+            sha256: sha256.to_string(),
+            manifest_sha256: manifest_sha256.to_string(),
+        })
+        .collect()
+}
+
+/// What approved a component's files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Approval {
+    /// The `sha256` and `manifest_sha256` of its entry.
+    Pinned,
+    /// No hashes in its entry, and the files of this shipped component.
+    Shipped { name: String },
+}
+
+impl fmt::Display for Approval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pinned => f.write_str("approved: pinned by the hashes in its entry"),
+            Self::Shipped { name } => write!(f, "approved: shipped with this build ({name})"),
+        }
+    }
+}
+
+/// What a component entry is checked against besides its own files.
+#[derive(Debug, Clone, Default)]
+pub struct Checks {
+    /// The user's time zone, given to a component that declares a `timezone` setting left unset.
+    pub timezone: String,
+    /// Components approved without hashes in their entry.
+    pub shipped: Vec<Shipped>,
+    /// Every `[[sources]]` entry: a component's tool prefixes must stay clear of the others.
+    pub sources: Vec<SourceConfig>,
+}
+
+impl Checks {
+    /// For the entries of `config`, with the components shipped with this build.
+    pub fn of(config: &Config) -> Self {
+        Self {
+            timezone: config.data.timezone.name().to_string(),
+            shipped: shipped(),
+            sources: config.sources.clone(),
+        }
+    }
+}
+
+/// A component entry ready to load, and what approved it.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    pub spec: ComponentSpec,
+    pub approval: Approval,
+}
+
+/// Check `config` against the component's approval and manifest and against `checks`, resolve
+/// its credentials, and return what to load.
+pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prepared> {
     let name = &config.name;
     let manifest_path = config.manifest_path();
     // The manifest parsed is the text hashed; the .wasm is hashed again as it is compiled.
@@ -61,10 +134,12 @@ pub fn prepare(config: &ComponentConfig, timezone: &str) -> anyhow::Result<Compo
         sha256: sha256_of(&config.path)?,
         manifest_sha256: sha256(text.as_bytes()),
     };
-    check_approval(config, &current, &manifest_path)?;
+    let approval = approve(config, &current, &manifest_path, &checks.shipped)?;
     let manifest = Manifest::parse(&text)
         .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
     let World::Tool = manifest.world;
+    check_namespace(config, &manifest.tool_prefixes, &checks.sources)?;
+    let timezone = &checks.timezone;
 
     let mut settings = config.settings.clone();
     let properties = manifest
@@ -126,30 +201,59 @@ pub fn prepare(config: &ComponentConfig, timezone: &str) -> anyhow::Result<Compo
         };
         credentials.push((origin, credential));
     }
+    // What the sandbox will refuse when the component loads (a credential over plain http to
+    // another machine), refused here too, so that `fronde check` reports it.
+    Grants::new(&allow, &credentials)?;
 
-    Ok(ComponentSpec {
-        name: name.clone(),
-        path: config.path.clone(),
-        allow,
-        credentials,
-        settings,
-        sha256: Some(current.sha256),
+    Ok(Prepared {
+        spec: ComponentSpec {
+            name: name.clone(),
+            path: config.path.clone(),
+            allow,
+            credentials,
+            settings,
+            sha256: Some(current.sha256),
+            tool_prefixes: manifest.tool_prefixes,
+        },
+        approval,
     })
 }
 
-fn check_approval(
+/// Hashes in the entry pin it to those files; without any, the files must be those of a component
+/// shipped with this build.
+fn approve(
     config: &ComponentConfig,
     current: &Hashes,
     manifest_path: &Path,
-) -> anyhow::Result<()> {
-    let (Some(sha256), Some(manifest_sha256)) = (&config.sha256, &config.manifest_sha256) else {
-        bail!(
-            "not approved yet: read its manifest {}, then add sha256 = \"{}\" and \
+    shipped: &[Shipped],
+) -> anyhow::Result<Approval> {
+    let (sha256, manifest_sha256) = match (&config.sha256, &config.manifest_sha256) {
+        (Some(sha256), Some(manifest_sha256)) => (sha256, manifest_sha256),
+        (None, None) => {
+            if let Some(s) = shipped.iter().find(|s| {
+                s.sha256 == current.sha256 && s.manifest_sha256 == current.manifest_sha256
+            }) {
+                return Ok(Approval::Shipped {
+                    name: s.name.clone(),
+                });
+            }
+            bail!(
+                "not approved yet: these files are not a component shipped with this build of \
+                 Fronde. Read its manifest {}, then add sha256 = \"{}\" and manifest_sha256 = \
+                 \"{}\" to its [[sources]] entry",
+                manifest_path.display(),
+                current.sha256,
+                current.manifest_sha256
+            );
+        }
+        _ => bail!(
+            "not approved yet: set both sha256 and manifest_sha256, or neither for a component \
+             shipped with this build. Read its manifest {}, then add sha256 = \"{}\" and \
              manifest_sha256 = \"{}\" to its [[sources]] entry",
             manifest_path.display(),
             current.sha256,
             current.manifest_sha256
-        );
+        ),
     };
     for (file, approved, now) in [
         (config.path.as_path(), sha256, &current.sha256),
@@ -162,6 +266,41 @@ fn check_approval(
             file.display(),
             manifest_path.display()
         );
+    }
+    Ok(Approval::Pinned)
+}
+
+/// The component's tool prefixes stay clear of the hub's own tools, of the tools of every other
+/// source (an upstream named `github` has `github_…`) and of other components' prefixes.
+fn check_namespace(
+    config: &ComponentConfig,
+    prefixes: &[String],
+    sources: &[SourceConfig],
+) -> anyhow::Result<()> {
+    let overlap = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
+    for prefix in prefixes {
+        if let Some(reserved) = RESERVED_TOOL_PREFIXES.iter().find(|r| overlap(prefix, r)) {
+            bail!("tool prefix {prefix:?} is reserved for the hub's own tools ({reserved}…)");
+        }
+        for source in sources.iter().filter(|s| s.name() != config.name) {
+            let other = source.name();
+            let theirs = format!("{other}_");
+            ensure!(
+                !overlap(prefix, &theirs),
+                "tool prefix {prefix:?} would mix its tools with those of the source {other:?} \
+                 ({theirs}…); rename that source"
+            );
+            // Another component's manifest that cannot be read keeps it from loading anyway.
+            if let SourceConfig::Component(c) = source
+                && let Ok(manifest) = Manifest::load(&c.manifest_path())
+                && let Some(p) = manifest.tool_prefixes.iter().find(|p| overlap(prefix, p))
+            {
+                bail!(
+                    "tool prefix {prefix:?} is also declared by the component {other:?} ({p}); \
+                     two components cannot share tool names, so keep only one of them"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -244,7 +383,14 @@ fn check_settings(
             );
         }
         if property.get("format").and_then(Value::as_str) == Some("uri") {
-            url::Url::parse(value).with_context(|| format!("{key} = {value:?} is not a URL"))?;
+            let url = url::Url::parse(value)
+                .with_context(|| format!("{key} = {value:?} is not a URL"))?;
+            // Not echoed: the value holds a secret.
+            ensure!(
+                url.username().is_empty() && url.password().is_none(),
+                "{key} has a user name or password in its URL: credentials go in the \
+                 [[sources.credentials]] entry for its origin, never in settings"
+            );
         }
         if let Some(pattern) = property.get("pattern").and_then(Value::as_str) {
             let re = regex::Regex::new(pattern)
@@ -269,15 +415,15 @@ fn check_settings(
 /// A component as a source of tools: it is checked and loaded when the hub starts.
 pub struct ComponentSource {
     config: ComponentConfig,
-    timezone: String,
+    checks: Checks,
     host: ComponentHost,
 }
 
 impl ComponentSource {
-    pub fn new(config: ComponentConfig, timezone: impl Into<String>, host: ComponentHost) -> Self {
+    pub fn new(config: ComponentConfig, checks: Checks, host: ComponentHost) -> Self {
         Self {
             config,
-            timezone: timezone.into(),
+            checks,
             host,
         }
     }
@@ -290,7 +436,8 @@ impl ToolSource for ComponentSource {
     }
 
     async fn start(&self) -> anyhow::Result<Session> {
-        let spec = prepare(&self.config, &self.timezone)?;
+        let Prepared { spec, approval } = prepare(&self.config, &self.checks)?;
+        tracing::info!("{}: {approval}", self.config.name);
         let component = LoadedComponent::load(&self.host, spec).await?;
         Ok(Session::lasting(component.tools()))
     }

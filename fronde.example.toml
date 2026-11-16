@@ -24,16 +24,20 @@ git = true
 
 # A tool component: a .wasm file run in a sandbox, with its manifest beside it (calendar.toml)
 # saying what it asks for. It reaches only the origins in allow, each one its manifest asks for,
-# and never sees its credentials: Fronde adds them to its requests. Once you have read the
-# manifest, copy the two hashes `fronde check` prints here: a component whose files change is not
-# loaded until you approve the new ones the same way.
+# and never sees its credentials: Fronde adds them to its requests. The calendar shipped with
+# Fronde is approved as it is: `fronde check` says "approved: shipped with this build". Any other
+# component needs the two hashes `fronde check` prints, copied here once you have read its
+# manifest; they pin it, and a component whose files change is not loaded until you approve the
+# new ones the same way.
 [[sources]]
 kind = "component"
 name = "calendar"
 path = "/app/components/calendar.wasm"
+# Only for a component not shipped with Fronde, or to pin this one:
 # sha256 = "…"
 # manifest_sha256 = "…"
-# A server on this machine or the local network needs { origin = "http://…", local = true }.
+# A server on this machine or the local network needs { origin = "http://…", local = true }, and
+# https unless it is this machine (in Docker, the container).
 allow = ["https://cloud.example"]
 
 # Fronde adds timezone from [data].

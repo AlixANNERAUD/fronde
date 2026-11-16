@@ -24,7 +24,7 @@ mise run agent   # the Claude adapter, to chat with a real agent
 | `mise run dev` | The server on <http://127.0.0.1:8484>, password `fronde` |
 | `mise run web-dev` | The web interface with hot reload on <http://127.0.0.1:8080> |
 | `mise run web-build` | Release build of the web interface |
-| `mise run build` | Release build: `web-build`, then `target/release/fronde` |
+| `mise run build` | Release build: `web-build` and `components`, then `target/release/fronde`, which approves the components of `components/dist` it was built with |
 | `mise run docs` | Builds this guide into `docs/book` |
 
 Builds are heavy: run one Cargo command at a time, through a task or `mise exec -- cargo …`.

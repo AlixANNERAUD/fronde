@@ -34,6 +34,7 @@ fn spec() -> ComponentSpec {
         credentials: vec![],
         settings: BTreeMap::new(),
         sha256: None,
+        tool_prefixes: vec!["echo_".into()],
     }
 }
 

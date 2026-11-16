@@ -99,12 +99,12 @@ struct Hello;
 
 impl Tools for Hello {
     fn list_tools() -> Vec<Tool> {
-        vec![Tool::new("hello", "Greet the user.", json!({"type": "object"}))]
+        vec![Tool::new("hello_greet", "Greet the user.", json!({"type": "object"}))]
     }
 
     fn call_tool(name: &str, _arguments: &str) -> ToolOutput {
         match name {
-            "hello" => ToolOutput::ok(settings::get("greeting").unwrap_or("hello".into())),
+            "hello_greet" => ToolOutput::ok(settings::get("greeting").unwrap_or("hello".into())),
             other => ToolOutput::error(format!("unknown tool {other}")),
         }
     }
@@ -118,7 +118,8 @@ with its `testing` feature, an in-memory HTTP server, settings and a runner to t
 natively. The crate needs no `unsafe` of its own: `#![forbid(unsafe_code)]` holds.
 
 Beside its `Cargo.toml`, a component has a [manifest](component-manifest.md),
-`fronde-component.toml`, which names the interface version it targets and what it asks for.
+`fronde-component.toml`, which names the interface version it targets, the prefixes of its tool
+names (`tool_prefixes = ["hello_"]` here) and what it asks for.
 
 In this repository, `components/echo` (the host's test bench) and `components/calendar` are such
 projects. `mise run components` builds each one and copies the `.wasm` files to `components/dist`.

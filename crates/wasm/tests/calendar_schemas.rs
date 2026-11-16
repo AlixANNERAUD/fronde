@@ -43,6 +43,7 @@ async fn component() -> Value {
         credentials: vec![],
         settings: BTreeMap::new(),
         sha256: None,
+        tool_prefixes: vec!["calendar_".into(), "reminders_".into()],
     };
     let calendar = LoadedComponent::load(&ComponentHost::new().unwrap(), spec)
         .await

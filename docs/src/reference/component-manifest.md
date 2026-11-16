@@ -19,6 +19,7 @@ api = "0.1"
 description = "Calendar and reminder tools over CalDAV."
 license = "Apache-2.0"
 repository = "https://github.com/AlixANNERAUD/fronde"
+tool_prefixes = ["calendar_", "reminders_"]
 
 [permissions]
 network = ["{{ events_url }}", "{{ reminders_url }}"]
@@ -52,6 +53,20 @@ format = "uri"
 | `license` | yes | An SPDX expression, such as `"MIT"`. |
 | `authors` | no | A list of names. |
 | `repository` | no | A URL. |
+
+## `tool_prefixes`
+
+Required. The prefixes of the component's tool names, such as `["calendar_", "reminders_"]`:
+each is lower-case letters and digits followed by `_` (`^[a-z][a-z0-9]*_$`). Fronde refuses to
+load a component that exports a tool whose name starts with none of them.
+
+The prefixes are the component's own namespace in the hub, so Fronde also refuses a component
+whose prefix:
+
+- is the name of another `[[sources]]` entry followed by `_` (an upstream MCP server named
+  `github` has the tools `github_…`);
+- is reserved for the hub's own tools: `hub_`, `memory_`, `search_` and `use_`;
+- is also declared by another component.
 
 ## `[permissions]`
 
@@ -90,7 +105,8 @@ Optional, each within the host's limit: `memory_mb` (up to 64), `call_timeout_ms
 The [JSON Schema](https://json-schema.org) of the component's settings, written in TOML. It is
 an object with `additionalProperties = false`, whose properties are all strings (`type =
 "string"`, with optional `title`, `description`, `format`, `default`, `enum`, `pattern` and
-`examples`). Setting names match `[a-z][a-z0-9_]*`.
+`examples`). Setting names match `[a-z][a-z0-9_]*`. The only `format` is `"uri"`: the value must
+be a URL, with no user name or password in it (those are credentials).
 
 Settings reach the component, so they never hold a secret: a property whose name contains a
 word such as `password`, `secret`, `token` or `api_key`, or that has `writeOnly = true`,

@@ -60,7 +60,8 @@ and is tested natively.
 `crates/wasm` runs WebAssembly components that bring tools, sandboxed and with a deny-by-default
 HTTP gate. Integrations with outside services are components, the CalDAV calendar first: each is
 a `.wasm` file with a manifest saying what it asks for, and a `[[sources]]` entry granting part
-of it, approved by the files' hashes. See [Component interface](../reference/wit-interface.md)
+of it, approved by the files' hashes: those in the entry, or those of the components the binary
+was built with (`crates/wasm/build.rs` hashes `components/dist`). See [Component interface](../reference/wit-interface.md)
 and [Security model](security.md#wasm-components).
 
 ## Planned

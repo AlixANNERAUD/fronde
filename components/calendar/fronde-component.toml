@@ -9,6 +9,8 @@ api = "0.1"
 description = "Calendar and reminder tools over CalDAV."
 license = "Apache-2.0"
 repository = "https://github.com/AlixANNERAUD/fronde"
+# Every tool it exports starts with one of these.
+tool_prefixes = ["calendar_", "reminders_"]
 
 [permissions]
 # The origins of the two collections, wherever the user's server is.

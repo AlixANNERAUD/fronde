@@ -66,6 +66,10 @@ pub fn render_config(user: &str, timezone: &str, adapter: Option<&Path>) -> Stri
     );
     let user = quoted(user);
     let timezone = quoted(timezone);
+    let calendar = quoted(&fronde_hub::config::shipped_calendar().map_or_else(
+        || "/path/to/fronde/components/dist/calendar.wasm".to_string(),
+        |p| p.display().to_string(),
+    ));
     format!(
         r#"# Fronde configuration, written by `fronde init`. Secrets are never written here:
 # use {{ file = "…" }} (relative to this file's directory) or {{ env = "…" }}.
@@ -95,13 +99,12 @@ env = {{}}
 builtin_tools = ["WebSearch", "WebFetch"]
 
 # Optional: where tools come from besides Fronde's own, 0..n. A calendar component (CalDAV
-# events and reminders); `fronde check` prints the two hashes that approve it.
+# events and reminders): the one shipped with Fronde needs no hashes (`fronde check` says
+# "approved: shipped with this build"); another needs the sha256 and manifest_sha256 it prints.
 # [[sources]]
 # kind = "component"
 # name = "calendar"
-# path = "/path/to/fronde/components/dist/calendar.wasm"
-# sha256 = "…"
-# manifest_sha256 = "…"
+# path = {calendar}
 # allow = ["https://cloud.example"]
 # [sources.settings]
 # events_url = "https://cloud.example/remote.php/dav/calendars/you/personal/"
@@ -223,6 +226,25 @@ mod tests {
         );
         assert!(text.contains(r#"command = ["/r/agent/node_modules/.bin/claude-agent-acp"]"#));
         assert!(render_config("a", "UTC", None).contains(r#"command = ["claude-agent-acp"]"#));
+    }
+
+    #[test]
+    fn the_calendar_entry_needs_no_hashes() {
+        let text = render_config("a", "UTC", None);
+        let start = text.find("# [[sources]]\n# kind = \"component\"").unwrap();
+        let entry: Vec<&str> = text[start..]
+            .lines()
+            .take_while(|l| l.starts_with("# "))
+            .map(|l| &l[2..])
+            .collect();
+        let entry = entry.join("\n");
+        assert!(!entry.contains("sha256"), "{entry}");
+        let table: toml::Table = toml::from_str(&entry).unwrap();
+        let source = &table["sources"].as_array().unwrap()[0];
+        assert!(
+            source["path"].as_str().unwrap().ends_with("calendar.wasm"),
+            "{entry}"
+        );
     }
 
     #[test]

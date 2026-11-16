@@ -12,7 +12,7 @@
 //!
 //! impl Tools for Hello {
 //!     fn list_tools() -> Vec<Tool> {
-//!         vec![Tool::new("hello", "Greet someone.", json!({
+//!         vec![Tool::new("hello_greet", "Greet someone.", json!({
 //!             "type": "object",
 //!             "properties": {"name": {"type": "string"}},
 //!         }))]
@@ -20,7 +20,7 @@
 //!
 //!     fn call_tool(name: &str, arguments: &str) -> ToolOutput {
 //!         match name {
-//!             "hello" => ToolOutput::ok(format!("hello {arguments}")),
+//!             "hello_greet" => ToolOutput::ok(format!("hello {arguments}")),
 //!             other => ToolOutput::error(format!("unknown tool {other}")),
 //!         }
 //!     }
@@ -33,6 +33,9 @@
 //! directory. A component reads its [`settings`] and reaches the network through [`http`], only
 //! to the origins the host allows, which adds the credentials itself: a component never holds a
 //! secret. The `testing` feature brings fakes to test a component natively.
+//!
+//! Every tool name starts with one of the prefixes the component's manifest declares in
+//! `tool_prefixes` (`hello_` above); Fronde refuses to load a component with any other.
 
 #![deny(unsafe_code)]
 
@@ -60,7 +63,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// A tool the component brings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
-    /// Matches `^[a-z][a-z0-9_]{0,63}$`.
+    /// Matches `^[a-z][a-z0-9_]{0,63}$` and starts with one of the manifest's `tool_prefixes`.
     pub name: String,
     /// A short imperative rule for the model.
     pub description: String,

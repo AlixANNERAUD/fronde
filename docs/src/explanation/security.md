@@ -71,14 +71,22 @@ under its name, at most 100 lines a call.
 
 A credential travels only over https, or over plain http to this machine (`localhost`,
 `127.0.0.1`, `::1`). A CalDAV server on the local network served over plain http must move to
-https, or Fronde must run on the same machine, for the component to send it a password.
+https, or Fronde must run on the same machine, for the component to send it a password. In
+Docker, the same machine means the container: a CalDAV server on the Docker host reached over
+plain http (`host.docker.internal`) does not get credentials, so use https there.
 
 A component asks and the configuration grants. Its manifest lists the origins and credentials it
 wants; its `[[sources]]` entry may grant only those, and never more (an origin or a credential
 the manifest does not ask for is refused). The grant is bound to the SHA-256 of the `.wasm` file
-and of the manifest, written in the entry: after an update, the component is skipped until you
-read the new manifest and copy the new hashes from `fronde check`. No tool can grant or approve
-anything, so the agent cannot widen what a component reaches. See
+and of the manifest. The `fronde` binary carries the hashes of the components built with it
+from this repository: an entry without hashes is approved only when its files are exactly those.
+Any other component needs both hashes written in its entry, which also pin a shipped one: after
+an update, the component is skipped until you read the new manifest and copy the new hashes from
+`fronde check`. A path never approves anything. No tool can grant or approve anything, so the
+agent cannot widen what a component reaches.
+
+A component's tools start with the prefixes its manifest declares, which no other source may
+use: a component cannot shadow the hub's tools or another source's. See
 [Configuration](../reference/configuration.md#kind--component).
 
 ## What is out of scope

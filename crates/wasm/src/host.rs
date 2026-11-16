@@ -207,9 +207,7 @@ impl Sandbox {
         let mut store = Store::new(
             self.host.engine(),
             HostState {
-                wasi: WasiCtx::builder()
-                    .stderr(GuestLog::new(&self.name))
-                    .build(),
+                wasi: WasiCtx::builder().stderr(GuestLog::new(&self.name)).build(),
                 http: WasiHttpCtx::new(),
                 table,
                 egress: Egress {

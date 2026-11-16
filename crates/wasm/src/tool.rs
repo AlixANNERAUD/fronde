@@ -4,7 +4,7 @@ use crate::ComponentSpec;
 use crate::api::Api;
 use crate::host::{ComponentHost, HostState, Sandbox};
 use crate::v0_1;
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use async_trait::async_trait;
 use fronde_hub::source::Tool;
 use fronde_hub::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
@@ -85,6 +85,7 @@ impl LoadedComponent {
         let exports = match api {
             Api::V0_1 => Tools::V0_1(v0_1::tool::Tools::new(host.linker(), &component)?),
         };
+        let prefixes = spec.tool_prefixes.clone();
         let sandbox = Sandbox::new(host, spec)?;
         let (mut store, out_of_cpu) = sandbox.store();
         let declared = sandbox
@@ -94,6 +95,14 @@ impl LoadedComponent {
         let tools = declared
             .into_iter()
             .map(|t| {
+                ensure!(
+                    prefixes.iter().any(|p| t.name.starts_with(p.as_str())),
+                    "component {} exports the tool {}, whose name starts with none of the \
+                     tool_prefixes of its manifest ({})",
+                    sandbox.name,
+                    t.name,
+                    prefixes.join(", ")
+                );
                 let input_schema = serde_json::from_str(&t.input_schema).with_context(|| {
                     format!(
                         "tool {} of {} has an invalid input schema",

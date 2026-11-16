@@ -24,7 +24,7 @@ pub use api::Api;
 pub use egress::{Allowed, Credential, Origin};
 pub use host::{ComponentHost, Limits};
 pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, NetworkRule, World};
-pub use source::{ComponentSource, Hashes, prepare};
+pub use source::{Approval, Checks, ComponentSource, Hashes, Prepared, Shipped, prepare, shipped};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 pub use tool::LoadedComponent;
@@ -42,4 +42,6 @@ pub struct ComponentSpec {
     pub settings: BTreeMap<String, String>,
     /// When set, the SHA-256 (hex) the file must have: the approved build.
     pub sha256: Option<String>,
+    /// Every tool the component exports must start with one of these.
+    pub tool_prefixes: Vec<String>,
 }

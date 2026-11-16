@@ -5,7 +5,7 @@ use fronde_hub::config::ComponentConfig;
 use fronde_hub::source::Supervisor;
 use fronde_hub::tools::Registry;
 use fronde_wasm::{
-    Allowed, ComponentHost, ComponentSource, ComponentSpec, Hashes, LoadedComponent,
+    Allowed, Checks, ComponentHost, ComponentSource, ComponentSpec, Hashes, LoadedComponent,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -37,6 +37,7 @@ async fn calendar_component_lists_its_tools() {
         credentials: vec![],
         settings: BTreeMap::new(),
         sha256: None,
+        tool_prefixes: vec!["calendar_".into(), "reminders_".into()],
     };
     let calendar = LoadedComponent::load(&host, spec).await.unwrap();
     let names: Vec<&str> = calendar
@@ -103,6 +104,7 @@ async fn calendar_component_reads_events_from_caldav() {
             ("timezone".to_string(), "America/New_York".to_string()),
         ]),
         sha256: None,
+        tool_prefixes: vec!["calendar_".into(), "reminders_".into()],
     };
     let calendar = LoadedComponent::load(&host, spec).await.unwrap();
     let out = calendar
@@ -235,7 +237,14 @@ async fn calendar_component_roundtrip() {
         password = password.display().to_string(),
     ));
     let host = ComponentHost::new().unwrap();
-    let source = ComponentSource::new(config, "Europe/Paris", host);
+    let source = ComponentSource::new(
+        config,
+        Checks {
+            timezone: "Europe/Paris".into(),
+            ..Checks::default()
+        },
+        host,
+    );
     let registry = Arc::new(Registry::new());
     let supervisor = Supervisor::new(registry.clone());
     supervisor.start(Arc::new(source)).await.unwrap();

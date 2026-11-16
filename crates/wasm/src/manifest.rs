@@ -29,6 +29,9 @@ pub struct Manifest {
     pub license: String,
     pub authors: Vec<String>,
     pub repository: Option<String>,
+    /// Every tool it exports starts with one of these (`calendar_`), which no other source may
+    /// use: a component cannot shadow another source's tools.
+    pub tool_prefixes: Vec<String>,
     /// The origins the component asks to reach.
     pub network: Vec<NetworkRule>,
     pub credentials: Vec<CredentialRequest>,
@@ -106,6 +109,7 @@ struct Raw {
     #[serde(default)]
     authors: Vec<String>,
     repository: Option<String>,
+    tool_prefixes: Vec<String>,
     #[serde(default)]
     permissions: RawPermissions,
     #[serde(default)]
@@ -161,6 +165,7 @@ impl Manifest {
         };
         ensure!(!raw.description.trim().is_empty(), "description is empty");
         ensure!(!raw.license.trim().is_empty(), "license is empty");
+        check_tool_prefixes(&raw.tool_prefixes).context("tool_prefixes")?;
         let settings = raw.settings.unwrap_or_else(
             || serde_json::json!({"type": "object", "additionalProperties": false, "properties": {}}),
         );
@@ -192,6 +197,7 @@ impl Manifest {
             license: raw.license,
             authors: raw.authors,
             repository: raw.repository,
+            tool_prefixes: raw.tool_prefixes,
             network,
             credentials,
             limits: raw.limits,
@@ -215,6 +221,34 @@ fn is_id(id: &str) -> bool {
         Some((publisher, name)) => is_label(publisher) && is_label(name),
         None => id.contains('.') && id.split('.').all(is_label),
     }
+}
+
+/// `^[a-z][a-z0-9]*_$`: a word and an underscore, so that two prefixes overlap only when equal.
+pub(crate) fn is_tool_prefix(s: &str) -> bool {
+    s.strip_suffix('_').is_some_and(|word| {
+        word.starts_with(|c: char| c.is_ascii_lowercase())
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
+fn check_tool_prefixes(prefixes: &[String]) -> anyhow::Result<()> {
+    ensure!(
+        !prefixes.is_empty(),
+        "list the prefixes of the component's tool names, such as [\"weather_\"]"
+    );
+    for (i, prefix) in prefixes.iter().enumerate() {
+        ensure!(
+            is_tool_prefix(prefix),
+            "{prefix:?} must be lower-case letters and digits followed by _, such as \"weather_\""
+        );
+        ensure!(
+            !prefixes[..i].contains(prefix),
+            "{prefix:?} is listed twice"
+        );
+    }
+    Ok(())
 }
 
 /// `[a-z][a-z0-9_]*`, as setting keys are.
@@ -445,6 +479,12 @@ fn check_settings(schema: &Value) -> anyhow::Result<&Map<String, Value>> {
             property.get("type") == Some(&Value::from("string")),
             "setting {name:?} must have type = \"string\": settings are strings"
         );
+        if let Some(format) = property.get("format") {
+            ensure!(
+                format == "uri",
+                "setting {name:?}: format {format} is not supported; the only format is \"uri\""
+            );
+        }
     }
     match schema.get("required") {
         None => {}
@@ -510,6 +550,7 @@ mod tests {
         api = "0.1"
         description = "Weather forecasts."
         license = "MIT"
+        tool_prefixes = ["weather_"]
     "#;
 
     fn with(extra: &str) -> String {
@@ -534,6 +575,7 @@ mod tests {
         assert_eq!(m.id, "org.example.weather");
         assert_eq!(m.version, semver::Version::new(1, 2, 0));
         assert_eq!(m.world, World::Tool);
+        assert_eq!(m.tool_prefixes, ["weather_"]);
         assert!(m.network.is_empty() && m.credentials.is_empty());
         assert_eq!(m.limits, LimitRequest::default());
     }
@@ -542,6 +584,7 @@ mod tests {
     fn calendar_manifest_declares_its_collections_and_credential() {
         let m = manifest_of("calendar");
         assert_eq!(m.id, "fronde/calendar");
+        assert_eq!(m.tool_prefixes, ["calendar_", "reminders_"]);
         assert_eq!(m.api, Api::V0_1);
         let collections = vec![
             NetworkRule::Setting("events_url".into()),
@@ -564,7 +607,9 @@ mod tests {
 
     #[test]
     fn echo_manifest_parses() {
-        assert_eq!(manifest_of("echo").id, "fronde/echo");
+        let m = manifest_of("echo");
+        assert_eq!(m.id, "fronde/echo");
+        assert_eq!(m.tool_prefixes, ["echo_"]);
     }
 
     #[test]
@@ -628,6 +673,29 @@ mod tests {
             let e = refused(&with(extra));
             assert!(e.contains("unknown field") && e.contains(key), "{e}");
         }
+    }
+
+    #[test]
+    fn tool_prefixes_are_required_and_checked() {
+        let e = refused(&MINIMAL.replace("tool_prefixes = [\"weather_\"]", ""));
+        assert!(e.contains("missing field `tool_prefixes`"), "{e}");
+        for (prefixes, expected) in [
+            ("[]", "list the prefixes"),
+            ("[\"weather\"]", "followed by _"),
+            ("[\"Weather_\"]", "followed by _"),
+            ("[\"_\"]", "followed by _"),
+            ("[\"1st_\"]", "followed by _"),
+            ("[\"weather_now_\"]", "followed by _"),
+            ("[\"weather_\", \"weather_\"]", "listed twice"),
+        ] {
+            let e = refused(&MINIMAL.replace("[\"weather_\"]", prefixes));
+            assert!(
+                e.contains("tool_prefixes") && e.contains(expected),
+                "{prefixes}: {e}"
+            );
+        }
+        let m = Manifest::parse(&MINIMAL.replace("[\"weather_\"]", "[\"weather_\", \"w2_\"]"));
+        assert_eq!(m.unwrap().tool_prefixes, ["weather_", "w2_"]);
     }
 
     #[test]
@@ -795,6 +863,10 @@ mod tests {
             (
                 "type = \"object\"\nadditionalProperties = false\nif = true",
                 "unknown key",
+            ),
+            (
+                "type = \"object\"\nadditionalProperties = false\n[settings.properties.day]\ntype = \"string\"\nformat = \"date\"",
+                "the only format is \"uri\"",
             ),
         ] {
             let e = refused(&with(&format!("[settings]\n{schema}")));

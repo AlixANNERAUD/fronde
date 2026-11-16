@@ -5,12 +5,14 @@ use fronde_hub::config::{Config, SourceConfig};
 use std::io::Write;
 
 /// Check the secrets and sources of a loaded configuration. For each component, write the hashes
-/// that approve its files to `out` first, so that a component not approved yet shows them.
+/// that approve its files to `out` first, so that a component not approved yet shows them, then
+/// what approved it.
 pub fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
     crate::check_token(&config.server.token.resolve().context("server.token")?)?;
     if let Some(web) = &config.web {
         crate::check_password(&web.password.resolve().context("web.password")?)?;
     }
+    let checks = fronde_wasm::Checks::of(config);
     for source in &config.sources {
         let name = source.name();
         match source {
@@ -29,8 +31,9 @@ pub fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
                     "source {name}: manifest_sha256 = \"{}\"",
                     hashes.manifest_sha256
                 )?;
-                fronde_wasm::prepare(c, config.data.timezone.name())
-                    .with_context(|| format!("source {name}"))?;
+                let prepared =
+                    fronde_wasm::prepare(c, &checks).with_context(|| format!("source {name}"))?;
+                writeln!(out, "source {name}: {}", prepared.approval)?;
             }
         }
     }

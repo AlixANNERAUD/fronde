@@ -126,9 +126,11 @@ EOF
 cargo run --package fronde -- serve --config "$dev/fronde.toml"
 '''
 
+# The binary carries the hashes of the components in components/dist (crates/wasm/build.rs), which
+# it approves without hashes in their entry: they are built first.
 [tasks.build]
-description = "Build the release binary and the web interface"
-depends = ["web-build"]
+description = "Build the components, the web interface and the release binary"
+depends = ["web-build", "components"]
 run = "cargo build --release --package fronde"
 
 # dx leaves the assets of earlier builds in place; the output starts empty so that only the
