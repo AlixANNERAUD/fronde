@@ -2,6 +2,7 @@
 
 use crate::config::is_valid_name;
 use crate::search::ToolIndex;
+use crate::source::Tool;
 use anyhow::bail;
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -128,7 +129,7 @@ where
     )
 }
 
-type Entry = (ToolDef, Arc<dyn ToolHandler>);
+type Entry = Tool;
 
 #[derive(Default)]
 pub struct Registry {
@@ -177,6 +178,12 @@ impl Registry {
             .iter()
             .filter_map(|n| self.get(n))
             .collect()
+    }
+
+    /// Every tool, deferred or not.
+    pub fn all(&self) -> Vec<ToolDef> {
+        let tools = self.tools.read().expect("registry lock");
+        tools.values().map(|(d, _)| d.clone()).collect()
     }
 
     pub fn visible(&self) -> Vec<ToolDef> {
@@ -249,6 +256,14 @@ struct UseArgs {
 
 /// Register `search_tools` and `use_tool`.
 pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
+    for (def, handler) in meta_tools(registry) {
+        registry.register(def, handler)?;
+    }
+    Ok(())
+}
+
+/// `search_tools` and `use_tool`, over `registry`.
+pub fn meta_tools(registry: &Arc<Registry>) -> Vec<Tool> {
     let r = Arc::downgrade(registry);
     let (def, h) = typed_tool(
         "search_tools",
@@ -275,7 +290,7 @@ pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
             }
         },
     );
-    registry.register(def, h)?;
+    let search = (def, h);
     let r = Arc::downgrade(registry);
     let (def, h) = typed_tool(
         "use_tool",
@@ -296,7 +311,7 @@ pub fn register_meta_tools(registry: &Arc<Registry>) -> anyhow::Result<()> {
             }
         },
     );
-    registry.register(def, h)
+    vec![search, (def, h)]
 }
 
 #[cfg(test)]

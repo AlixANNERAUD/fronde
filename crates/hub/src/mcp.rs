@@ -108,7 +108,7 @@ mod tests {
             dir.display().to_string()
         );
         let config: crate::config::Config = toml::from_str(&toml).unwrap();
-        let hub = Hub::start(config).await.unwrap();
+        let hub = Hub::start(config, vec![]).await.unwrap();
         let (mut d, h) = typed_tool(
             "mcphub_secret_tool",
             "Hidden",

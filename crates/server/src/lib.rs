@@ -144,7 +144,7 @@ pub async fn start_with(
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
     let agent = config.agent.clone();
-    let hub = Arc::new(Hub::start(config).await?);
+    let hub = Arc::new(Hub::start(config, vec![]).await?);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot listen on {listen}"))?;

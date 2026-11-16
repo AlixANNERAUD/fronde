@@ -3,6 +3,7 @@
 use super::git::commit_all;
 use super::index::MemoryIndex;
 use super::{MemoryFile, MemoryStore};
+use crate::source::Tool;
 use crate::tools::{Registry, ToolOutput, typed_tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -74,7 +75,16 @@ pub fn register_memory_tools(
     index: Arc<MemoryIndex>,
     git: bool,
 ) -> anyhow::Result<()> {
+    for (def, handler) in memory_tools(store, index, git) {
+        reg.register(def, handler)?;
+    }
+    Ok(())
+}
+
+/// `memory_add`, `memory_replace` and `memory_search`.
+pub fn memory_tools(store: Arc<MemoryStore>, index: Arc<MemoryIndex>, git: bool) -> Vec<Tool> {
     let ctx = Arc::new(Ctx { store, index, git });
+    let mut tools = Vec::new();
 
     let c = ctx.clone();
     let (d, h) = typed_tool(
@@ -91,7 +101,7 @@ pub fn register_memory_tools(
             }
         },
     );
-    reg.register(d, h)?;
+    tools.push((d, h));
 
     let c = ctx.clone();
     let (d, h) = typed_tool(
@@ -108,7 +118,7 @@ pub fn register_memory_tools(
             }
         },
     );
-    reg.register(d, h)?;
+    tools.push((d, h));
 
     let c = ctx;
     let (d, h) = typed_tool(
@@ -123,7 +133,8 @@ pub fn register_memory_tools(
             }
         },
     );
-    reg.register(d, h)
+    tools.push((d, h));
+    tools
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod memory;
 pub mod private;
 pub mod search;
+pub mod source;
 pub mod tools;
 pub mod upstream;
 
@@ -15,20 +16,27 @@ use calendar::caldav::CalDav;
 use calendar::{CalDavBackend, tools::register_calendar_tools};
 use config::Config;
 use memory::index::MemoryIndex;
-use memory::{MemoryStore, tools::register_memory_tools};
+use memory::{MemoryStore, tools::memory_tools};
+use source::{Native, Supervisor, ToolSource};
 use std::sync::Arc;
-use tools::{Registry, register_meta_tools};
+use tools::{Registry, meta_tools};
+use upstream::Upstream;
 
 /// Everything the hub serves, assembled from the configuration.
 pub struct Hub {
     pub registry: Arc<Registry>,
     pub memory: Arc<MemoryStore>,
+    pub sources: Supervisor,
     pub config: Config,
 }
 
 impl Hub {
-    /// Open memory, register native tools and start upstream connections (in the background).
-    pub async fn start(config: Config) -> anyhow::Result<Self> {
+    /// Open memory, register the hub's own tools, start `components` (one that fails is skipped
+    /// with a warning) and connect upstream servers in the background.
+    pub async fn start(
+        config: Config,
+        components: Vec<Arc<dyn ToolSource>>,
+    ) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
         private::prepare_data_dir(dir)?;
         let memory = Arc::new(MemoryStore::open(
@@ -40,8 +48,10 @@ impl Hub {
         index.reindex_all(memory.dir())?;
 
         let registry = Arc::new(Registry::new());
-        register_meta_tools(&registry)?;
-        register_memory_tools(&registry, memory.clone(), index, config.memory.git)?;
+        let sources = Supervisor::new(registry.clone());
+        let mut own = meta_tools(&registry);
+        own.extend(memory_tools(memory.clone(), index, config.memory.git));
+        sources.start(Arc::new(Native::new("hub", own))).await?;
         if let Some(c) = &config.calendar {
             let password = c.password.resolve().context("calendar.password")?;
             let backend = CalDavBackend {
@@ -51,12 +61,19 @@ impl Hub {
             };
             register_calendar_tools(&registry, Arc::new(backend), config.data.timezone)?;
         }
+        for component in components {
+            let name = component.name().to_string();
+            if let Err(e) = sources.start(component).await {
+                tracing::warn!("{name}: skipped: {e:#}");
+            }
+        }
         for m in &config.mcp {
-            upstream::spawn_upstream(m.clone(), registry.clone());
+            sources.spawn(Arc::new(Upstream::new(m.clone())));
         }
         Ok(Self {
             registry,
             memory,
+            sources,
             config,
         })
     }

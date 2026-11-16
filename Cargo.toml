@@ -16,6 +16,8 @@ agent-client-protocol = { version = "5.3", features = ["process"] }
 anyhow = "1"
 axum = "0.8"
 async-trait = "0.1"
+# The supervisor's backoff only: no sleeper, no blocking support.
+backon = { version = "1.6", default-features = false, features = ["std"] }
 base64 = "0.22"
 bytes = "1"
 dioxus = { version = "0.7.10", features = ["router"] }

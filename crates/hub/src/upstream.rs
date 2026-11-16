@@ -1,7 +1,8 @@
-//! Upstream MCP servers: their tools become deferred hub tools, with reconnection.
+//! Upstream MCP servers: their tools become deferred hub tools; the supervisor reconnects them.
 
 use crate::config::UpstreamConfig;
-use crate::tools::{Registry, ToolDef, ToolHandler, ToolOutput};
+use crate::source::{Session, ToolSource, unreachable};
+use crate::tools::{ToolDef, ToolHandler, ToolOutput};
 use async_trait::async_trait;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::{RunningService, ServiceError};
@@ -9,7 +10,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -34,17 +35,8 @@ pub fn tool_name(server: &str, tool: &str) -> String {
 
 struct Link {
     name: String,
-    client: RwLock<Option<Arc<Client>>>,
+    client: Client,
     broken: Notify,
-}
-
-impl Link {
-    fn unreachable(&self) -> ToolOutput {
-        ToolOutput::error(format!(
-            "{} is unreachable right now; retry later or do without it",
-            self.name
-        ))
-    }
 }
 
 struct Forward {
@@ -80,22 +72,18 @@ fn to_output(r: CallToolResult) -> ToolOutput {
 #[async_trait]
 impl ToolHandler for Forward {
     async fn call(&self, args: Value) -> ToolOutput {
-        let client = self.link.client.read().expect("link lock").clone();
-        let Some(client) = client else {
-            return self.link.unreachable();
-        };
         let mut params = CallToolRequestParams::new(self.tool.clone());
         if let Value::Object(map) = args {
             params = params.with_arguments(map);
         }
-        match client.call_tool(params).await {
+        match self.link.client.call_tool(params).await {
             Ok(r) => to_output(r),
             // The server answered with an error: report it, the link is fine.
             Err(ServiceError::McpError(e)) => ToolOutput::error(e.message.to_string()),
             Err(e) => {
                 tracing::warn!("{}: call to {} failed: {e}", self.link.name, self.tool);
                 self.link.broken.notify_one();
-                self.link.unreachable()
+                unreachable(&self.link.name)
             }
         }
     }
@@ -134,54 +122,60 @@ async fn open(cfg: &UpstreamConfig) -> anyhow::Result<Client> {
     }
 }
 
-/// Connect to an upstream server forever: register its tools as deferred, re-register on reconnect.
-pub fn spawn_upstream(cfg: UpstreamConfig, registry: Arc<Registry>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+/// An upstream MCP server: its tools become deferred hub tools named `{name}_{tool}`.
+pub struct Upstream {
+    cfg: UpstreamConfig,
+}
+
+impl Upstream {
+    pub fn new(cfg: UpstreamConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+#[async_trait]
+impl ToolSource for Upstream {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    /// Connect and list the tools; the session ends when the connection is lost.
+    async fn start(&self) -> anyhow::Result<Session> {
+        let (client, tools) = connect(&self.cfg).await?;
+        let name = self.cfg.name.clone();
         let link = Arc::new(Link {
-            name: cfg.name.clone(),
-            client: RwLock::new(None),
+            name: name.clone(),
+            client,
             broken: Notify::new(),
         });
-        let mut delay = Duration::from_secs(2);
-        loop {
-            match connect(&cfg).await {
-                Ok((client, tools)) => {
-                    delay = Duration::from_secs(2);
-                    let client = Arc::new(client);
-                    registry.unregister_source(&cfg.name);
-                    for t in tools {
-                        let def = ToolDef {
-                            name: tool_name(&cfg.name, &t.name),
-                            description: t.description.as_deref().unwrap_or_default().to_string(),
-                            input_schema: Value::Object((*t.input_schema).clone()),
-                            deferred: true,
-                            source: cfg.name.clone(),
-                        };
-                        let handler = Arc::new(Forward {
-                            link: link.clone(),
-                            tool: t.name.to_string(),
-                        });
-                        if let Err(e) = registry.register(def, handler) {
-                            tracing::warn!("{}: skipped tool {}: {e:#}", cfg.name, t.name);
-                        }
-                    }
-                    *link.client.write().expect("link lock") = Some(client.clone());
-                    tracing::info!("{}: connected", cfg.name);
-                    loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(5)) => if client.is_closed() { break },
-                            _ = link.broken.notified() => break,
-                        }
-                    }
-                    *link.client.write().expect("link lock") = None;
-                    tracing::warn!("{}: disconnected", cfg.name);
+        let tools = tools
+            .into_iter()
+            .map(|t| {
+                let def = ToolDef {
+                    name: tool_name(&name, &t.name),
+                    description: t.description.as_deref().unwrap_or_default().to_string(),
+                    input_schema: Value::Object((*t.input_schema).clone()),
+                    deferred: true,
+                    source: name.clone(),
+                };
+                let handler: Arc<dyn ToolHandler> = Arc::new(Forward {
+                    link: link.clone(),
+                    tool: t.name.to_string(),
+                });
+                (def, handler)
+            })
+            .collect();
+        tracing::info!("{name}: connected");
+        Ok(Session::until(tools, async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => if link.client.is_closed() { break },
+                    _ = link.broken.notified() => break,
                 }
-                Err(e) => tracing::warn!("{}: cannot connect: {e:#}", cfg.name),
             }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(60));
-        }
-    })
+            tracing::warn!("{}: disconnected", link.name);
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +263,8 @@ pub(crate) mod test_server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::Supervisor;
+    use crate::tools::Registry;
     use serde_json::json;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -280,6 +276,11 @@ mod tests {
             command: None,
             token: None,
         }
+    }
+
+    /// Through the supervisor, as the hub connects them.
+    fn spawn_upstream(cfg: UpstreamConfig, registry: Arc<Registry>) {
+        Supervisor::new(registry).spawn(Arc::new(Upstream::new(cfg)));
     }
 
     async fn wait_for(reg: &Registry, name: &str, secs: u64) -> bool {
