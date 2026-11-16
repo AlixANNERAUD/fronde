@@ -18,7 +18,8 @@ and exports, and refuses one built for a version it does not serve, naming the v
 | --- | --- |
 | 0.1 | `fronde:component@0.1.x` |
 
-Within a version, patch releases (0.1.1, …) only fix documentation: the interfaces stay the same.
+A released version's directory under `wit/` is frozen and never edited, so within a version the
+interfaces stay the same. A fix is a new version, which Fronde then serves beside the old one.
 
 ## The `tool` world
 

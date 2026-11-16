@@ -2,8 +2,8 @@
 
 Each component project has a `fronde-component.toml` beside its `Cargo.toml`. It says what the
 component is, which version of the [component interface](wit-interface.md) it targets, and what it
-asks for: the origins it reaches, the credentials the host should add, tighter limits and its
-settings. The manifest is a request, never a grant: Fronde's configuration decides what a
+asks for: the origins it reaches, the credentials the host should add, tighter limits
+(**planned**: parsed, not applied yet) and its settings. The manifest is a request, never a grant: Fronde's configuration decides what a
 component gets, and never more than its manifest asks.
 
 Fronde reads it strictly: an unknown key, a wildcard in the wrong place or a setting that looks
@@ -92,10 +92,13 @@ sees it.
 | Key | Value |
 | --- | --- |
 | `name` | Unique in the manifest: lower-case letters, digits, `_` and `-`. |
-| `injection` | `"basic"` (`Authorization: Basic`, from a user name and password), `"bearer"` (`Authorization: Bearer`), or `"header:<Name>"` (the secret as that header's value; hop-by-hop headers and `Host` are refused). |
+| `injection` | `"basic"` (`Authorization: Basic`, from a user name and password), `"bearer"` (`Authorization: Bearer`), or `"header:<Name>"` (the secret as that header's value; hop-by-hop headers and `Host` are refused). `header:<Name>` is **planned**: the manifest parses it, but a credential in the configuration is `basic` or `bearer` only, so it cannot be granted yet. |
 | `origins` | Entries of `permissions.network` the credential goes to. |
 
 ## `[limits]`
+
+**Planned.** The host parses these keys and checks them against its own limits, but does not
+apply them yet: every component runs under the host's limits.
 
 Optional, each within the host's limit: `memory_mb` (up to 64), `call_timeout_ms` (up to
 60000), `cpu_ms` (running time, up to 10000) and `request_timeout_ms` (up to 30000).
@@ -105,7 +108,7 @@ Optional, each within the host's limit: `memory_mb` (up to 64), `call_timeout_ms
 The [JSON Schema](https://json-schema.org) of the component's settings, written in TOML. It is
 an object with `additionalProperties = false`, whose properties are all strings (`type =
 "string"`, with optional `title`, `description`, `format`, `default`, `enum`, `pattern` and
-`examples`). Setting names match `[a-z][a-z0-9_]*`. The only `format` is `"uri"`: the value must
+`examples`; the host does not apply `default` yet, which is **planned**). Setting names match `[a-z][a-z0-9_]*`. The only `format` is `"uri"`: the value must
 be a URL, with no user name or password in it (those are credentials).
 
 Settings reach the component, so they never hold a secret: a property whose name contains a
