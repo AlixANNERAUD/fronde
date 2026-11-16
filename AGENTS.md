@@ -8,6 +8,7 @@ own subscriptions over ACP, serves its memory, calendar and tools over MCP, and 
 | Crate | Role |
 | --- | --- |
 | `crates/hub` (`fronde-hub`) | Tools registry and search, memory, CalDAV calendar and reminders, upstream MCP servers, the MCP server |
+| `crates/fs` (`fronde-fs`) | Private-file helpers shared by the hub and the agent: 0700 directories, 0600 files, durable atomic replacement (`atomic-write-file`: sync of file and directory) |
 | `crates/protocol` (`fronde-protocol`) | Types shared by the conversation log, the server and the web interface (`Event`, `Entry`); serde and chrono only |
 | `crates/agent` (`fronde-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/client` (`fronde-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |

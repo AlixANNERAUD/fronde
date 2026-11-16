@@ -1,6 +1,6 @@
 //! Conversation log: an append-only JSONL file, mirrored in memory, with live broadcast.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -69,13 +69,14 @@ impl ConversationLog {
             Some(id) => id,
             None => write_header(path)?,
         };
-        let mut file = private_options()
+        let mut file = fronde_fs::private_options()
             .create(true)
             .read(true)
             .append(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        restrict(path).with_context(|| format!("restricting {}", path.display()))?;
+        fronde_fs::restrict_file(path)
+            .with_context(|| format!("restricting {}", path.display()))?;
         let length = file.metadata()?.len();
         let torn = length > 0 && {
             let mut last = [0u8; 1];
@@ -125,6 +126,7 @@ impl ConversationLog {
         // A failed write may leave partial bytes behind.
         state.torn = true;
         state.file.write_all(line.as_bytes())?;
+        state.file.sync_data()?;
         state.torn = false;
         state.entries.push(entry.clone());
         // No subscriber is not an error.
@@ -156,7 +158,7 @@ impl ConversationLog {
 }
 
 /// Names the log at `path` with a new random id, written as its first line, and returns the id.
-/// Entries already there (a log from before ids) are kept; the file is replaced in one rename.
+/// Entries already there (a log from before ids) are kept; the file is replaced atomically.
 fn write_header(path: &Path) -> anyhow::Result<String> {
     let log_id = uuid::Uuid::new_v4().simple().to_string();
     let mut text = serde_json::to_string(&Header {
@@ -174,42 +176,9 @@ fn write_header(path: &Path) -> anyhow::Result<String> {
     }
     let mut bytes = text.into_bytes();
     bytes.extend(old);
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = std::path::PathBuf::from(temporary);
-    write_private(&temporary, &bytes)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+    fronde_fs::write_atomic(path, &bytes)
+        .with_context(|| format!("replacing {}", path.display()))?;
     Ok(log_id)
-}
-
-/// Options for a file only its owner can read, whatever the umask says.
-pub(crate) fn private_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options
-}
-
-/// Make an existing file 0600 (one from an older version may be open to others).
-pub(crate) fn restrict(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
-/// Write a file that is 0600 from its creation.
-pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = private_options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    restrict(path)?;
-    file.write_all(bytes)
 }
 
 #[cfg(test)]

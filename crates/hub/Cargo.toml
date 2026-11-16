@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+fronde-fs = { path = "../fs" }
 async-trait.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true

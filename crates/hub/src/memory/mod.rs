@@ -93,8 +93,7 @@ fn read(path: &Path) -> std::io::Result<String> {
 }
 
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    crate::private::write_atomic(path, &tmp, content)
+    crate::private::write_atomic(path, content)
 }
 
 impl MemoryStore {
@@ -266,8 +265,13 @@ mod tests {
         assert_eq!(mode(dir.path().join("journal")), 0o700);
         assert_eq!(mode(dir.path().to_path_buf()), 0o700);
         assert_eq!(mode(dir.path().join("MEMORY.md")), 0o600);
-        write_atomic(&dir.path().join("MEMORY.md"), "x").unwrap();
+        let content = "- a fact\n".repeat(500);
+        write_atomic(&dir.path().join("MEMORY.md"), &content).unwrap();
         assert_eq!(mode(dir.path().join("MEMORY.md")), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("MEMORY.md")).unwrap(),
+            content
+        );
     }
 
     fn now() -> DateTime<Utc> {

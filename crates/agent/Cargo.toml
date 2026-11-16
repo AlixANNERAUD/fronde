@@ -15,6 +15,7 @@ agent-client-protocol.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
+fronde-fs = { path = "../fs" }
 fronde-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
