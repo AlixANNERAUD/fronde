@@ -387,13 +387,26 @@ thread's first message, with its own directories, its own sandbox and its own hu
   `threads_send`, `threads_read`, `threads_cancel`) work only while the thread is in a turn, and a
   wait ends with the turn. Since a misled agent spends the subscription's quota in the
   background, `[threads]` bounds it: by default 3 sub-agents of a thread in a turn at once, 30
-  started a day by all threads, 30 minutes per sub-agent turn (and 200 kept per thread, against
-  clutter); a quota-based budget is planned.
+  started and 100 turns of sub-agents a day by all threads, 30 minutes per sub-agent turn or
+  woken turn, 10 woken turns in a row without a message of the owner's (and 200 kept per thread,
+  against clutter); within those bounds a misled agent still spends quota, and a quota-based
+  budget is planned.
   An outside MCP client, which holds
   `server.token`, gets no `threads_*` tool and is refused them. What a sub-agent writes reaches
   its parent capped, with hidden characters shown as U+FFFD and marked as data, not
   instructions: a page the sub-agent read cannot pass for its parent's instructions unseen,
   though the parent's model still reads it, as it reads any tool result.
+- **Wakes.** A sub-agent's result wakes its parent in a turn the owner did not start, from text
+  the sub-agent may have read anywhere: an injection's way into a thread that holds more than
+  the sub-agent. Such a turn names its sub-agent on every card it shows, offers no lasting
+  ("always") permission option, runs on an agent process that holds none (Fronde restarts the
+  agent first if the owner granted one to the running process, which loads no settings file), and
+  may not ask for a secret. It may start and resend sub-agents, whose results wake the thread
+  again; `wakes_without_owner` ends such a chain, holding the next results for the owner's
+  message, and the owner's Stop holds them too. Archiving a thread retires every thread under
+  it: each agent's token is revoked at once, and nothing under it is woken or delegates again;
+  an archive and a sub-agent's start or message are serialised, so one never slips past the
+  other.
 - **Limits.** Each agent process has its own systemd scope, named after its thread
   (`fronde-agent-<hash>-t<id>-…`), with the limits of `[agent.limits]`; starting or stopping one
   never stops another. At most `[threads] max_running` run at once, and `fronde-agents.slice`

@@ -121,6 +121,9 @@ enum NotShown {
     Reused(anyhow::Error),
     /// The calling thread's turn ended, or is ending: a card shown now would outlive it.
     TurnOver,
+    /// The threads refused it, saying why, for the agent: a secret asked in a turn a
+    /// sub-agent's result started.
+    Refused(String),
     /// Something broke; logged here.
     Failed,
 }
@@ -140,7 +143,7 @@ impl Asking {
                     Err(ThreadError::NoSuchThread) => {
                         Err(anyhow::anyhow!("the calling thread is unknown"))
                     }
-                    Err(ThreadError::Refused(message)) => Err(anyhow::anyhow!(message)),
+                    Err(ThreadError::Refused(message)) => return Err(NotShown::Refused(message)),
                 }
             }
             _ => self.requests.ask(ask).await,
@@ -251,6 +254,7 @@ async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) ->
                 "{error}; give a new client_request_id for a new secret, or retry with exactly the same arguments"
             ));
         }
+        Err(NotShown::Refused(message)) => return ToolOutput::error(message),
         Err(NotShown::TurnOver) => {
             return ToolOutput::error(
                 "the card was not shown: your turn ended before it could be; if you still need this secret, ask for it again with user_secret in a later turn, never in chat",
@@ -443,6 +447,7 @@ async fn user_ask(asking: &Asking, context: CallContext, args: AskArgs) -> ToolO
                 "{error}; give a new client_request_id for a new question, or retry with exactly the same questions"
             ));
         }
+        Err(NotShown::Refused(message)) => return ToolOutput::error(message),
         Err(NotShown::TurnOver) => {
             return ToolOutput::error(
                 "the question was not shown: your turn ended before it could be; ask it again in a later turn if you still need the answer",

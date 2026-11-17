@@ -483,7 +483,7 @@ async fn waited(
 fn status_after(outcome: TurnOutcome) -> ThreadStatus {
     match outcome {
         TurnOutcome::Done => ThreadStatus::Done,
-        TurnOutcome::Cancelled => ThreadStatus::Cancelled,
+        TurnOutcome::Cancelled | TurnOutcome::Archived => ThreadStatus::Cancelled,
         TurnOutcome::Refused | TurnOutcome::Limit | TurnOutcome::Error => ThreadStatus::Failed,
     }
 }

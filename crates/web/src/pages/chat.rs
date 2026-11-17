@@ -327,10 +327,17 @@ fn RowView(
             card,
             from,
             server,
+            woken_by,
             status,
             refusal,
             by,
         } => rsx! {
+            // A turn a sub-agent's result started follows text the owner did not write.
+            if let Some(woken_by) = woken_by {
+                p { class: "text-muted-foreground px-1 text-xs wrap-break-word",
+                    {woken_by_line(&woken_by)}
+                }
+            }
             RequestCard {
                 id,
                 card: *card,
@@ -347,9 +354,18 @@ fn RowView(
     }
 }
 
+/// What a card asked in a wake's turn says above it.
+fn woken_by_line(woken_by: &fronde_protocol::WokenBy) -> String {
+    format!(
+        "Tour lancé par le résultat du sous-agent « {} » (#{})",
+        woken_by.title, woken_by.thread
+    )
+}
+
 /// How a sub-agent's turn ended, as its parent's chat says it.
 fn child_ended_label(outcome: TurnOutcome) -> &'static str {
     match outcome {
+        TurnOutcome::Archived => "Sous-agent archivé",
         TurnOutcome::Done => "Sous-agent terminé",
         TurnOutcome::Cancelled => "Sous-agent terminé (interrompu)",
         TurnOutcome::Refused => "Sous-agent terminé (refus)",
@@ -753,6 +769,30 @@ mod tests {
     }
 
     const PERMISSION_REQUEST: &str = r#"{"type":"request","id":2,"card":{"kind":"permission","title":"Écrire dans la mémoire","options":[{"id":"allow-once","kind":"allow_once"},{"id":"reject","kind":"reject_once"}]}}"#;
+
+    /// A card asked in a turn a sub-agent's result started says so, its title as text; a card
+    /// of the owner's own turn does not.
+    #[test]
+    fn a_card_of_a_wake_turn_names_its_sub_agent() {
+        let ended = r#"{"type":"child_ended","thread":7,"title":"Vols <b>bon marché</b>","outcome":"done","summary":"Trois vols."}"#;
+        let woken = r#"{"type":"woken","child_ended":1}"#;
+        let request = r#"{"type":"request","id":2,"card":{"kind":"permission","title":"Écrire dans la mémoire","options":[{"id":"allow-once","kind":"allow_once"},{"id":"reject","kind":"reject_once"}]},"woken_by":{"thread":7,"title":"Vols <b>bon marché</b>"}}"#;
+        let page = render(chat(&[ended, woken, request]), Status::Open);
+        assert!(
+            page.contains(
+                "Tour lancé par le résultat du sous-agent « Vols &#60;b&#62;bon marché&#60;/b&#62; » (#7)"
+            ),
+            "{page}"
+        );
+        assert!(!page.contains("<b>"), "{page}");
+        let page = render(chat(&[USER, PERMISSION_REQUEST]), Status::Open);
+        assert!(!page.contains("Tour lancé par"), "{page}");
+        // An archived sub-agent is a line of its own.
+        let archived =
+            r#"{"type":"child_ended","thread":7,"title":"Vols","outcome":"archived","summary":""}"#;
+        let page = render(chat(&[archived]), Status::Open);
+        assert!(page.contains("Sous-agent archivé"), "{page}");
+    }
 
     #[test]
     fn permission_card_disabled_after_turn() {

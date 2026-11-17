@@ -119,4 +119,10 @@ max_depth = 1
 children_running = 3
 children_per_day = 30
 children_kept = 200
+# Turns of sub-agents threads start in 24 hours: each threads_start and threads_send.
+child_turns_per_day = 100
+# Also caps a turn that a sub-agent's result woke.
 child_turn_timeout = "30m"
+# Turns a thread may be woken by sub-agents' results in a row without a message from you;
+# later results wait for your next message.
+wakes_without_owner = 10

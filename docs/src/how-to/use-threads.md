@@ -55,8 +55,14 @@ When a sub-agent finishes, its parent's chat shows a small line, *Sous-agent ter
 the sub-agent's title (with *(interrompu)* or *(échec)* when it did not end normally). The title
 is a link to the sub-agent's thread. The parent agent then answers on its own with what the
 sub-agent found: you do not have to ask. If the parent was in the middle of a reply, it finishes
-that reply first. Stop interrupts that answer only; the sub-agents keep working, and the next one
-to finish wakes the parent again. An archived thread is not woken.
+that reply first. Cards shown during such an answer say *Tour lancé par le résultat du
+sous-agent* with its title: that turn follows the sub-agent's text, not yours, so its permission
+cards offer no "always" option and it cannot ask you for a secret. Stop interrupts that answer
+only; the sub-agents keep working. Results that were waiting, and those that come after, then
+wait for your next message, which carries them. After ten such answers in a row without a
+message from you, the next results wait the same way, and the chat says how many. An archived
+thread is not woken, nor are the threads under it. Archiving a sub-agent itself shows a
+*Sous-agent archivé* line in its parent's chat.
 
 Stop in a sub-agent's own thread stops that sub-agent; its parent is told it ended
 *(interrompu)*. A sub-agent's turn that runs longer than 30 minutes is stopped the same way, with
@@ -73,9 +79,11 @@ max_depth = 1             # 0: no sub-agents; 2: a sub-agent may start its own
 children_running = 3      # per thread, at once
 children_per_day = 30     # all threads together, in 24 hours
 children_kept = 200       # per thread, not archived
-child_turn_timeout = "30m"
+child_turns_per_day = 100 # each task and each threads_send, all threads, in 24 hours
+child_turn_timeout = "30m" # also caps an answer a sub-agent's result started
+wakes_without_owner = 10  # answers to sub-agents' results in a row without your message
 ```
 
-Restart Fronde for a change to apply. Raise a limit only for work you trust: each one bounds what
-an agent misled by something it read could spend without you (see
+Restart Fronde for a change to apply. Raise a limit only for work you trust: together they bound
+what an agent misled by something it read could spend without you (see
 [Threads and sub-agents](../explanation/threads.md#limits)).

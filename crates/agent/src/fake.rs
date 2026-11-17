@@ -51,6 +51,9 @@ pub struct FakeScript {
     pub ignore_cancel: bool,
     /// After this many updates of each prompt, wait for the notify before sending the rest.
     pub pause: Option<(usize, Arc<Notify>)>,
+    /// Given a permit each time a prompt reaches `pause`, before it waits there: a test knows
+    /// the turn is held.
+    pub paused: Option<Arc<tokio::sync::Semaphore>>,
     /// Ask this `elicitation/create` during each prompt, after the permission if any, its
     /// `sessionId` filled in unless it has one: the JSON the agent would send, such as the Claude
     /// adapter's form for `AskUserQuestion`.
@@ -82,6 +85,7 @@ impl Default for FakeScript {
             signed_out: false,
             ignore_cancel: false,
             pause: None,
+            paused: None,
             elicitation: None,
             leave_elicitation_pending: false,
             withdraw_elicitation: None,
@@ -314,7 +318,15 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
                             if let Some((after, gate)) = &script.pause
                                 && index == *after
                             {
-                                gate.notified().await;
+                                // Listening first: a release right after the signal is not
+                                // missed.
+                                let released = gate.notified();
+                                tokio::pin!(released);
+                                released.as_mut().enable();
+                                if let Some(paused) = &script.paused {
+                                    paused.add_permits(1);
+                                }
+                                released.await;
                             }
                             cx.send_notification(SessionNotification::new(
                                 session.clone(),

@@ -30,6 +30,9 @@ pub enum TurnOutcome {
     Refused,
     Limit,
     Error,
+    /// Only in [`Event::ChildEnded`]: the owner archived the sub-agent itself. Its parent is
+    /// told, never woken.
+    Archived,
 }
 
 /// One thing that happened in the conversation.
@@ -79,6 +82,10 @@ pub enum Event {
         from: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         server: bool,
+        /// The sub-agent whose result started the turn that asks: the card says so, since that
+        /// turn follows text the owner did not write.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        woken_by: Option<WokenBy>,
     },
     /// `by`: the user who answered, when someone did.
     RequestClosed {
@@ -93,7 +100,9 @@ pub enum Event {
     /// `truncated` when it was cut. It is the sub-agent's own text: data, never instructions.
     ///
     /// Logged while no turn runs, it opens the parent's wake turn; logged during a turn, its wake
-    /// waits, and each [`Event::TurnEnded`] opens the next wake waiting, in order.
+    /// waits, and each [`Event::TurnEnded`] opens the next wake waiting, in order; past the wake
+    /// budget, or after the owner's Stop, it is held instead ([`Event::WakesHeld`]). With the
+    /// outcome [`TurnOutcome::Archived`] it only tells, and wakes nothing.
     ChildEnded {
         thread: ThreadId,
         title: String,
@@ -108,6 +117,20 @@ pub enum Event {
     Woken {
         child_ended: u64,
     },
+    /// Sub-agents' results wait for the owner's next message instead of waking the thread:
+    /// `count` of them, since the owner stopped the turn or since
+    /// `[threads] wakes_without_owner` turns were woken without the owner. That message
+    /// carries them to the agent. Logged in the parent's stream.
+    WakesHeld {
+        count: u32,
+    },
+}
+
+/// The sub-agent whose result woke a thread, as a card asked in that wake's turn names it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct WokenBy {
+    pub thread: ThreadId,
+    pub title: String,
 }
 
 /// The longest final answer of a sub-agent its parent gets at once, in characters.
@@ -458,6 +481,7 @@ mod tests {
             card: card.clone(),
             from: Some("Codex".into()),
             server: false,
+            woken_by: None,
         };
         let json = serde_json::to_string(&asked).unwrap();
         assert_eq!(
@@ -471,6 +495,7 @@ mod tests {
             card,
             from: Some("github".into()),
             server: true,
+            woken_by: None,
         };
         let json = serde_json::to_string(&served).unwrap();
         assert_eq!(
@@ -728,6 +753,39 @@ mod tests {
         let json = serde_json::to_string(&woken).unwrap();
         assert_eq!(json, r#"{"type":"woken","child_ended":4}"#);
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), woken);
+        let held = Event::WakesHeld { count: 2 };
+        let json = serde_json::to_string(&held).unwrap();
+        assert_eq!(json, r#"{"type":"wakes_held","count":2}"#);
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), held);
+        let archived = serde_json::to_string(&TurnOutcome::Archived).unwrap();
+        assert_eq!(archived, r#""archived""#);
+    }
+
+    #[test]
+    fn a_card_asked_in_a_wake_names_its_sub_agent() {
+        let asked = Event::Request {
+            id: 4,
+            card: Card::Form {
+                message: String::new(),
+                fields: Vec::new(),
+                submit: None,
+                truncated: false,
+                replaced: false,
+                during: Vec::new(),
+            },
+            from: None,
+            server: false,
+            woken_by: Some(WokenBy {
+                thread: ThreadId(7),
+                title: "Vols".into(),
+            }),
+        };
+        let json = serde_json::to_string(&asked).unwrap();
+        assert!(
+            json.ends_with(r#""woken_by":{"thread":7,"title":"Vols"}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), asked);
     }
 
     #[test]

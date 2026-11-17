@@ -2,7 +2,7 @@
 //! APIs, so it is tested natively.
 
 use fronde_protocol::{
-    Card, Entry, Event, Outcome, RequestId, ServerMsg, ThreadId, ToolState, TurnOutcome,
+    Card, Entry, Event, Outcome, RequestId, ServerMsg, ThreadId, ToolState, TurnOutcome, WokenBy,
 };
 
 /// How a tool call ended, as the chat shows it.
@@ -67,6 +67,8 @@ pub enum Item {
         from: Option<String>,
         /// `from` is one of Fronde's upstream MCP servers, not a client.
         server: bool,
+        /// The sub-agent whose result started the turn that asks: the card says so.
+        woken_by: Option<WokenBy>,
         status: RequestStatus,
         /// Why the server refused this page's last answer, while the request is open.
         refusal: Option<String>,
@@ -112,6 +114,8 @@ pub struct Chat {
     /// Sub-agents' results logged during a turn: each `turn_ended` opens the next one's turn,
     /// as the server runs them.
     wakes: u32,
+    /// The running turn is a wake whose prompt has not gone out: held results close it.
+    unwoken: bool,
     /// The log the entries come from, as the server's last hello named it.
     log_id: Option<String>,
     /// Counts log resets.
@@ -232,6 +236,7 @@ impl Chat {
         match entry.event {
             Event::User { text, by } => {
                 self.running = true;
+                self.unwoken = false;
                 self.push(seq, Item::User { text, by });
             }
             Event::Assistant { text } => {
@@ -286,10 +291,15 @@ impl Chat {
                 outcome,
                 ..
             } => {
-                if self.running {
-                    self.wakes += 1;
-                } else {
-                    self.running = true;
+                // An archived sub-agent's entry only tells; held results wake nothing, and the
+                // `wakes_held` entry that follows says so.
+                if outcome != TurnOutcome::Archived {
+                    if self.running {
+                        self.wakes += 1;
+                    } else {
+                        self.running = true;
+                        self.unwoken = true;
+                    }
                 }
                 self.push(
                     seq,
@@ -301,9 +311,24 @@ impl Chat {
                 );
             }
             // The wake's prompt went out: nothing to show.
-            Event::Woken { .. } => {}
+            Event::Woken { .. } => self.unwoken = false,
+            Event::WakesHeld { count } => {
+                // Every result waiting is held, a wake turn that never gave its prompt included.
+                self.wakes = 0;
+                if self.unwoken {
+                    self.unwoken = false;
+                    self.running = false;
+                }
+                self.push(
+                    seq,
+                    Item::Notice {
+                        text: held_notice(count),
+                    },
+                );
+            }
             Event::TurnEnded { outcome } => {
                 self.running = false;
+                self.unwoken = false;
                 for row in self.current_turn() {
                     set_tool_status(row, ToolStatus::Interrupted);
                     set_permission_status(row, PermissionStatus::Expired);
@@ -313,7 +338,7 @@ impl Chat {
                     TurnOutcome::Refused => Some("Fronde a refusé de répondre."),
                     TurnOutcome::Limit => Some("Limite d'utilisation atteinte."),
                     // An error is already explained by the notice logged before.
-                    TurnOutcome::Done | TurnOutcome::Error => None,
+                    TurnOutcome::Done | TurnOutcome::Error | TurnOutcome::Archived => None,
                 };
                 if let Some(text) = notice {
                     self.push(seq, Item::Notice { text: text.into() });
@@ -321,6 +346,7 @@ impl Chat {
                 if self.wakes > 0 {
                     self.wakes -= 1;
                     self.running = true;
+                    self.unwoken = true;
                 }
             }
             Event::Notice { text } => self.push(seq, Item::Notice { text }),
@@ -329,6 +355,7 @@ impl Chat {
                 card,
                 from,
                 server,
+                woken_by,
             } => self.push(
                 seq,
                 Item::Request {
@@ -336,6 +363,7 @@ impl Chat {
                     card: Box::new(card),
                     from,
                     server,
+                    woken_by,
                     status: RequestStatus::Open,
                     refusal: None,
                     by: None,
@@ -381,6 +409,15 @@ impl Chat {
 }
 
 /// Ends a running tool call; any other row is left alone.
+/// What the chat says when `count` sub-agents' results wait for the owner's next message.
+pub fn held_notice(count: u32) -> String {
+    if count == 1 {
+        "1 résultat de sous-agent en attente — envoie un message pour le recevoir".to_owned()
+    } else {
+        format!("{count} résultats de sous-agents en attente — envoie un message pour les recevoir")
+    }
+}
+
 fn set_tool_status(row: &mut Row, new: ToolStatus) {
     if let Item::Tool { status, .. } = &mut row.item
         && *status == ToolStatus::Running
@@ -582,6 +619,61 @@ mod tests {
         )
     }
 
+    /// Held results open no turn, and the chat says how many wait; an archived sub-agent's
+    /// entry only tells.
+    #[test]
+    fn held_results_and_an_archived_sub_agent_open_no_turn() {
+        let mut chat = Chat::default();
+        apply_all(
+            &mut chat,
+            [child_ended(1, 7), entry(2, Event::WakesHeld { count: 1 })],
+        );
+        assert!(!chat.running(), "held, not woken");
+        // Results waiting for a stopped turn are held at its end.
+        apply_all(
+            &mut chat,
+            [
+                user(3, "Va"),
+                child_ended(4, 8),
+                entry(5, Event::WakesHeld { count: 2 }),
+                ended(6, TurnOutcome::Cancelled),
+            ],
+        );
+        assert!(!chat.running());
+        let archived = entry(
+            7,
+            Event::ChildEnded {
+                thread: ThreadId(9),
+                title: "Archivé".into(),
+                outcome: TurnOutcome::Archived,
+                summary: String::new(),
+                truncated: false,
+            },
+        );
+        apply_all(&mut chat, [archived]);
+        assert!(!chat.running());
+        let notices: Vec<Item> = items(&chat)
+            .into_iter()
+            .filter(|item| matches!(item, Item::Notice { .. }))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                Item::Notice {
+                    text: "1 résultat de sous-agent en attente — envoie un message pour le recevoir"
+                        .into()
+                },
+                Item::Notice {
+                    text: "2 résultats de sous-agents en attente — envoie un message pour les recevoir"
+                        .into()
+                },
+                Item::Notice {
+                    text: "Réponse interrompue.".into()
+                },
+            ]
+        );
+    }
+
     #[test]
     fn a_sub_agents_result_shows_and_runs_its_wake_turns() {
         let mut chat = Chat::default();
@@ -759,6 +851,7 @@ mod tests {
                 card,
                 from: None,
                 server: false,
+                woken_by: None,
             },
         )
     }
@@ -801,6 +894,7 @@ mod tests {
                         card,
                         from: None,
                         server: false,
+                        woken_by: None,
                     },
                 ),
             ],

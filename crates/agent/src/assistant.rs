@@ -8,17 +8,17 @@ use crate::confine::Confine;
 use crate::elicitation;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
-use crate::threads::wakes::{self, Opened, Wake};
-use crate::threads::{self, Changes, Handoff, Pool, Registry, Slot, ThreadId, TurnResult};
+use crate::threads::wakes::{self, Opened, Queue, Wake};
+use crate::threads::{self, Changes, Handoff, Limits, Pool, Registry, Slot, ThreadId, TurnResult};
 use crate::tokens::{TokenLease, Tokens};
-use agent_client_protocol::v1::schema::CreateElicitationResponse;
+use agent_client_protocol::v1::schema::{CreateElicitationResponse, RequestPermissionOutcome};
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
-use fronde_protocol::{Card, Outcome, RequestId, ThreadStatus};
+use fronde_protocol::{Card, Outcome, PermissionKind, RequestId, ThreadStatus, WokenBy};
 use fronde_requests::{Ask, Caller, Requests, Resolution, User, Waiter};
 use futures::future::BoxFuture;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
@@ -39,6 +39,10 @@ const ARCHIVED: &str = "Cette conversation est archivée : elle ne reçoit plus 
 const WAITING: &str = "En attente : d'autres conversations utilisent l'agent.";
 /// Shown when a sub-agent's turn ran past `[threads] child_turn_timeout`, followed by how long.
 pub const TIMED_OUT: &str = "Délai dépassé : ce tour de sous-agent a été arrêté au bout de";
+/// Shown when a turn a sub-agent's result woke ran past `[threads] child_turn_timeout`,
+/// followed by how long.
+pub const WAKE_TIMED_OUT: &str =
+    "Délai dépassé : ce tour lancé par un résultat de sous-agent a été arrêté au bout de";
 /// The main thread's stream in the database.
 pub const TOPIC: &str = "conversation";
 /// How long the agent gets to start and open its session.
@@ -88,6 +92,8 @@ pub(crate) struct Shared {
     pub(crate) handoff: Arc<Handoff>,
     /// The registry, through which a sub-agent's result wakes its parent.
     pub(crate) registry: Registry,
+    /// What threads may do with sub-agents: the wake budget and the wake turns' time cap.
+    pub(crate) limits: Limits,
 }
 
 pub struct Assistant {
@@ -123,8 +129,11 @@ pub struct Assistant {
     permission_timeout: Mutex<Duration>,
     /// How long an elicitation's card waits for an answer.
     elicitation_timeout: Mutex<Duration>,
-    /// How long a turn may run once its agent has it: a sub-agent's, `None` for the others.
+    /// How long a turn may run once its agent has it: a sub-agent's, `None` for the others,
+    /// whose wake turns only are capped, by `limits.child_turn_timeout`.
     turn_timeout: Mutex<Option<Duration>>,
+    /// The wake budget and the wake turns' time cap.
+    limits: Limits,
     /// Where its turns stand, for the thread list.
     activity: Mutex<Activity>,
     /// Told when [`Assistant::status`] changes.
@@ -135,10 +144,17 @@ pub struct Assistant {
     parent: Option<ThreadId>,
     /// The registry, through which this thread's results wake its parent.
     registry: Registry,
-    /// The wakes waiting for the running turn to end, oldest first (see [`wakes`]).
-    wakes: Mutex<VecDeque<Wake>>,
+    /// The wakes waiting for the running turn to end, and the results held for the next
+    /// message (see [`wakes`]).
+    wakes: Mutex<Queue>,
     /// Told once the requests are set: a wake turn waits for them.
     requests_set: Notify,
+    /// The sub-agent whose result started the running turn, if a wake did: what its cards say.
+    /// Kept beside the turn, which is locked while a card is shown.
+    woken_by: Mutex<Option<WokenBy>>,
+    /// The owner granted a lasting permission ("always") to the running agent process: a wake
+    /// turn starts a new process first, so that the rule does not apply to it.
+    lasting: Arc<AtomicBool>,
 }
 
 /// Where a thread's turns stand, as the thread list shows it.
@@ -170,6 +186,10 @@ struct Turn {
     /// Stopped with its thread's tree (`threads_cancel`, archive): its end wakes no parent,
     /// and the wakes waiting for it end with it.
     quiet: bool,
+    /// The owner stopped it: the results waiting are held for the owner's next message.
+    stopped: bool,
+    /// The sub-agent whose result started it, for a wake turn.
+    woken_by: Option<WokenBy>,
 }
 
 /// What a turn starts from.
@@ -180,8 +200,9 @@ struct Start {
     after: u64,
     /// What the agent is told.
     prompt: String,
-    /// A wake's `ChildEnded` entry: its `Woken` is logged before the prompt goes out.
-    wake: Option<u64>,
+    /// A wake's: its `Woken` is logged before the prompt goes out, and it is held if the
+    /// prompt never goes out.
+    wake: Option<Wake>,
 }
 
 /// A connected agent and the task recording its events.
@@ -210,11 +231,14 @@ impl Assistant {
     /// Opens the conversation of `thread`, stored in `db` under `topic`; the agent is started on
     /// the first message. [`Threads`](crate::threads::Threads) opens each thread once.
     /// `owners`: the owner started the thread. `parent`: the thread whose agent started this
-    /// one, which its results wake.
+    /// one, which its results wake. `turn_timeout`: how long each of its turns may run, a
+    /// sub-agent's.
     ///
     /// A turn a stop left open is closed as interrupted, unless it is a wake whose prompt never
     /// went out: that one runs again, once the requests are set, and the wakes logged after it
-    /// wait for it (see [`wakes`]).
+    /// wait for it (see [`wakes`]). With the assistant, the final answer of the turn closed so,
+    /// if any: the parent is told it failed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
         thread: ThreadId,
         topic: String,
@@ -223,7 +247,8 @@ impl Assistant {
         archived: bool,
         owners: bool,
         parent: Option<ThreadId>,
-    ) -> anyhow::Result<Arc<Self>> {
+        turn_timeout: Option<Duration>,
+    ) -> anyhow::Result<(Arc<Self>, Option<String>)> {
         let Shared {
             db,
             connector,
@@ -232,6 +257,7 @@ impl Assistant {
             changes,
             handoff,
             registry,
+            limits,
         } = shared;
         let log = ConversationLog::open(&db, &topic).await?;
         let assistant = Arc::new(Self {
@@ -252,18 +278,23 @@ impl Assistant {
             requests: OnceLock::new(),
             permission_timeout: Mutex::new(permission::PERMISSION_TIMEOUT),
             elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
-            turn_timeout: Mutex::new(None),
+            turn_timeout: Mutex::new(turn_timeout),
+            limits,
             activity: Mutex::new(Activity::default()),
             changes,
             handoff,
             parent,
             registry,
-            wakes: Mutex::new(VecDeque::new()),
+            wakes: Mutex::new(Queue::default()),
             requests_set: Notify::new(),
+            woken_by: Mutex::new(None),
+            lasting: Arc::new(AtomicBool::new(false)),
         });
-        let wakes::Replay { open, mut waiting } = wakes::replay(&assistant.log.since(0));
+        let budget = limits.wakes_without_owner;
+        let wakes::Replay { open, mut queue } = wakes::replay(&assistant.log.since(0), budget);
         // The wake to run now, and the seq its turn's entries follow.
         let mut resume = None;
+        let mut interrupted = None;
         match open {
             None => {}
             Some(Opened::Wake {
@@ -273,7 +304,11 @@ impl Assistant {
             }) => resume = Some((wake, after)),
             // A turn the server stopped in the middle of would otherwise run forever on the
             // pages. Its end opens the next wake waiting.
-            Some(Opened::User | Opened::Wake { .. }) => {
+            Some(opened @ (Opened::User { .. } | Opened::Wake { .. })) => {
+                let start = match opened {
+                    Opened::User { seq } => seq,
+                    Opened::Wake { after, .. } => after,
+                };
                 assistant
                     .append(Event::Notice {
                         text: INTERRUPTED.into(),
@@ -284,7 +319,19 @@ impl Assistant {
                         outcome: TurnOutcome::Error,
                     })
                     .await;
-                resume = end.and_then(|end| waiting.pop_front().map(|wake| (wake, end)));
+                // Its end logged: a later start does not tell the parent again.
+                if end.is_some() {
+                    interrupted = Some(threads::final_answer(&assistant.log.since(start)));
+                }
+                let after = end.unwrap_or_else(|| assistant.log.last_seq());
+                if queue.holds(budget) {
+                    if !queue.waiting.is_empty() {
+                        let count = queue.hold(None);
+                        assistant.append(held_entry(count)).await;
+                    }
+                } else {
+                    resume = queue.waiting.pop_front().map(|wake| (wake, after));
+                }
             }
         }
         if archived {
@@ -299,17 +346,18 @@ impl Assistant {
                     "thread {thread} is archived: the wake of its entry {} is dropped",
                     wake.seq
                 );
-                resume = end.and_then(|end| waiting.pop_front().map(|wake| (wake, end)));
+                let after = end.unwrap_or_else(|| assistant.log.last_seq());
+                resume = queue.waiting.pop_front().map(|wake| (wake, after));
             }
         }
-        *lock(&assistant.wakes) = waiting;
+        *lock(&assistant.wakes) = queue;
         lock(&assistant.activity).last_outcome = last_outcome(&assistant.log.since(0));
         if let Some((wake, after)) = resume {
             tracing::info!("thread {thread} has a wake whose prompt never went out: it runs again");
             let mut turn = assistant.turn.lock().await;
             assistant.begin(&mut turn, Start::wake(wake, after));
         }
-        Ok(assistant)
+        Ok((assistant, interrupted))
     }
 
     pub fn log(&self) -> &ConversationLog {
@@ -421,7 +469,8 @@ impl Assistant {
     /// Logs the message, written by `by` when it is not the page's user (a parent thread for its
     /// child's task), and runs the turn in the background: the seq of the message, `None` when
     /// it could not be logged. Refused, with nothing logged, while a turn runs and when the
-    /// thread is archived.
+    /// thread is archived. The sub-agents' results held for the next message go to the agent
+    /// with it, before it; the owner's message resets the wake budget.
     pub async fn try_send(
         self: &Arc<Self>,
         text: String,
@@ -437,17 +486,30 @@ impl Assistant {
         if turn.is_some() {
             return Err(Refused::Busy);
         }
+        let by_owner = by.is_none();
         let message = Event::User {
             text: text.clone(),
             by,
         };
         let seq = self.append_seq(message).await;
+        // Logged, the message carries the results held: a restart would not hold them again.
+        let held = match seq {
+            Some(_) => lock(&self.wakes).message(by_owner),
+            None => Vec::new(),
+        };
+        if !held.is_empty() {
+            tracing::info!(
+                "thread {}: {} sub-agent result(s) held go with the message",
+                self.thread,
+                held.len()
+            );
+        }
         self.begin(
             &mut turn,
             Start {
                 seq,
                 after: seq.map_or(0, |seq| seq.saturating_sub(1)),
-                prompt: text,
+                prompt: wakes::with_held(&held, &text),
                 wake: None,
             },
         );
@@ -456,12 +518,16 @@ impl Assistant {
 
     /// Logs `event`, the `ChildEnded` entry of a sub-agent of this thread, and wakes the thread
     /// with it: at once when no turn runs, else once the running turn and the wakes before it
-    /// have ended. An archived thread logs nothing and is not woken. Whether it is.
+    /// have ended; or holds it for the next message, past the wake budget or once results are
+    /// held (see [`wakes`]). A thread archived, or under an archived thread, logs nothing and is
+    /// not woken. Whether the entry was logged.
     pub(crate) async fn wake(self: &Arc<Self>, event: Event) -> bool {
         // Under the turn's lock, as a message is: the entry opens a turn or waits for one, as
-        // `wakes::replay` reads it again after a restart.
+        // `wakes::replay` reads it again after a restart. An archive up the tree retires this
+        // thread under the same lock, after marking the rows: either it comes first and the
+        // check below sees it, or the turn opened here is stopped with the tree.
         let mut turn = self.turn.lock().await;
-        if self.archived.load(Ordering::SeqCst) {
+        if self.archived.load(Ordering::SeqCst) || self.under_archived().await {
             return false;
         }
         let entry = match self.log.append(event).await {
@@ -472,27 +538,76 @@ impl Assistant {
             }
         };
         let Some(wake) = Wake::of(&entry) else {
-            tracing::error!("a wake was asked with an entry other than ChildEnded");
+            // An archived sub-agent's entry only tells.
             return true;
         };
         if turn.is_some() {
-            lock(&self.wakes).push_back(wake);
-        } else {
-            let after = wake.seq;
-            self.begin(&mut turn, Start::wake(wake, after));
+            lock(&self.wakes).waiting.push_back(wake);
+            return true;
+        }
+        let held = {
+            let mut queue = lock(&self.wakes);
+            if queue.holds(self.limits.wakes_without_owner) {
+                queue.held.push(wake);
+                Some(queue.hold(None))
+            } else {
+                let after = wake.seq;
+                drop(queue);
+                self.begin(&mut turn, Start::wake(wake, after));
+                None
+            }
+        };
+        if let Some(count) = held {
+            tracing::info!(
+                "thread {}: a sub-agent's result is held for the next message ({count} held)",
+                self.thread
+            );
+            self.append(held_entry(count)).await;
         }
         true
+    }
+
+    /// Logs `event`, a `ChildEnded` entry that only tells (an archived sub-agent's), unless this
+    /// thread is archived or under an archived thread.
+    pub(crate) async fn tell(&self, event: Event) {
+        let _turn = self.turn.lock().await;
+        if self.archived.load(Ordering::SeqCst) || self.under_archived().await {
+            return;
+        }
+        self.append(event).await;
+    }
+
+    /// Whether a thread above this one is archived, as far as the registry tells; yes when it
+    /// cannot tell, so that nothing wakes a thread that may be retired.
+    async fn under_archived(&self) -> bool {
+        let Some(threads) = self.registry.get().and_then(Weak::upgrade) else {
+            return false;
+        };
+        match threads.chain_archived(self.thread).await {
+            Ok(archived) => archived,
+            Err(error) => {
+                tracing::error!(
+                    "cannot tell whether a thread above thread {} is archived: {error:#}",
+                    self.thread
+                );
+                true
+            }
+        }
     }
 
     /// Starts the turn of `start` in the background, `turn` being the turn's slot, locked and
     /// empty.
     fn begin(self: &Arc<Self>, turn: &mut Option<Turn>, start: Start) {
         let cancel = CancellationToken::new();
+        let woken_by = start.wake.as_ref().map(|wake| wake.from.clone());
+        *lock(&self.woken_by) = woken_by.clone();
         *turn = Some(Turn {
             cancel: cancel.clone(),
             seq: start.seq,
             ending: false,
             quiet: false,
+            stopped: false,
+            woken_by,
         });
         // A turn keeps its agent: the idle stop waits for its end.
         if let Some(timer) = lock(&self.idle_timer).take() {
@@ -504,7 +619,9 @@ impl Assistant {
     }
 
     /// Runs a turn to its end, logs its end and hands its result over; then opens the next wake
-    /// waiting, if any, or leaves the agent idle.
+    /// waiting, if any, or leaves the agent idle. A result not given is held for the next
+    /// message: this wake's, when its prompt never went out, and the ones waiting, when the owner
+    /// stopped the turn or the wake budget is spent.
     fn run(self: Arc<Self>, start: Start, cancel: CancellationToken) -> BoxFuture<'static, ()> {
         Box::pin(async move {
             let Start {
@@ -513,7 +630,11 @@ impl Assistant {
                 prompt,
                 wake,
             } = start;
-            let outcome = match self.run_turn(&prompt, &cancel, wake).await {
+            let mut delivered = false;
+            let outcome = match self
+                .run_turn(&prompt, &cancel, wake.as_ref(), &mut delivered)
+                .await
+            {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::warn!("the turn failed: {error:#}");
@@ -528,16 +649,35 @@ impl Assistant {
             // card being shown holds the lock taken here, and is cancelled below. A request
             // coming in later (a background task of the agent's) finds the turn over rather than
             // one whose requests were already cancelled.
-            let quiet = match self.turn.lock().await.as_mut() {
+            let (quiet, stopped) = match self.turn.lock().await.as_mut() {
                 Some(turn) => {
                     turn.ending = true;
-                    turn.quiet
+                    (turn.quiet, turn.stopped)
                 }
-                None => false,
+                None => (false, false),
             };
             self.cancel_requests(seq).await;
             let mut turn = self.turn.lock().await;
-            let mut end = self.append_seq(Event::TurnEnded { outcome }).await;
+            // Stopped with its tree, or archived: the wakes waiting end with it.
+            let dropping = quiet || self.archived.load(Ordering::SeqCst);
+            if !dropping {
+                // Before the turn's end, as `wakes::replay` reads it: the end then opens no wake.
+                let held = {
+                    let mut queue = lock(&self.wakes);
+                    let own = wake.clone().filter(|_| !delivered);
+                    let hold_waiting = stopped || queue.holds(self.limits.wakes_without_owner);
+                    (own.is_some() || (hold_waiting && !queue.waiting.is_empty()))
+                        .then(|| queue.hold(own))
+                };
+                if let Some(count) = held {
+                    tracing::info!(
+                        "thread {}: {count} sub-agent result(s) held for the next message",
+                        self.thread
+                    );
+                    self.append(held_entry(count)).await;
+                }
+            }
+            let end = self.append_seq(Event::TurnEnded { outcome }).await;
             // After its end is logged, still under the turn's lock: a call that waits for this
             // turn and registered before gets its result here; one that registers later finds
             // the end in the log (see `Handoff`). A result nobody took wakes the parent.
@@ -556,16 +696,17 @@ impl Assistant {
                     self.wake_parent(outcome, &answer).await;
                 }
             }
-            // The end opens the next wake waiting; an archived thread's, or one stopped with its
-            // tree, end at once.
-            let mut next = None;
-            while let Some(after) = end {
-                let Some(wake) = lock(&self.wakes).pop_front() else {
+            // The end opens the next wake waiting, even when it could not be logged: none is
+            // left behind. An archived thread's, or one stopped with its tree, end at once.
+            let mut after = end.unwrap_or_else(|| self.log.last_seq());
+            loop {
+                let next = lock(&self.wakes).waiting.pop_front();
+                let Some(wake) = next else {
                     break;
                 };
-                if !quiet && !self.archived.load(Ordering::SeqCst) {
-                    next = Some((wake, after));
-                    break;
+                if !dropping {
+                    self.begin(&mut turn, Start::wake(wake, after));
+                    return;
                 }
                 tracing::info!(
                     "thread {} is archived or was stopped with its tree: the wake of its entry {} \
@@ -573,17 +714,15 @@ impl Assistant {
                     self.thread,
                     wake.seq
                 );
-                end = self
+                let end = self
                     .append_seq(Event::TurnEnded {
                         outcome: TurnOutcome::Cancelled,
                     })
                     .await;
-            }
-            if let Some((wake, after)) = next {
-                self.begin(&mut turn, Start::wake(wake, after));
-                return;
+                after = end.unwrap_or_else(|| self.log.last_seq());
             }
             *turn = None;
+            *lock(&self.woken_by) = None;
             self.set_activity(|activity| {
                 *activity = Activity {
                     running: false,
@@ -669,10 +808,13 @@ impl Assistant {
     }
 
     /// Stops the running turn, if any, and cancels the requests it asked: the agent may wait
-    /// on one, and its cancel may never reach the tool call.
+    /// on one, and its cancel may never reach the tool call. The owner's Stop: the sub-agents'
+    /// results waiting for the turn's end are held for the owner's next message, which then runs
+    /// before them.
     pub async fn cancel(&self) {
-        let seq = match self.turn.lock().await.as_ref() {
+        let seq = match self.turn.lock().await.as_mut() {
             Some(turn) => {
+                turn.stopped = true;
                 turn.cancel.cancel();
                 turn.seq
             }
@@ -713,11 +855,22 @@ impl Assistant {
         running(self.turn.lock().await.as_ref())
     }
 
+    /// [`Assistant::current_turn`], and whether a sub-agent's result started that turn.
+    pub async fn turn_and_wake(&self) -> (Option<u64>, bool) {
+        let turn = self.turn.lock().await;
+        (
+            running(turn.as_ref()),
+            turn.as_ref()
+                .is_some_and(|turn| !turn.ending && turn.woken_by.is_some()),
+        )
+    }
+
     /// Opens `ask`, a request this thread's agent makes through the hub during its turn
     /// [`Ask::turn`], and shows its card while that turn still runs, as the agent's own cards
     /// are: a turn that ends or is stopped meanwhile waits for the card and cancels it with its
     /// other requests, before its end is logged. `None`, with nothing asked, once that turn is
-    /// over or ending: its card would outlive it.
+    /// over or ending: its card would outlive it. In a turn a sub-agent's result started, the
+    /// card says so, as the agent's own do.
     pub async fn ask_during(&self, ask: Ask) -> anyhow::Result<Option<Waiter>> {
         anyhow::ensure!(
             ask.topic == self.topic && ask.caller == Caller::Thread(self.thread),
@@ -730,6 +883,12 @@ impl Assistant {
         let turn = self.turn.lock().await;
         if ask.turn.is_none() || running(turn.as_ref()) != ask.turn {
             return Ok(None);
+        }
+        // A secret kept "for this conversation" would go to a turn the owner did not start.
+        if matches!(ask.card, Card::Secret { .. })
+            && turn.as_ref().is_some_and(|turn| turn.woken_by.is_some())
+        {
+            return Err(SecretInWake.into());
         }
         let waiter = requests.ask(ask).await?;
         drop(turn);
@@ -760,22 +919,48 @@ impl Assistant {
             reply.send(permission::denial(&options));
             return;
         };
+        // A turn a sub-agent's result started follows text the owner did not write: its cards
+        // offer nothing lasting, and it is shown in the turn it was made for only.
+        let (Some(turn), woken) = self.turn_and_wake().await else {
+            tracing::warn!("a permission request came outside a turn: refused");
+            reply.send(permission::denial(&options));
+            return;
+        };
         let rules = &self.spec.provider.permissions;
-        let Some(card) = permission::card(rules, &tool_call, &options, owner.admin) else {
+        let Some(card) = permission::card(rules, &tool_call, &options, owner.admin && !woken)
+        else {
             tracing::warn!("a permission request offered nothing the card can show: refused");
             reply.send(permission::denial(&options));
             return;
         };
         let offered = permission::offered(&card);
+        let lasting: Vec<String> = match &card {
+            Card::Permission { options, .. } => options
+                .iter()
+                .filter(|option| option.kind == PermissionKind::AllowAlways)
+                .map(|option| option.id.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
         let timeout = *lock(&self.permission_timeout);
         let denial = permission::denial(&options);
+        let granted = self.lasting.clone();
         self.ask_in_turn(
             "permission",
             card,
             timeout,
             reply,
             denial,
-            move |resolution| permission::outcome(resolution, &options, &offered),
+            Some(turn),
+            move |resolution| {
+                let outcome = permission::outcome(resolution, &options, &offered);
+                if let RequestPermissionOutcome::Selected(selected) = &outcome
+                    && lasting.iter().any(|id| **id == *selected.option_id.0)
+                {
+                    granted.store(true, Ordering::SeqCst);
+                }
+                outcome
+            },
         )
         .await;
     }
@@ -805,6 +990,7 @@ impl Assistant {
             timeout,
             reply,
             cancel,
+            None,
             move |resolution| elicitation::response(resolution, &elicited),
         )
         .await;
@@ -814,6 +1000,8 @@ impl Assistant {
     /// makes of the request's end, or with `refusal` at once when it cannot be shown: nobody
     /// could answer it. A request outside a turn, or once its turn is ending, is refused: only a
     /// turn's request is cancelled with its turn, and its card closes before the turn's end.
+    /// With `made_for`, the card was made for that turn, and is refused in any other.
+    #[allow(clippy::too_many_arguments)]
     async fn ask_in_turn<T: Unanswered + Send + 'static>(
         &self,
         what: &'static str,
@@ -821,6 +1009,7 @@ impl Assistant {
         timeout: Duration,
         reply: Arc<Reply<T>>,
         refusal: T,
+        made_for: Option<u64>,
         answer: impl FnOnce(&Resolution) -> T + Send + 'static,
     ) {
         let (Some(requests), Some((_, owner))) = (self.requests(), self.requests.get()) else {
@@ -832,9 +1021,11 @@ impl Assistant {
         // marks itself ending under this lock, so it waits for the card and cancels it with its
         // other requests, before its end is logged.
         let running_turn = self.turn.lock().await;
-        let Some(turn) = running(running_turn.as_ref()) else {
+        let Some(turn) = running(running_turn.as_ref())
+            .filter(|turn| made_for.is_none_or(|made_for| made_for == *turn))
+        else {
             drop(running_turn);
-            tracing::warn!("a {what} request came outside a turn: refused");
+            tracing::warn!("a {what} request came outside the turn it was made for: refused");
             reply.send(refusal);
             return;
         };
@@ -886,11 +1077,13 @@ impl Assistant {
         });
     }
 
+    /// Runs the turn of `text`; `delivered` is set once a wake's prompt is about to go out.
     async fn run_turn(
         self: &Arc<Self>,
         text: &str,
         cancel: &CancellationToken,
-        wake: Option<u64>,
+        wake: Option<&Wake>,
+        delivered: &mut bool,
     ) -> anyhow::Result<TurnOutcome> {
         if wake.is_some() {
             // A wake may come at start, before the requests its turn asks through are set.
@@ -898,6 +1091,15 @@ impl Assistant {
                 biased;
                 () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
                 () = self.requests_ready() => {}
+            }
+            // The owner granted a lasting permission to this agent process: it holds the rule,
+            // which must not apply to a turn the owner did not start. A new process, resuming
+            // the session, starts without it.
+            if self.lasting.swap(false, Ordering::SeqCst) && self.session_slot().take().is_some() {
+                tracing::info!(
+                    "thread {}: its agent holds a lasting permission, restarted for a wake",
+                    self.thread
+                );
             }
         }
         let running = self.session_slot().clone();
@@ -922,15 +1124,27 @@ impl Assistant {
                 }
             }
         };
-        if let Some(child_ended) = wake {
+        if let Some(wake) = wake {
             // Before the prompt goes out: from here on the result reached the agent, and a
-            // restart does not give it again.
-            self.append(Event::Woken { child_ended }).await;
+            // restart does not give it again. Not logged, it is not sent: it is held instead.
+            if self
+                .append_seq(Event::Woken {
+                    child_ended: wake.seq,
+                })
+                .await
+                .is_none()
+            {
+                anyhow::bail!("cannot log that the wake's prompt goes out: not sent");
+            }
+            *delivered = true;
+            lock(&self.wakes).since_owner += 1;
         }
         let prompt = session.client.prompt(text);
         tokio::pin!(prompt);
-        // From here the agent has the turn: a sub-agent's may last this long.
-        let limit = *lock(&self.turn_timeout);
+        // From here the agent has the turn: a sub-agent's may last this long, and so may a turn
+        // its result woke.
+        let child_limit = *lock(&self.turn_timeout);
+        let limit = child_limit.or(wake.map(|_| self.limits.child_turn_timeout));
         let timed_out = async move {
             match limit {
                 Some(limit) => tokio::time::sleep(limit).await,
@@ -950,8 +1164,9 @@ impl Assistant {
                     "the turn of thread {} ran past {limit}: stopped",
                     self.thread
                 );
+                let notice = if child_limit.is_some() { TIMED_OUT } else { WAKE_TIMED_OUT };
                 self.append(Event::Notice {
-                    text: format!("{TIMED_OUT} {limit} ([threads] child_turn_timeout)."),
+                    text: format!("{notice} {limit} ([threads] child_turn_timeout)."),
                 })
                 .await;
                 cancel.cancel();
@@ -988,6 +1203,8 @@ impl Assistant {
             }
         }
         let saved = self.saved_session_id().await;
+        // A new process holds no lasting permission yet.
+        self.lasting.store(false, Ordering::SeqCst);
         let mut lease = self.tokens.issue(self.thread)?;
         let mut spec = self.spec.clone();
         // Only the spec, dropped once the agent started, holds the token itself.
@@ -1045,11 +1262,12 @@ impl Assistant {
         self.session_slot().take().is_some()
     }
 
-    /// Lets the thread's agent go for good, as archiving does: cancels the running turn, if
-    /// any, waking no parent, and revokes the agent's hub token at once; its process stops when
-    /// the turn has ended, or now when no turn runs.
-    pub(crate) async fn retire(&self) {
-        self.cancel_quietly().await;
+    /// Lets the thread's agent go, as archiving does to the thread and every thread under it:
+    /// cancels the running turn, if any, waking no parent, and revokes the agent's hub token at
+    /// once; its process stops when the turn has ended, or now when no turn runs. Whether a turn
+    /// was running.
+    pub(crate) async fn retire(&self) -> bool {
+        let was_running = self.cancel_quietly().await;
         if let Some(timer) = lock(&self.idle_timer).take() {
             timer.cancel();
         }
@@ -1058,6 +1276,7 @@ impl Assistant {
             session.lease.revoke();
             tracing::info!("the agent of thread {} was let go", self.thread);
         }
+        was_running
     }
 
     /// Whether the thread's agent process is running, as far as Fronde knows.
@@ -1175,9 +1394,16 @@ impl Start {
         Self {
             seq: Some(wake.seq),
             after,
-            prompt: wake.prompt,
-            wake: Some(wake.seq),
+            prompt: wake.prompt.clone(),
+            wake: Some(wake),
         }
+    }
+}
+
+/// The entry saying that `count` sub-agents' results wait for the next message.
+fn held_entry(count: usize) -> Event {
+    Event::WakesHeld {
+        count: u32::try_from(count).unwrap_or(u32::MAX),
     }
 }
 
@@ -1217,6 +1443,21 @@ async fn record_events(
         }
     }
 }
+
+/// A turn a sub-agent's result started asked the owner for a secret: refused, since that turn
+/// follows text the owner did not write. The text is for the agent.
+#[derive(Debug)]
+pub struct SecretInWake;
+
+impl std::fmt::Display for SecretInWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this turn was started by a sub-agent's result, not by the user: it cannot ask for a secret; end your turn saying what you need, and ask in the turn the user's next message starts",
+        )
+    }
+}
+
+impl std::error::Error for SecretInWake {}
 
 /// The agent did not start within [`START_TIMEOUT`].
 #[derive(Debug)]
@@ -1300,7 +1541,7 @@ pub(crate) fn status_after(outcome: Option<TurnOutcome>) -> ThreadStatus {
     match outcome {
         None => ThreadStatus::Idle,
         Some(TurnOutcome::Done) => ThreadStatus::Done,
-        Some(TurnOutcome::Cancelled) => ThreadStatus::Cancelled,
+        Some(TurnOutcome::Cancelled | TurnOutcome::Archived) => ThreadStatus::Cancelled,
         Some(TurnOutcome::Refused | TurnOutcome::Limit | TurnOutcome::Error) => {
             ThreadStatus::Failed
         }
@@ -1325,6 +1566,12 @@ impl Assistant {
         card: &Card,
         caller: &Caller,
     ) -> anyhow::Result<u64> {
+        // The thread's own agent asks during a turn a sub-agent's result started: the card says
+        // so. Read beside the turn, which is locked while a card of its own is shown.
+        let woken_by = match caller {
+            Caller::Thread(asker) if *asker == self.thread => lock(&self.woken_by).clone(),
+            _ => None,
+        };
         let entry = self
             .log
             .append(Event::Request {
@@ -1332,6 +1579,7 @@ impl Assistant {
                 card: card.clone(),
                 from: caller.from().map(str::to_owned),
                 server: caller.is_source(),
+                woken_by,
             })
             .await?;
         Ok(entry.seq)

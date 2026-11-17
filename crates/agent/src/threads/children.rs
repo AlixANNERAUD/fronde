@@ -13,12 +13,12 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use chrono::Utc;
-use fronde_entity::threads;
+use fronde_entity::{stream_entries, threads};
 use fronde_protocol::{ThreadStatus, ThreadSummary};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::{StartedBy, ThreadId, ThreadRow, Threads, lock};
@@ -42,6 +42,13 @@ pub const DEFAULT_CHILDREN_PER_DAY: usize = 30;
 /// Sub-agents one thread keeps not archived, by default: a guard against clutter only.
 pub const DEFAULT_CHILDREN_KEPT: usize = 200;
 
+/// Turns of sub-agents all threads together may start in 24 hours, by default.
+pub const DEFAULT_CHILD_TURNS_PER_DAY: usize = 100;
+
+/// Turns a thread may be woken by its sub-agents' results in a row without the owner, by
+/// default.
+pub const DEFAULT_WAKES_WITHOUT_OWNER: usize = 10;
+
 /// How long a sub-agent's turn may run once its agent has it, by default.
 pub const DEFAULT_CHILD_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -50,14 +57,14 @@ const DAY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 
 /// The longest chain of parents walked: more than any depth allowed, and a guard against a
 /// cycle a damaged database could hold.
-const MAX_CHAIN: usize = 64;
+pub(super) const MAX_CHAIN: usize = 64;
 
 /// The most sub-agents [`Threads::children`] lists, newest first.
 pub const MAX_LISTED: usize = 50;
 
-/// What threads may do with sub-agents: `[threads]` in the configuration. Each bounds what an
-/// agent, a prompt-injected one included, may spend of the subscription's quota without the
-/// owner; the hub enforces them, whatever the agent's prompt says.
+/// What threads may do with sub-agents: `[threads]` in the configuration. Together they bound
+/// what an agent, a prompt-injected one included, may spend of the subscription's quota without
+/// the owner; Fronde enforces them, whatever the agent's prompt says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// How deep a thread may be and still start sub-agents: the owner's threads are at depth 0,
@@ -70,9 +77,15 @@ pub struct Limits {
     pub children_per_day: usize,
     /// Sub-agents one thread keeps not archived.
     pub children_kept: usize,
-    /// How long a sub-agent's turn may run once its agent has it; it is then stopped, as Stop
-    /// does.
+    /// Turns of sub-agents all threads together started in the last 24 hours: each
+    /// sub-agent's task and each message sent to one.
+    pub child_turns_per_day: usize,
+    /// How long a sub-agent's turn, or a turn a sub-agent's result woke, may run once its agent
+    /// has it; it is then stopped, as Stop does.
     pub child_turn_timeout: Duration,
+    /// Turns a thread may be woken by its sub-agents' results since the owner's last message;
+    /// later results wait for the owner's next message, which carries them.
+    pub wakes_without_owner: usize,
 }
 
 impl Default for Limits {
@@ -82,7 +95,9 @@ impl Default for Limits {
             children_running: DEFAULT_CHILDREN_RUNNING,
             children_per_day: DEFAULT_CHILDREN_PER_DAY,
             children_kept: DEFAULT_CHILDREN_KEPT,
+            child_turns_per_day: DEFAULT_CHILD_TURNS_PER_DAY,
             child_turn_timeout: DEFAULT_CHILD_TURN_TIMEOUT,
+            wakes_without_owner: DEFAULT_WAKES_WITHOUT_OWNER,
         }
     }
 }
@@ -93,9 +108,11 @@ pub(super) struct Children {
     limits: Limits,
     /// Held while a sub-agent starts: a retry of the same call finds the first one's child with
     /// its task logged, and two starts never both pass the limits.
-    starting: tokio::sync::Mutex<()>,
+    pub(super) starting: tokio::sync::Mutex<()>,
     /// Shared with every thread's assistant, whose turns' ends go through it.
     pub(super) handoff: Arc<Handoff>,
+    /// For tests: where [`Threads::start_child`] and [`Threads::wait_child`] pause.
+    pauses: Pauses,
 }
 
 impl Children {
@@ -104,6 +121,53 @@ impl Children {
             limits,
             starting: tokio::sync::Mutex::new(()),
             handoff,
+            pauses: Pauses::default(),
+        }
+    }
+}
+
+/// A point where a call stops until a test lets it go: `reached` is told when the call gets
+/// there, and the call goes on once `release` is told.
+#[derive(Clone)]
+pub struct Pause {
+    pub reached: Arc<Notify>,
+    pub release: Arc<Notify>,
+}
+
+impl Pause {
+    pub fn new() -> Self {
+        Self {
+            reached: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn hold(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+}
+
+impl Default for Pause {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The pauses tests set; none in Fronde itself.
+#[derive(Default)]
+struct Pauses {
+    /// In `start_child`, once the limits passed, before the sub-agent's row is made.
+    start: Mutex<Option<Pause>>,
+    /// In `wait_child`, once the wait stopped, before it withdraws.
+    withdraw: Mutex<Option<Pause>>,
+}
+
+impl Pauses {
+    async fn at(slot: &Mutex<Option<Pause>>) {
+        let pause = lock(slot).take();
+        if let Some(pause) = pause {
+            pause.hold().await;
         }
     }
 }
@@ -132,7 +196,8 @@ pub struct TurnResult {
 ///   `ChildEnded` entry (see [`super::wakes`]): never both;
 /// - a call that stops waiting (timeout, given up, a card, its turn over)
 ///   [`Handoff::withdraw`]s: if the result was handed over meanwhile, it gets it then, so that
-///   a result marked delivered is never lost.
+///   a result marked delivered is never lost; a call whose caller is gone gives it back
+///   ([`Handoff::give_back`]), and it wakes the parent instead.
 ///
 /// It also remembers which child each `(parent, client_request_id)` started, in which of the
 /// parent's turns, so that a retry joins it only in that turn; those entries go when that turn
@@ -145,25 +210,27 @@ pub struct Handoff {
 /// The calls waiting for one turn: each one's id and where its result goes.
 type Waiting = Vec<(u64, oneshot::Sender<TurnResult>)>;
 
+/// How many ended turns of each thread [`Handoff`] remembers the fate of.
+const ENDS_KEPT: usize = 32;
+
 #[derive(Default)]
 struct HandoffState {
     next: u64,
     /// The calls waiting, by thread and turn.
     waiting: HashMap<(ThreadId, u64), Waiting>,
-    /// The last turn of each thread whose end was decided.
-    ended: HashMap<ThreadId, u64>,
-    /// The last turn of each thread whose result a waiting call took.
-    delivered: HashMap<ThreadId, u64>,
+    /// The last turns of each thread whose end was decided, by seq: whether a waiting call
+    /// took the result (or the turn was settled), else it went to the parent as a wake.
+    ended: HashMap<ThreadId, std::collections::BTreeMap<u64, bool>>,
     /// `(parent, client_request_id)` → (child, the parent's turn that started it).
     retries: HashMap<(ThreadId, String), (ThreadId, u64)>,
 }
 
 /// The turn's end was decided before the call registered: its result is in the stream.
-/// `taken`: a waiting call took it; else it woke the parent (or this is not the last turn
-/// whose end was decided, and nothing more is known of it).
+/// `taken`: whether a waiting call took it (`Some(false)`: it woke the parent); `None` when
+/// that turn is too old to be remembered, or no turn's seq.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AlreadyEnded {
-    pub taken: bool,
+    pub taken: Option<bool>,
 }
 
 /// A call's place among those waiting for a turn.
@@ -176,9 +243,11 @@ impl Handoff {
     /// Registers a call waiting for turn `seq` of `thread`.
     pub fn register(&self, thread: ThreadId, seq: u64) -> Result<Registration, AlreadyEnded> {
         let mut state = lock(&self.state);
-        if state.ended.get(&thread).is_some_and(|ended| *ended >= seq) {
+        if let Some(ended) = state.ended.get(&thread)
+            && ended.last_key_value().is_some_and(|(last, _)| *last >= seq)
+        {
             return Err(AlreadyEnded {
-                taken: state.delivered.get(&thread) == Some(&seq),
+                taken: ended.get(&seq).copied(),
             });
         }
         state.next += 1;
@@ -234,7 +303,6 @@ impl Handoff {
         settled: bool,
     ) -> bool {
         let mut state = lock(&self.state);
-        state.ended.insert(thread, seq);
         state
             .retries
             .retain(|(parent, _), (_, turn)| !(*parent == thread && *turn <= seq));
@@ -242,17 +310,38 @@ impl Handoff {
         for (_, sender) in state.waiting.remove(&(thread, seq)).unwrap_or_default() {
             delivered |= sender.send(result.clone()).is_ok();
         }
-        if delivered || settled {
-            state.delivered.insert(thread, seq);
-        } else {
-            state.delivered.remove(&thread);
+        let ended = state.ended.entry(thread).or_default();
+        ended.insert(seq, delivered || settled);
+        while ended.len() > ENDS_KEPT {
+            ended.pop_first();
         }
         delivered || settled
     }
 
-    /// The last turn of `thread` whose result a waiting call took.
+    /// The result of turn `seq` of `thread` was handed to a call whose caller is gone: it is
+    /// no longer taken, and goes to the parent as a wake. Whether it was taken.
+    pub fn give_back(&self, thread: ThreadId, seq: u64) -> bool {
+        let mut state = lock(&self.state);
+        match state
+            .ended
+            .get_mut(&thread)
+            .and_then(|ended| ended.get_mut(&seq))
+        {
+            Some(taken) if *taken => {
+                *taken = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The last turn of `thread` whose end was decided, if a waiting call took its result.
     pub fn delivered(&self, thread: ThreadId) -> Option<u64> {
-        lock(&self.state).delivered.get(&thread).copied()
+        lock(&self.state)
+            .ended
+            .get(&thread)
+            .and_then(|ended| ended.last_key_value())
+            .and_then(|(seq, taken)| taken.then_some(*seq))
     }
 
     /// How many calls wait for turns of `thread`.
@@ -360,6 +449,8 @@ pub enum Delegation {
     TooManyKept { limit: usize },
     /// The threads started as many sub-agents in the last 24 hours as they may.
     TooManyToday { limit: usize },
+    /// The threads started as many turns of sub-agents in the last 24 hours as they may.
+    TooManyTurnsToday { limit: usize },
     /// The caller named its own thread.
     Itself,
     /// The sub-agent is in a turn: one message at a time.
@@ -390,7 +481,7 @@ impl std::fmt::Display for Delegation {
                 "you are a sub-agent, and sub-agents go {max_depth} level(s) deep at most (the setting [threads] max_depth): you cannot start or drive sub-agents; do the task yourself"
             ),
             Self::CallerArchived => f.write_str(
-                "your thread is archived: it cannot start or drive sub-agents",
+                "your thread, or a thread above it, is archived: it cannot start or drive sub-agents",
             ),
             Self::TooManyRunning { limit } => write!(
                 f,
@@ -403,6 +494,10 @@ impl std::fmt::Display for Delegation {
             Self::TooManyToday { limit } => write!(
                 f,
                 "{limit} sub-agents were started in the last 24 hours, the most allowed (the setting [threads] children_per_day); do the task yourself, or ask the user"
+            ),
+            Self::TooManyTurnsToday { limit } => write!(
+                f,
+                "{limit} turns of sub-agents were started in the last 24 hours, the most allowed (the setting [threads] child_turns_per_day); do the task yourself, or ask the user"
             ),
             Self::Itself => f.write_str("that is your own thread; name one of your sub-agents"),
             Self::Busy => f.write_str(
@@ -491,17 +586,34 @@ impl Threads {
         let Some(row) = self.get(caller).await? else {
             bail!(Delegation::NoSuchThread);
         };
-        Self::delegates(&row, self.max_depth())
+        self.delegates(&row).await
     }
 
-    fn delegates(row: &ThreadRow, max_depth: u32) -> anyhow::Result<()> {
-        if row.archived_at.is_some() {
+    /// Whether thread `row` may start and drive sub-agents: neither it nor a thread above it
+    /// is archived, and it is less deep than [`Threads::max_depth`].
+    async fn delegates(&self, row: &ThreadRow) -> anyhow::Result<()> {
+        if row.archived_at.is_some() || self.chain_archived(row.id).await? {
             bail!(Delegation::CallerArchived);
         }
+        let max_depth = self.max_depth();
         if row.depth >= max_depth {
             bail!(Delegation::TooDeep { max_depth });
         }
         Ok(())
+    }
+
+    /// For tests: the next [`Threads::start_child`] stops at `pause`, under the lock that
+    /// starts, sends and archives hold, once its limits passed.
+    #[doc(hidden)]
+    pub fn pause_next_start(&self, pause: Pause) {
+        *lock(&self.children.pauses.start) = Some(pause);
+    }
+
+    /// For tests: the next [`Threads::wait_child`] that stops waiting stops at `pause`, before
+    /// it withdraws.
+    #[doc(hidden)]
+    pub fn pause_next_withdraw(&self, pause: Pause) {
+        *lock(&self.children.pauses.withdraw) = Some(pause);
     }
 
     /// `parent`'s own sub-agents not archived.
@@ -523,6 +635,27 @@ impl Threads {
             .filter(threads::Column::CreatedAt.gt(since))
             .count(&self.db)
             .await?)
+    }
+
+    /// How many turns of sub-agents all threads together started since `since`: the messages
+    /// a thread wrote (a task, or a `threads_send`), read from the streams.
+    async fn turns_since(&self, since: chrono::DateTime<Utc>) -> anyhow::Result<u64> {
+        Ok(stream_entries::Entity::find()
+            .filter(stream_entries::Column::At.gt(since))
+            .filter(Expr::cust("json_extract(event, '$.type')").eq("user"))
+            .filter(Expr::cust("json_extract(event, '$.by')").is_not_null())
+            .count(&self.db)
+            .await?)
+    }
+
+    /// Refuses a new turn of a sub-agent past [`Limits::child_turns_per_day`].
+    async fn check_turns_today(&self) -> anyhow::Result<()> {
+        let limit = self.limits().child_turns_per_day;
+        let today = self.turns_since(Utc::now() - DAY).await?;
+        if today >= u64::try_from(limit).unwrap_or(u64::MAX) {
+            bail!(Delegation::TooManyTurnsToday { limit });
+        }
+        Ok(())
     }
 
     /// How many of `children` are in a turn or waiting for an agent: only an open thread runs
@@ -608,11 +741,11 @@ impl Threads {
         turn: Option<u64>,
         child: ChildTask,
     ) -> anyhow::Result<StartedChild> {
-        let _starting = self.children.starting.lock().await;
+        let starting = self.children.starting.lock().await;
         let Some(parent_row) = self.get(parent).await? else {
             bail!(Delegation::NoSuchThread);
         };
-        Self::delegates(&parent_row, self.max_depth())?;
+        self.delegates(&parent_row).await?;
         let provider = child
             .provider
             .clone()
@@ -671,6 +804,8 @@ impl Threads {
                 limit: limits.children_per_day
             });
         }
+        self.check_turns_today().await?;
+        Pauses::at(&self.children.pauses.start).await;
         let transaction = fronde_db::begin_write(&self.db).await?;
         let mut row = self
             .insert(
@@ -718,7 +853,7 @@ impl Threads {
                         .handoff
                         .forget_retry(parent, client_request_id);
                 }
-                if let Err(error) = self.set_archived(row.id, true).await {
+                if let Err(error) = self.archive_locked(row.id, true, &starting).await {
                     tracing::error!(
                         "cannot archive the sub-agent {} left without its task: {error:#}",
                         row.id
@@ -789,14 +924,16 @@ impl Threads {
         text: String,
     ) -> anyhow::Result<u64> {
         let row = self.descendant(caller, target).await?;
-        self.check_delegate(caller).await?;
-        // The sub-agent itself is idle, or the send is refused below as busy.
+        // Under the lock an archive takes: the checks hold until the message is logged. The
+        // sub-agent itself is idle, or the send is refused below as busy.
         let _starting = self.children.starting.lock().await;
+        self.check_delegate(caller).await?;
         let kept = self.kept_children(caller).await?;
         let limit = self.limits().children_running;
         if self.running_among(&kept).await >= limit {
             bail!(Delegation::TooManyRunning { limit });
         }
+        self.check_turns_today().await?;
         let by = self.get(caller).await?.map(|caller| caller.title);
         let assistant = self.opened(row.id).await?;
         match assistant.try_send(text, by).await {
@@ -881,8 +1018,10 @@ impl Threads {
         reason: Option<&str>,
     ) -> anyhow::Result<bool> {
         let row = self.descendant(caller, target).await?;
+        let starting = self.children.starting.lock().await;
+        let assistant = self.open.lock().await.get(&row.id).cloned();
         if let Some(reason) = reason
-            && let Some(assistant) = self.open.lock().await.get(&row.id).cloned()
+            && let Some(assistant) = assistant
             && matches!(
                 assistant.status(),
                 ThreadStatus::Running | ThreadStatus::Queued
@@ -894,7 +1033,7 @@ impl Threads {
                 })
                 .await;
         }
-        let stopped = self.cancel_tree(row.id).await?;
+        let stopped = self.stop_tree(row.id, false, &starting).await?;
         tracing::info!("thread {caller} stopped its sub-agent {target} and those under it");
         Ok(stopped)
     }
@@ -902,23 +1041,59 @@ impl Threads {
     /// Stops the running turn of thread `root` and of every thread under it, deepest first,
     /// with their pending cards and the wakes waiting for them; none of those turns wakes its
     /// parent. Deepest first, so that a result coming up meanwhile finds its parent's turn
-    /// still to be stopped. Whether `root` was in a turn.
-    pub(super) async fn cancel_tree(&self, root: ThreadId) -> anyhow::Result<bool> {
-        let mut tree = vec![root];
-        tree.extend(self.descendants(root).await?.into_iter().map(|row| row.id));
+    /// still to be stopped. With `retire`, as an archive does, each agent is also let go, its
+    /// token revoked, and the secrets given "for this conversation" in each thread forgotten.
+    /// Whether `root` was in a turn. `starting` is held throughout: no sub-agent starts, and
+    /// none is sent a message, while the tree stops.
+    pub(super) async fn stop_tree(
+        &self,
+        root: ThreadId,
+        retire: bool,
+        _starting: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> anyhow::Result<bool> {
+        let mut tree = vec![(root, super::topic_of(root))];
+        tree.extend(
+            self.descendants(root)
+                .await?
+                .into_iter()
+                .map(|row| (row.id, row.topic)),
+        );
         let mut stopped = false;
         // `descendants` goes level by level: reversed, the deepest come first.
-        for thread in tree.into_iter().rev() {
+        for (thread, topic) in tree.into_iter().rev() {
+            if retire {
+                self.forget_secrets(thread, &topic);
+            }
             let Some(assistant) = self.open.lock().await.get(&thread).cloned() else {
-                // A thread not open runs no turn.
+                // A thread not open runs no turn and no agent.
                 continue;
             };
-            if assistant.cancel_quietly().await {
+            let was_running = if retire {
+                assistant.retire().await
+            } else {
+                assistant.cancel_quietly().await
+            };
+            if was_running {
                 stopped |= thread == root;
                 tracing::info!("the turn of thread {thread} was stopped with its tree");
             }
         }
         Ok(stopped)
+    }
+
+    /// Forgets the secrets given in thread `thread`'s cards "for this conversation".
+    fn forget_secrets(&self, thread: ThreadId, topic: &str) {
+        if let Some(requests) = self.requests.get().and_then(std::sync::Weak::upgrade)
+            && let Some(secrets) = requests.secrets()
+        {
+            let forgotten = secrets.ephemeral().forget_topic(topic);
+            if forgotten > 0 {
+                tracing::info!(
+                    "thread {thread} is archived or under an archived thread: {forgotten} \
+                     secret(s) given for it forgotten"
+                );
+            }
+        }
     }
 
     /// Waits for the turn of `caller`'s sub-agent `target` whose message is `seq` to end, at
@@ -947,7 +1122,7 @@ impl Threads {
         let mut registration = match handoff.register(row.id, seq) {
             Ok(registration) => registration,
             // Nobody took it: it woke the sub-agent's parent, maybe this caller.
-            Err(AlreadyEnded { taken: false }) if row.parent == Some(caller) => {
+            Err(AlreadyEnded { taken: Some(false) }) if row.parent == Some(caller) => {
                 return Ok(ChildEnd::Woken);
             }
             Err(AlreadyEnded { .. }) => return Ok(ended_in_log(&assistant, seq)),
@@ -1000,8 +1175,20 @@ impl Threads {
                 }
             }
         };
-        // Handed over while this call was stopping: it takes the result, marked delivered.
+        Pauses::at(&self.children.pauses.withdraw).await;
+        // Handed over while this call was stopping: it takes the result, marked delivered;
+        // unless the call was given up, its caller gone, when it goes to the parent as a wake.
         Ok(match handoff.withdraw(row.id, seq, registration) {
+            Some(TurnResult { outcome, answer }) if stopped == ChildEnd::GaveUp => {
+                if handoff.give_back(row.id, seq) {
+                    tracing::info!(
+                        "a wait for sub-agent {target} was given up as its result came: it \
+                         wakes the parent instead"
+                    );
+                    self.child_ended(row.id, outcome, &answer).await?;
+                }
+                stopped
+            }
             Some(TurnResult { outcome, answer }) => ChildEnd::Ended { outcome, answer },
             None => stopped,
         })
@@ -1099,11 +1286,12 @@ mod tests {
         // A turn whose end was decided is read from the stream: registering is refused.
         assert!(matches!(
             handoff.register(child, 5),
-            Err(AlreadyEnded { taken: true })
+            Err(AlreadyEnded { taken: Some(true) })
         ));
+        // An older seq is refused too, its fate not known: no turn of it ended here.
         assert!(matches!(
             handoff.register(child, 3),
-            Err(AlreadyEnded { taken: false })
+            Err(AlreadyEnded { taken: None })
         ));
         assert!(handoff.register(child, 9).is_ok());
     }
@@ -1149,14 +1337,14 @@ mod tests {
         // A retry of that wait reads it again: it is the same caller's.
         assert_eq!(
             handoff.register(child, 5).err(),
-            Some(AlreadyEnded { taken: true })
+            Some(AlreadyEnded { taken: Some(true) })
         );
         // The end comes first: nobody took it, so it wakes the parent, and a wait registering
         // after it learns so instead of getting the result again.
         assert!(!handoff.turn_ended(child, 7, result("Réveil.")), "a wake");
         assert_eq!(
             handoff.register(child, 7).err(),
-            Some(AlreadyEnded { taken: false })
+            Some(AlreadyEnded { taken: Some(false) })
         );
         assert_eq!(handoff.waiting(child), 0);
     }
@@ -1171,12 +1359,57 @@ mod tests {
         assert_eq!(handoff.delivered(child), Some(5));
         assert_eq!(
             handoff.register(child, 5).err(),
-            Some(AlreadyEnded { taken: true })
+            Some(AlreadyEnded { taken: Some(true) })
         );
         // A waiting call still gets it.
         let waiting = handoff.register(child, 7).unwrap();
         assert!(handoff.turn_ended_with(child, 7, result("Encore."), true));
         assert_eq!(handoff.withdraw(child, 7, waiting), Some(result("Encore.")));
+    }
+
+    /// Each ended turn keeps its own fate: a wait for an older turn that a call took is not
+    /// told it woke the parent because a later turn did.
+    #[test]
+    fn an_older_turns_fate_is_its_own() {
+        let handoff = Handoff::default();
+        let child = ThreadId(2);
+        let taken = handoff.register(child, 5).unwrap();
+        assert!(handoff.turn_ended(child, 5, result("Pris.")));
+        assert!(!handoff.turn_ended(child, 7, result("Réveil.")));
+        assert_eq!(handoff.withdraw(child, 5, taken), Some(result("Pris.")));
+        assert_eq!(
+            handoff.register(child, 5).err(),
+            Some(AlreadyEnded { taken: Some(true) })
+        );
+        assert_eq!(
+            handoff.register(child, 7).err(),
+            Some(AlreadyEnded { taken: Some(false) })
+        );
+        // Only the last few are kept; an older one is not known, never said to have woken.
+        for seq in 0..(ENDS_KEPT as u64) {
+            handoff.turn_ended(child, 100 + seq, result(""));
+        }
+        assert_eq!(
+            handoff.register(child, 5).err(),
+            Some(AlreadyEnded { taken: None })
+        );
+    }
+
+    /// A result handed to a call whose caller is gone is given back, once: it wakes the parent.
+    #[test]
+    fn a_result_given_back_is_no_longer_taken() {
+        let handoff = Handoff::default();
+        let child = ThreadId(2);
+        let waiting = handoff.register(child, 5).unwrap();
+        assert!(handoff.turn_ended(child, 5, result("Pris.")));
+        assert_eq!(handoff.withdraw(child, 5, waiting), Some(result("Pris.")));
+        assert!(handoff.give_back(child, 5));
+        assert!(!handoff.give_back(child, 5), "once");
+        assert_eq!(handoff.delivered(child), None);
+        assert_eq!(
+            handoff.register(child, 5).err(),
+            Some(AlreadyEnded { taken: Some(false) })
+        );
     }
 
     #[test]

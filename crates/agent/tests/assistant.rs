@@ -253,6 +253,7 @@ fn permission(id: u64) -> Event {
         card: permission_card(),
         from: None,
         server: false,
+        woken_by: None,
     }
 }
 
@@ -1027,6 +1028,7 @@ async fn requests_are_shown_in_the_conversation() {
                 card,
                 from: Some("Codex".into()),
                 server: false,
+                woken_by: None,
             },
             Event::RequestClosed {
                 id,
@@ -1649,6 +1651,7 @@ async fn wait_for_form(assistant: &Assistant) -> (u64, Card) {
                 card: card @ Card::Form { .. },
                 from: None,
                 server: false,
+                woken_by: None,
             } => Some((id, card)),
             _ => None,
         })

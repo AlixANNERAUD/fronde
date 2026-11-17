@@ -45,9 +45,10 @@ pub(crate) mod wakes;
 
 pub(crate) use children::Handoff;
 pub use children::{
-    ChildEnd, ChildTask, DEFAULT_CHILD_TURN_TIMEOUT, DEFAULT_CHILDREN_KEPT,
-    DEFAULT_CHILDREN_PER_DAY, DEFAULT_CHILDREN_RUNNING, DEFAULT_MAX_DEPTH, Delegation, Limits,
-    MAX_LISTED, StartedChild, TurnResult, final_answer, may_access,
+    ChildEnd, ChildTask, DEFAULT_CHILD_TURN_TIMEOUT, DEFAULT_CHILD_TURNS_PER_DAY,
+    DEFAULT_CHILDREN_KEPT, DEFAULT_CHILDREN_PER_DAY, DEFAULT_CHILDREN_RUNNING, DEFAULT_MAX_DEPTH,
+    DEFAULT_WAKES_WITHOUT_OWNER, Delegation, Limits, MAX_LISTED, Pause, StartedChild, TurnResult,
+    final_answer, may_access,
 };
 
 /// Where the agent's session id was kept before threads: the key-value table's scope and key.
@@ -478,14 +479,16 @@ impl Threads {
             changes: changes.clone(),
             handoff: handoff.clone(),
             registry: registry.clone(),
+            limits: budget.limits,
         };
-        let main = Assistant::open(
+        let (main, _) = Assistant::open(
             ThreadId::MAIN,
             TOPIC.into(),
             spec.clone(),
             shared,
             false,
             true,
+            None,
             None,
         )
         .await?;
@@ -565,11 +568,33 @@ impl Threads {
     }
 
     /// The assistant of thread `id`, opened now if it was not; `None` when there is no such
-    /// thread.
+    /// thread. A sub-agent's turn that a stop left open is closed as failed when it opens, and
+    /// its parent told so.
     pub async fn assistant(&self, id: ThreadId) -> anyhow::Result<Option<Arc<Assistant>>> {
+        let (assistant, interrupted) = match self.open_assistant(id).await? {
+            Some(opened) => opened,
+            None => return Ok(None),
+        };
+        // Once the thread is in `open`, which the parent's wake goes through.
+        if let Some(answer) = interrupted
+            && let Err(error) = Box::pin(self.child_ended(id, TurnOutcome::Error, &answer)).await
+        {
+            tracing::error!(
+                "cannot tell the parent of thread {id} that its interrupted turn failed: {error:#}"
+            );
+        }
+        Ok(Some(assistant))
+    }
+
+    /// [`Threads::assistant`], with the final answer of a turn a stop left open, when it was
+    /// opened now and closed so.
+    async fn open_assistant(
+        &self,
+        id: ThreadId,
+    ) -> anyhow::Result<Option<(Arc<Assistant>, Option<String>)>> {
         let mut open = self.open.lock().await;
         if let Some(assistant) = open.get(&id) {
-            return Ok(Some(assistant.clone()));
+            return Ok(Some((assistant.clone(), None)));
         }
         let Some(row) = self.get(id).await? else {
             return Ok(None);
@@ -591,13 +616,15 @@ impl Threads {
             changes: self.changes.clone(),
             handoff: self.children.handoff.clone(),
             registry: self.registry.clone(),
+            limits: self.limits(),
         };
         // Only a thread's sub-agent wakes its parent.
         let parent = match row.started_by {
             StartedBy::Thread(starter) if row.parent == Some(starter) => Some(starter),
             _ => None,
         };
-        let assistant = Assistant::open(
+        let turn_timeout = row.parent.map(|_| self.limits().child_turn_timeout);
+        let (assistant, interrupted) = Assistant::open(
             id,
             row.topic.clone(),
             self.spec_for(&row),
@@ -605,17 +632,15 @@ impl Threads {
             row.archived_at.is_some(),
             row.started_by == StartedBy::User,
             parent,
+            turn_timeout,
         )
         .await?;
         self.pool.register(&assistant);
-        if row.parent.is_some() {
-            assistant.set_turn_timeout(Some(self.limits().child_turn_timeout));
-        }
         if let Some(requests) = self.requests.get().and_then(Weak::upgrade) {
             assistant.set_requests(&requests, self.owner.clone());
         }
         open.insert(id, assistant.clone());
-        Ok(Some(assistant))
+        Ok(Some((assistant, interrupted.filter(|_| parent.is_some()))))
     }
 
     /// How thread `row`'s agent starts: the main thread's spec, with another thread's own
@@ -922,14 +947,39 @@ impl Threads {
 
     /// Archives thread `id`, or brings it back; an archived thread refuses messages, and its
     /// agent is let go: its running turn cancelled, its hub token revoked at once, its process
-    /// stopped, the secrets given in its cards "for this conversation" forgotten. Archiving also
-    /// stops the turns of every sub-agent under it, with their cards and the wakes waiting for
-    /// them, as `threads_cancel` does; they stay, not archived, with what they wrote. None of
-    /// the turns stopped so wakes a parent. The main thread is never archived.
+    /// stopped. Every sub-agent under it is retired the same way, its turn, cards and the wakes
+    /// waiting for it stopped, but stays, not archived, with what it wrote; nothing under an
+    /// archived thread is woken, starts or drives a sub-agent. The secrets given in their cards
+    /// "for this conversation" are forgotten. None of the turns stopped so wakes a parent; a
+    /// sub-agent archived itself is noted in its parent's stream, which it does not wake. The
+    /// main thread is never archived.
+    ///
+    /// Under the lock sub-agents start and are sent messages under: an archive and a start or
+    /// a send never interleave.
     pub async fn set_archived(&self, id: ThreadId, archived: bool) -> anyhow::Result<()> {
         if id == ThreadId::MAIN {
             bail!("the main thread cannot be archived");
         }
+        let starting = self.children.starting.lock().await;
+        let was = self
+            .get(id)
+            .await?
+            .is_some_and(|row| row.archived_at.is_some());
+        self.archive_locked(id, archived, &starting).await?;
+        drop(starting);
+        if archived && !was {
+            self.tell_parent_archived(id).await;
+        }
+        Ok(())
+    }
+
+    /// [`Threads::set_archived`], `starting` held, its parent not told.
+    pub(super) async fn archive_locked(
+        &self,
+        id: ThreadId,
+        archived: bool,
+        starting: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> anyhow::Result<()> {
         let at = archived.then(Utc::now);
         self.update(id, threads::Column::ArchivedAt, Expr::value(at))
             .await?;
@@ -938,25 +988,69 @@ impl Threads {
             assistant.set_archived(archived);
         }
         if archived {
-            // Archived first: a result coming up the tree meanwhile does not wake it.
-            self.cancel_tree(id).await?;
-            if let Some(assistant) = &assistant {
-                assistant.retire().await;
-            }
-            if let Some(row) = self.get(id).await?
-                && let Some(requests) = self.requests.get().and_then(Weak::upgrade)
-                && let Some(secrets) = requests.secrets()
-            {
-                let forgotten = secrets.ephemeral().forget_topic(&row.topic);
-                if forgotten > 0 {
-                    tracing::info!(
-                        "thread {id} is archived: {forgotten} secret(s) given for it forgotten"
-                    );
-                }
-            }
+            // Archived first: a result coming up the tree meanwhile wakes none of it.
+            self.stop_tree(id, true, starting).await?;
         }
         self.changes.notify();
         Ok(())
+    }
+
+    /// Notes in thread `id`'s parent, when its agent started it, that the owner archived it:
+    /// a `ChildEnded` entry with the outcome `archived`, which wakes nothing.
+    async fn tell_parent_archived(&self, id: ThreadId) {
+        let row = match self.get(id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!("cannot read the archived thread {id}: {error:#}");
+                return;
+            }
+        };
+        let (Some(parent), StartedBy::Thread(starter)) = (row.parent, &row.started_by) else {
+            return;
+        };
+        if *starter != parent {
+            return;
+        }
+        let assistant = match self.assistant(parent).await {
+            Ok(Some(assistant)) => assistant,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(
+                    "cannot open thread {parent} to tell it {id} is archived: {error:#}"
+                );
+                return;
+            }
+        };
+        let (title, _) = fronde_protocol::text::readable(&row.title, fronde_protocol::MAX_TITLE);
+        assistant
+            .tell(Event::ChildEnded {
+                thread: id,
+                title,
+                outcome: TurnOutcome::Archived,
+                summary: String::new(),
+                truncated: false,
+            })
+            .await;
+    }
+
+    /// Whether thread `id`, or a thread above it, is archived; `false` for no such thread.
+    pub(crate) async fn chain_archived(&self, id: ThreadId) -> anyhow::Result<bool> {
+        let mut next = Some(id);
+        for _ in 0..children::MAX_CHAIN {
+            let Some(id) = next else {
+                return Ok(false);
+            };
+            let Some(row) = self.get(id).await? else {
+                return Ok(false);
+            };
+            if row.archived_at.is_some() {
+                return Ok(true);
+            }
+            next = row.parent;
+        }
+        // A chain longer than any depth allowed: a damaged database, read as archived.
+        Ok(true)
     }
 
     /// Sets one column of thread `id`, and its `updated_at`.

@@ -72,7 +72,8 @@ agent's (it starts one that runs `true`), or `agent limits: none (…)` with the
 many agents run at once and their memory together: `agents: at most 3 at once (one kept for your
 own threads), stopped after 10m idle, 4 GiB for all of them (2 GiB each)`, then the limits on
 sub-agents: `sub-agents: your threads may start sub-agents, theirs may not; 3 running at once per
-thread, 30 a day in all, 200 kept per thread, 30m per turn`, then, with
+thread, 30 a day in all (100 turns), 200 kept per thread, 30m per turn, 10 wakes in a row without
+you`, then, with
 `[agent] oauth_token`, `agent token: [agent] oauth_token, read` once it read a
 file or variable token (a stored one is named, and opened when the agent starts), and refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the

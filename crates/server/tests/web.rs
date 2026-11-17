@@ -1631,9 +1631,10 @@ async fn permission_card_over_websocket() {
             card,
             from,
             server,
+            woken_by,
         } = next_entry(&mut socket).await.event
         {
-            assert_eq!((from, server), (None, false));
+            assert_eq!((from, server, woken_by), (None, false, None));
             break (id, card);
         }
     };

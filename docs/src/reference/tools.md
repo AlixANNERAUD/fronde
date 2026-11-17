@@ -147,7 +147,9 @@ The user picks how long the secret is kept:
 
 The value never reaches the agent, the conversation, the request's row, a log or any file but the
 sealed row. Declined, expired and cancelled calls return as `user_ask`'s do, and so does a call
-that comes as its turn ends. `user_secret` is
+that comes as its turn ends. A thread's turn that a sub-agent's result started (a wake, see
+[Threads](#threads)) cannot ask for a secret: the call is refused, telling the agent to ask in
+the turn the user's next message starts. `user_secret` is
 served only while the chat runs, beside `user_ask`. See
 [Requests and cards](../explanation/requests.md#secret-cards).
 
@@ -276,13 +278,15 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
   process it started (a shell command): their calls are refused.
 - **Depth.** A thread at `[threads] max_depth` (1 by default: a sub-agent) is not offered
   `threads_start` and `threads_send`, is refused them, and its instructions do not mention them:
-  the threads you start may delegate, theirs may not. An archived thread may not either.
+  the threads you start may delegate, theirs may not. An archived thread may not either, nor
+  any thread under an archived one.
 - **Limits.** By default a thread has at most 3 sub-agents in a turn at once, those waiting for
   an agent included (`children_running`), and keeps at most 200 not archived (`children_kept`);
-  all threads together start at most 30 in 24 hours (`children_per_day`); a sub-agent's turn
-  stops after 30 minutes (`child_turn_timeout`). Past one, `threads_start` (and `threads_send`
-  for the first) is refused with a message naming the `[threads]` setting (see
-  [Configuration](configuration.md#threads)).
+  all threads together start at most 30 in 24 hours (`children_per_day`) and at most 100 turns
+  of sub-agents, each task and each `threads_send` (`child_turns_per_day`); a sub-agent's turn,
+  and a turn a result woke, stops after 30 minutes (`child_turn_timeout`). Past one,
+  `threads_start` (and `threads_send` for the first and the turns) is refused with a message
+  naming the `[threads]` setting (see [Configuration](configuration.md#threads)).
 - **Provider and model.** `provider` is one of `threads_list`'s (only `claude` today; `codex` and
   `gemini` are refused as planned). `model` is one of the models the provider's agent offered,
   as `threads_list` shows them; another is refused with the list. Without them, the parent's
@@ -302,8 +306,13 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
   entry `child_ended` in that thread, then a new turn whose prompt reads
   `Sub-agent #<id> "<title>" ended (<outcome>).`, followed by its answer (at most 8000
   characters, hidden characters shown) between two lines no answer can forge, marked as data, and
-  `Read more with threads_read (thread <id>).` A wake waits for the running turn, wakes run in
-  order, an archived thread is not woken, and a wake runs at most once, a restart included (see
+  `Read more with threads_read (thread <id>).`, the title quoted and escaped on one line. A wake
+  waits for the running turn, wakes run in order, a thread archived or under an archived one is
+  not woken, and a result reaches the thread at most once, a restart included. After
+  `wakes_without_owner` woken turns since the user's last message, or after the user's Stop, the
+  results are held and come with the user's next message, before its text, as data. A woken
+  turn may use `threads_start` and `threads_send` (what they return wakes it again, within that
+  budget), but not `user_secret`, which refuses it; its cards name the sub-agent (see
   [Wakes](../explanation/threads.md#wakes)).
 - **Retries.** A call retried in the same turn with the same `client_request_id` and the same
   arguments joins the sub-agent the first one started (`joined: true`). The same id for another

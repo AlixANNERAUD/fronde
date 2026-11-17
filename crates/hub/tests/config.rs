@@ -968,7 +968,9 @@ fn threads_default_and_parse() {
             children_running: 3,
             children_per_day: 30,
             children_kept: 200,
+            child_turns_per_day: 100,
             child_turn_timeout: Duration::from_secs(30 * 60),
+            wakes_without_owner: 10,
         }
     );
     let threads = |table: &str| {
@@ -1006,6 +1008,17 @@ fn threads_default_and_parse() {
             t.child_turn_timeout
         ),
         (3, 1, 100, 5, Duration::from_secs(2 * 3600))
+    );
+    let t = threads(
+        "child_turns_per_day = 1000\nwakes_without_owner = 1\nchild_turn_timeout = \"24h\"",
+    );
+    assert_eq!(
+        (
+            t.child_turns_per_day,
+            t.wakes_without_owner,
+            t.child_turn_timeout
+        ),
+        (1000, 1, Duration::from_secs(24 * 3600))
     );
     assert_eq!(threads("max_depth = 0").max_depth, 0);
     assert_eq!(
@@ -1055,6 +1068,33 @@ fn threads_refuse_bad_values() {
         (
             "child_turn_timeout = \"long\"",
             "child_turn_timeout: expected a duration",
+        ),
+        // Bounded above too, the bound named.
+        (
+            "child_turn_timeout = \"25h\"",
+            "child_turn_timeout: at most 24h, not 25h",
+        ),
+        (
+            "children_per_day = 1001",
+            "children_per_day: expected a number of sub-agents from 1 to 1000",
+        ),
+        ("max_running = 5000", "max_running: expected"),
+        ("children_kept = 100000", "children_kept: expected"),
+        (
+            "child_turns_per_day = 0",
+            "child_turns_per_day: expected a number of turns from 1 to 1000",
+        ),
+        (
+            "child_turns_per_day = 1001",
+            "child_turns_per_day: expected",
+        ),
+        (
+            "wakes_without_owner = 0",
+            "wakes_without_owner: expected a number of turns from 1 to 1000",
+        ),
+        (
+            "wakes_without_owner = \"10\"",
+            "wakes_without_owner: expected",
         ),
         // Unknown keys are refused, not ignored.
         ("max_children = 3", "unknown field"),

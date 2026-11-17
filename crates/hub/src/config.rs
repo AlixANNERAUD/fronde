@@ -286,10 +286,25 @@ pub struct ThreadsConfig {
     /// Sub-agents one thread keeps not archived: a guard against clutter only.
     #[serde(deserialize_with = "children_kept")]
     pub children_kept: usize,
-    /// How long one turn of a sub-agent may run once its agent has it; it is then stopped.
+    /// Turns of sub-agents that threads start in 24 hours, all threads together: each
+    /// `threads_start`'s first turn and each `threads_send`.
+    #[serde(deserialize_with = "child_turns_per_day")]
+    pub child_turns_per_day: usize,
+    /// How long one turn of a sub-agent, or a turn a sub-agent's result woke, may run once its
+    /// agent has it; it is then stopped. At most [`MAX_TURN_TIMEOUT`].
     #[serde(deserialize_with = "child_turn_timeout")]
     pub child_turn_timeout: std::time::Duration,
+    /// Turns a thread may be woken by its sub-agents' results in a row, without a message of
+    /// the owner's in between; later results wait for the owner's next message.
+    #[serde(deserialize_with = "wakes_without_owner")]
+    pub wakes_without_owner: usize,
 }
+
+/// The longest `[threads] child_turn_timeout` allowed.
+pub const MAX_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The greatest count a `[threads]` limit takes.
+pub const MAX_COUNT: i64 = 1_000;
 
 /// The deepest `[threads] max_depth` allowed.
 pub const MAX_DEPTH: u32 = 3;
@@ -303,7 +318,9 @@ impl Default for ThreadsConfig {
             children_running: 3,
             children_per_day: 30,
             children_kept: 200,
+            child_turns_per_day: 100,
             child_turn_timeout: std::time::Duration::from_secs(30 * 60),
+            wakes_without_owner: 10,
         }
     }
 }
@@ -324,11 +341,19 @@ fn children_kept<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Err
     count(d, "children_kept", "a number of sub-agents")
 }
 
-/// A whole number of at least 1, for the key `key`.
+fn child_turns_per_day<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    count(d, "child_turns_per_day", "a number of turns")
+}
+
+fn wakes_without_owner<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    count(d, "wakes_without_owner", "a number of turns")
+}
+
+/// A whole number from 1 to [`MAX_COUNT`], for the key `key`.
 fn count<'de, D: serde::Deserializer<'de>>(d: D, key: &str, what: &str) -> Result<usize, D::Error> {
-    let expected = format!("{key}: expected {what} of at least 1");
+    let expected = format!("{key}: expected {what} from 1 to {MAX_COUNT}");
     match RawLimit::deserialize(d)? {
-        RawLimit::Integer(count) if count >= 1 => {
+        RawLimit::Integer(count) if (1..=MAX_COUNT).contains(&count) => {
             usize::try_from(count).map_err(|_| serde::de::Error::custom(expected))
         }
         _ => Err(serde::de::Error::custom(expected)),
@@ -352,7 +377,15 @@ fn idle_stop<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::time::Durati
 fn child_turn_timeout<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<std::time::Duration, D::Error> {
-    duration(d, "child_turn_timeout")
+    let timeout = duration(d, "child_turn_timeout")?;
+    if timeout > MAX_TURN_TIMEOUT {
+        return Err(serde::de::Error::custom(format!(
+            "child_turn_timeout: at most {}, not {}",
+            duration_text(MAX_TURN_TIMEOUT),
+            duration_text(timeout)
+        )));
+    }
+    Ok(timeout)
 }
 
 /// A duration as humans write it: `"10m"`, `"1h 30m"`, `"90s"`; above zero.

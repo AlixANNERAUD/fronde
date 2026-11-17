@@ -547,14 +547,16 @@ pub fn budget(config: &Config) -> Budget {
             children_running: threads.children_running,
             children_per_day: threads.children_per_day,
             children_kept: threads.children_kept,
+            child_turns_per_day: threads.child_turns_per_day,
             child_turn_timeout: threads.child_turn_timeout,
+            wakes_without_owner: threads.wakes_without_owner,
         },
     }
 }
 
 /// The limits on sub-agents, for the start log and `fronde check`: `your threads may start
-/// sub-agents, theirs may not; 3 running at once per thread, 30 a day in all, 200 kept per
-/// thread, 30m per turn`.
+/// sub-agents, theirs may not; 3 running at once per thread, 30 a day in all (100 turns), 200
+/// kept per thread, 30m per turn, 10 wakes in a row without you`.
 pub fn children_line(config: &Config) -> String {
     let threads = &config.threads;
     let depth = match threads.max_depth {
@@ -563,11 +565,14 @@ pub fn children_line(config: &Config) -> String {
         depth => format!("sub-agents go {depth} levels deep under your threads"),
     };
     format!(
-        "{depth}; {} running at once per thread, {} a day in all, {} kept per thread, {} per turn",
+        "{depth}; {} running at once per thread, {} a day in all ({} turns), {} kept per thread, \
+         {} per turn, {} wakes in a row without you",
         threads.children_running,
         threads.children_per_day,
+        threads.child_turns_per_day,
         threads.children_kept,
         fronde_hub::config::duration_text(threads.child_turn_timeout),
+        threads.wakes_without_owner,
     )
 }
 
