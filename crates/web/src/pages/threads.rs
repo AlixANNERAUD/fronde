@@ -740,6 +740,55 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_agents_result_links_to_its_thread() {
+        let ended = |seq, outcome| {
+            entry(
+                seq,
+                Event::ChildEnded {
+                    thread: ThreadId(3),
+                    title: "Mesurer <b>la porte</b>".into(),
+                    outcome,
+                    summary: "La porte fait 83 cm.".into(),
+                    truncated: false,
+                },
+            )
+        };
+        let mut threads = several();
+        threads.open(ThreadId(2));
+        threads.apply(&hello(2, "deux", 3));
+        threads.apply(&ended(1, fronde_protocol::TurnOutcome::Done));
+        threads.apply(&entry(2, Event::Woken { child_ended: 1 }));
+        threads.apply(&ended(3, fronde_protocol::TurnOutcome::Error));
+        let page = live(threads, View::Thread(ThreadId(2))).html();
+        let line = |label: &str| {
+            let start = at(&page, label);
+            page[start..start + page[start..].find("</p>").unwrap()].to_owned()
+        };
+        // A small line, the sub-agent's title a link to its thread; its answer is not shown.
+        let done = line("Sous-agent terminé :");
+        assert!(done.contains(r#"href="/t/3""#), "{done}");
+        assert!(
+            done.contains("Mesurer &#60;b&#62;la porte&#60;/b&#62;"),
+            "{done}"
+        );
+        let failed = line("Sous-agent terminé (échec) :");
+        assert!(failed.contains(r#"href="/t/3""#), "{failed}");
+        assert!(!page.contains("83 cm"), "{page}");
+        assert!(!page.contains("<b>"), "{page}");
+        // The wake turn runs: the composer offers Stop.
+        assert!(page.contains(r#"aria-label="Stop""#), "{page}");
+
+        // A page without threads links the same way.
+        let mut chat = Chat::default();
+        chat.apply(&ended(1, fronde_protocol::TurnOutcome::Done));
+        let mut dom = VirtualDom::new_with_props(Before, BeforeProps { chat });
+        dom.rebuild_in_place();
+        let page = dioxus_ssr::render(&dom);
+        assert!(page.contains(r#"href="/t/3""#), "{page}");
+        assert!(page.contains("Sous-agent terminé :"), "{page}");
+    }
+
+    #[test]
     fn main_chat_is_unchanged_with_one_thread() {
         let mut page = live(
             threads(vec![summary(1, "Fronde", "09:00")]),

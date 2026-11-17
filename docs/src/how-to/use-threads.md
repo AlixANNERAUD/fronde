@@ -48,3 +48,10 @@ parent's, marked *sous-agent*. Open it to follow the work. Its first message is 
 sub-agent asks shows in its own thread, and its row says *attend ta réponse*. What you write in a
 sub-agent's thread is read by its parent agent too, with `threads_read` (see
 [Threads and sub-agents](../explanation/threads.md#how-the-answer-comes-back)).
+
+When a sub-agent finishes, its parent's chat shows a small line, *Sous-agent terminé* followed by
+the sub-agent's title (with *(interrompu)* or *(échec)* when it did not end normally). The title
+is a link to the sub-agent's thread. The parent agent then answers on its own with what the
+sub-agent found: you do not have to ask. If the parent was in the middle of a reply, it finishes
+that reply first. Stop interrupts that answer only; the sub-agents keep working, and the next one
+to finish wakes the parent again. An archived thread is not woken.

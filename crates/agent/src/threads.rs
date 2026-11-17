@@ -41,6 +41,7 @@ use crate::log::{Event, TurnOutcome, new_log_id, new_stream};
 use crate::tokens::Tokens;
 
 mod children;
+pub(crate) mod wakes;
 
 pub(crate) use children::Handoff;
 pub use children::{
@@ -389,6 +390,10 @@ pub struct Holder {
     pub turn: Option<u64>,
 }
 
+/// The registry as every thread's assistant reaches it: set once it is made; weak, since it
+/// holds the assistants.
+pub(crate) type Registry = Arc<OnceLock<Weak<Threads>>>;
+
 /// Every thread, and the [`Assistant`] of each thread opened so far.
 pub struct Threads {
     db: DatabaseConnection,
@@ -416,6 +421,8 @@ pub struct Threads {
     tails: Mutex<HashMap<ThreadId, Tail>>,
     /// What the threads' agents may do with sub-agents: see [`children`].
     children: children::Children,
+    /// Itself, as the assistants reach it to wake a parent: see [`wakes`].
+    registry: Registry,
 }
 
 impl Threads {
@@ -457,6 +464,7 @@ impl Threads {
         let pool = Pool::new(budget);
         let changes = Changes::new();
         let handoff = Arc::new(Handoff::default());
+        let registry = Registry::default();
         let shared = Shared {
             db: db.clone(),
             connector: connector.clone(),
@@ -464,6 +472,7 @@ impl Threads {
             pool: pool.clone(),
             changes: changes.clone(),
             handoff: handoff.clone(),
+            registry: registry.clone(),
         };
         let main = Assistant::open(
             ThreadId::MAIN,
@@ -472,6 +481,7 @@ impl Threads {
             shared,
             false,
             true,
+            None,
         )
         .await?;
         pool.register(&main);
@@ -489,9 +499,19 @@ impl Threads {
             changes,
             tails: Mutex::new(HashMap::new()),
             children: children::Children::new(handoff),
+            registry: registry.clone(),
         });
+        // Set before any thread but the main one opens: a turn's end may wake its parent.
+        let _ = registry.set(Arc::downgrade(&threads));
+        let parents = threads.parents().await?;
         for row in threads.list(false).await? {
             if row.id == ThreadId::MAIN {
+                continue;
+            }
+            // A parent may have wakes waiting, which only its whole stream tells: it opens now,
+            // and its wakes run once the requests are set.
+            if parents.contains(&row.id) {
+                threads.assistant(row.id).await?;
                 continue;
             }
             match turn_left_open(&threads.db, &row.topic).await {
@@ -508,13 +528,26 @@ impl Threads {
         Ok(threads)
     }
 
+    /// The threads some thread is the parent of.
+    async fn parents(&self) -> anyhow::Result<std::collections::HashSet<ThreadId>> {
+        let parents: Vec<Option<i64>> = threads::Entity::find()
+            .select_only()
+            .column(threads::Column::ParentId)
+            .filter(threads::Column::ParentId.is_not_null())
+            .distinct()
+            .into_tuple()
+            .all(&self.db)
+            .await?;
+        Ok(parents.into_iter().flatten().map(ThreadId).collect())
+    }
+
     /// The main thread's assistant.
     pub fn main(&self) -> Arc<Assistant> {
         self.main.clone()
     }
 
     /// The requests every thread asks through, for the owner: see
-    /// [`Assistant::set_requests`]. Set once.
+    /// [`Assistant::set_requests`]. Set once. The wakes a stop left waiting run from then on.
     pub async fn set_requests(&self, requests: &Arc<Requests>) {
         let open = self.open.lock().await;
         if self.requests.set(Arc::downgrade(requests)).is_err() {
@@ -552,6 +585,12 @@ impl Threads {
             pool: self.pool.clone(),
             changes: self.changes.clone(),
             handoff: self.children.handoff.clone(),
+            registry: self.registry.clone(),
+        };
+        // Only a thread's sub-agent wakes its parent.
+        let parent = match row.started_by {
+            StartedBy::Thread(starter) if row.parent == Some(starter) => Some(starter),
+            _ => None,
         };
         let assistant = Assistant::open(
             id,
@@ -560,6 +599,7 @@ impl Threads {
             shared,
             row.archived_at.is_some(),
             row.started_by == StartedBy::User,
+            parent,
         )
         .await?;
         self.pool.register(&assistant);

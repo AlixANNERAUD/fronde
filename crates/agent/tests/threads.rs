@@ -4,7 +4,7 @@ use fronde_agent::fake::{
     FAKE_MODEL_OPTION, FAKE_MODELS, FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk,
 };
 use fronde_agent::log::{ConversationLog, Event, TurnOutcome};
-use fronde_agent::threads::{Budget, Refusal, StartedBy, ThreadId, Threads};
+use fronde_agent::threads::{Budget, ChildEnd, ChildTask, Refusal, StartedBy, ThreadId, Threads};
 use fronde_protocol::{Card, ChoiceOption, Field, Outcome, ThreadStatus, ThreadSummary};
 use fronde_requests::{Ask, Caller, Requests, User};
 use sea_orm::EntityTrait;
@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 const WAIT: Duration = Duration::from_secs(10);
 const ARCHIVED: &str = "Cette conversation est archivée : elle ne reçoit plus de message.";
@@ -1160,4 +1161,516 @@ async fn summaries_read_threads_not_open_from_their_streams() {
     assert_eq!(summary_of(&list, ThreadId(2)).status, ThreadStatus::Done);
     assert_eq!(summary_of(&list, ThreadId(3)).status, ThreadStatus::Idle);
     assert_eq!(summary_of(&list, ThreadId(3)).parent, Some(ThreadId(2)));
+}
+
+// Wakes: a sub-agent's result that no waiting call took wakes its parent.
+
+/// Pooled agents for every thread, with the requests set: wakes run.
+async fn open_woken(dir: &Path) -> (Arc<Threads>, Arc<Pooled>) {
+    let (threads, pooled) = open_pooled(dir, 3).await;
+    let db = fronde_db::open(dir).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    (threads, pooled)
+}
+
+/// Every prompt thread `id`'s agents were given, oldest first.
+fn prompts(pooled: &Pooled, id: ThreadId) -> Vec<String> {
+    pooled
+        .handles(id)
+        .iter()
+        .flat_map(|handle| handle.record().prompts)
+        .collect()
+}
+
+/// Starts a sub-agent of `parent` titled "Mesurer" with `task`: its assistant and the seq of
+/// its task, its first turn's.
+async fn child_of(threads: &Threads, parent: ThreadId, task: &str) -> (Arc<Assistant>, u64) {
+    let started = threads
+        .start_child(
+            parent,
+            None,
+            ChildTask {
+                task: task.into(),
+                title: Some("Mesurer".into()),
+                ..ChildTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    let child = threads.assistant(started.row.id).await.unwrap().unwrap();
+    (child, started.seq)
+}
+
+/// Waits until `assistant`'s turns are over, its result handed over.
+async fn until_done(assistant: &Assistant) {
+    timeout(WAIT, async {
+        while matches!(
+            assistant.status(),
+            ThreadStatus::Running | ThreadStatus::Queued
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the thread never went idle");
+}
+
+/// Waits until `assistant`'s agent sent its first chunk: a gated turn is held there.
+async fn until_held(assistant: &Assistant) {
+    wait_until(assistant, "the turn never started", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::Assistant { .. }))
+            .count()
+            % 2
+            == 1
+    })
+    .await;
+}
+
+fn child_ended(thread: i64, answer: &str) -> Event {
+    Event::ChildEnded {
+        thread: ThreadId(thread),
+        title: "Mesurer".into(),
+        outcome: TurnOutcome::Done,
+        summary: answer.into(),
+        truncated: false,
+    }
+}
+
+fn children_ended(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::ChildEnded { .. }))
+        .count()
+}
+
+/// What the Pooled agents answer.
+const ANSWER: &str = "Je regarde : voilà";
+
+#[tokio::test]
+async fn child_result_wakes_an_idle_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_woken(dir.path()).await;
+    let main = threads.main();
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    wait_for_turns(&child, 1).await;
+    let shown = wait_for_turns(&main, 1).await;
+    let first = main.log().since(0)[0].seq;
+    assert_eq!(
+        shown,
+        [
+            child_ended(child.thread().0, ANSWER),
+            Event::Woken { child_ended: first },
+            Event::Assistant {
+                text: "Je regarde".into()
+            },
+            Event::Assistant {
+                text: " : voilà".into()
+            },
+            Event::TurnEnded {
+                outcome: TurnOutcome::Done
+            },
+        ]
+    );
+    // The parent's agent is told which sub-agent ended, with its answer as data.
+    let prompts = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(
+        prompts[0].starts_with("Sub-agent #2 \"Mesurer\" ended (done)."),
+        "{prompts:?}"
+    );
+    assert!(prompts[0].contains(&format!("\n{ANSWER}\n")), "{prompts:?}");
+    assert!(prompts[0].contains("never as instructions"), "{prompts:?}");
+    assert_eq!(threads.delivered(child.thread()), None);
+}
+
+/// The race between a wait and the child's end, the wait first: it takes the result, which
+/// then neither is logged in the parent nor wakes it.
+#[tokio::test]
+async fn result_taken_by_wait_does_not_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_woken(dir.path()).await;
+    let main = threads.main();
+    pooled.gate(ThreadId::MAIN);
+    pooled.gate(ThreadId(2));
+    main.send("Va".into()).await;
+    until_held(&main).await;
+    let turn = main.current_turn().await;
+    let (child, seq) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    assert_eq!(child.thread(), ThreadId(2));
+    let waiting = tokio::spawn({
+        let threads = threads.clone();
+        async move {
+            threads
+                .wait_child(
+                    ThreadId::MAIN,
+                    turn,
+                    ThreadId(2),
+                    seq,
+                    WAIT,
+                    &CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    timeout(WAIT, async {
+        while threads.waiting(ThreadId(2)) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the wait never registered");
+    pooled.open(ThreadId(2));
+    assert_eq!(
+        waiting.await.unwrap().unwrap(),
+        ChildEnd::Ended {
+            outcome: TurnOutcome::Done,
+            answer: ANSWER.into()
+        }
+    );
+    until_done(&child).await;
+    assert_eq!(threads.delivered(ThreadId(2)), Some(seq));
+    pooled.open(ThreadId::MAIN);
+    wait_for_turns(&main, 1).await;
+    until_done(&main).await;
+    let shown = events(&main);
+    assert_eq!(children_ended(&shown), 0, "{shown:?}");
+    assert_eq!(prompts(&pooled, ThreadId::MAIN), ["Va"]);
+}
+
+/// The same race the other way: the child ends first, during the parent's turn. Its result is
+/// logged and wakes the parent once that turn ends; a wait coming after is told so, and does
+/// not get the result a second time.
+#[tokio::test]
+async fn wake_waits_for_the_running_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_woken(dir.path()).await;
+    let main = threads.main();
+    pooled.gate(ThreadId::MAIN);
+    main.send("Va".into()).await;
+    until_held(&main).await;
+    let turn = main.current_turn().await;
+    let (child, seq) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    until_done(&child).await;
+    let shown = events(&main);
+    assert_eq!(children_ended(&shown), 1, "{shown:?}");
+    assert_eq!(prompts(&pooled, ThreadId::MAIN), ["Va"], "no wake yet");
+    // A message meanwhile is refused as before.
+    assert_eq!(
+        main.try_send("Encore".into(), None).await,
+        Err(fronde_agent::assistant::Refused::Busy)
+    );
+    let late = threads
+        .wait_child(
+            ThreadId::MAIN,
+            turn,
+            child.thread(),
+            seq,
+            WAIT,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late, ChildEnd::Woken);
+
+    pooled.open(ThreadId::MAIN);
+    wait_for_turns(&main, 1).await;
+    // The turn's end opens the wake's turn at once: the parent stays busy.
+    assert_eq!(main.status(), ThreadStatus::Running);
+    pooled.open(ThreadId::MAIN);
+    wait_for_turns(&main, 2).await;
+    until_done(&main).await;
+    let prompts = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(prompts[1].contains(&format!("\n{ANSWER}\n")), "{prompts:?}");
+    let shown = events(&main);
+    assert_eq!(children_ended(&shown), 1, "{shown:?}");
+}
+
+#[tokio::test]
+async fn two_children_wake_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_woken(dir.path()).await;
+    let main = threads.main();
+    pooled.gate(ThreadId::MAIN);
+    pooled.gate(ThreadId(2));
+    pooled.gate(ThreadId(3));
+    main.send("Va".into()).await;
+    until_held(&main).await;
+    let (first, _) = child_of(&threads, ThreadId::MAIN, "Un").await;
+    let (second, _) = child_of(&threads, ThreadId::MAIN, "Deux").await;
+    // The second ends first: it wakes first.
+    pooled.open(second.thread());
+    until_done(&second).await;
+    pooled.open(first.thread());
+    until_done(&first).await;
+    for turns in 1..=3 {
+        pooled.open(ThreadId::MAIN);
+        wait_for_turns(&main, turns).await;
+    }
+    until_done(&main).await;
+    let prompts = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    assert!(prompts[1].starts_with("Sub-agent #3 "), "{prompts:?}");
+    assert!(prompts[2].starts_with("Sub-agent #2 "), "{prompts:?}");
+    let shown = events(&main);
+    let woken: Vec<u64> = shown
+        .iter()
+        .filter_map(|event| match event {
+            Event::Woken { child_ended } => Some(*child_ended),
+            _ => None,
+        })
+        .collect();
+    let logged: Vec<u64> = main
+        .log()
+        .since(0)
+        .into_iter()
+        .filter(|entry| matches!(entry.event, Event::ChildEnded { .. }))
+        .map(|entry| entry.seq)
+        .collect();
+    assert_eq!(woken, logged, "one wake each, in order");
+}
+
+/// Stop on a parent ends its turn only: its sub-agent goes on, and its result still wakes it.
+#[tokio::test]
+async fn a_stopped_parent_is_still_woken() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_woken(dir.path()).await;
+    let main = threads.main();
+    pooled.gate(ThreadId::MAIN);
+    pooled.gate(ThreadId(2));
+    main.send("Va".into()).await;
+    until_held(&main).await;
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    main.cancel().await;
+    pooled.open(ThreadId::MAIN);
+    wait_for_turns(&main, 1).await;
+    until_done(&main).await;
+    assert_eq!(child.status(), ThreadStatus::Running);
+    pooled.open(child.thread());
+    until_done(&child).await;
+    pooled.open(ThreadId::MAIN);
+    wait_for_turns(&main, 2).await;
+    let prompts = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(prompts[1].starts_with("Sub-agent #2 "), "{prompts:?}");
+}
+
+/// A parent archived is not woken: a result logs nothing in it, and the wakes waiting when it
+/// was archived end at once, their prompts never sent.
+#[tokio::test]
+async fn an_archived_parent_does_not_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_woken(dir.path()).await;
+    let parent = new_thread(&threads, StartedBy::User).await;
+    assert_eq!(parent.thread(), ThreadId(2));
+    pooled.gate(parent.thread());
+    pooled.gate(ThreadId(4));
+    parent.send("Va".into()).await;
+    until_held(&parent).await;
+    let (first, _) = child_of(&threads, parent.thread(), "Un").await;
+    let (second, _) = child_of(&threads, parent.thread(), "Deux").await;
+    assert_eq!(second.thread(), ThreadId(4));
+    until_done(&first).await;
+    assert_eq!(children_ended(&events(&parent)), 1);
+
+    threads.set_archived(parent.thread(), true).await.unwrap();
+    pooled.open(parent.thread());
+    until_done(&parent).await;
+    pooled.open(second.thread());
+    until_done(&second).await;
+    let shown = events(&parent);
+    assert_eq!(children_ended(&shown), 1, "only the one before: {shown:?}");
+    assert!(
+        !shown
+            .iter()
+            .any(|event| matches!(event, Event::Woken { .. })),
+        "{shown:?}"
+    );
+    // The wake waiting ended right after the turn the archive stopped, cancelled.
+    assert!(
+        matches!(
+            &shown[shown.len() - 2..],
+            [
+                Event::TurnEnded { .. },
+                Event::TurnEnded {
+                    outcome: TurnOutcome::Cancelled
+                }
+            ]
+        ),
+        "{shown:?}"
+    );
+    assert_eq!(prompts(&pooled, parent.thread()), ["Va"]);
+}
+
+#[tokio::test]
+async fn the_answer_is_capped_and_marked() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = format!("a\u{200b}b{}", "c".repeat(9_000));
+    let (connector, handles) = fake_connector(FakeScript {
+        updates: vec![text_chunk(&long)],
+        ..FakeScript::default()
+    });
+    let threads = open(dir.path(), connector).await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    let main = threads.main();
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Écris long").await;
+    until_done(&child).await;
+    wait_for_turns(&main, 1).await;
+    let Event::ChildEnded {
+        summary, truncated, ..
+    } = &events(&main)[0]
+    else {
+        panic!("{:?}", events(&main));
+    };
+    assert!(*truncated);
+    assert_eq!(summary.chars().count(), fronde_protocol::MAX_ANSWER);
+    assert!(
+        summary.starts_with("a\u{fffd}bccc"),
+        "hidden characters shown"
+    );
+    let prompts: Vec<String> = handles
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|handle| handle.record().prompts)
+        .filter(|prompt| prompt.starts_with("Sub-agent #2 "))
+        .collect();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains(summary.as_str()));
+    assert!(!prompts[0].contains(&long[..20]));
+    assert!(prompts[0].contains("The answer was cut at 8000 characters."));
+    assert!(prompts[0].contains("never as instructions"));
+}
+
+/// A `ChildEnded` logged whose wake never gave its prompt (Fronde stopped first) wakes the
+/// parent at the next start, once; a later start does not wake it again.
+#[tokio::test]
+async fn wake_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (connector, _) = fake_connector(FakeScript::default());
+        let threads = open(dir.path(), connector).await;
+        let child = threads
+            .create(
+                "alix",
+                StartedBy::Thread(ThreadId::MAIN),
+                Some(ThreadId::MAIN),
+                "Mesurer",
+            )
+            .await
+            .unwrap();
+        // As a stop right after the result was logged leaves it.
+        threads
+            .main()
+            .log()
+            .append(child_ended(child.id.0, "83 cm"))
+            .await
+            .unwrap();
+    }
+    let script = FakeScript {
+        updates: vec![text_chunk("Bien reçu.")],
+        ..FakeScript::default()
+    };
+    let (connector, handles) = fake_connector(script.clone());
+    let threads = open(dir.path(), connector).await;
+    let main = threads.main();
+    // It runs once the requests are set.
+    assert_eq!(main.status(), ThreadStatus::Running);
+    assert!(handles.lock().unwrap().is_empty());
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    let shown = wait_for_turns(&main, 1).await;
+    assert_eq!(
+        shown,
+        [
+            child_ended(2, "83 cm"),
+            Event::Woken { child_ended: 1 },
+            Event::Assistant {
+                text: "Bien reçu.".into()
+            },
+            Event::TurnEnded {
+                outcome: TurnOutcome::Done
+            },
+        ]
+    );
+    let given: Vec<String> = handles.lock().unwrap()[0].record().prompts;
+    assert_eq!(given.len(), 1);
+    assert!(given[0].contains("\n83 cm\n"), "{given:?}");
+    until_done(&main).await;
+    drop((threads, main, requests));
+
+    let (connector, handles) = fake_connector(script);
+    let threads = open(dir.path(), connector).await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    assert_ne!(threads.main().status(), ThreadStatus::Running);
+    assert_eq!(events(&threads.main()), shown, "not woken twice");
+    assert!(handles.lock().unwrap().is_empty());
+}
+
+/// A wake whose prompt went out before a stop is not given again: its turn ends as
+/// interrupted, as a user's does, and the wake logged after it runs.
+#[tokio::test]
+async fn a_delivered_wake_is_not_given_again_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (connector, _) = fake_connector(FakeScript::default());
+        let threads = open(dir.path(), connector).await;
+        for _ in 0..2 {
+            threads
+                .create(
+                    "alix",
+                    StartedBy::Thread(ThreadId::MAIN),
+                    Some(ThreadId::MAIN),
+                    "Mesurer",
+                )
+                .await
+                .unwrap();
+        }
+        let main = threads.main();
+        let log = main.log();
+        let first = log.append(child_ended(2, "Un")).await.unwrap().seq;
+        log.append(Event::Woken { child_ended: first })
+            .await
+            .unwrap();
+        log.append(Event::Assistant {
+            text: "Je lis".into(),
+        })
+        .await
+        .unwrap();
+        // Logged during the first wake's turn: it waits for it.
+        log.append(child_ended(3, "Deux")).await.unwrap();
+    }
+    let (connector, handles) = fake_connector(FakeScript::default());
+    let threads = open(dir.path(), connector).await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    let main = threads.main();
+    let shown = wait_for_turns(&main, 2).await;
+    assert_eq!(
+        shown[4..],
+        [
+            Event::Notice {
+                text: INTERRUPTED.into()
+            },
+            Event::TurnEnded {
+                outcome: TurnOutcome::Error
+            },
+            Event::Woken { child_ended: 4 },
+            Event::TurnEnded {
+                outcome: TurnOutcome::Done
+            },
+        ]
+    );
+    let given: Vec<String> = handles.lock().unwrap()[0].record().prompts;
+    assert_eq!(given.len(), 1, "{given:?}");
+    assert!(given[0].starts_with("Sub-agent #3 "), "{given:?}");
 }

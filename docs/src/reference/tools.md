@@ -259,9 +259,9 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `threads_start` | `task`, `title` (optional, at most 80 characters), `provider` (optional), `model` (optional), `wait` (default `false`), `timeout_secs` (1 to 3600, default 600), `client_request_id` (optional, 1 to 128 characters) | Starts a sub-agent whose only context is `task`, and returns `{ thread, title, status }`; with `wait`, its answer. |
+| `threads_start` | `task`, `title` (optional, at most 80 characters), `provider` (optional), `model` (optional), `wait` (default `false`), `timeout_secs` (1 to 3600, default 600), `client_request_id` (optional, 1 to 128 characters) | Starts a sub-agent whose only context is `task`, and returns `{ thread, title, status }`; with `wait`, its answer. Without, its answer wakes you when it ends. |
 | `threads_send` | `thread`, `text`, `wait`, `timeout_secs` | Sends a sub-agent a new message, as a new turn; refused while it is in a turn. |
-| `threads_read` | `thread`, `after` (default 0), `limit` (1 to 50, default 20), `max_chars` (100 to 8000, default 4000) | Reads a sub-agent's thread, oldest first: its messages (`user`), its answers (`assistant`, a turn's text together), Fronde's notices (`notice`) and each turn's end (`turn_ended`, with its `outcome`). Each item has its `seq`; a text longer than `max_chars` is cut and marked `truncated`, and a page holds at most 32000 characters of text (one item at least). When there is more, `next_after` is the `after` of the next page. |
+| `threads_read` | `thread`, `after` (default 0), `limit` (1 to 50, default 20), `max_chars` (100 to 8000, default 4000) | Reads a sub-agent's thread, oldest first: its messages (`user`), its answers (`assistant`, a turn's text together), Fronde's notices (`notice`), each turn's end (`turn_ended`, with its `outcome`) and, in a thread that has sub-agents of its own, each of their results that woke it (`child_ended`, with its `thread` and `outcome`, its answer as `text`). Each item has its `seq`; a text longer than `max_chars` is cut and marked `truncated`, and a page holds at most 32000 characters of text (one item at least). When there is more, `next_after` is the `after` of the next page. |
 | `threads_list` | none | The sub-agents you started, newest first (at most 50, `more` counting the rest), each with its `thread`, `title`, `status`, `provider` and `model`, `waiting_for_user` when cards wait in it, `archived` when it is; and `providers`: each provider a sub-agent may run on, with the models its agent offered when it last started. |
 | `threads_cancel` | `thread`, `reason` (optional, one line, at most 200 characters) | Stops a sub-agent's running turn, its pending cards and its own sub-agents' turns; `reason` is shown in its thread. A finished turn keeps its result. Returns whether it was in a turn. |
 
@@ -283,15 +283,24 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
   `gemini` are refused as planned). `model` is one of the models the provider's agent offered,
   as `threads_list` shows them; another is refused with the list. Without them, the parent's
   provider and the provider's default model.
-- **Waiting.** Without `wait`, the call returns at once and the sub-agent works on its own: read
-  its answer later with `threads_read`. With `wait`, the call returns when its turn ends, with
+- **Waiting.** Without `wait`, the call returns at once and the sub-agent works on its own: its
+  answer wakes you when its turn ends (see below), and `threads_read` reads it at any time. With
+  `wait`, the call returns when its turn ends, with
   `{ thread, status, outcome, answer, note }`: `answer` is the text of that turn after its message,
   at most 8000 characters (`truncated` when cut). It returns earlier with `status:
   "waiting_for_user"` when a card opens in the sub-agent's thread, `status: "queued"` when the
   sub-agent waits for an agent to stop before it can start, or `status: "running"` when
   `timeout_secs` passes, the call is given up, or the caller's own turn ends; the sub-agent goes
-  on either way. Its result
-  waking the parent on its own is **planned**.
+  on either way. A result taken by a waiting call does not wake you; one the turn's end gave to a
+  wake before the call began to wait returns `status: "ended"` without the answer, so that it is
+  never given twice.
+- **Wakes.** A sub-agent's turn whose result no call took wakes the thread that started it: an
+  entry `child_ended` in that thread, then a new turn whose prompt reads
+  `Sub-agent #<id> "<title>" ended (<outcome>).`, followed by its answer (at most 8000
+  characters, hidden characters shown) between two lines no answer can forge, marked as data, and
+  `Read more with threads_read (thread <id>).` A wake waits for the running turn, wakes run in
+  order, an archived thread is not woken, and a wake runs at most once, a restart included (see
+  [Wakes](../explanation/threads.md#wakes)).
 - **Retries.** A call retried in the same turn with the same `client_request_id` and the same
   arguments joins the sub-agent the first one started (`joined: true`). The same id for another
   task, title, provider or model, or in another turn, is refused while that sub-agent is not

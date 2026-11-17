@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use dioxus::html::{ScrollBehavior, geometry::PixelsVector2D};
 use dioxus::prelude::*;
 use fronde_client::{Chat, Item, PermissionStatus, Threads, ToolStatus};
-use fronde_protocol::{ClientMsg, ThreadId, ThreadSummary};
+use fronde_protocol::{ClientMsg, ThreadId, ThreadSummary, TurnOutcome};
 
 use crate::{
     components::icons::{ArrowUp, Check, LogOut, Menu, Plus, Square, Wrench, X},
@@ -227,7 +227,13 @@ pub fn ChatView(
                     class: "mx-auto flex w-full max-w-3xl flex-col gap-3 px-4 py-4",
                     for row in chat.rows() {
                         li { key: "{row.generation}-{row.seq}", class: "flex flex-col",
-                            RowView { item: row.item.clone(), open, admin: chat.admin(), on_send }
+                            RowView {
+                                item: row.item.clone(),
+                                open,
+                                admin: chat.admin(),
+                                on_send,
+                                on_go,
+                            }
                         }
                     }
                     if let Some(text) = pending {
@@ -270,7 +276,13 @@ pub fn ChatView(
 }
 
 #[component]
-fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>) -> Element {
+fn RowView(
+    item: Item,
+    open: bool,
+    admin: bool,
+    on_send: EventHandler<Outgoing>,
+    #[props(default)] on_go: Option<EventHandler<Place>>,
+) -> Element {
     match item {
         Item::User { text, by } => rsx! {
             Message { align: MessageAlign::End,
@@ -303,6 +315,13 @@ fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>)
         Item::Notice { text } => rsx! {
             p { class: "text-muted-foreground px-4 text-center text-xs", "{text}" }
         },
+        Item::ChildEnded {
+            thread,
+            title,
+            outcome,
+        } => rsx! {
+            ChildEndedLine { thread, title, outcome, on_go }
+        },
         Item::Request {
             id,
             card,
@@ -325,6 +344,40 @@ fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>)
                 on_send,
             }
         },
+    }
+}
+
+/// How a sub-agent's turn ended, as its parent's chat says it.
+fn child_ended_label(outcome: TurnOutcome) -> &'static str {
+    match outcome {
+        TurnOutcome::Done => "Sous-agent terminé",
+        TurnOutcome::Cancelled => "Sous-agent terminé (interrompu)",
+        TurnOutcome::Refused => "Sous-agent terminé (refus)",
+        TurnOutcome::Limit => "Sous-agent terminé (limite atteinte)",
+        TurnOutcome::Error => "Sous-agent terminé (échec)",
+    }
+}
+
+const CHILD_LINK: &str = "hover:text-foreground focus-visible:ring-ring/50 min-w-0 truncate rounded-sm underline underline-offset-2 outline-none focus-visible:ring-[3px]";
+
+/// A sub-agent's result woke the thread: a line linking to the sub-agent's thread.
+#[component]
+fn ChildEndedLine(
+    thread: ThreadId,
+    title: String,
+    outcome: TurnOutcome,
+    on_go: Option<EventHandler<Place>>,
+) -> Element {
+    let place = Place::Thread(thread);
+    rsx! {
+        p { class: "text-muted-foreground flex items-center justify-center gap-1 px-4 text-xs",
+            span { class: "shrink-0", "{child_ended_label(outcome)} :" }
+            if let Some(on_go) = on_go {
+                PlaceLink { place, on_go, class: CHILD_LINK, "{title}" }
+            } else {
+                a { href: place.href(), class: CHILD_LINK, "{title}" }
+            }
+        }
     }
 }
 

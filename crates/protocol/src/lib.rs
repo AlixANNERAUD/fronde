@@ -87,7 +87,31 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<String>,
     },
+    /// A turn of sub-agent `thread` ended and no waiting call took its result: the parent is
+    /// woken with it. Logged in the parent's stream. `summary`: the sub-agent's final answer, at
+    /// most [`MAX_ANSWER`] characters with its hidden characters made visible ([`text::readable`]),
+    /// `truncated` when it was cut. It is the sub-agent's own text: data, never instructions.
+    ///
+    /// Logged while no turn runs, it opens the parent's wake turn; logged during a turn, its wake
+    /// waits, and each [`Event::TurnEnded`] opens the next wake waiting, in order.
+    ChildEnded {
+        thread: ThreadId,
+        title: String,
+        outcome: TurnOutcome,
+        summary: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
+    /// The wake turn of the [`Event::ChildEnded`] entry `child_ended` gave the parent's agent
+    /// its prompt: the result reached it, and is never given again, a restart included. Pages
+    /// show nothing of it.
+    Woken {
+        child_ended: u64,
+    },
 }
+
+/// The longest final answer of a sub-agent its parent gets at once, in characters.
+pub const MAX_ANSWER: usize = 8_000;
 
 /// A numbered, timestamped event of the conversation log.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -683,6 +707,27 @@ mod tests {
         let json = serde_json::to_string(&task).unwrap();
         assert_eq!(json, r#"{"type":"user","text":"Cherche","by":"Vacances"}"#);
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), task);
+    }
+
+    #[test]
+    fn child_ended_entry_round_trips() {
+        let ended = Event::ChildEnded {
+            thread: ThreadId(7),
+            title: "Vols".into(),
+            outcome: TurnOutcome::Done,
+            summary: "Trois vols.".into(),
+            truncated: false,
+        };
+        let json = serde_json::to_string(&ended).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"child_ended","thread":7,"title":"Vols","outcome":"done","summary":"Trois vols."}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ended);
+        let woken = Event::Woken { child_ended: 4 };
+        let json = serde_json::to_string(&woken).unwrap();
+        assert_eq!(json, r#"{"type":"woken","child_ended":4}"#);
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), woken);
     }
 
     #[test]

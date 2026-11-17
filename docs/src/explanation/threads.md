@@ -34,9 +34,10 @@ or else on the provider's default.
 ## How the answer comes back
 
 By default the call that starts a sub-agent returns at once, and the sub-agent works on its own.
-The parent reads it with `threads_read`: its messages, its answers and each turn's end, paged.
-Its messages include any you write yourself in the sub-agent's thread from the chat: the parent
-agent reads them too.
+When one of its turns ends, its result **wakes the parent**: no call has to wait or poll for it
+(see [Wakes](#wakes) below). The parent can also read it with `threads_read`: its messages, its
+answers and each turn's end, paged. Its messages include any you write yourself in the
+sub-agent's thread from the chat: the parent agent reads them too.
 
 When the turn needs the answer now, the call waits (`wait: true`). It returns:
 
@@ -46,14 +47,44 @@ When the turn needs the answer now, the call waits (`wait: true`). It returns:
 - `queued` as soon as the sub-agent waits for another agent to stop before it can start;
 - `running` once `timeout_secs` passes, when the call is given up, or when the parent's own turn
   ends. The sub-agent goes on: a wait never stops it.
+- `ended` when the turn had already ended before the call began to wait, and its result went to
+  the parent as a wake: the result is not given a second time.
 
-A turn's end hands its result to the calls waiting for it, and an answer a waiting call took is
-marked delivered; the hand-over and the mark happen together, so that a result is either taken by
-a waiting call or left for the parent to be told otherwise. Waking the parent with its sub-agent's
-answer when it ends, so that no call has to wait, is **planned**.
+A result reaches the parent once: either a waiting call takes it, or it wakes the parent, never
+both. The turn's end decides which, in one step with the calls registering to wait, so that a
+call that starts waiting just as the turn ends either takes the result or learns that it went to
+a wake.
 
 What a sub-agent writes may come from anything it read, the web among it. It reaches its parent
 capped, with hidden characters shown, and marked as data, not instructions.
+
+## Wakes
+
+When a sub-agent's turn ends and no call waits for it, Fronde writes a *sub-agent ended* entry in
+its parent's thread (the sub-agent, how its turn ended, and its final answer: at most 8000
+characters, hidden characters shown), then wakes the parent: a new turn of the parent's agent
+whose prompt says which sub-agent ended and carries its answer between two marker lines, as data
+the agent must never follow as instructions. The chat shows the entry as a small *Sous-agent
+terminé* line linking to the sub-agent's thread; the answer itself is the agent's to read and
+summarise.
+
+- **One at a time.** A wake is a turn like any other. While the parent is in a turn, the wake
+  waits for it to end, then runs; several wakes run one after the other, in the order the
+  sub-agents ended. While a wake runs, a message you send is refused as during any turn. A wake
+  takes an agent slot like any turn, so it may wait for one (*En file d'attente*).
+- **Stop.** Stop in the chat ends the parent's running turn, a wake's included, and nothing else:
+  its sub-agents go on, and one that ends afterwards still wakes it.
+- **Archive.** An archived thread is not woken: a result logs nothing in it, and the wakes waiting
+  when it was archived end at once, without reaching its agent. Its sub-agents' own threads keep
+  their answers.
+- **Restarts.** The parent's thread is the queue: the entry is written before the wake runs, and
+  the wake writes a mark just before its prompt goes to the agent. A wake whose prompt never went
+  out (Fronde stopped before it did) runs at the next start, once; one whose prompt went out is
+  not given again: its turn ends as interrupted, like a message of yours a stop cut, and the
+  wakes after it run in order. So a result reaches the parent at most once, and exactly once
+  unless Fronde stops between that mark and the prompt.
+- **Who is woken.** Only the thread whose agent started the sub-agent. An outside MCP client never
+  is: it reads or waits.
 
 ## What a thread may reach
 
@@ -75,7 +106,8 @@ started holds it too, but neither has a turn. An outside MCP client gets no `thr
 - **Retries.** A call retried in the same turn with the same `client_request_id` joins the
   sub-agent the first one started, so that a lost reply does not start two.
 - **Stopping.** `threads_cancel` stops a sub-agent's running turn, its pending cards and its own
-  sub-agents' turns; what it wrote stays. Stop in the chat stops only the thread you are in.
+  sub-agents' turns; what it wrote stays, and its parent is woken with how it ended. Stop in the
+  chat stops only the thread you are in.
 
 Sub-agents started per day, time per turn, configurable limits and depth, and archiving a thread
 stopping its sub-agents are **planned**.
@@ -83,7 +115,7 @@ stopping its sub-agents are **planned**.
 ## Compared with T3 Code
 
 Fronde follows T3 Code's delegation: a sub-agent gets only its task, works on its own by default,
-can be waited for with a timeout that never stops it, ends a wait when it asks a question, can be
+wakes its parent with its result when it ends, can be waited for with a timeout that never stops it, ends a wait when it asks a question, can be
 retried safely with a request id, and is stopped with its own sub-agents. It differs where Fronde
 is not a coding tool: each sub-agent has its own confined directories rather than a shared or new
 git checkout, there is no mode to raise (permissions are cards), the providers and models come

@@ -161,6 +161,7 @@ impl ThreadControl for ThreadBridge {
             ChildEnd::Ended { outcome, answer } => Waited::Ended { outcome, answer },
             ChildEnd::WaitingForUser => Waited::WaitingForUser,
             ChildEnd::Queued => Waited::Queued,
+            ChildEnd::Woken => Waited::Woken,
             ChildEnd::TimedOut => Waited::TimedOut,
             ChildEnd::GaveUp => Waited::GaveUp,
         })

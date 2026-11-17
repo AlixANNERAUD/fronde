@@ -83,12 +83,13 @@ pub struct TurnResult {
 ///
 /// - a call that waits for turn `seq` of thread `child` [`Handoff::register`]s before it
 ///   blocks; registering a turn whose end was already decided is refused
-///   ([`AlreadyEnded`]), and that call reads the result from the stream, the end being logged
-///   there before it was decided;
+///   ([`AlreadyEnded`]), saying whether a waiting call took it: if one did, that call reads the
+///   result from the stream, the end being logged there before it was decided; if none did,
+///   the result went to the parent as a wake, and the call does not return it again;
 /// - the turn's end, once logged, calls [`Handoff::turn_ended`]: the result goes through a
 ///   oneshot to every call registered for that turn, which is then marked delivered, and the
-///   function says whether one took it. A turn nobody took is for the parent to be told of
-///   otherwise (the planned `ChildEnded` wake goes there);
+///   function says whether one took it. A turn nobody took wakes the parent instead, with a
+///   `ChildEnded` entry (see [`super::wakes`]): never both;
 /// - a call that stops waiting (timeout, given up, a card, its turn over)
 ///   [`Handoff::withdraw`]s: if the result was handed over meanwhile, it gets it then, so that
 ///   a result marked delivered is never lost.
@@ -118,8 +119,12 @@ struct HandoffState {
 }
 
 /// The turn's end was decided before the call registered: its result is in the stream.
+/// `taken`: a waiting call took it; else it woke the parent (or this is not the last turn
+/// whose end was decided, and nothing more is known of it).
 #[derive(Debug, PartialEq, Eq)]
-pub struct AlreadyEnded;
+pub struct AlreadyEnded {
+    pub taken: bool,
+}
 
 /// A call's place among those waiting for a turn.
 pub struct Registration {
@@ -132,7 +137,9 @@ impl Handoff {
     pub fn register(&self, thread: ThreadId, seq: u64) -> Result<Registration, AlreadyEnded> {
         let mut state = lock(&self.state);
         if state.ended.get(&thread).is_some_and(|ended| *ended >= seq) {
-            return Err(AlreadyEnded);
+            return Err(AlreadyEnded {
+                taken: state.delivered.get(&thread) == Some(&seq),
+            });
         }
         state.next += 1;
         let id = state.next;
@@ -191,6 +198,16 @@ impl Handoff {
     /// The last turn of `thread` whose result a waiting call took.
     pub fn delivered(&self, thread: ThreadId) -> Option<u64> {
         lock(&self.state).delivered.get(&thread).copied()
+    }
+
+    /// How many calls wait for turns of `thread`.
+    pub fn waiting(&self, thread: ThreadId) -> usize {
+        lock(&self.state)
+            .waiting
+            .iter()
+            .filter(|((waited, _), _)| *waited == thread)
+            .map(|(_, calls)| calls.len())
+            .sum()
     }
 
     /// Remembers that `client_request_id` started `child` in `parent`'s turn `turn`.
@@ -264,6 +281,9 @@ pub enum ChildEnd {
     WaitingForUser,
     /// The sub-agent waits for an agent slot: it starts once another agent stops.
     Queued,
+    /// The turn had already ended, and its result went to the caller as a wake: not given
+    /// twice.
+    Woken,
     /// The wait timed out; the sub-agent goes on.
     TimedOut,
     /// The call waiting was given up, or the caller's turn is over; the sub-agent goes on.
@@ -457,6 +477,11 @@ impl Threads {
     /// waiting call took: that result reached the parent already.
     pub fn delivered(&self, child: ThreadId) -> Option<u64> {
         self.children.handoff.delivered(child)
+    }
+
+    /// How many calls wait for turns of thread `child`.
+    pub fn waiting(&self, child: ThreadId) -> usize {
+        self.children.handoff.waiting(child)
     }
 
     /// Thread `target` if `caller` may reach it ([`may_access`]); else
@@ -814,7 +839,8 @@ impl Threads {
     /// with its agent running. Ends early when a card opens in that turn, for the user to answer,
     /// or when the sub-agent waits for an agent slot. The result comes through the [`Handoff`],
     /// which marks it delivered ([`Threads::delivered`]); a turn whose end was decided before
-    /// this call registered is read from the stream, and is not marked.
+    /// this call registered is read from the stream, and is not marked, unless its result woke
+    /// the caller: then it is [`ChildEnd::Woken`], so that it never reaches the caller twice.
     pub async fn wait_child(
         &self,
         caller: ThreadId,
@@ -833,7 +859,11 @@ impl Threads {
         let handoff = &self.children.handoff;
         let mut registration = match handoff.register(row.id, seq) {
             Ok(registration) => registration,
-            Err(AlreadyEnded) => return Ok(ended_in_log(&assistant, seq)),
+            // Nobody took it: it woke the sub-agent's parent, maybe this caller.
+            Err(AlreadyEnded { taken: false }) if row.parent == Some(caller) => {
+                return Ok(ChildEnd::Woken);
+            }
+            Err(AlreadyEnded { .. }) => return Ok(ended_in_log(&assistant, seq)),
         };
         let deadline = tokio::time::Instant::now() + timeout;
         let mut seen = seq;
@@ -980,8 +1010,14 @@ mod tests {
         assert_eq!(waiting.result.try_recv().unwrap(), result("Fini."));
         assert_eq!(handoff.delivered(child), Some(5));
         // A turn whose end was decided is read from the stream: registering is refused.
-        assert!(matches!(handoff.register(child, 5), Err(AlreadyEnded)));
-        assert!(matches!(handoff.register(child, 3), Err(AlreadyEnded)));
+        assert!(matches!(
+            handoff.register(child, 5),
+            Err(AlreadyEnded { taken: true })
+        ));
+        assert!(matches!(
+            handoff.register(child, 3),
+            Err(AlreadyEnded { taken: false })
+        ));
         assert!(handoff.register(child, 9).is_ok());
     }
 
@@ -1009,6 +1045,33 @@ mod tests {
         // A later turn nobody waited for clears the mark.
         assert!(!handoff.turn_ended(child, 11, result("Seul.")));
         assert_eq!(handoff.delivered(child), None);
+    }
+
+    /// The race between a wait and the end of the turn it waits for, forced both ways: the
+    /// result goes to the wait or to a wake, never to both.
+    #[test]
+    fn a_result_goes_to_the_wait_or_to_the_wake_never_both() {
+        let handoff = Handoff::default();
+        let child = ThreadId(2);
+        // The wait registers first: it takes the result, so the end wakes nobody.
+        let first = handoff.register(child, 5).unwrap();
+        assert_eq!(handoff.waiting(child), 1);
+        assert!(handoff.turn_ended(child, 5, result("Pris.")), "no wake");
+        assert_eq!(handoff.withdraw(child, 5, first), Some(result("Pris.")));
+        assert_eq!(handoff.waiting(child), 0);
+        // A retry of that wait reads it again: it is the same caller's.
+        assert_eq!(
+            handoff.register(child, 5).err(),
+            Some(AlreadyEnded { taken: true })
+        );
+        // The end comes first: nobody took it, so it wakes the parent, and a wait registering
+        // after it learns so instead of getting the result again.
+        assert!(!handoff.turn_ended(child, 7, result("Réveil.")), "a wake");
+        assert_eq!(
+            handoff.register(child, 7).err(),
+            Some(AlreadyEnded { taken: false })
+        );
+        assert_eq!(handoff.waiting(child), 0);
     }
 
     #[test]

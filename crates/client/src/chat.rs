@@ -73,6 +73,13 @@ pub enum Item {
         /// Who answered, once closed, when it was not this page's user.
         by: Option<String>,
     },
+    /// A sub-agent's turn ended and its result woke this thread: a link to the sub-agent's
+    /// thread. Its answer is the agent's to read, not shown here.
+    ChildEnded {
+        thread: ThreadId,
+        title: String,
+        outcome: TurnOutcome,
+    },
 }
 
 /// An item with the seq of its first entry and a version that changes each time the item does.
@@ -99,8 +106,12 @@ impl Row {
 pub struct Chat {
     rows: Vec<Row>,
     last_seq: u64,
-    /// A turn runs: from a user message to its `turn_ended`.
+    /// A turn runs: from a user message, or a sub-agent's result logged while none ran, to its
+    /// `turn_ended`.
     running: bool,
+    /// Sub-agents' results logged during a turn: each `turn_ended` opens the next one's turn,
+    /// as the server runs them.
+    wakes: u32,
     /// The log the entries come from, as the server's last hello named it.
     log_id: Option<String>,
     /// Counts log resets.
@@ -269,6 +280,28 @@ impl Chat {
                     set_permission_status(row, PermissionStatus::Answered { allowed });
                 }
             }
+            Event::ChildEnded {
+                thread,
+                title,
+                outcome,
+                ..
+            } => {
+                if self.running {
+                    self.wakes += 1;
+                } else {
+                    self.running = true;
+                }
+                self.push(
+                    seq,
+                    Item::ChildEnded {
+                        thread,
+                        title,
+                        outcome,
+                    },
+                );
+            }
+            // The wake's prompt went out: nothing to show.
+            Event::Woken { .. } => {}
             Event::TurnEnded { outcome } => {
                 self.running = false;
                 for row in self.current_turn() {
@@ -284,6 +317,10 @@ impl Chat {
                 };
                 if let Some(text) = notice {
                     self.push(seq, Item::Notice { text: text.into() });
+                }
+                if self.wakes > 0 {
+                    self.wakes -= 1;
+                    self.running = true;
                 }
             }
             Event::Notice { text } => self.push(seq, Item::Notice { text }),
@@ -530,6 +567,69 @@ mod tests {
             )],
         );
         assert!(!chat.running());
+    }
+
+    fn child_ended(seq: u64, thread: i64) -> Entry {
+        entry(
+            seq,
+            Event::ChildEnded {
+                thread: ThreadId(thread),
+                title: format!("Sous-tâche {thread}"),
+                outcome: TurnOutcome::Done,
+                summary: "Fini.".into(),
+                truncated: false,
+            },
+        )
+    }
+
+    #[test]
+    fn a_sub_agents_result_shows_and_runs_its_wake_turns() {
+        let mut chat = Chat::default();
+        // While idle, a result opens its wake turn: its answer joins one bubble.
+        apply_all(
+            &mut chat,
+            [
+                child_ended(1, 7),
+                entry(2, Event::Woken { child_ended: 1 }),
+                assistant(3, "Le sous-agent "),
+                assistant(4, "a fini."),
+            ],
+        );
+        assert!(chat.running());
+        apply_all(&mut chat, [ended(5, TurnOutcome::Done)]);
+        assert!(!chat.running());
+        // During a turn, two results wait: each end opens the next one's turn.
+        apply_all(
+            &mut chat,
+            [user(6, "Salut"), child_ended(7, 8), child_ended(8, 9)],
+        );
+        apply_all(&mut chat, [ended(9, TurnOutcome::Done)]);
+        assert!(chat.running(), "the first wake runs");
+        apply_all(&mut chat, [ended(10, TurnOutcome::Cancelled)]);
+        assert!(chat.running(), "then the second");
+        apply_all(&mut chat, [ended(11, TurnOutcome::Done)]);
+        assert!(!chat.running());
+        let items = items(&chat);
+        assert_eq!(
+            items[..2],
+            [
+                Item::ChildEnded {
+                    thread: ThreadId(7),
+                    title: "Sous-tâche 7".into(),
+                    outcome: TurnOutcome::Done,
+                },
+                Item::Assistant {
+                    text: "Le sous-agent a fini.".into()
+                },
+            ]
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, Item::ChildEnded { .. }))
+                .count(),
+            3
+        );
     }
 
     #[test]

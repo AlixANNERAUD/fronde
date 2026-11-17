@@ -32,6 +32,20 @@ pub fn first_hidden(text: &str, multiline: bool) -> Option<char> {
         .find(|&c| hidden(c) && !(multiline && matches!(c, '\n' | '\t')))
 }
 
+/// `text` as an agent may read another agent's text: hidden characters other than line breaks
+/// and tabs as U+FFFD, at most `max` characters; and whether it was cut.
+pub fn readable(text: &str, max: usize) -> (String, bool) {
+    let mut out = String::new();
+    for (count, c) in text.chars().enumerate() {
+        if count == max {
+            return (out, true);
+        }
+        let hidden = hidden(c) && !matches!(c, '\n' | '\t');
+        out.push(if hidden { '\u{fffd}' } else { c });
+    }
+    (out, false)
+}
+
 /// Unicode's `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt, stable since 6.0 save
 /// for unassigned points it already covered): code points a renderer may show as nothing at all.
 fn default_ignorable(c: char) -> bool {

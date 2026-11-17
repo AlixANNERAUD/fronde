@@ -1137,9 +1137,10 @@ async fn wait_timeout_leaves_the_child_running() {
     assert_eq!(assistant.status(), fronde_protocol::ThreadStatus::Running);
     assert!(assistant.current_turn().await.is_some());
     // It ends on its own, with its answer, read in the parent's next turn.
+    let before = turn_of(&bench, ThreadId::MAIN).await;
     bench.gate.notify_waiters();
     until_idle(&assistant).await;
-    next_turn(&bench, ThreadId::MAIN).await;
+    next_turn(&bench, ThreadId::MAIN, before).await;
     let read = call(
         &main,
         "threads_read",
@@ -1232,12 +1233,11 @@ async fn retry_with_the_same_client_request_id_joins_the_child() {
     }
     assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 1);
 
-    // Another turn of the parent: the same call does not join the earlier child.
-    let main_assistant = bench.assistant(ThreadId::MAIN).await;
+    // Another turn of the parent (the child's wake, or a new message): the same call does not
+    // join the earlier child.
+    let before = turn_of(&bench, ThreadId::MAIN).await;
     bench.gate.notify_waiters();
-    until_idle(&main_assistant).await;
-    main_assistant.send("Encore".into()).await;
-    assert!(main_assistant.current_turn().await.is_some());
+    next_turn(&bench, ThreadId::MAIN, before).await;
     let refused = call(&main, "threads_start", args).await;
     assert!(
         refused["error"]
@@ -1511,9 +1511,10 @@ async fn cancel_stops_the_child_and_keeps_what_it_wrote() {
             .is_some()
     );
     // The fake agent ends its turn once released; the parent reads it in its next turn.
+    let before = turn_of(&bench, ThreadId::MAIN).await;
     bench.gate.notify_waiters();
     until_idle(&assistant).await;
-    next_turn(&bench, ThreadId::MAIN).await;
+    next_turn(&bench, ThreadId::MAIN, before).await;
     let read = call(
         &main,
         "threads_read",
@@ -1541,13 +1542,33 @@ async fn cancel_stops_the_child_and_keeps_what_it_wrote() {
     bench.gate.notify_waiters();
 }
 
-/// Ends thread `id`'s running turn, once its agent is released, and starts another one, with the
-/// same agent and token.
-async fn next_turn(bench: &Bench, id: ThreadId) {
+/// Thread `id`'s running turn, before its agent is released: see [`next_turn`].
+async fn turn_of(bench: &Bench, id: ThreadId) -> Option<u64> {
+    bench.assistant(id).await.current_turn().await
+}
+
+/// Waits for thread `id`'s next turn after `before`, once its agent is released, with the same
+/// agent and token: the wake of a sub-agent whose result no call waited for, or else a new
+/// message, sent once the thread is idle.
+async fn next_turn(bench: &Bench, id: ThreadId, before: Option<u64>) {
     let assistant = bench.assistant(id).await;
-    until_idle(&assistant).await;
-    assistant.send("Encore".into()).await;
-    assert!(assistant.current_turn().await.is_some());
+    timeout(WAIT, async {
+        loop {
+            match assistant.current_turn().await {
+                Some(turn) if Some(turn) != before => return,
+                None if !matches!(
+                    assistant.status(),
+                    fronde_protocol::ThreadStatus::Running | fronde_protocol::ThreadStatus::Queued
+                ) =>
+                {
+                    assistant.send("Encore".into()).await;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("no next turn");
 }
 
 #[tokio::test]
