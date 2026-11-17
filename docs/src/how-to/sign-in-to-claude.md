@@ -1,7 +1,8 @@
 # Sign Fronde in to Claude
 
-Fronde's agent is Claude Code, run through its ACP adapter. It has its own home, `home/` in the
-data directory, and never uses your `~/.claude`. It reads none of Claude Code's settings: your
+Fronde's agent is Claude Code, run through its ACP adapter. Each conversation (thread) has its
+own agent with its own home: `home/` in the data directory for the main one, the chat,
+`threads/<id>/home/` for the others. None uses your `~/.claude`. It reads none of Claude Code's settings: your
 plugins, MCP servers, hooks and permission rules do not apply to it. It signs in with a
 long-lived token, which you make once and give to Fronde as `[agent] oauth_token` (see
 [Configuration](../reference/configuration.md#agent)).
@@ -44,6 +45,10 @@ agent can write its home: a hook, an `apiKeyHelper` or a `statusLine` it put in
 its sandbox, the moment you start `claude` there. The token keeps you from ever running Claude
 Code in a directory the agent controls.
 
+Every thread other than the main one starts with a fresh, empty home: only the token signs its
+agent in. A Claude directory placed in the main thread's home (see Docker below) signs in the
+main thread only.
+
 Versions of Fronde before the agent got its own home used your `~/.claude`. After the upgrade,
 the agent is signed out until you give it a token, and the chat's agent session starts afresh:
 its history stays in the chat, but the agent no longer remembers the previous session.
@@ -85,6 +90,8 @@ docker run … -v ./claude:/data/home/.claude …
 ```
 
 The copy and the original share one sign-in. If one of them stops working, use a token instead.
+This signs in the main thread's agent only: the agents of other threads have homes of their own,
+and need the token.
 
 ## When it fails
 

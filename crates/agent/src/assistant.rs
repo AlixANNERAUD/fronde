@@ -9,8 +9,9 @@ use crate::elicitation;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
 use crate::threads::{self, ThreadId};
+use crate::tokens::{TokenLease, Tokens};
 use agent_client_protocol::v1::schema::CreateElicitationResponse;
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use fronde_db::DatabaseConnection;
 use fronde_protocol::{Card, Outcome, RequestId};
 use fronde_requests::{Ask, Caller, Requests, Resolution, User};
@@ -72,8 +73,11 @@ pub struct Assistant {
     thread: ThreadId,
     /// The thread's stream.
     topic: String,
+    /// How this thread's agent starts: its directories and its scope's name are the thread's.
     spec: AgentSpec,
     connector: Connector,
+    /// Where each start of the agent gets its own hub token.
+    tokens: Tokens,
     log: ConversationLog,
     db: DatabaseConnection,
     /// The thread is archived: it refuses messages.
@@ -104,6 +108,9 @@ struct Turn {
 struct Session {
     client: Arc<AgentClient>,
     flushes: UnboundedSender<oneshot::Sender<()>>,
+    /// The agent process's hub token: revoked once the last clone of the session is dropped,
+    /// with the client that stops the process.
+    _lease: Arc<TokenLease>,
 }
 
 impl Session {
@@ -125,6 +132,7 @@ impl Assistant {
         spec: AgentSpec,
         db: DatabaseConnection,
         connector: Connector,
+        tokens: Tokens,
         archived: bool,
     ) -> anyhow::Result<Arc<Self>> {
         let log = ConversationLog::open(&db, &topic).await?;
@@ -133,6 +141,7 @@ impl Assistant {
             topic,
             spec,
             connector,
+            tokens,
             log,
             db,
             archived: AtomicBool::new(archived),
@@ -402,7 +411,7 @@ impl Assistant {
             .ask(Ask {
                 topic: self.topic.clone(),
                 turn: Some(turn),
-                caller: Caller::Assistant,
+                caller: Caller::Thread(self.thread),
                 client_request_id: None,
                 card,
                 for_user: owner.name.clone(),
@@ -502,14 +511,27 @@ impl Assistant {
         })
     }
 
-    /// The current session, connecting (and resuming the saved one) when there is none.
+    /// The current session, connecting (and resuming the saved one) when there is none. Each
+    /// start of the agent gets a new hub token, which the session holds.
     async fn connect(self: &Arc<Self>) -> anyhow::Result<Session> {
         if let Some(session) = self.session_slot().clone() {
             return Ok(session);
         }
+        // The main thread's directories are the data directory's `agent` and `home`, which the
+        // server makes; another thread's are made when its agent first starts.
+        if self.thread != ThreadId::MAIN {
+            for dir in [&self.spec.cwd, &self.spec.home, &self.spec.home.join("tmp")] {
+                fronde_fs::create_dir_all(dir).with_context(|| {
+                    format!("cannot create the agent's directory {}", dir.display())
+                })?;
+            }
+        }
         let saved = self.saved_session_id().await;
+        let lease = self.tokens.issue(self.thread)?;
+        let mut spec = self.spec.clone();
+        spec.hub_token = lease.token().clone();
         let (events, agent_events) = mpsc::unbounded_channel();
-        let client = (self.connector)(&self.spec, saved.clone(), events).await?;
+        let client = (self.connector)(&spec, saved.clone(), events).await?;
         let id = client.session_id();
         if saved.as_deref() != Some(id) {
             if saved.is_some() {
@@ -524,15 +546,50 @@ impl Assistant {
         }
         let client = Arc::new(client);
         let (flushes, flush_requests) = mpsc::unbounded_channel();
-        tokio::spawn(record_events(
+        let recorder = record_events(
             Arc::downgrade(self),
+            Arc::downgrade(&client),
             Recorder::default(),
             agent_events,
             flush_requests,
-        ));
-        let session = Session { client, flushes };
+        );
+        let session = Session {
+            client,
+            flushes,
+            _lease: Arc::new(lease),
+        };
+        // In its slot before its events are read: a connection that ended at once finds it.
         *self.session_slot() = Some(session.clone());
+        tokio::spawn(recorder);
         Ok(session)
+    }
+
+    /// Stops the thread's agent process when no turn runs, revoking its hub token; the next
+    /// message starts it again, resuming its session. Whether it stopped one.
+    pub async fn stop_agent(&self) -> bool {
+        let turn = self.turn.lock().await;
+        if turn.is_some() {
+            return false;
+        }
+        self.session_slot().take().is_some()
+    }
+
+    /// Whether the thread's agent process is running, as far as Fronde knows.
+    pub fn agent_running(&self) -> bool {
+        self.session_slot().is_some()
+    }
+
+    /// The agent connection of `client` ended (its process exited): its session goes, and with
+    /// it the token the process held, unless a newer session already replaced it.
+    fn connection_ended(&self, client: &Weak<AgentClient>) {
+        let mut slot = self.session_slot();
+        if slot
+            .as_ref()
+            .is_some_and(|session| std::ptr::eq(Arc::as_ptr(&session.client), client.as_ptr()))
+        {
+            tracing::info!("the agent of thread {} stopped", self.thread);
+            *slot = None;
+        }
     }
 
     async fn saved_session_id(&self) -> Option<String> {
@@ -600,9 +657,11 @@ struct Recorder {
     tool_titles: HashMap<String, String>,
 }
 
-/// Logs the agent's events for the lifetime of its client and answers flush requests.
+/// Logs the agent's events for the lifetime of its connection and answers flush requests. When
+/// the connection ends, the session of `client` goes.
 async fn record_events(
     assistant: Weak<Assistant>,
+    client: Weak<AgentClient>,
     mut recorder: Recorder,
     mut events: UnboundedReceiver<AgentEvent>,
     mut flush_requests: UnboundedReceiver<oneshot::Sender<()>>,
@@ -612,7 +671,12 @@ async fn record_events(
             // Events first: a flush is acknowledged only once those sent before it are logged.
             biased;
             event = events.recv() => {
-                let (Some(event), Some(owner)) = (event, assistant.upgrade()) else {
+                let Some(owner) = assistant.upgrade() else {
+                    break;
+                };
+                let Some(event) = event else {
+                    // Every sender is gone: the connection ended.
+                    owner.connection_ended(&client);
                     break;
                 };
                 owner.record(event, &mut recorder).await;

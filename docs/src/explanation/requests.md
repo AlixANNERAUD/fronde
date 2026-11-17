@@ -22,11 +22,12 @@ A request ends in one of four ways:
 | `answered` | You sent an answer | *Réponse : …*, or for a secret where it was kept |
 | `declined` | You pressed *Refuser* on a question or secret card | *Refusée* |
 | `expired` | Its time ran out | *Expirée* (*Expirée, refusée* for a permission) |
-| `cancelled` | The asker gave up (its tool call was cancelled), the assistant's turn that asked ended or was stopped, or the request could not be shown | *Annulée* |
+| `cancelled` | The asker gave up (its tool call was cancelled), the agent's turn that asked ended or was stopped, or the request could not be shown | *Annulée* |
 
 The row is closed before the one who asked is told, and a closed request never reopens. Every
-request expires: no answer means no. The row keeps who answered, when, and a short summary of the
-answer, as an audit trail.
+request expires: no answer means no. The row keeps who asked (`thread:<id>` for a thread's agent;
+rows from before threads say `assistant` and read as thread 1's), who answered, when, and a short
+summary of the answer, as an audit trail.
 
 ## Answers are checked
 
@@ -56,14 +57,17 @@ in its own field. It never has to parse prose, and never gets a label it did not
 Each request is for one user, and only that user answers it. A request can also be marked for an
 admin only, for cards that grant something lasting; today the one user, the owner, is the admin.
 
-The hub knows who asks. Fronde's own assistant reaches `/mcp` with a token of its own, made at
-each start and kept in memory: its questions are tied to its running turn and headed *Question de
-Fronde*. Any other client uses `server.token`: its questions are headed with the name it gave when
+The hub knows who asks. Each of Fronde's threads has its own agent, which reaches `/mcp` with a
+token of its own, made when its process starts and kept in memory: its questions are tied to its
+thread's running turn, appear as cards in that thread's stream, not in the main one, and are
+headed *Question de Fronde*. The token alone names the thread: an argument, a header or a name
+cannot put a card in another thread. Any other client uses `server.token`: its questions are headed with the name it gave when
 it connected, quoted and marked as a client, such as *Question de « Codex » (client MCP)*, so a
 card from an outside agent never passes for Fronde's own. An upstream MCP server's form is
 headed with the server's name, marked as a server: *Question de « github » (serveur MCP)*, and is
-for the admin only. Only the token makes a caller the
-assistant: a client that calls itself `assistant` is still an outside client. Since a client
+for the admin only. Only the token makes a caller one of Fronde's
+agents: a client that calls itself `assistant` is still an outside client. Outside clients' cards
+go to the main thread. Since a client
 chooses its name, the hub refuses to ask the user anything for one named *Fronde* or *assistant*
 (in any case), one whose name is longer than 40 characters, or one whose name holds a control
 character.
@@ -131,7 +135,7 @@ The server refuses any option the card does not offer, and the agent only ever g
 offered.
 
 The answer is the same `answer` message as any card's, checked by the same code, and the first
-one wins. Only Fronde's assistant may ask for a permission. A refused answer (not yours, already
+one wins. Only a thread's agent may ask for a permission, in its own thread. A refused answer (not yours, already
 closed, not an option of the card) is logged as a warning naming the user and the request, never
 the answer. The agent then gets the option chosen. It gets a refusal (the agent's *reject once*, or
 a cancel if it offered none) when the card expires after **30 minutes** or is declined: no answer
@@ -238,10 +242,10 @@ request it started instead of showing a second card. Secrets kept for a conversa
 survive a restart: they live in memory only. A secret card still pending after a restart stays
 answerable.
 
-The id alone proves nothing: the assistant reuses ids from one turn to the next, and outside
+The id alone proves nothing: an agent reuses ids from one turn to the next, and outside
 clients choose their names, so two of them can share one. A retry therefore joins a request only
-when it asks the very same questions of the same user, and only while it is current: for the
-assistant, in the same turn; for an outside client, while the request is pending or within its
+when it asks the very same questions of the same user, and only while it is current: for a
+thread's agent, in the same turn of the same thread; for an outside client, while the request is pending or within its
 timeout. A cancelled request is never joined. Anything else is a new question: it gets a card of
 its own, or an error asking for a new id while the request holding that id is still pending (the
 table allows one pending request per caller and id). A new question never gets an old answer.

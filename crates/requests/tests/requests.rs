@@ -4,7 +4,9 @@ use fronde_protocol::{
     Card, ChoiceAnswer, ChoiceOption, Field, Outcome, PermissionChoice, PermissionKind, RequestId,
     Response,
 };
-use fronde_requests::{Ask, Caller, Journal, Refusal, Requests, Resolution, Reused, User};
+use fronde_requests::{
+    Ask, Caller, Journal, Refusal, Requests, Resolution, Reused, ThreadId, User,
+};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, EntityTrait};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,6 +31,8 @@ enum Shown {
 #[derive(Default)]
 struct FakeJournal {
     shown: Mutex<Vec<Shown>>,
+    /// Who asked each request announced, in order.
+    callers: Mutex<Vec<Caller>>,
     refuse: Mutex<bool>,
 }
 
@@ -52,6 +56,7 @@ impl Journal for FakeJournal {
         if *self.refuse.lock().unwrap() {
             anyhow::bail!("disk full");
         }
+        self.callers.lock().unwrap().push(caller.clone());
         let mut shown = self.shown.lock().unwrap();
         shown.push(Shown::Announced {
             id,
@@ -115,7 +120,7 @@ fn ask() -> Ask {
     Ask {
         topic: TOPIC.into(),
         turn: Some(1),
-        caller: Caller::Assistant,
+        caller: Caller::Thread(ThreadId::MAIN),
         client_request_id: None,
         card: question(),
         for_user: "alix".into(),
@@ -748,7 +753,7 @@ async fn restart_expires_permissions() {
 }
 
 #[tokio::test]
-async fn only_the_assistant_asks_for_permissions() {
+async fn only_a_threads_agent_asks_for_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let (requests, journal) = open(dir.path()).await;
     for caller in [Caller::Mcp("Codex".into()), Caller::Source("github".into())] {
@@ -757,7 +762,7 @@ async fn only_the_assistant_asks_for_permissions() {
         asked.caller = caller;
         let error = requests.ask(asked).await.unwrap_err();
         assert!(
-            format!("{error:#}").contains("only the assistant"),
+            format!("{error:#}").contains("only a thread's agent"),
             "{error:#}"
         );
     }
@@ -765,6 +770,11 @@ async fn only_the_assistant_asks_for_permissions() {
     assert_eq!(journal.shown(), []);
     let db = fronde_db::open(dir.path()).await.unwrap();
     assert!(requests::Entity::find().all(&db).await.unwrap().is_empty());
+    // Any thread's agent may.
+    let mut asked = ask();
+    asked.card = permission();
+    asked.caller = Caller::Thread(ThreadId(2));
+    requests.ask(asked).await.unwrap();
 }
 
 #[tokio::test]
@@ -876,6 +886,58 @@ async fn one_unreadable_row_does_not_stop_the_start() {
     let (requests, _) = open(dir.path()).await;
     assert_eq!(row(dir.path(), unreadable).await.status, "cancelled");
     requests.answer(good, pick("Seerr"), &alix()).await.unwrap();
+}
+
+/// A request asked before threads was stored as the assistant's: it reads as the main thread's,
+/// whose agent the assistant was, and is shown and answered as such.
+#[tokio::test]
+async fn old_assistant_rows_read_as_thread_one() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(dir.path()).await);
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let old = requests::ActiveModel {
+        topic: Set(TOPIC.into()),
+        turn: Set(Some(4)),
+        caller: Set("assistant".into()),
+        client_request_id: Set(None),
+        kind: Set("form".into()),
+        card: Set(serde_json::to_value(question()).unwrap()),
+        for_user: Set("alix".into()),
+        admin_only: Set(false),
+        status: Set("pending".into()),
+        created_at: Set(chrono::Utc::now()),
+        expires_at: Set(Some(chrono::Utc::now() + chrono::Duration::minutes(10))),
+        ..Default::default()
+    };
+    let old = requests::Entity::insert(old)
+        .exec(&db)
+        .await
+        .unwrap()
+        .last_insert_id as RequestId;
+
+    let (requests, journal) = open(dir.path()).await;
+    assert_eq!(
+        journal.shown(),
+        [Shown::Announced {
+            id: old,
+            from: None
+        }]
+    );
+    assert_eq!(
+        *journal.callers.lock().unwrap(),
+        [Caller::Thread(ThreadId::MAIN)]
+    );
+    requests.answer(old, pick("Seerr"), &alix()).await.unwrap();
+    assert_eq!(row(dir.path(), old).await.status, "answered");
+    // New rows name the thread.
+    let waiter = requests
+        .ask(Ask {
+            caller: Caller::Thread(ThreadId(2)),
+            ..ask()
+        })
+        .await
+        .unwrap();
+    assert_eq!(row(dir.path(), waiter.id()).await.caller, "thread:2");
 }
 
 #[tokio::test]
@@ -1047,7 +1109,7 @@ mod secrets {
     fn assistant_scope() -> EphemeralScope {
         EphemeralScope {
             topic: TOPIC.into(),
-            asker: "assistant".into(),
+            asker: "thread:1".into(),
         }
     }
 

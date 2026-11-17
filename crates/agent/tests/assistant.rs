@@ -30,9 +30,11 @@ const FAILED: &str = "L'agent a rencontré une erreur.";
 
 fn spec() -> AgentSpec {
     AgentSpec {
+        thread: fronde_protocol::ThreadId::MAIN,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: "/srv/fronde/agent".into(),
+        home: "/srv/fronde/home".into(),
         hub_url: "http://127.0.0.1:7878/mcp".into(),
         hub_token: "hub-token".into(),
         oauth_token: None,
@@ -1058,7 +1060,7 @@ async fn ask_during_a_turn(
         .ask(Ask {
             topic: TOPIC.into(),
             turn: assistant.current_turn().await,
-            caller: Caller::Assistant,
+            caller: Caller::Thread(fronde_protocol::ThreadId::MAIN),
             client_request_id: None,
             card: question_card(),
             for_user: "alix".into(),

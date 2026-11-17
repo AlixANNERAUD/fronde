@@ -310,9 +310,11 @@ fn no_secret_in_debug() {
     };
     let bearer = Credential::Bearer(bearer_canary.into());
     let agent_spec = AgentSpec {
+        thread: fronde_agent::threads::ThreadId::MAIN,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: dir.path().to_path_buf(),
+        home: dir.path().join("home"),
         hub_url: "http://127.0.0.1:8484/mcp".into(),
         hub_token: agent_canary.into(),
         oauth_token: None,

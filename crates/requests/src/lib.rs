@@ -20,6 +20,7 @@ use fronde_db::DatabaseConnection;
 use fronde_db::ephemeral::{EphemeralScope, EphemeralSecrets};
 use fronde_db::master_key::{Backend, Backends};
 use fronde_entity::requests;
+pub use fronde_protocol::ThreadId;
 use fronde_protocol::request::{
     self, Card, Invalid, Keep, KeyPlace, Outcome, RequestId, Response, SecretValue,
 };
@@ -50,33 +51,45 @@ const PERMISSION: &str = "permission";
 /// waiting forever.
 const EXPIRY_GRACE: Duration = Duration::from_secs(2);
 
-/// Who asked: Fronde's own assistant, an outside MCP client, or a tool source (an upstream
-/// server's elicitation).
+/// Who asked: one of Fronde's threads (its agent, known by the token it holds), an outside MCP
+/// client, or a tool source (an upstream server's elicitation).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Caller {
-    Assistant,
-    /// An MCP client other than the assistant, by the name it gave (`clientInfo.name`).
+    /// The agent of a thread. Only the hub's gate makes one, from the token that thread's agent
+    /// process was given: nothing a caller sends names a thread.
+    Thread(ThreadId),
+    /// An MCP client other than Fronde's agents, by the name it gave (`clientInfo.name`).
     Mcp(String),
     Source(String),
 }
 
+/// How a thread's agent was stored before threads: it was the main thread's.
+const LEGACY_ASSISTANT: &str = "assistant";
+
 impl Caller {
-    /// How the caller is stored: `assistant`, `mcp:<name>` or `source:<name>`.
+    /// How the caller is stored: `thread:<id>`, `mcp:<name>` or `source:<name>`.
     pub fn id(&self) -> String {
         match self {
-            Self::Assistant => "assistant".into(),
+            Self::Thread(id) => format!("thread:{id}"),
             Self::Mcp(name) => format!("mcp:{name}"),
             Self::Source(name) => format!("source:{name}"),
         }
     }
 
-    fn parse(id: &str) -> Self {
+    /// The caller stored as `id`. A row from before threads (`assistant`) reads as the main
+    /// thread's, as does anything else unknown, as before.
+    pub fn parse(id: &str) -> Self {
         if let Some(name) = id.strip_prefix("mcp:") {
             Self::Mcp(name.into())
         } else if let Some(name) = id.strip_prefix("source:") {
             Self::Source(name.into())
+        } else if let Some(thread) = id.strip_prefix("thread:").and_then(|n| n.parse().ok()) {
+            Self::Thread(ThreadId(thread))
         } else {
-            Self::Assistant
+            if id != LEGACY_ASSISTANT {
+                tracing::warn!("a request's caller {id:?} is unknown: read as the main thread");
+            }
+            Self::Thread(ThreadId::MAIN)
         }
     }
 
@@ -86,10 +99,10 @@ impl Caller {
         matches!(self, Self::Source(_))
     }
 
-    /// The name a card shows for an asker other than the assistant.
+    /// The name a card shows for an asker other than Fronde's own agents.
     pub fn from(&self) -> Option<&str> {
         match self {
-            Self::Assistant => None,
+            Self::Thread(_) => None,
             Self::Mcp(name) | Self::Source(name) => Some(name),
         }
     }
@@ -111,7 +124,7 @@ pub struct Ask {
     pub turn: Option<u64>,
     pub caller: Caller,
     /// A retried call with the same id from the same caller joins the same request, as long as
-    /// it asks the same thing of the same user in the same place: for the assistant in the same
+    /// it asks the same thing of the same user in the same place: for a thread's agent in the same
     /// turn, for anyone else while the first request is pending or within its timeout.
     pub client_request_id: Option<String>,
     pub card: Card,
@@ -222,7 +235,7 @@ impl std::error::Error for Reused {}
 #[async_trait]
 pub trait Journal: Send + Sync {
     /// Shows the request `id` that `caller` asks in `topic`; returns the seq of its entry. An
-    /// asker other than the assistant is named on the card ([`Caller::from`]).
+    /// asker other than a thread's agent is named on the card ([`Caller::from`]).
     async fn announce(
         &self,
         topic: &str,
@@ -389,13 +402,13 @@ impl Requests {
     /// [`Ask::client_request_id`]) gets a waiter on the first request instead, already resolved
     /// if that one ended. A [`Reused`] error when the id names another pending request. Refused
     /// when the card breaks a card's rules ([`Card::check`]), or for a permission card asked by
-    /// anyone but the assistant: only the agent's own tool calls need one.
+    /// anyone but a thread's agent: only the agent's own tool calls need one.
     pub async fn ask(&self, ask: Ask) -> anyhow::Result<Waiter> {
         ask.card
             .check()
             .map_err(|error| anyhow::anyhow!("the card cannot be shown: {error}"))?;
-        if matches!(ask.card, Card::Permission { .. }) && ask.caller != Caller::Assistant {
-            anyhow::bail!("only the assistant asks for permissions");
+        if matches!(ask.card, Card::Permission { .. }) && !matches!(ask.caller, Caller::Thread(_)) {
+            anyhow::bail!("only a thread's agent asks for permissions");
         }
         let caller = ask.caller.id();
         if let Some(waiter) = self.retried(&ask).await? {
@@ -551,7 +564,9 @@ impl Requests {
             (Keep::Conversation, _) => {
                 let scope = EphemeralScope {
                     topic: row.topic.clone(),
-                    asker: row.caller.clone(),
+                    // As the asker's calls name it now: a row from before threads says
+                    // `assistant`, the main thread's agent.
+                    asker: Caller::parse(&row.caller).id(),
                 };
                 let (reference, expires_at) = store
                     .ephemeral
@@ -855,7 +870,7 @@ impl Requests {
 }
 
 /// Whether `ask` retries the request `row`: the same caller and id (already matched), the same
-/// card for the same user in the same stream, not cancelled, and for the assistant the same
+/// card for the same user in the same stream, not cancelled, and for a thread's agent the same
 /// turn, for anyone else while the request is pending or within its timeout. Callers share
 /// ids across turns and outside clients share a name, so the id alone proves nothing.
 fn retries(ask: &Ask, row: &requests::Model, now: chrono::DateTime<Utc>) -> bool {
@@ -865,7 +880,7 @@ fn retries(ask: &Ask, row: &requests::Model, now: chrono::DateTime<Utc>) -> bool
         && row.admin_only == ask.admin_only
         && serde_json::from_value::<Card>(row.card.clone()).is_ok_and(|card| card == ask.card);
     let still_current = match ask.caller {
-        Caller::Assistant => {
+        Caller::Thread(_) => {
             ask.turn.is_some() && row.turn == ask.turn.and_then(|turn| i64::try_from(turn).ok())
         }
         Caller::Mcp(_) | Caller::Source(_) => {
@@ -927,6 +942,7 @@ fn failed(error: anyhow::Error) -> Refusal {
 #[cfg(test)]
 mod tests {
     use super::Caller;
+    use fronde_protocol::ThreadId;
 
     #[test]
     fn a_client_named_like_the_assistant_stays_a_client() {
@@ -935,7 +951,12 @@ mod tests {
             assert_eq!(Caller::parse(&caller.id()), caller, "{name}");
             assert_eq!(caller.from(), Some(name));
         }
-        assert_eq!(Caller::parse("assistant"), Caller::Assistant);
-        assert_eq!(Caller::Assistant.from(), None);
+        assert_eq!(Caller::parse("assistant"), Caller::Thread(ThreadId::MAIN));
+        assert_eq!(Caller::Thread(ThreadId::MAIN).from(), None);
+        for id in [1, 2, 42] {
+            let caller = Caller::Thread(ThreadId(id));
+            assert_eq!(caller.id(), format!("thread:{id}"));
+            assert_eq!(Caller::parse(&caller.id()), caller);
+        }
     }
 }

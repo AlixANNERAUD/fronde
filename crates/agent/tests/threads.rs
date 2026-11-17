@@ -17,9 +17,11 @@ const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
 
 fn spec() -> AgentSpec {
     AgentSpec {
+        thread: fronde_protocol::ThreadId::MAIN,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: "/srv/fronde/agent".into(),
+        home: "/srv/fronde/home".into(),
         hub_url: "http://127.0.0.1:7878/mcp".into(),
         hub_token: "hub-token".into(),
         oauth_token: None,

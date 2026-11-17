@@ -17,8 +17,10 @@ and, separately, a key file.
 | `fronde.lock` | Locked by `fronde serve` while it runs, and by `fronde secret rotate-key` and `move-key`, so that none of them runs beside another on this data directory; it holds the process id and command of the last one. The system releases the lock when the process ends, crash included; deleting the file while nothing runs is harmless. |
 | `master-key.lock` | An empty file that two `fronde secret set` commands storing a first secret at once lock in turn, so that they make one master key. It holds nothing; deleting it while no command runs is harmless. |
 | `*.imported` | Files an earlier version kept the conversation in, once imported into the database (see below). Fronde no longer reads them: keep them as a backup or delete them. |
-| `agent/` | The agent's working directory. It starts empty. |
-| `home/` | The agent's home (`HOME`): Claude's sign-in and settings (`.claude.json`, `.claude/`), its sessions' transcripts, and `tmp/`, its `TMPDIR`. Your own `~/.claude` is never used. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
+| `agent/` | The main thread's agent's working directory. It starts empty. |
+| `home/` | The main thread's agent's home (`HOME`): Claude's sign-in and settings (`.claude.json`, `.claude/`), its sessions' transcripts, and `tmp/`, its `TMPDIR`. Your own `~/.claude` is never used. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
+| `threads/<id>/work/` | Thread `<id>`'s agent's working directory, for every thread but the main one. Created private (0700) when that thread's agent first starts. |
+| `threads/<id>/home/` | Thread `<id>`'s agent's home, with its `tmp/`: its own Claude settings and transcripts, never another thread's. It starts empty, so the agent signs in with `[agent] oauth_token` only. |
 
 Earlier versions kept the memory's search index in `index.sqlite`: Fronde deletes it at start.
 
@@ -27,8 +29,10 @@ parent if another thread started it, the id of its agent session, resumed after 
 the agent allows it, and when it was archived) and a stream of numbered entries, with the log id
 pages use to notice a new conversation. The chat is thread 1, over the stream `conversation`.
 Earlier versions kept the agent's session id apart, in a key-value row: the first start of this
-version moves it to thread 1's row. A directory per thread, `threads/<id>/` with its own working
-directory and home, is planned.
+version moves it to thread 1's row. Each thread's agent works in a directory of its own and has
+a home of its own: `agent/` and `home/` for the main thread, as before threads, and
+`threads/<id>/work/` and `threads/<id>/home/` for the others. Its sandbox lets it read and write
+those two and no other thread's (see [Security](../explanation/security.md#threads)).
 
 Earlier versions also kept the conversation in `conversation.jsonl` and the agent's session id in
 `agent.session` (`jarvis.jsonl` and `jarvis.session` before that). When the database has no

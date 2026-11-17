@@ -17,13 +17,13 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use fronde_agent::acp::AgentSpec;
-use fronde_agent::assistant::{Assistant, Connector, confined_connector};
+use fronde_agent::assistant::{Connector, confined_connector};
 use fronde_agent::confine::{
-    CONNECT_PORTS, Confine, GrantRequest, KEEP_ENV, Policy, SYSTEM_READ, Sandbox, Support, grants,
-    url_port,
+    CONNECT_PORTS, Confine, GrantRequest, KEEP_ENV, Policy, SYSTEM_READ, Sandbox, Support,
+    canonical_paths, grants, url_port, write_grant,
 };
 use fronde_agent::scope::{Limits, SLICE, Scope};
-use fronde_agent::threads::Threads;
+use fronde_agent::threads::{ThreadId, Threads, thread_dirs};
 use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
@@ -120,11 +120,11 @@ pub(crate) fn same_secret(given: &[u8], expected: &SecretString) -> bool {
     bool::from(given.as_slice().ct_eq(expected.as_slice()))
 }
 
-/// The tokens `/mcp` accepts: `server.token`, for outside clients, and the assistant's own,
-/// which tells the hub that a call comes from Fronde's assistant and from which turn.
+/// The tokens `/mcp` accepts: `server.token`, for outside clients, and the token of each running
+/// agent process, which tells the hub which thread calls and from which turn.
 struct Gate {
     token: SecretString,
-    assistant: Option<(SecretString, Arc<Assistant>)>,
+    threads: Option<Arc<Threads>>,
 }
 
 async fn require_token(
@@ -138,15 +138,21 @@ async fn require_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
-    // Both compared, so the time taken does not tell which token was close.
+    // Both looked up, so the time taken does not tell which kind of token was close. Each
+    // comparison is constant-time: `same_secret` here, and the agents' tokens' digests in
+    // `Tokens::lookup`.
     let outside = same_secret(given.as_bytes(), &gate.token);
-    let assistant = gate
-        .assistant
-        .as_ref()
-        .filter(|(token, _)| same_secret(given.as_bytes(), token));
-    let caller = match (outside, assistant) {
-        (_, Some((_, assistant))) => McpCaller::Assistant {
-            turn: assistant.current_turn().await,
+    let holder = match &gate.threads {
+        Some(threads) => threads.holder(given.as_bytes()).await,
+        None => None,
+    };
+    // The token alone names the thread: nothing else in the request (headers, arguments,
+    // `clientInfo`, `_meta`) is read for it.
+    let caller = match (outside, holder) {
+        (_, Some(holder)) => McpCaller::Thread {
+            id: holder.thread,
+            topic: holder.topic,
+            turn: holder.turn,
         },
         (true, None) => McpCaller::Outside,
         (false, None) => return Err(StatusCode::UNAUTHORIZED),
@@ -156,12 +162,9 @@ async fn require_token(
     Ok(next.run(req).await)
 }
 
-/// `/health` and `/mcp`. `assistant`: the assistant and the token it holds, when the chat runs.
-pub fn router(
-    hub: Arc<Hub>,
-    token: SecretString,
-    assistant: Option<(SecretString, Arc<Assistant>)>,
-) -> Router {
+/// `/health` and `/mcp`. `threads`: the threads whose agents' tokens `/mcp` accepts, when the
+/// chat runs.
+pub fn router(hub: Arc<Hub>, token: SecretString, threads: Option<Arc<Threads>>) -> Router {
     // Host checks are off: every /mcp request must carry the token, which a rebinding page cannot know.
     let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
     let mcp = StreamableHttpService::new(
@@ -173,7 +176,7 @@ pub fn router(
         .nest_service("/mcp", mcp)
         // Only /mcp: unknown paths stay 404 and other routers can be merged in.
         .route_layer(middleware::from_fn_with_state(
-            Arc::new(Gate { token, assistant }),
+            Arc::new(Gate { token, threads }),
             require_token,
         ));
     Router::new()
@@ -372,21 +375,30 @@ pub async fn start_with_helper(
     start_with(config, connector, &site_root()).await
 }
 
-/// How the agent is started through `helper`, the `fronde` binary: in `<data>/agent`, with its
-/// own home `<data>/home` (and `TMPDIR` in it), created here, and only the variables it needs
-/// from Fronde's environment, never a `{ env }` secret's. With `[agent] sandbox`, Landlock keeps
-/// it to the system's directories, its program's and its own two, and to the TCP ports it needs,
-/// and a seccomp filter keeps it from Unix sockets.
+/// How agents are started through `helper`, the `fronde` binary: each in its thread's
+/// directories ([`thread_dirs`]: the main thread's `<data>/agent` and `<data>/home`, created
+/// here, another thread's `<data>/threads/<id>/`, created when its agent first starts), with
+/// `HOME` and `TMPDIR` there, and only the variables it needs from Fronde's environment, never a
+/// `{ env }` secret's. With `[agent] sandbox`, Landlock keeps it to the system's directories, its
+/// program's and its own thread's two, and to the TCP ports it needs, and a seccomp filter keeps
+/// it from Unix sockets.
 pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> {
     let data = &config.data.dir;
     fronde_hub::private::prepare_data_dir(data)?;
-    let home = data.join("home");
-    for dir in [data.join("agent"), home.clone(), home.join("tmp")] {
+    let main = thread_dirs(data, ThreadId::MAIN);
+    for dir in [main.work.clone(), main.home.clone(), main.home.join("tmp")] {
         fronde_hub::private::create_dir_all(&dir)
             .with_context(|| format!("cannot create the agent's directory {}", dir.display()))?;
     }
+    let protected = canonical_paths(&protected_paths(config));
     let sandbox = if config.agent.sandbox {
-        Some(agent_sandbox(config, &[data.join("agent"), home.clone()])?)
+        // Each agent's own directories are added, and checked as every grant is, when it
+        // starts; the main thread's are checked here too, so that a bad data directory stops
+        // Fronde at start.
+        for dir in [&main.work, &main.home] {
+            write_grant(dir, &protected)?;
+        }
+        Some(agent_sandbox(config, &[])?)
     } else {
         tracing::warn!(
             "[agent] sandbox = false: the agent runs unconfined, with access to every file your \
@@ -396,13 +408,13 @@ pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> 
     };
     Ok(Confine {
         helper: helper.to_path_buf(),
-        home,
         policy: Policy {
-            cwd: data.join("agent"),
+            cwd: main.work,
             keep_env: KEEP_ENV.map(str::to_owned).to_vec(),
             drop_env: config.secret_env_names(),
             sandbox,
         },
+        protected,
         // `start` adds it: whether systemd-run is there is the machine's, not the configuration's.
         scope: None,
     })
@@ -675,18 +687,23 @@ pub async fn start_with(
     // The chat's assistant and its requests come first: the hub's tools ask through them.
     let chat = match password {
         Some((password, secure_cookie)) => {
-            let cwd = data_dir.join("agent");
-            fronde_hub::private::create_dir_all(&cwd)
-                .with_context(|| format!("cannot create the agent dir {}", cwd.display()))?;
-            // The assistant's own token, made at each start and only ever in memory: the hub
-            // tells its calls from outside clients' by it.
-            let assistant_token = SecretString::from(init::random_token()?);
+            let main = thread_dirs(&data_dir, ThreadId::MAIN);
+            for dir in [&main.work, &main.home] {
+                fronde_hub::private::create_dir_all(dir).with_context(|| {
+                    format!("cannot create the agent's directory {}", dir.display())
+                })?;
+            }
+            // The main thread's agent; another thread's has its own directories. Each start of
+            // an agent process gets its own hub token from the threads, only ever in memory and
+            // in that process's environment: the hub tells a thread's calls by it.
             let spec = AgentSpec {
+                thread: ThreadId::MAIN,
                 command: agent.command,
                 env: agent.env.into_iter().collect(),
-                cwd,
+                cwd: main.work,
+                home: main.home,
                 hub_url: format!("http://{}/mcp", reachable(addr)),
-                hub_token: assistant_token.clone(),
+                hub_token: SecretString::from(String::new()),
                 oauth_token: agent
                     .oauth_token
                     .map(|token| agent_oauth_token(token, db.clone(), backends.clone())),
@@ -702,17 +719,15 @@ pub async fn start_with(
             let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
             let requests = Requests::open_with(db.clone(), threads.clone(), Some(secrets)).await?;
             threads.set_requests(&requests).await;
-            Some((threads, assistant_token, requests, password, secure_cookie))
+            Some((threads, requests, password, secure_cookie))
         }
         None => None,
     };
-    let requests = chat.as_ref().map(|(_, _, requests, ..)| requests.clone());
+    let requests = chat.as_ref().map(|(_, requests, ..)| requests.clone());
     let hub = Arc::new(Hub::start(config, db.clone(), components, requests).await?);
-    let own = chat
-        .as_ref()
-        .map(|(threads, token, ..)| (token.clone(), threads.main()));
-    let mut app = router(hub, token, own);
-    if let Some((threads, _, requests, password, secure_cookie)) = chat {
+    let threads = chat.as_ref().map(|(threads, ..)| threads.clone());
+    let mut app = router(hub, token, threads);
+    if let Some((threads, requests, password, secure_cookie)) = chat {
         app = app.merge(web::router(
             web::Web {
                 threads,

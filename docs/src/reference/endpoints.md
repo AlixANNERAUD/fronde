@@ -5,7 +5,7 @@
 | Method and path | Answer |
 | --- | --- |
 | `GET /health` | `200 ok`. No authentication. |
-| `/mcp` | The hub's MCP server, over Streamable HTTP. Requires `Authorization: Bearer <token>`, else `401`. |
+| `/mcp` | The hub's MCP server, over Streamable HTTP. Requires `Authorization: Bearer <token>`, else `401`: `server.token`, or the token Fronde gives one of its agent processes, which names that agent's thread and is refused once the process is gone. |
 
 `/mcp` does not check the `Host` header: every request must carry the token, which a page on
 another site cannot know.

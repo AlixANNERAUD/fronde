@@ -467,6 +467,167 @@ async fn assistant_token_never_appears() {
     );
 }
 
+/// Every thread's agent process gets its own `/mcp` token, and none is ever logged: not when it
+/// is made, not when the agent gets it, not when it calls the hub, not when it is revoked and
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_threads_token_never_appears() {
+    use fronde_agent::acp::{AgentClient, AgentSpec};
+    use fronde_agent::assistant::Connector;
+    use fronde_agent::fake::{FakeScript, fake_agent};
+    use fronde_agent::threads::{StartedBy, ThreadId, Threads, thread_dirs};
+    use secrecy::{ExposeSecret as _, SecretString};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    const WAIT: Duration = Duration::from_secs(10);
+    let _serial = SERIAL.lock().await;
+    let scanner = capture();
+    *scanner.0.lock().unwrap() = Scan {
+        secrets: vec![MCP_CANARY.to_owned()],
+        wanted: vec!["memory_search".to_string()],
+        keep: true,
+        ..Scan::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config: Config = toml::from_str(&format!(
+        "[server]\ntoken = {{ env = \"UNUSED\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+         [memory]\ngit = false\n[secrets]\nbackend = \"file\"\nmaster_key = {{ file = {:?} }}\n",
+        data.display().to_string(),
+        dir.path().join("master.key").display().to_string(),
+    ))
+    .unwrap();
+    fronde_hub::private::prepare_data_dir(&data).unwrap();
+    let db = fronde_db::open(&data).await.unwrap();
+    let starts: Arc<Mutex<Vec<(ThreadId, String)>>> = Arc::default();
+    let connector: Connector = Arc::new({
+        let starts = starts.clone();
+        move |spec: &AgentSpec, resume, events| {
+            starts
+                .lock()
+                .unwrap()
+                .push((spec.thread, spec.hub_token.expose_secret().to_owned()));
+            let spec = spec.clone();
+            Box::pin(async move {
+                let (transport, _handle) = fake_agent(FakeScript::default());
+                AgentClient::connect(transport, &spec, resume, events).await
+            })
+        }
+    });
+    let main = thread_dirs(&data, ThreadId::MAIN);
+    let spec = AgentSpec {
+        thread: ThreadId::MAIN,
+        command: vec!["claude-agent-acp".into()],
+        env: Vec::new(),
+        cwd: main.work,
+        home: main.home,
+        hub_url: "http://127.0.0.1:1/mcp".into(),
+        hub_token: SecretString::from(String::new()),
+        oauth_token: None,
+        system_prompt: String::new(),
+        builtin_tools: Vec::new(),
+    };
+    let owner = fronde_requests::User {
+        name: "alix".into(),
+        admin: true,
+    };
+    let threads = Threads::open(db.clone(), &data, spec, connector, owner)
+        .await
+        .unwrap();
+    let requests = fronde_requests::Requests::open(db.clone(), threads.clone())
+        .await
+        .unwrap();
+    threads.set_requests(&requests).await;
+    let hub = fronde_hub::Hub::start(config, db, vec![], Some(requests))
+        .await
+        .unwrap();
+    let app = fronde::router(
+        Arc::new(hub),
+        SecretString::from(MCP_CANARY),
+        Some(threads.clone()),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Two threads' agents start, each with its token, and call the hub with it.
+    let second = threads
+        .create("alix", StartedBy::User, None, "Une autre")
+        .await
+        .unwrap()
+        .id;
+    for id in [ThreadId::MAIN, second] {
+        let assistant = threads.assistant(id).await.unwrap().unwrap();
+        assistant.send("Salut".into()).await;
+    }
+    let tokens = timeout(WAIT, async {
+        loop {
+            let tokens = starts.lock().unwrap().clone();
+            if tokens.len() == 2 {
+                return tokens;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for (_, token) in &tokens {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+                .auth_header(token.clone()),
+        );
+        let client = ().serve(transport).await.unwrap();
+        let search = json!({"query": "chat"}).as_object().unwrap().clone();
+        let result = client
+            .call_tool(CallToolRequestParams::new("memory_search").with_arguments(search))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    }
+    // Thread 2's agent stops: its token is revoked, and refused.
+    let assistant = threads.assistant(second).await.unwrap().unwrap();
+    timeout(WAIT, async {
+        while !assistant.stop_agent().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, revoked) = tokens.iter().find(|(id, _)| *id == second).unwrap();
+    let refused = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", format!("Bearer {revoked}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+    server.abort();
+
+    let scan = std::mem::take(&mut *scanner.0.lock().unwrap());
+    assert!(scan.lines > 0, "nothing was captured");
+    assert!(scan.leaked.is_empty(), "{:#?}", scan.leaked);
+    for want in &scan.wanted {
+        assert!(scan.seen.contains(want), "{want} is not in the log");
+    }
+    for (id, token) in &tokens {
+        let leaks: Vec<&String> = scan
+            .kept
+            .iter()
+            .filter(|line| line.contains(token.as_str()))
+            .take(4)
+            .collect();
+        assert!(
+            leaks.is_empty(),
+            "thread {id}'s token is in the log: {leaks:#?}"
+        );
+    }
+}
+
 /// A secret typed in a card goes from the page to the store and nowhere else: not to the log
 /// (at TRACE, every crate), not to the conversation stream or any message the pages get, not to
 /// the request's row or any file of the data directory, not to the tool's result. A malformed

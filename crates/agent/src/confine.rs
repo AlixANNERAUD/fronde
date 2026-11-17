@@ -13,9 +13,6 @@ use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-/// The thread whose agent this is, until each thread has its own: the single chat.
-const MAIN_THREAD: i64 = 1;
-
 /// The subcommand of the `fronde` binary that runs [`run_helper`].
 pub const SUBCOMMAND: &str = "__confine";
 
@@ -118,15 +115,18 @@ impl Policy {
     }
 }
 
-/// How Fronde starts its agent through the helper.
+/// How Fronde starts its agents through the helper, whichever thread each works for.
 #[derive(Clone, Debug)]
 pub struct Confine {
     /// The `fronde` binary.
     pub helper: PathBuf,
-    /// The agent's own home, `<data>/home`; its `tmp` is the agent's `TMPDIR`.
-    pub home: PathBuf,
-    /// Everything but what the spec gives: its directory, its variables and the hub's port.
+    /// Everything but what the spec gives: its directories, its variables and the hub's port.
+    /// The sandbox's write grants hold no agent's directory: each agent gets its own two, its
+    /// thread's, from its spec, so that it reaches no other thread's.
     pub policy: Policy,
+    /// What no grant may equal or contain, as [`GrantRequest::protected`]: the spec's
+    /// directories are checked against it as every other grant is.
+    pub protected: Vec<PathBuf>,
     /// The systemd scope that caps the agent's resources, when `systemd-run` is there; whether
     /// the user manager answers is checked at each start ([`Confine::ready`]).
     pub scope: Option<Scope>,
@@ -194,13 +194,19 @@ impl Confine {
             .iter()
             .cloned()
             .chain([
-                ("HOME".to_owned(), path_string(&self.home)?),
-                ("TMPDIR".to_owned(), path_string(&self.home.join("tmp"))?),
+                ("HOME".to_owned(), path_string(&spec.home)?),
+                ("TMPDIR".to_owned(), path_string(&spec.home.join("tmp"))?),
             ])
             .chain(secrets)
             .collect();
         let mut policy = self.policy.clone();
         policy.cwd = spec.cwd.clone();
+        // The agent writes its thread's directories, and no other thread's.
+        if let Some(sandbox) = &mut policy.sandbox {
+            for dir in [&spec.cwd, &spec.home] {
+                push(&mut sandbox.write, write_grant(dir, &self.protected)?);
+            }
+        }
         for (name, _) in &env {
             if !policy.keep_env.contains(name) {
                 policy.keep_env.push(name.clone());
@@ -254,7 +260,7 @@ impl Confine {
             });
         };
         // `systemd-run --scope` puts itself in the scope and `exec`s the helper.
-        let unit = scope.new_unit(MAIN_THREAD);
+        let unit = scope.new_unit(spec.thread.0);
         let mut run_args = scope.args(Some(&unit));
         run_args.push(path_string(&self.helper)?);
         run_args.extend(helper_args);
@@ -443,7 +449,8 @@ pub struct GrantRequest<'a> {
     pub program: &'a str,
     /// `[agent] read`.
     pub extra: &'a [PathBuf],
-    /// The agent's directories: `<data>/agent` and `<data>/home`.
+    /// Directories the agent writes besides its thread's, which [`Confine::command_with`] adds
+    /// from its spec: none in Fronde, which grants every agent only its own thread's.
     pub write: &'a [PathBuf],
     /// What no grant may equal or contain: the data directory, the configuration's directory,
     /// the master key, secret files, the memory.
@@ -551,20 +558,31 @@ pub fn grants(request: &GrantRequest<'_>) -> anyhow::Result<Grants> {
         .map(PathBuf::as_path)
         .chain(DEVICES_WRITE.map(Path::new))
     {
-        let canonical = dir
-            .canonicalize()
-            .with_context(|| format!("cannot find the agent's directory {}", dir.display()))?;
-        if let Some(p) = covering(&canonical) {
-            bail!(
-                "the agent may write {}, which holds {}: keep Fronde's configuration and secrets \
-                 out of the data directory's agent/ and home/",
-                canonical.display(),
-                p.display()
-            );
-        }
-        push(&mut grants.write, canonical);
+        push(&mut grants.write, write_grant(dir, &protected)?);
     }
     Ok(grants)
+}
+
+/// `dir` as a write grant: canonical, so that a symbolic link cannot hide what it points to, and
+/// holding none of the `protected` paths, which must be canonical.
+pub fn write_grant(dir: &Path, protected: &[PathBuf]) -> anyhow::Result<PathBuf> {
+    let canonical = dir
+        .canonicalize()
+        .with_context(|| format!("cannot find the agent's directory {}", dir.display()))?;
+    if let Some(p) = protected.iter().find(|p| p.starts_with(&canonical)) {
+        bail!(
+            "the agent may write {}, which holds {}: keep Fronde's configuration and secrets \
+             out of the data directory's agent/, home/ and threads/",
+            canonical.display(),
+            p.display()
+        );
+    }
+    Ok(canonical)
+}
+
+/// `paths` resolved as [`grants`] resolves protected paths, for [`Confine::protected`].
+pub fn canonical_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths.iter().map(|p| canonical(p)).collect()
 }
 
 fn push(list: &mut Vec<PathBuf>, path: PathBuf) {
@@ -925,13 +943,25 @@ mod seccomp_rules {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fronde_protocol::ThreadId;
     use secrecy::SecretString;
 
-    fn spec(env: Vec<(String, String)>) -> AgentSpec {
+    /// A data directory with the main thread's directories, `agent` and `home`.
+    fn data() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["agent", "home"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+        }
+        dir
+    }
+
+    fn spec(data: &tempfile::TempDir, env: Vec<(String, String)>) -> AgentSpec {
         AgentSpec {
+            thread: ThreadId::MAIN,
             command: vec!["claude-agent-acp".into(), "--flag".into()],
             env,
-            cwd: PathBuf::from("/data/agent"),
+            cwd: data.path().join("agent"),
+            home: data.path().join("home"),
             hub_url: "http://127.0.0.1:8484/mcp".into(),
             hub_token: SecretString::from("token-value-never-on-the-command-line"),
             oauth_token: None,
@@ -943,17 +973,17 @@ mod tests {
     fn confine(sandbox: bool) -> Confine {
         Confine {
             helper: PathBuf::from("/usr/bin/fronde"),
-            home: PathBuf::from("/data/home"),
             policy: Policy {
                 cwd: PathBuf::new(),
                 keep_env: KEEP_ENV.map(str::to_owned).to_vec(),
                 drop_env: vec!["SERVER_TOKEN".into(), "SHARED".into()],
                 sandbox: sandbox.then(|| Sandbox {
                     read: vec!["/usr".into()],
-                    write: vec!["/data/agent".into()],
+                    write: vec!["/dev/null".into()],
                     connect_ports: CONNECT_PORTS.to_vec(),
                 }),
             },
+            protected: Vec::new(),
             scope: None,
         }
     }
@@ -961,10 +991,14 @@ mod tests {
     #[test]
     fn policy_holds_no_values() {
         let value = "a-value-only-the-environment-holds";
-        let spec = spec(vec![
-            ("FOO".into(), value.into()),
-            ("CLAUDE_CODE_OAUTH_TOKEN".into(), value.into()),
-        ]);
+        let data = data();
+        let spec = spec(
+            &data,
+            vec![
+                ("FOO".into(), value.into()),
+                ("CLAUDE_CODE_OAUTH_TOKEN".into(), value.into()),
+            ],
+        );
         let command = confine(true).command(&spec).unwrap();
         let line = command.args.join(" ");
         assert!(!line.contains(value), "{line}");
@@ -998,7 +1032,10 @@ mod tests {
                 "oauth-secret-value".to_owned(),
             ),
         ];
-        let command = confine.command_with(&spec(Vec::new()), secrets).unwrap();
+        let data = data();
+        let command = confine
+            .command_with(&spec(&data, Vec::new()), secrets)
+            .unwrap();
         let line = command.args.join(" ");
         assert!(!line.contains("secret-value"), "{line}");
         for (name, value) in [
@@ -1012,8 +1049,9 @@ mod tests {
 
     #[test]
     fn helper_command_runs_the_agent_through_the_helper() {
+        let data = data();
         let command = confine(true)
-            .command(&spec(vec![("SHARED".into(), "set".into())]))
+            .command(&spec(&data, vec![("SHARED".into(), "set".into())]))
             .unwrap();
         assert_eq!(command.program, PathBuf::from("/usr/bin/fronde"));
         let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
@@ -1021,7 +1059,7 @@ mod tests {
         assert_eq!(args[1], "--policy");
         assert_eq!(&args[3..], ["--", "claude-agent-acp", "--flag"]);
         let policy = Policy::from_arg(args[2]).unwrap();
-        assert_eq!(policy.cwd, PathBuf::from("/data/agent"));
+        assert_eq!(policy.cwd, data.path().join("agent"));
         assert_eq!(
             policy.sandbox.as_ref().unwrap().connect_ports,
             [443, 53, 8484],
@@ -1035,14 +1073,76 @@ mod tests {
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
-        assert!(env.contains(&("HOME", "/data/home")));
-        assert!(env.contains(&("TMPDIR", "/data/home/tmp")));
+        let home = data.path().join("home");
+        let tmp = home.join("tmp");
+        assert!(env.contains(&("HOME", home.to_str().unwrap())));
+        assert!(env.contains(&("TMPDIR", tmp.to_str().unwrap())));
+    }
+
+    #[test]
+    fn each_thread_writes_only_its_own_directories() {
+        let data = data();
+        let mut confine = confine(true);
+        let second = data.path().join("threads/2");
+        for sub in ["work", "home"] {
+            std::fs::create_dir_all(second.join(sub)).unwrap();
+        }
+        let main = spec(&data, Vec::new());
+        let thread = AgentSpec {
+            thread: ThreadId(2),
+            cwd: second.join("work"),
+            home: second.join("home"),
+            ..spec(&data, Vec::new())
+        };
+        let grants = |spec: &AgentSpec, confine: &Confine| {
+            confine.command(spec).map(|command| {
+                let env = command.env.clone();
+                (command.policy.sandbox.unwrap().write, env)
+            })
+        };
+        let canonical = |path: PathBuf| path.canonicalize().unwrap();
+        let (write, env) = grants(&thread, &confine).unwrap();
+        assert_eq!(
+            write,
+            [
+                PathBuf::from("/dev/null"),
+                canonical(second.join("work")),
+                canonical(second.join("home")),
+            ]
+        );
+        let home = second.join("home").display().to_string();
+        assert!(env.contains(&("HOME".to_owned(), home.clone())), "{env:?}");
+        assert!(env.contains(&("TMPDIR".to_owned(), format!("{home}/tmp"))));
+        // The main thread keeps `agent` and `home`, and gets nothing of thread 2's.
+        let (write, _) = grants(&main, &confine).unwrap();
+        assert_eq!(
+            write,
+            [
+                PathBuf::from("/dev/null"),
+                canonical(data.path().join("agent")),
+                canonical(data.path().join("home")),
+            ]
+        );
+        // A thread's directory that holds a protected path, or that is missing, is refused.
+        confine.protected = vec![canonical(second.join("home")).join("fronde.toml")];
+        let error = grants(&thread, &confine).unwrap_err().to_string();
+        assert!(error.contains("fronde.toml"), "{error}");
+        confine.protected = Vec::new();
+        let missing = AgentSpec {
+            home: data.path().join("threads/3/home"),
+            ..thread.clone()
+        };
+        assert!(grants(&missing, &confine).is_err());
+        // Unconfined, no grant is checked: there is no sandbox to grant anything in.
+        confine.policy.sandbox = None;
+        assert!(confine.command(&missing).is_ok());
     }
 
     #[test]
     fn helper_command_runs_through_the_scope() {
         let mut confine = confine(true);
-        let spec = spec(Vec::new());
+        let data = data();
+        let spec = spec(&data, Vec::new());
         let plain = confine.command(&spec).unwrap();
         assert!(plain.unit.is_none());
         confine.scope = Some(Scope {
@@ -1057,6 +1157,13 @@ mod tests {
         let command = confine.command(&spec).unwrap();
         assert_eq!(command.program, PathBuf::from("/usr/bin/systemd-run"));
         let unit = command.unit.clone().unwrap();
+        assert!(unit.starts_with("fronde-agent-0123abcd-t1-"), "{unit}");
+        let other = AgentSpec {
+            thread: ThreadId(7),
+            ..spec.clone()
+        };
+        let other = confine.command(&other).unwrap().unit.unwrap();
+        assert!(other.starts_with("fronde-agent-0123abcd-t7-"), "{other}");
         let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
         let dash = args.iter().position(|a| *a == "--").unwrap();
         assert_eq!(
@@ -1348,7 +1455,8 @@ mod tests {
 
     #[test]
     fn helper_command_blanks_what_the_agent_does_not_keep() {
-        let command = confine(true).command(&spec(Vec::new())).unwrap();
+        let data = data();
+        let command = confine(true).command(&spec(&data, Vec::new())).unwrap();
         let mut blanked = 0;
         for (name, _) in std::env::vars_os() {
             let Some(name) = name.to_str() else { continue };

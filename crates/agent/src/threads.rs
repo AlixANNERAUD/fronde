@@ -4,9 +4,13 @@
 //!
 //! [`Threads`] is the registry: it makes sure thread 1 exists, opens each thread's [`Assistant`]
 //! when it is first needed, and shows every request in the stream of the thread it was asked in.
+//!
+//! Each thread's agent has its own directories ([`ThreadDirs`]), which its sandbox lets it write,
+//! and no other thread's; and each start of an agent process its own hub token ([`Tokens`]),
+//! by which the hub knows the thread, revoked when Fronde lets the process go.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{Context, bail};
@@ -28,6 +32,7 @@ use crate::acp::AgentSpec;
 use crate::assistant::{self, Assistant, Connector, TOPIC};
 use crate::legacy;
 use crate::log::{Event, new_log_id, new_stream};
+use crate::tokens::Tokens;
 
 /// Where the agent's session id was kept before threads: the key-value table's scope and key.
 /// Read once, then moved to thread 1's row.
@@ -128,11 +133,49 @@ pub fn topic_of(id: ThreadId) -> String {
     }
 }
 
+/// A thread's agent's directories: its working directory and its home (with its `TMPDIR`,
+/// `tmp`). The only ones of the data directory its sandbox lets it read and write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadDirs {
+    pub work: PathBuf,
+    pub home: PathBuf,
+}
+
+/// Thread `id`'s directories in `data_dir`: `agent` and `home` for the main thread, as before
+/// threads; `threads/<id>/work` and `threads/<id>/home` for the others.
+pub fn thread_dirs(data_dir: &Path, id: ThreadId) -> ThreadDirs {
+    if id == ThreadId::MAIN {
+        return ThreadDirs {
+            work: data_dir.join("agent"),
+            home: data_dir.join("home"),
+        };
+    }
+    let thread = data_dir.join("threads").join(id.to_string());
+    ThreadDirs {
+        work: thread.join("work"),
+        home: thread.join("home"),
+    }
+}
+
+/// Which thread's agent holds a hub token, as the hub's gate needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holder {
+    pub thread: ThreadId,
+    /// The thread's stream.
+    pub topic: String,
+    /// The seq of the thread's running turn's user message.
+    pub turn: Option<u64>,
+}
+
 /// Every thread, and the [`Assistant`] of each thread opened so far.
 pub struct Threads {
     db: DatabaseConnection,
+    data_dir: PathBuf,
+    /// The main thread's agent spec; another thread's differs by its directories.
     spec: AgentSpec,
     connector: Connector,
+    /// The live hub tokens of every thread's agent processes.
+    tokens: Tokens,
     /// The user the threads are for: the owner, the one user so far.
     owner: User,
     main: Arc<Assistant>,
@@ -149,7 +192,8 @@ impl Threads {
     /// `data_dir` before the database, then makes sure the main thread exists, moving the
     /// agent's session id there from the key-value table. Other threads open when first needed,
     /// or now if a stop left their last turn open, so that it is closed. Every thread's agent
-    /// is started from `spec` by `connector`, on its first message.
+    /// is started by `connector`, on its first message: the main thread's from `spec`, another
+    /// thread's from `spec` with that thread's [`thread_dirs`].
     pub async fn open(
         db: DatabaseConnection,
         data_dir: &Path,
@@ -161,19 +205,27 @@ impl Threads {
         ensure_main(&db, &owner.name)
             .await
             .context("cannot make the main thread in the database")?;
+        let spec = AgentSpec {
+            thread: ThreadId::MAIN,
+            ..spec
+        };
+        let tokens = Tokens::new();
         let main = Assistant::open(
             ThreadId::MAIN,
             TOPIC.into(),
             spec.clone(),
             db.clone(),
             connector.clone(),
+            tokens.clone(),
             false,
         )
         .await?;
         let threads = Arc::new(Self {
             db,
+            data_dir: data_dir.to_path_buf(),
             spec,
             connector,
+            tokens,
             owner,
             open: tokio::sync::Mutex::new(HashMap::from([(ThreadId::MAIN, main.clone())])),
             main,
@@ -228,9 +280,10 @@ impl Threads {
         let assistant = Assistant::open(
             id,
             row.topic,
-            self.spec.clone(),
+            self.spec_for(id),
             self.db.clone(),
             self.connector.clone(),
+            self.tokens.clone(),
             row.archived_at.is_some(),
         )
         .await?;
@@ -239,6 +292,40 @@ impl Threads {
         }
         open.insert(id, assistant.clone());
         Ok(Some(assistant))
+    }
+
+    /// How thread `id`'s agent starts: the main thread's spec, with another thread's own
+    /// directories and scope name.
+    fn spec_for(&self, id: ThreadId) -> AgentSpec {
+        if id == ThreadId::MAIN {
+            return self.spec.clone();
+        }
+        let ThreadDirs { work, home } = thread_dirs(&self.data_dir, id);
+        AgentSpec {
+            thread: id,
+            cwd: work,
+            home,
+            ..self.spec.clone()
+        }
+    }
+
+    /// The thread whose agent process holds the hub token `given`, with its stream and running
+    /// turn; `None` for any other value, a revoked token's among them. The token is the only
+    /// thing that names a thread to the hub.
+    pub async fn holder(&self, given: &[u8]) -> Option<Holder> {
+        let thread = self.tokens.lookup(given)?;
+        // A live token's agent runs, so its thread is open.
+        let assistant = self.open.lock().await.get(&thread).cloned()?;
+        Some(Holder {
+            thread,
+            topic: assistant.topic().to_owned(),
+            turn: assistant.current_turn().await,
+        })
+    }
+
+    /// The live hub tokens of the threads' agent processes.
+    pub fn tokens(&self) -> &Tokens {
+        &self.tokens
     }
 
     /// The assistant of the thread over the stream `topic`.

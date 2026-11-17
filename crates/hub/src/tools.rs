@@ -83,11 +83,23 @@ pub struct CallContext {
     pub user: String,
     /// The stream where that user sees what the call asks.
     pub topic: String,
-    /// The seq of the user message of the turn calling, for Fronde's assistant.
+    /// The seq of the user message of the turn calling, for a thread's agent.
     pub turn: Option<u64>,
     /// Cancelled when the caller gives the call up (MCP `notifications/cancelled`): rmcp does not
     /// stop the handler, so a tool that waits must watch it.
     pub cancelled: CancellationToken,
+}
+
+impl CallContext {
+    /// Whose ephemeral secrets this caller may use: those given in its own stream to itself.
+    /// A thread's agent has its own stream and its own caller id, so a reference given in one
+    /// thread is refused in another.
+    pub fn secret_scope(&self) -> fronde_db::ephemeral::EphemeralScope {
+        fronde_db::ephemeral::EphemeralScope {
+            topic: self.topic.clone(),
+            asker: self.caller.id(),
+        }
+    }
 }
 
 #[async_trait]

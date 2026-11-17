@@ -65,7 +65,7 @@ async fn bench() -> Bench {
 
 fn context() -> CallContext {
     CallContext {
-        caller: Caller::Assistant,
+        caller: Caller::Thread(fronde_requests::ThreadId::MAIN),
         user: "alix".into(),
         topic: "conversation".into(),
         turn: Some(3),

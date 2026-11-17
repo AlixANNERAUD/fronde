@@ -156,8 +156,9 @@ Some plain copies remain:
 - An upstream MCP token is handed to the MCP client library as a `String`, which keeps it for the
   life of the connection.
 - The `Authorization` header Fronde gives its agent for `/mcp` is a plain string in the ACP
-  request, and the agent process holds the token. That token is the assistant's own, not
-  `server.token`: it is made at each start, never written anywhere, and dies with the process.
+  request, and the agent process holds the token. That token is the agent process's own, not
+  `server.token`: it is made when the process starts, never written anywhere, and dies with the
+  process (see [Threads](#threads)).
 - A `{ env = "…" }` value stays in Fronde's environment. The agent never gets it (see
   [The agent's environment](#the-agents-environment)), but an upstream MCP server started from a
   `command` inherits Fronde's whole environment.
@@ -199,7 +200,8 @@ wiped at the next use of the store and every hour, all of them when Fronde stops
 conversation will forget that conversation's references (**planned**: nothing starts a new
 conversation yet). No tool takes a reference yet.
 
-The asker is the assistant, or an outside MCP client by the name it gave in `clientInfo`.
+The asker is a thread's agent, in its own thread (see [Threads](#threads)), or an outside MCP
+client by the name it gave in `clientInfo`.
 Outside clients that give the same name share one asker, and so the references given to it: they
 all hold `server.token`, and Fronde trusts them as one.
 
@@ -241,12 +243,13 @@ encrypted: see above, and below.
 ## Two doors
 
 - **`/mcp`** needs a bearer token, compared in constant time: `server.token`, at least 32
-  characters, for outside clients, or the assistant's own random token. Which one a call carries
+  characters, for outside clients, or the random token of one of Fronde's agent processes, its
+  own and its thread's (see [Threads](#threads)). Which one a call carries
   tells the hub who asks, so a card an outside client opens is labelled with that client's name,
   quoted and marked, as in *Question de « Codex » (client MCP)*, and is never mistaken for
   Fronde's own question. A client chooses its name, so the hub asks nothing for one named
   *Fronde* or *assistant*, one with a name over 40 characters, or one whose name holds a control
-  character; a name is never what makes a caller the assistant, only its token is. `/mcp` skips the `Host` check against DNS
+  character; a name is never what makes a caller one of Fronde's agents, only its token is. `/mcp` skips the `Host` check against DNS
   rebinding: a page that rebinds a name to Fronde still cannot send a token.
 - **The chat** needs the password. A wrong one is answered after a second, and five in a row lock
   sign-in for a minute for everyone: there is a single password to guess, so the throttle is
@@ -297,7 +300,8 @@ prepares the process and then replaces itself with the agent, keeping the same p
 process group. The agent does not inherit Fronde's environment. It keeps only an allow list:
 `PATH`, the locale and `TZ`, `CLAUDE_*` and `ANTHROPIC_*` (where the Claude token is), the proxy
 and CA certificate variables, and the names `[agent] env` sets. Fronde sets `HOME` to the agent's
-own home, `<data>/home`, and `TMPDIR` to `<data>/home/tmp`. Every other variable is dropped,
+own home, its thread's (`<data>/home` for the main thread, `<data>/threads/<id>/home` for another),
+and `TMPDIR` to that home's `tmp`. Every other variable is dropped,
 among them `XDG_*` and `DBUS_*`, which point at your session's directories and buses,
 `CREDENTIALS_DIRECTORY`, where systemd puts the service's credentials, `SSH_AUTH_SOCK`, and every
 `{ env = "…" }` secret's variable, even one whose name the allow list matches. The helper reads
@@ -308,10 +312,11 @@ Two secrets reach the agent, both through its environment, which only your user 
 
 - `[agent] oauth_token`, its Claude sign-in, as `CLAUDE_CODE_OAUTH_TOKEN`, read again at each
   start;
-- the token it calls the hub's `/mcp` with, made at each start, as `FRONDE_HUB_TOKEN`. The ACP
-  adapter hands the session's MCP servers to Claude Code on its command line, which every user
-  of the machine can read in `/proc`, so the header Fronde sends holds only
-  `Bearer ${FRONDE_HUB_TOKEN}`, which Claude Code expands from its environment.
+- the token it calls the hub's `/mcp` with, as `FRONDE_HUB_TOKEN`: its own, made for this agent
+  process (see [Threads](#threads)). The ACP adapter hands the session's MCP servers to Claude
+  Code on its command line, which every user of the machine can read in `/proc`, so the header
+  Fronde sends holds only `Bearer ${FRONDE_HUB_TOKEN}`, which Claude Code expands from its
+  environment.
 
 The agent has its own home rather than yours, so that it never reads or writes your
 `~/.claude`: a hook it wrote there would run in your own terminal. For the same reason, never run
@@ -324,6 +329,37 @@ outside its sandbox. The agent signs in with a token instead, which you make wit
 raises the agent's OOM score to the maximum and lowers its priority, so that the kernel kills the
 agent first when memory runs out, and Fronde comes first for the CPU, and turns its core dumps
 off.
+
+### Threads
+
+Each conversation is a thread, and each thread's agent is a process of its own, started on the
+thread's first message, with its own directories, its own sandbox and its own hub identity:
+
+- **Directories.** The main thread's agent works in `<data>/agent` with `<data>/home` as its home,
+  as before threads; thread `<id>`'s in `<data>/threads/<id>/work` and `<data>/threads/<id>/home`,
+  created private (0700) when its agent first starts. Its sandbox grants it these two and no
+  other thread's: one thread's agent cannot read another's files, nor its Claude transcripts
+  (`home/.claude/projects/`), nor list or write them. Each directory is checked against the
+  protected paths, as every grant is, each time an agent starts.
+- **Sign-in.** A thread other than the main one has a fresh home, without a `/login` in it: the
+  token of `[agent] oauth_token` (or `CLAUDE_CODE_OAUTH_TOKEN` kept from Fronde's environment)
+  signs every thread in.
+- **Token.** Each start of an agent process gets a new hub token, 256 random bits, only in
+  memory and in that process's environment, never on a command line or in the log. The hub's
+  gate knows the thread by this token and by nothing else: no argument, header, `clientInfo`
+  name or `_meta` field can name a thread, and a call carrying another thread's id is still its
+  own thread's. Fronde keeps only each token's SHA-256 digest and compares it with every live one
+  in constant time, as it compares `server.token`. The token is revoked when Fronde lets the
+  process go: a turn that failed, Fronde stopping it, its connection ending (the process exited),
+  or Fronde stopping. After that, `/mcp` answers 401 to it, even within an MCP session opened
+  before.
+- **What it asks.** A thread's cards appear in that thread's stream, and a secret given in one of
+  them "for this conversation" can be used only by that thread's agent, in that thread: another
+  thread's agent, or an outside client, gets the same refusal as for an unknown reference.
+- **Limits.** Each agent process has its own systemd scope, named after its thread
+  (`fronde-agent-<hash>-t<id>-…`), with the limits of `[agent.limits]`; starting or stopping one
+  never stops another. A cap on how many agents run at once, and on all of them together, is
+  planned.
 
 ### Where the agent runs
 
@@ -340,8 +376,9 @@ The agent may:
   (the topmost `node_modules` above the program, or else its directory), and `[agent] read`;
 - read `/dev/zero`, `/dev/random` and `/dev/urandom`, and write `/dev/null` and `/dev/full`: no
   other device, so no terminal (`/dev/tty`, `/dev/pts`) and no shared memory (`/dev/shm`);
-- read, write, create and remove files in `<data>/agent`, its working directory, and
-  `<data>/home`, its home;
+- read, write, create and remove files in its thread's two directories, and no other thread's:
+  its working directory and its home, `<data>/agent` and `<data>/home` for the main thread,
+  `<data>/threads/<id>/work` and `<data>/threads/<id>/home` for another;
 - connect over TCP to ports 443 (https, Claude's API and `WebFetch`), 53 (DNS over TCP), the
   hub's own port, for `/mcp`, and the port of an `HTTPS_PROXY` or `HTTP_PROXY` it is given. It may
   not listen on any TCP port;
@@ -351,7 +388,7 @@ The agent may:
   starts.
 
 Everything else on disk is out of its reach. It cannot read or write `fronde.db` (with its `-wal`
-and `-shm`), the memory files, anything else in the data directory, the configuration's directory
+and `-shm`), the memory files, another thread's directories, anything else in the data directory, the configuration's directory
 (`fronde.toml`, `master.key`, a systemd `.cred` file), any `{ file = "…" }` secret, systemd's
 credentials (`$CREDENTIALS_DIRECTORY`, `/run/credentials`, `/run/user/<uid>/credentials`), or
 your own files (`~/.ssh`, `~/.claude` and the rest of your home) outside what the grants above

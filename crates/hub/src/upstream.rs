@@ -926,7 +926,7 @@ mod tests {
             let mut bench = Bench::new().await;
             let reg = connected(Some(bench.asking(DEFAULT_TIMEOUT))).await;
             let context = CallContext {
-                caller: Caller::Assistant,
+                caller: Caller::Thread(fronde_requests::ThreadId::MAIN),
                 user: "alix".into(),
                 topic: "conversation".into(),
                 turn: Some(1),

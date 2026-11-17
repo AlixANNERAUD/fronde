@@ -81,7 +81,7 @@ async fn bench() -> Bench {
 
 fn context() -> CallContext {
     CallContext {
-        caller: Caller::Assistant,
+        caller: Caller::Thread(fronde_requests::ThreadId::MAIN),
         user: "alix".into(),
         topic: "conversation".into(),
         turn: Some(3),
@@ -290,8 +290,9 @@ async fn user_secret_returns_a_reference_not_the_value() {
     let secret_ref = value["result"]["secret_ref"].as_str().unwrap();
     let scope = EphemeralScope {
         topic: "conversation".into(),
-        asker: "assistant".into(),
+        asker: "thread:1".into(),
     };
+    assert_eq!(context().secret_scope(), scope);
     assert_eq!(
         bench
             .ephemeral
@@ -300,6 +301,45 @@ async fn user_secret_returns_a_reference_not_the_value() {
             .expose_secret(),
         CANARY
     );
+}
+
+/// A reference given to one thread's agent is refused to another thread's, in its stream or in
+/// the first one's: each thread is its own asker.
+#[tokio::test]
+async fn a_reference_stays_in_its_thread() {
+    use fronde_requests::ThreadId;
+    let mut bench = bench().await;
+    let call = bench.call(context(), args());
+    let (id, _, _) = bench.card().await;
+    bench
+        .requests
+        .answer(id, secret(CANARY, Keep::Conversation), &alix())
+        .await
+        .unwrap();
+    let value = result(call).await;
+    let secret_ref = value["result"]["secret_ref"].as_str().unwrap();
+    let second = CallContext {
+        caller: Caller::Thread(ThreadId(2)),
+        topic: "thread:2".into(),
+        ..context()
+    };
+    let posing = CallContext {
+        caller: Caller::Thread(ThreadId(2)),
+        ..context()
+    };
+    for other in [&second, &posing] {
+        assert!(
+            bench
+                .ephemeral
+                .take(secret_ref, &other.secret_scope())
+                .is_err()
+        );
+    }
+    let taken = bench
+        .ephemeral
+        .take(secret_ref, &context().secret_scope())
+        .unwrap();
+    assert_eq!(taken.expose_secret(), CANARY);
 }
 
 #[tokio::test]

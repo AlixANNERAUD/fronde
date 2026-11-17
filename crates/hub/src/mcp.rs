@@ -3,7 +3,7 @@
 use crate::Hub;
 use crate::guide::instructions;
 use crate::tools::CallContext;
-use fronde_requests::Caller;
+use fronde_requests::{Caller, ThreadId};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
@@ -13,15 +13,21 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::Value;
 use std::sync::Arc;
 
-/// The stream where the owner sees what tools ask: the chat's conversation.
+/// The stream where the owner sees what outside clients ask: the main thread's.
 pub const TOPIC: &str = "conversation";
 
 /// Who holds the bearer token of an HTTP request to `/mcp`, as the server's gate found it and
 /// put it in the request's extensions. Without it, a caller is an outside client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum McpCaller {
-    /// Fronde's assistant, with the seq of its running turn's user message.
-    Assistant { turn: Option<u64> },
+    /// The agent of thread `id`, known by the token its process was given; `topic` is the
+    /// thread's stream and `turn` the seq of its running turn's user message. Nothing else in a
+    /// request (arguments, headers, `clientInfo`, `_meta`) names a thread.
+    Thread {
+        id: ThreadId,
+        topic: String,
+        turn: Option<u64>,
+    },
     /// Any other MCP client, holding `server.token`.
     Outside,
 }
@@ -46,10 +52,10 @@ impl HubServer {
             .extensions
             .get::<http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<McpCaller>())
-            .copied()
+            .cloned()
             .unwrap_or(McpCaller::Outside);
-        let (caller, turn) = match holder {
-            McpCaller::Assistant { turn } => (Caller::Assistant, turn),
+        let (caller, topic, turn) = match holder {
+            McpCaller::Thread { id, topic, turn } => (Caller::Thread(id), topic, turn),
             McpCaller::Outside => {
                 let name = context
                     .peer
@@ -57,13 +63,13 @@ impl HubServer {
                     .map(|info| info.client_info.name.trim().to_owned())
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| "MCP".to_owned());
-                (Caller::Mcp(name), None)
+                (Caller::Mcp(name), TOPIC.to_owned(), None)
             }
         };
         CallContext {
             caller,
             user: self.hub.config.data.user.clone(),
-            topic: TOPIC.to_owned(),
+            topic,
             turn,
             cancelled: context.ct.clone(),
         }
@@ -375,7 +381,7 @@ mod tests {
                 other => panic!("{other:?}"),
             };
             let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            // Only the assistant's token makes a caller the assistant, never a name.
+            // Only a thread's token makes a caller a thread, never a name.
             assert_eq!(
                 value["result"],
                 serde_json::json!({"caller": format!("mcp:{name}"), "turn": null}),

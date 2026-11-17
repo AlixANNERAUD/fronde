@@ -1523,7 +1523,7 @@ async fn answer_over_websocket_reaches_the_waiter() {
         rows,
         [
             (
-                "assistant".into(),
+                "thread:1".into(),
                 Some(1),
                 "answered".into(),
                 Some("Alix".into())
@@ -1649,7 +1649,7 @@ async fn permission_card_over_websocket() {
     assert_eq!(
         rows,
         [(
-            "assistant/permission".into(),
+            "thread:1/permission".into(),
             Some(1),
             "answered".into(),
             Some("Alix".into()),

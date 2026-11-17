@@ -16,6 +16,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ErrorCode};
 use anyhow::{Context, anyhow};
+use fronde_protocol::ThreadId;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use std::collections::HashMap;
@@ -53,10 +54,17 @@ where
 /// How to start the agent and what its session gets.
 #[derive(Clone)]
 pub struct AgentSpec {
+    /// The thread the agent works for: its scope unit names it.
+    pub thread: ThreadId,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// The agent's working directory, which its sandbox lets it write.
     pub cwd: PathBuf,
+    /// The agent's `HOME`, its `tmp` the agent's `TMPDIR`, which its sandbox lets it write.
+    pub home: PathBuf,
     pub hub_url: String,
+    /// The agent process's own hub token: a [`Threads`](crate::threads::Threads) thread's agent
+    /// gets a fresh one at each start, which dies with the process.
     pub hub_token: SecretString,
     /// Given to the agent as `CLAUDE_CODE_OAUTH_TOKEN` when set.
     pub oauth_token: Option<OauthToken>,
@@ -68,9 +76,11 @@ pub struct AgentSpec {
 impl fmt::Debug for AgentSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentSpec")
+            .field("thread", &self.thread)
             .field("command", &self.command)
             .field("env", &self.env)
             .field("cwd", &self.cwd)
+            .field("home", &self.home)
             .field("hub_url", &self.hub_url)
             .field("hub_token", &"[REDACTED]")
             .field(

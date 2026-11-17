@@ -41,11 +41,12 @@ hundreds of tool schemas in the model's context on every turn.
 With `[web]`, Fronde also runs an agent for its own chat (`crates/agent`). On the first message it
 starts `claude-agent-acp`, the Claude Code ACP adapter, and opens a session with it over standard
 input and output. The session gets the hub as an MCP server named `fronde`, reached over the
-loopback with a token of its own, made at each start and kept only in memory, and a short system
-prompt. The hub tells the assistant's calls from those of outside clients by that token: a call
-from the assistant belongs to its conversation and its running turn, a call with `server.token`
-to an outside client, named from the `clientInfo` it gave. The session id is saved with its
-thread, so a restart resumes the same conversation.
+loopback with a token of its own, made when that agent process starts and kept only in memory,
+and a short system prompt. The hub tells the agents' calls from those of outside clients, and one
+thread's agent from another's, by that token alone: a call with an agent's token belongs to that
+agent's thread and its running turn, a call with `server.token` to an outside client, named from
+the `clientInfo` it gave. The token is revoked when Fronde lets the process go. The session id is
+saved with its thread, so a restart resumes the same conversation.
 
 Fronde does not start the adapter itself, but through a chain of programs that each `exec` the
 next, so that the adapter keeps Fronde's pipes and process group:
@@ -73,9 +74,14 @@ database, with its own agent session, whose id the row keeps. The chat is the ma
 thread 1, over the topic `conversation`, the stream it had before threads existed. Fronde opens a
 thread's conversation the first time it is needed, and at start any thread a stop left in the
 middle of a turn, to close that turn. A request is shown in the stream of the thread it was asked
-in. An archived thread refuses messages; the main thread is never archived. Several threads in
-the chat, each with its own agent process and hub identity, and threads that agents start for
-a task, are planned.
+in. An archived thread refuses messages; the main thread is never archived.
+
+Each thread has its own agent process, started on the thread's first message, in its own
+directories (`agent/` and `home/` for the main thread, `threads/<id>/work/` and
+`threads/<id>/home/` for another), confined to them, in a systemd scope named after the thread,
+and with its own hub token (see [Threads](security.md#threads)). Starting or stopping one never
+stops another. Several threads in the chat, a cap on how many agents run at once, and threads
+that agents start for a task, are planned.
 
 ## Requests
 

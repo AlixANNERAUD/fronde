@@ -14,6 +14,7 @@
 
 use fronde_agent::acp::AgentSpec;
 use fronde_agent::confine::{Confine, Support};
+use fronde_agent::threads::{ThreadId, thread_dirs};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -85,12 +86,14 @@ impl Setup {
 
     fn spec_with_hub(&self, command: &[&str], env: &[(&str, &str)], hub_port: u16) -> AgentSpec {
         AgentSpec {
+            thread: ThreadId::MAIN,
             command: command.iter().map(|s| s.to_string()).collect(),
             env: env
                 .iter()
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .collect(),
             cwd: self.data.join("agent"),
+            home: self.data.join("home"),
             hub_url: format!("http://127.0.0.1:{hub_port}/mcp"),
             hub_token: SecretString::from("unused"),
             oauth_token: None,
@@ -573,26 +576,91 @@ fn probe_setup() -> Probe {
 impl Probe {
     /// Runs the probe confined; `None` when this kernel refused to confine it, as it must.
     fn run(&self) -> Option<Report> {
+        self.run_as(ThreadId::MAIN)
+    }
+
+    /// Runs the probe as the agent of `thread`, in that thread's directories, as Fronde's
+    /// threads start their agents.
+    fn run_as(&self, thread: ThreadId) -> Option<Report> {
         let exe = std::env::current_exe().unwrap();
         let plan = serde_json::to_string(&self.plan).unwrap();
-        let spec = self.setup.spec_with_hub(
-            &[
-                exe.to_str().unwrap(),
-                "--exact",
-                "probe_child",
-                "--nocapture",
-            ],
-            &[("FRONDE_PROBE", &plan)],
-            self.plan.open_port,
-        );
+        let dirs = thread_dirs(&self.setup.data, thread);
+        let spec = AgentSpec {
+            thread,
+            cwd: dirs.work.clone(),
+            home: dirs.home,
+            ..self.setup.spec_with_hub(
+                &[
+                    exe.to_str().unwrap(),
+                    "--exact",
+                    "probe_child",
+                    "--nocapture",
+                ],
+                &[("FRONDE_PROBE", &plan)],
+                self.plan.open_port,
+            )
+        };
         let output = self.setup.run(&spec, &[]);
         if !landlock() {
             refused_without_landlock(&output);
             return None;
         }
         assert!(output.status.success(), "{output:?}");
-        let report = std::fs::read(self.setup.data.join("agent/report.json")).unwrap();
+        let report = std::fs::read(dirs.work.join("report.json")).unwrap();
         Some(serde_json::from_slice(&report).unwrap())
+    }
+
+    /// Every protected path of the plan was refused in every way the probe tried, every allowed
+    /// directory let it do everything, and nothing protected changed.
+    fn assert_confined(&self, report: &Report) {
+        let protected: Vec<String> = self
+            .plan
+            .protected_files
+            .iter()
+            .chain(&self.plan.protected_dirs)
+            .map(|p| p.display().to_string())
+            .collect();
+        let allowed: Vec<String> = self
+            .plan
+            .allowed_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let mut checked = 0;
+        for (attempt, result) in report {
+            let Some((_, target)) = attempt.split_once(' ') else {
+                continue;
+            };
+            let target = target.trim_start_matches("in ");
+            if protected.iter().any(|p| p == target) {
+                assert_eq!(result, "denied", "{attempt}");
+                checked += 1;
+            } else if allowed.iter().any(|a| Path::new(target).starts_with(a)) {
+                assert_eq!(result, "ok", "{attempt}");
+                checked += 1;
+            }
+        }
+        // Four attempts on each protected file, two on each directory, six in each allowed one.
+        let expected = 4 * self.plan.protected_files.len()
+            + 2 * self.plan.protected_dirs.len()
+            + 6 * self.plan.allowed_dirs.len();
+        assert_eq!(checked, expected, "{report:#?}");
+        for (file, content) in &self.originals {
+            assert_eq!(&std::fs::read(file).unwrap(), content, "{}", file.display());
+        }
+        for dir in &self.plan.protected_dirs {
+            assert!(!dir.join("probe-new.txt").exists(), "{}", dir.display());
+        }
+    }
+
+    /// Makes `file` with a content of its own, as another thread's agent might have left it,
+    /// and plans to try it.
+    fn protect_file(&mut self, file: PathBuf) {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let content = format!("secret {}", file.display()).into_bytes();
+        std::fs::write(&file, &content).unwrap();
+        self.originals.push((file.clone(), content));
+        self.plan.protected_files.push(file);
     }
 }
 
@@ -600,43 +668,53 @@ impl Probe {
 fn agent_cannot_touch_protected_paths() {
     let probe = probe_setup();
     let Some(report) = probe.run() else { return };
-    let protected: Vec<String> = probe
-        .plan
-        .protected_files
-        .iter()
-        .chain(&probe.plan.protected_dirs)
-        .map(|p| p.display().to_string())
-        .collect();
-    let allowed: Vec<String> = probe
-        .plan
-        .allowed_dirs
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-    let mut checked = 0;
-    for (attempt, result) in &report {
-        let Some((_, target)) = attempt.split_once(' ') else {
-            continue;
-        };
-        let target = target.trim_start_matches("in ");
-        if protected.iter().any(|p| p == target) {
-            assert_eq!(result, "denied", "{attempt}");
-            checked += 1;
-        } else if allowed.iter().any(|a| Path::new(target).starts_with(a)) {
-            assert_eq!(result, "ok", "{attempt}");
-            checked += 1;
+    probe.assert_confined(&report);
+}
+
+/// Each thread's agent reads and writes its own two directories, and nothing of another
+/// thread's: not the main thread's `agent` and `home` (its Claude transcripts), not a sibling's
+/// `threads/<id>/`, and, like every agent, not the database.
+#[test]
+fn thread_agent_cannot_touch_other_threads_files() {
+    for (thread, others) in [
+        (ThreadId(2), [ThreadId::MAIN, ThreadId(3)]),
+        (ThreadId(3), [ThreadId::MAIN, ThreadId(2)]),
+        (ThreadId::MAIN, [ThreadId(2), ThreadId(3)]),
+    ] {
+        let mut probe = probe_setup();
+        let data = probe.setup.data.clone();
+        let own = thread_dirs(&data, thread);
+        for dir in [&own.work, &own.home, &own.home.join("tmp")] {
+            std::fs::create_dir_all(dir).unwrap();
         }
-    }
-    // Four attempts on each protected file, two on each directory, six in each allowed one.
-    let expected = 4 * probe.plan.protected_files.len()
-        + 2 * probe.plan.protected_dirs.len()
-        + 6 * probe.plan.allowed_dirs.len();
-    assert_eq!(checked, expected, "{report:#?}");
-    for (file, content) in &probe.originals {
-        assert_eq!(&std::fs::read(file).unwrap(), content, "{}", file.display());
-    }
-    for dir in &probe.plan.protected_dirs {
-        assert!(!dir.join("probe-new.txt").exists(), "{}", dir.display());
+        probe.plan.allowed_dirs = vec![own.work.clone(), own.home.clone(), own.home.join("tmp")];
+        probe.plan.protected_dirs.push(data.join("threads"));
+        for other in others {
+            let dirs = thread_dirs(&data, other);
+            probe.protect_file(dirs.home.join(".claude/projects/fronde/session.jsonl"));
+            probe.protect_file(dirs.work.join("notes.md"));
+            probe.plan.protected_dirs.extend([
+                dirs.work.clone(),
+                dirs.home.clone(),
+                dirs.home.join(".claude"),
+            ]);
+        }
+        let Some(report) = probe.run_as(thread) else {
+            return;
+        };
+        probe.assert_confined(&report);
+        let main_home = data.join("home").display().to_string();
+        if thread != ThreadId::MAIN {
+            for attempt in ["list", "create in"] {
+                assert_eq!(
+                    report[&format!("{attempt} {main_home}")],
+                    "denied",
+                    "{thread}"
+                );
+            }
+        }
+        let db = data.join("fronde.db").display().to_string();
+        assert_eq!(report[&format!("read {db}")], "denied", "{thread}");
     }
 }
 

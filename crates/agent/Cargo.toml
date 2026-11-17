@@ -16,14 +16,18 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 sea-orm.workspace = true
 fronde-db = { path = "../db" }
 fronde-entity = { path = "../entity" }
+fronde-fs = { path = "../fs" }
 fronde-protocol = { path = "../protocol" }
 fronde-requests = { path = "../requests" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
