@@ -2675,6 +2675,7 @@ dependencies = [
  "futures",
  "gloo-net",
  "gloo-timers",
+ "js-sys",
  "serde_json",
  "strum",
  "tw_merge",

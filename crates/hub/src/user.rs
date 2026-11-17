@@ -10,7 +10,7 @@ use fronde_protocol::request::{
     MAX_DESCRIPTION, MAX_HEADER, MAX_LABEL, MAX_PLACEHOLDER, MAX_PREVIEW, MAX_QUESTION, MAX_REASON,
     MAX_SECRET_LABEL, MAX_URL,
 };
-use fronde_protocol::{Card, ChoiceOption, Field, Remember, Response};
+use fronde_protocol::{Card, ChoiceAnswer, ChoiceOption, Field, FieldValue, Remember, Response};
 use fronde_requests::{Ask, Caller, Requests, Resolution, Reused, Saved, Waiter};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -393,7 +393,11 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
                 .iter()
                 .enumerate()
                 .map(|(index, question)| {
-                    let answer = values.get(&key(index)).cloned().unwrap_or_default();
+                    // `check` let only a choice's answer through for a choice.
+                    let answer = match values.get(&key(index)) {
+                        Some(FieldValue::Choice(answer)) => answer.clone(),
+                        _ => ChoiceAnswer::default(),
+                    };
                     json!({
                         "question": question,
                         "selected": answer.selected,
@@ -610,12 +614,15 @@ fn check(args: &AskArgs) -> Result<(Card, Duration), String> {
             multi: q.multi_select,
             other: true,
             required: true,
+            note: true,
         });
     }
     let card = Card::Form {
         message: String::new(),
         fields,
         submit: None,
+        truncated: false,
+        replaced: false,
     };
     Ok((card, timeout))
 }

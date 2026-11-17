@@ -6,10 +6,10 @@
 use dioxus::html::Key;
 use dioxus::prelude::*;
 use fronde_client::RequestStatus;
-use fronde_protocol::request::check;
+use fronde_protocol::request::{check, show_number};
 use fronde_protocol::{
-    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, Invalid, Keep, KeyPlace, Outcome,
-    PermissionChoice, Remember, RequestId, Response, SecretValue, ToolKind,
+    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, FieldValue, Invalid, Keep, KeyPlace,
+    Outcome, PermissionChoice, Remember, RequestId, Response, SecretValue, TextFormat, ToolKind,
 };
 use std::collections::BTreeMap;
 
@@ -44,7 +44,7 @@ const BODY_LINES: usize = 6;
 /// cannot reorder a command's arguments, whatever the agent wrote.
 const IN_ORDER: &str = "[unicode-bidi:bidi-override]";
 
-/// What the user did with one question so far.
+/// What the user did with one field so far.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Draft {
     /// The options ticked, for a question with several answers, in the order they were ticked.
@@ -53,6 +53,41 @@ struct Draft {
     other_ticked: bool,
     other: String,
     note: String,
+    /// What a text or number field's box holds.
+    text: String,
+    /// Whether a toggle is on.
+    on: bool,
+}
+
+impl Draft {
+    /// A field's draft before the user does anything: its default.
+    fn of(field: &Field) -> Self {
+        match field {
+            Field::Text {
+                default: Some(text),
+                format,
+                ..
+            } => Self {
+                text: match format {
+                    Some(TextFormat::DateTime) => local_date_time(text),
+                    _ => text.clone(),
+                },
+                ..Self::default()
+            },
+            Field::Number {
+                default: Some(number),
+                ..
+            } => Self {
+                text: show_number(*number),
+                ..Self::default()
+            },
+            Field::Toggle { default, .. } => Self {
+                on: *default,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
 }
 
 #[component]
@@ -71,7 +106,7 @@ pub fn RequestCard(
     admin: bool,
     on_send: EventHandler<Outgoing>,
 ) -> Element {
-    let (message, fields, submit) = match card {
+    let (message, fields, submit, truncated, replaced) = match card {
         Card::Permission {
             title,
             tool,
@@ -101,7 +136,9 @@ pub fn RequestCard(
             message,
             fields,
             submit,
-        } => (message, fields, submit),
+            truncated,
+            replaced,
+        } => (message, fields, submit, truncated, replaced),
         Card::Secret {
             label,
             reason,
@@ -138,6 +175,8 @@ pub fn RequestCard(
                 message,
                 fields,
                 submit,
+                truncated,
+                replaced,
                 refusal,
                 open,
                 on_send,
@@ -150,7 +189,7 @@ pub fn RequestCard(
                 }
                 CardContent { class: "flex flex-col gap-1",
                     for field in fields.iter() {
-                        p { class: "text-muted-foreground text-sm wrap-break-word", {question(field)} }
+                        p { class: "text-muted-foreground text-sm wrap-break-word", {field.label()} }
                     }
                 }
                 CardFooter { class: "flex-wrap gap-2",
@@ -346,11 +385,6 @@ fn secret_asker(from: Option<&str>) -> String {
         None => "Secret demandé par Fronde".into(),
         Some(name) => format!("Secret demandé par « {name} » (client MCP)"),
     }
-}
-
-fn question(field: &Field) -> &str {
-    let Field::Choice { question, .. } = field;
-    question
 }
 
 fn closed_badge(outcome: &Outcome) -> Element {
@@ -700,44 +734,102 @@ fn OpenSecretCard(
     }
 }
 
-/// The answer the drafts make: questions left blank are left out, for [`check`] to name.
-fn response(fields: &[Field], radios: &[String], drafts: &[Draft]) -> Response {
+/// The answer the drafts make: fields left blank are left out, for [`check`] to name. A number
+/// box that holds no number is refused here, since no answer can say it.
+fn response(fields: &[Field], radios: &[String], drafts: &[Draft]) -> Result<Response, Invalid> {
     let mut values = BTreeMap::new();
     for ((field, radio), draft) in fields.iter().zip(radios).zip(drafts) {
-        let Field::Choice {
-            key,
-            options,
-            multi,
-            ..
-        } = field;
-        let (selected, other) = if *multi {
-            let selected = options
-                .iter()
-                .filter(|option| draft.ticked.contains(&option.label))
-                .map(|option| option.label.clone())
-                .collect();
-            (selected, draft.other_ticked.then(|| draft.other.clone()))
-        } else {
-            match radio.as_str() {
-                "" => (Vec::new(), None),
-                OTHER => (Vec::new(), Some(draft.other.clone())),
-                label => (vec![label.to_owned()], None),
+        let value = match field {
+            Field::Choice { options, multi, .. } => {
+                let (selected, other) = if *multi {
+                    let selected = options
+                        .iter()
+                        .filter(|option| draft.ticked.contains(&option.label))
+                        .map(|option| option.label.clone())
+                        .collect();
+                    (selected, draft.other_ticked.then(|| draft.other.clone()))
+                } else {
+                    match radio.as_str() {
+                        "" => (Vec::new(), None),
+                        OTHER => (Vec::new(), Some(draft.other.clone())),
+                        label => (vec![label.to_owned()], None),
+                    }
+                };
+                let note = Some(draft.note.trim().to_owned()).filter(|note| !note.is_empty());
+                if selected.is_empty() && other.is_none() && note.is_none() {
+                    continue;
+                }
+                FieldValue::Choice(ChoiceAnswer {
+                    selected,
+                    other,
+                    note,
+                })
             }
+            Field::Text { format, .. } => {
+                let text = draft.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                FieldValue::Text(match format {
+                    Some(TextFormat::DateTime) => with_offset(text),
+                    _ => text.to_owned(),
+                })
+            }
+            Field::Number { key, .. } => {
+                let text = draft.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                // A French keyboard types a decimal comma.
+                match text.replace(',', ".").parse::<f64>() {
+                    Ok(number) if number.is_finite() => FieldValue::Number(number),
+                    _ => {
+                        return Err(Invalid {
+                            key: Some(key.clone()),
+                            message: "Saisis un nombre, comme 12 ou 3,5.".into(),
+                        });
+                    }
+                }
+            }
+            Field::Toggle { .. } => FieldValue::Toggle(draft.on),
         };
-        let note = Some(draft.note.trim().to_owned()).filter(|note| !note.is_empty());
-        if selected.is_empty() && other.is_none() && note.is_none() {
-            continue;
-        }
-        values.insert(
-            key.clone(),
-            ChoiceAnswer {
-                selected,
-                other,
-                note,
-            },
-        );
+        values.insert(field.key().to_owned(), value);
     }
-    Response::Form { values }
+    Ok(Response::Form { values })
+}
+
+/// A `datetime-local` box's value (`2026-11-17T14:30`) as RFC 3339, with the browser's offset
+/// for that moment.
+fn with_offset(local: &str) -> String {
+    let seconds = if local.len() == 16 { ":00" } else { "" };
+    let minutes = local_offset_minutes(local);
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let minutes = minutes.unsigned_abs();
+    format!(
+        "{local}{seconds}{sign}{:02}:{:02}",
+        minutes / 60,
+        minutes % 60
+    )
+}
+
+/// An RFC 3339 date and time as a `datetime-local` box shows it: its first 16 characters,
+/// `2026-11-17T14:30`, in the offset it was written with.
+fn local_date_time(text: &str) -> String {
+    text.get(..16).unwrap_or(text).to_owned()
+}
+
+/// The browser's offset from UTC at the local time `local`, in minutes east.
+#[cfg(target_arch = "wasm32")]
+fn local_offset_minutes(local: &str) -> i32 {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_str(local));
+    let west = date.get_timezone_offset();
+    if west.is_finite() { -(west as i32) } else { 0 }
+}
+
+/// Natively there is no browser: UTC.
+#[cfg(not(target_arch = "wasm32"))]
+fn local_offset_minutes(_local: &str) -> i32 {
+    0
 }
 
 #[component]
@@ -747,6 +839,10 @@ fn FormCard(
     message: String,
     fields: Vec<Field>,
     submit: Option<String>,
+    /// Part of a text was left out.
+    truncated: bool,
+    /// Hidden characters were replaced.
+    replaced: bool,
     refusal: Option<String>,
     open: bool,
     on_send: EventHandler<Outgoing>,
@@ -754,7 +850,7 @@ fn FormCard(
     // One radio value per question, the drafts of the rest; a card's fields never change.
     let radios: Vec<Signal<String>> =
         use_hook(|| fields.iter().map(|_| Signal::new(String::new())).collect());
-    let drafts = use_signal(|| vec![Draft::default(); fields.len()]);
+    let drafts = use_signal(|| fields.iter().map(Draft::of).collect::<Vec<_>>());
     let mut invalid = use_signal(|| None::<Invalid>);
     let mut sent = use_signal(|| false);
     let delivered = use_callback(move |()| sent.set(true));
@@ -764,6 +860,8 @@ fn FormCard(
         message: message.clone(),
         fields: fields.clone(),
         submit: submit.clone(),
+        truncated,
+        replaced,
     };
     let send = use_callback({
         let radios = radios.clone();
@@ -771,11 +869,18 @@ fn FormCard(
         move |()| {
             let values: Vec<String> = radios.iter().map(|radio| radio()).collect();
             let response = response(&fields, &values, &drafts.read());
-            if let Err(error) = check(&card, &response) {
+            if let Err(error) = response
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|response| check(&card, response))
+            {
                 invalid.set(Some(error));
                 return;
             }
             invalid.set(None);
+            let Ok(response) = response else {
+                return;
+            };
             // A dropped answer leaves the card as it was, to send again.
             on_send.call(Outgoing {
                 message: ClientMsg::Answer { id, response },
@@ -817,17 +922,40 @@ fn FormCard(
                 if !message.is_empty() {
                     p { class: "text-sm whitespace-pre-wrap wrap-break-word", "{message}" }
                 }
+                if truncated {
+                    p { id: "r{id}-truncated", role: "note", class: "text-destructive text-xs font-medium",
+                        "Texte tronqué : le milieu est omis."
+                    }
+                }
+                if replaced {
+                    p { id: "r{id}-replaced", role: "note", class: "text-destructive text-xs font-medium",
+                        "Caractères cachés remplacés par �."
+                    }
+                }
                 for (index , field) in fields.iter().enumerate() {
-                    ChoiceField {
-                        key: "{index}",
-                        request: id,
-                        index,
-                        field: field.clone(),
-                        radio: radios[index],
-                        drafts,
-                        error: error_for(field.key()),
-                        disabled,
-                        on_submit: send,
+                    if matches!(field, Field::Choice { .. }) {
+                        ChoiceField {
+                            key: "{index}",
+                            request: id,
+                            index,
+                            field: field.clone(),
+                            radio: radios[index],
+                            drafts,
+                            error: error_for(field.key()),
+                            disabled,
+                            on_submit: send,
+                        }
+                    } else {
+                        InputField {
+                            key: "{index}",
+                            request: id,
+                            index,
+                            field: field.clone(),
+                            drafts,
+                            error: error_for(field.key()),
+                            disabled,
+                            on_submit: send,
+                        }
                     }
                 }
                 if let Some(error) = card_error {
@@ -876,8 +1004,12 @@ fn ChoiceField(
         options,
         multi,
         other,
+        note,
         ..
-    } = field;
+    } = field
+    else {
+        return rsx! {};
+    };
     let mut drafts = drafts;
     let mut radio = radio;
     let mut noting = use_signal(|| false);
@@ -1069,18 +1201,20 @@ fn ChoiceField(
             if let Some(error) = error {
                 FieldError { "{error}" }
             }
-            Button {
-                id: "{note_id}-toggle",
-                variant: ButtonVariant::Ghost,
-                class: "text-muted-foreground h-11 self-start px-2 sm:h-8",
-                onclick: move |_| noting.toggle(),
-                if noting() {
-                    "Retirer la précision"
-                } else {
-                    "Ajouter une précision"
+            if note {
+                Button {
+                    id: "{note_id}-toggle",
+                    variant: ButtonVariant::Ghost,
+                    class: "text-muted-foreground h-11 self-start px-2 sm:h-8",
+                    onclick: move |_| noting.toggle(),
+                    if noting() {
+                        "Retirer la précision"
+                    } else {
+                        "Ajouter une précision"
+                    }
                 }
             }
-            if noting() {
+            if note && noting() {
                 label { r#for: "{note_id}", class: "sr-only", "Précision" }
                 Textarea {
                     id: note_id.clone(),
@@ -1090,6 +1224,124 @@ fn ChoiceField(
                     disabled,
                     oninput: move |event: FormEvent| drafts.write()[index].note = event.value(),
                 }
+            }
+        }
+    }
+}
+
+/// A text, number or toggle field: its title, its description, then a box sized for a thumb
+/// (the keyboard a phone shows follows what the box takes), or a box to tick on a row as tall.
+/// Enter in a box sends the card.
+#[component]
+fn InputField(
+    request: RequestId,
+    index: usize,
+    field: Field,
+    drafts: Signal<Vec<Draft>>,
+    error: Option<String>,
+    disabled: bool,
+    on_submit: Callback<()>,
+) -> Element {
+    let mut drafts = drafts;
+    let draft = drafts.read()[index].clone();
+    let id = format!("r{request}-q{index}");
+    let on_key = move |event: KeyboardEvent| {
+        if event.key() == Key::Enter && !event.is_composing() && !disabled {
+            event.prevent_default();
+            on_submit.call(());
+        }
+    };
+    let (title, description, required) = match &field {
+        Field::Text {
+            title,
+            description,
+            required,
+            ..
+        }
+        | Field::Number {
+            title,
+            description,
+            required,
+            ..
+        } => (title.clone(), description.clone(), *required),
+        Field::Toggle {
+            title, description, ..
+        } => {
+            let (title, description) = (title.clone(), description.clone());
+            return rsx! {
+                FieldLabel { html_for: id.clone(), class: "min-h-11 w-full",
+                    FieldRow { variant: FieldVariant::Horizontal,
+                        Checkbox {
+                            id: id.clone(),
+                            checked: draft.on,
+                            disabled,
+                            aria_label: title.clone(),
+                            on_checked_change: move |on: bool| drafts.write()[index].on = on,
+                        }
+                        FieldContent {
+                            FieldTitle { class: "wrap-break-word", "{title}" }
+                            if let Some(description) = description {
+                                FieldDescription { class: "wrap-break-word", "{description}" }
+                            }
+                        }
+                    }
+                }
+                if let Some(error) = error {
+                    FieldError { "{error}" }
+                }
+            };
+        }
+        Field::Choice { .. } => return rsx! {},
+    };
+    let (kind, mode, placeholder) = match &field {
+        Field::Text {
+            format,
+            placeholder,
+            ..
+        } => (
+            match format {
+                Some(TextFormat::Email) => InputType::Email,
+                Some(TextFormat::Uri) => InputType::Url,
+                Some(TextFormat::Date) => InputType::Date,
+                Some(TextFormat::DateTime) => InputType::DatetimeLocal,
+                None => InputType::Text,
+            },
+            None,
+            placeholder.clone(),
+        ),
+        // A number box as text: a browser's own number box loses "3,5" on a French keyboard.
+        Field::Number { integer, .. } => (
+            InputType::Text,
+            Some(if *integer { "numeric" } else { "decimal" }.to_owned()),
+            None,
+        ),
+        _ => (InputType::Text, None, None),
+    };
+    let input_id = format!("{id}-input");
+    rsx! {
+        div { class: "flex flex-col gap-2", onkeydown: on_key,
+            label { r#for: "{input_id}", class: "text-sm font-medium wrap-break-word",
+                "{title}"
+                if !required {
+                    span { class: "text-muted-foreground font-normal", " (facultatif)" }
+                }
+            }
+            if let Some(description) = description {
+                p { class: "text-muted-foreground text-sm wrap-break-word", "{description}" }
+            }
+            Input {
+                id: input_id.clone(),
+                r#type: kind,
+                inputmode: mode,
+                value: draft.text.clone(),
+                placeholder,
+                autocomplete: "off",
+                disabled,
+                class: "h-11 md:h-9",
+                oninput: move |event: FormEvent| drafts.write()[index].text = event.value(),
+            }
+            if let Some(error) = error {
+                FieldError { "{error}" }
             }
         }
     }
@@ -1209,6 +1461,7 @@ mod tests {
             multi,
             other: true,
             required: true,
+            note: true,
         }
     }
 
@@ -1217,6 +1470,8 @@ mod tests {
             message: String::new(),
             fields,
             submit: None,
+            truncated: false,
+            replaced: false,
         }
     }
 
@@ -1258,7 +1513,8 @@ mod tests {
                         selected: selected.iter().map(|s| (*s).to_owned()).collect(),
                         other: other.map(str::to_owned),
                         note: note.map(str::to_owned),
-                    },
+                    }
+                    .into(),
                 )]
                 .into(),
             },
@@ -2330,5 +2586,203 @@ mod tests {
         assert!(!head.contains("ligne 7"), "{head}");
         // The whole body is there to unfold.
         assert!(page.contains("ligne 10"), "{page}");
+    }
+
+    /// An e-mail (required), a whole number from 1 to 10, a decimal one (optional), a date and
+    /// time (optional) and a toggle that starts on.
+    fn inputs() -> Card {
+        let text = |key: &str, title: &str, format, required| Field::Text {
+            key: key.into(),
+            title: title.into(),
+            description: None,
+            placeholder: None,
+            format,
+            min_length: None,
+            max_length: None,
+            default: None,
+            required,
+        };
+        form(vec![
+            text("mail", "Adresse e-mail", Some(TextFormat::Email), true),
+            Field::Number {
+                key: "count".into(),
+                title: "Combien de places ?".into(),
+                description: Some("De 1 à 10".into()),
+                integer: true,
+                min: Some(1.0),
+                max: Some(10.0),
+                default: None,
+                required: true,
+            },
+            Field::Number {
+                key: "price".into(),
+                title: "Prix maximum".into(),
+                description: None,
+                integer: false,
+                min: None,
+                max: None,
+                default: Some(12.5),
+                required: false,
+            },
+            text("at", "Quand ?", Some(TextFormat::DateTime), false),
+            Field::Toggle {
+                key: "remind".into(),
+                title: "Me le rappeler".into(),
+                description: Some("La veille au soir".into()),
+                default: true,
+            },
+        ])
+    }
+
+    #[test]
+    fn text_number_and_toggle_fields_render_for_a_phone() {
+        let page = render(props(inputs()));
+        assert!(page.contains("Questions de Fronde"), "{page}");
+        let mail = tag(&page, "r7-q0-input").unwrap();
+        assert!(mail.contains(r#"type="email""#), "{mail}");
+        assert!(page.contains(r#"for="r7-q0-input""#), "{page}");
+        // A number is typed as text, with the phone's number keyboard.
+        let count = tag(&page, "r7-q1-input").unwrap();
+        assert!(count.contains(r#"type="text""#) && count.contains(r#"inputmode="numeric""#));
+        let price = tag(&page, "r7-q2-input").unwrap();
+        assert!(price.contains(r#"inputmode="decimal""#) && price.contains(r#"value="12.5""#));
+        assert!(
+            tag(&page, "r7-q3-input")
+                .unwrap()
+                .contains(r#"type="datetime-local""#)
+        );
+        assert!(page.contains("De 1 à 10") && page.contains("La veille au soir"));
+        assert!(page.contains("Prix maximum<span") && page.contains(" (facultatif)"));
+        assert!(checked(&page, "r7-q4"));
+        assert!(page.contains(r#"for="r7-q4""#), "{page}");
+        // 44 px tall on a phone.
+        for box_id in ["r7-q0-input", "r7-q1-input", "r7-q2-input"] {
+            assert!(class_of(&page, box_id).contains("h-11"), "{box_id}");
+        }
+        // No note where nothing can carry it, nor on these fields.
+        assert!(!page.contains("Ajouter une précision"), "{page}");
+    }
+
+    #[test]
+    fn text_number_and_toggle_fields_send_typed_answers() {
+        let mut live = Live::new(props(inputs()));
+        live.click("r7-send");
+        assert!(live.html().contains("Remplis ce champ."), "{}", live.html());
+        assert_eq!(sent(), []);
+        live.type_text("r7-q0-input", "alix.example.com");
+        live.type_text("r7-q1-input", "deux");
+        live.click("r7-send");
+        assert!(live.html().contains("Saisis un nombre, comme 12 ou 3,5."));
+        live.type_text("r7-q1-input", "12");
+        live.click("r7-send");
+        assert!(
+            live.html().contains("Adresse e-mail invalide."),
+            "{}",
+            live.html()
+        );
+        live.type_text("r7-q0-input", " alix@example.com ");
+        live.click("r7-send");
+        assert!(live.html().contains("Le nombre doit être au plus 10."));
+        assert_eq!(sent(), []);
+        live.type_text("r7-q1-input", "3");
+        live.type_text("r7-q2-input", "9,90");
+        live.type_text("r7-q3-input", "2026-11-17T14:30");
+        live.click("r7-q4");
+        // Enter in a box sends the card, as in a form.
+        live.key_in("r7-q2-input", Key::Enter, Code::Enter);
+        let expected = Response::Form {
+            values: [
+                ("mail", FieldValue::Text("alix@example.com".into())),
+                ("count", FieldValue::Number(3.0)),
+                ("price", FieldValue::Number(9.9)),
+                // Natively the page's offset is UTC's.
+                ("at", FieldValue::Text("2026-11-17T14:30:00+00:00".into())),
+                ("remind", FieldValue::Toggle(false)),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+        };
+        assert_eq!(
+            sent(),
+            [ClientMsg::Answer {
+                id: ID,
+                response: expected
+            }]
+        );
+    }
+
+    #[test]
+    fn optional_fields_left_blank_are_left_out() {
+        let mut live = Live::new(props(inputs()));
+        live.type_text("r7-q0-input", "alix@example.com");
+        live.type_text("r7-q1-input", "1");
+        live.type_text("r7-q2-input", "  ");
+        live.click("r7-send");
+        let sent = sent();
+        let [
+            ClientMsg::Answer {
+                response: Response::Form { values },
+                ..
+            },
+        ] = sent.as_slice()
+        else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(
+            values.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["count", "mail", "remind"]
+        );
+        assert_eq!(values["remind"], FieldValue::Toggle(true));
+    }
+
+    #[test]
+    fn date_and_time_carry_an_offset() {
+        assert_eq!(with_offset("2026-11-17T14:30"), "2026-11-17T14:30:00+00:00");
+        assert_eq!(
+            with_offset("2026-11-17T14:30:05"),
+            "2026-11-17T14:30:05+00:00"
+        );
+        assert_eq!(
+            local_date_time("2026-11-17T14:30:00+01:00"),
+            "2026-11-17T14:30"
+        );
+    }
+
+    #[test]
+    fn a_cleaned_form_says_so_and_a_choice_without_note_offers_none() {
+        let mut card = single();
+        if let Card::Form {
+            fields,
+            truncated,
+            replaced,
+            ..
+        } = &mut card
+        {
+            *truncated = true;
+            *replaced = true;
+            if let Some(Field::Choice { note, .. }) = fields.first_mut() {
+                *note = false;
+            }
+        }
+        let page = render(props(card));
+        assert!(
+            page.contains("Texte tronqué : le milieu est omis."),
+            "{page}"
+        );
+        assert!(
+            page.contains("Caractères cachés remplacés par �."),
+            "{page}"
+        );
+        assert!(!page.contains("Ajouter une précision"), "{page}");
+        // The closed card names each field, whatever its kind.
+        let mut closed = props(inputs());
+        closed.status = RequestStatus::Closed(Outcome::Answered {
+            summary: "alix@example.com ; 3".into(),
+        });
+        let page = render(closed);
+        for text in ["Adresse e-mail", "Combien de places ?", "Me le rappeler"] {
+            assert!(page.contains(text), "{text}: {page}");
+        }
     }
 }

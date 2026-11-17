@@ -1286,7 +1286,8 @@ async fn bad_answer_is_a_notice_not_a_log_line() {
             fronde_protocol::ChoiceAnswer {
                 selected: vec![CANARY.into()],
                 ..Default::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     };
@@ -1444,7 +1445,8 @@ async fn answer_over_websocket_reaches_the_waiter() {
             fronde_protocol::ChoiceAnswer {
                 selected: vec!["Seerr".into()],
                 ..Default::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     };

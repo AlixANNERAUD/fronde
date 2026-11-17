@@ -30,12 +30,23 @@ answer, as an audit trail.
 
 ## Answers are checked
 
-The card is a form, and the answer must fit it: only options the card offers, one pick for a
-question with one answer, required questions answered, free text non-empty and at most 2000
-characters. The page runs these checks before sending, to say at once what is missing, and the
-server runs the same code again, from `fronde_protocol::request::check`: a page cannot slip an
-option the card never offered past it. An answer that does not fit is refused to that page alone,
-and the request stays as it was.
+The card is a form, and the answer must fit it. A form holds up to 12 fields of four kinds:
+
+| Field | Shows | Its answer |
+| --- | --- | --- |
+| Question (`choice`) | Options to pick, one or several, maybe *Autre…* and a note | The labels picked, the *Autre…* text, the note |
+| Text (`text`) | One line, maybe for an e-mail address, an address (URI), a date or a date and time | The text, at most 2000 characters and within the field's own minimum and maximum length |
+| Number (`number`) | A number, maybe whole, maybe between a minimum and a maximum | The number |
+| Toggle (`toggle`) | A box to tick, on or off at first | `true` or `false` |
+
+The rules: only fields the card has, each answered with its own kind of value; only options the
+card offers, one pick for a question with one answer, required fields answered, free text
+non-empty; a text field's length and format (`name@domain.tld`; a URI with a scheme such as
+`https:`; `YYYY-MM-DD`; RFC 3339 such as `2026-11-17T14:30:00+01:00`); a number's bounds, and a
+whole number where one is asked. A blank text counts as unanswered. The page runs these checks
+before sending, to say at once what is missing, and the server runs the same code again, from
+`fronde_protocol::request::check`: a page cannot slip an option the card never offered past it.
+An answer that does not fit is refused to that page alone, and the request stays as it was.
 
 An agent that asked gets typed answers: the labels you picked, your free text and your note, each
 in its own field. It never has to parse prose, and never gets a label it did not offer.
@@ -195,9 +206,13 @@ Cards are built for a phone first: full width below 640 px, each option a row at
 that you can tap anywhere, *Envoyer* and *Refuser* full width. A question with one answer is a
 radio group (arrow keys move the pick, as in any radio group); one with several answers is a list
 of boxes. *Enter* sends the card, as in a form. *Autre…* reveals a text box, where the arrow keys
-move the caret, and *Ajouter une précision* a note. An option's preview
-shows under it on a phone and beside the options on a wider screen. Text from an agent is shown
-as text, never as HTML.
+move the caret, and *Ajouter une précision* a note (not offered where the asker has nowhere to
+put it). An option's preview shows under it on a phone and beside the options on a wider screen.
+A text field is a 44 px box whose keyboard follows its format (e-mail, address, a date picker); a
+number field is a text box with the phone's number keyboard, so that a decimal comma (`3,5`)
+works; a date and time is sent with the browser's offset from UTC; a toggle is a box on a row
+you can tap anywhere. An optional field says *(facultatif)*. Text from an agent is shown as text,
+never as HTML.
 
 ## Compared with T3 Code
 

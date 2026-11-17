@@ -16,7 +16,7 @@ use fronde_protocol::request::{
     MAX_OPTION_DETAIL, MAX_OPTION_ID, MAX_PERMISSION_BODY, MAX_PERMISSION_LINE,
     MAX_PERMISSION_TITLE,
 };
-use fronde_protocol::text::hidden;
+use fronde_protocol::text::{Notes, block, hidden, line};
 use fronde_protocol::{Card, PermissionChoice, PermissionKind, Response, ToolKind};
 use fronde_requests::Resolution;
 use std::collections::{HashMap, HashSet};
@@ -50,18 +50,8 @@ const PLAIN_NAMES: &[&str] = &[
     "reject always",
 ];
 
-/// A run of blank space longer than this shows as a marker: padding could push what follows
-/// out of sight.
-const MAX_SPACES: usize = 8;
-
-/// More blank lines in a row than this show as a marker.
-const MAX_BLANK_LINES: usize = 2;
-
 /// How many changed lines of each file the card shows.
 const DIFF_LINES: usize = 8;
-
-/// Room kept for a "[… N caractères omis …]" marker.
-const MARKER: usize = 32;
 
 /// Whether a lasting option of the Claude ACP adapter (0.107.0, `permissions/options/`) only
 /// adds an allow rule for the tool at hand: `allow-with-updates` on Read, Glob and Grep (reading
@@ -229,13 +219,6 @@ fn tool_kind(kind: AcpToolKind) -> ToolKind {
     }
 }
 
-/// What cleaning a card's texts did, for the card to say so.
-#[derive(Default)]
-struct Notes {
-    truncated: bool,
-    replaced: bool,
-}
-
 /// What the tool call would do, line by line: the command, the files and addresses it names
 /// (or its whole input, when it names none of them), its text content (a plan), each change
 /// with an excerpt, and the other places it touches.
@@ -338,134 +321,10 @@ fn changed_lines<'a>(old: &'a str, new: &'a str) -> (Vec<&'a str>, Vec<&'a str>)
     (removed, added)
 }
 
-/// The character the card shows for `c`: U+FFFD for a hidden one.
-fn visible(c: char, notes: &mut Notes) -> char {
-    if hidden(c) {
-        notes.replaced = true;
-        '\u{fffd}'
-    } else {
-        c
-    }
-}
-
-/// Long runs of blank space within a line as a marker naming their length.
-fn spaces(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut run = 0;
-    let flush = |out: &mut String, run: usize| {
-        if run > MAX_SPACES {
-            out.push_str(&format!(" [… {run} espaces …] "));
-        } else {
-            out.extend(std::iter::repeat_n(' ', run));
-        }
-    };
-    for c in line.chars() {
-        if c == ' ' || c == '\t' || (c.is_whitespace() && c != '\n') {
-            run += 1;
-            continue;
-        }
-        flush(&mut out, run);
-        run = 0;
-        out.push(c);
-    }
-    flush(&mut out, run);
-    out
-}
-
-/// `text` on one line: line breaks and tabs become spaces, hidden characters U+FFFD, long runs
-/// of space a marker; at most `max` characters, its head and tail kept.
-fn line(text: &str, max: usize, notes: &mut Notes) -> String {
-    let flat: String = text
-        .trim()
-        .chars()
-        .map(|c| match c {
-            '\n' | '\r' | '\t' => ' ',
-            c => visible(c, notes),
-        })
-        .collect();
-    elide(spaces(&flat).trim(), max, notes)
-}
-
-/// `text` with its line breaks, tabs as spaces, hidden characters U+FFFD, long runs of space or of blank lines
-/// a marker, each line at most [`MAX_PERMISSION_LINE`] characters and the whole at most
-/// [`MAX_PERMISSION_BODY`], their heads and tails kept.
+/// `text` with its line breaks, as [`block`] cleans it, each line at most
+/// [`MAX_PERMISSION_LINE`] characters and the whole at most [`MAX_PERMISSION_BODY`].
 fn text(text: &str, notes: &mut Notes) -> String {
-    let clean: String = text
-        .trim()
-        .replace("\r\n", "\n")
-        .chars()
-        .map(|c| match c {
-            '\n' => c,
-            '\t' => ' ',
-            c => visible(c, notes),
-        })
-        .collect();
-    let mut lines: Vec<String> = Vec::new();
-    let mut blank = 0;
-    for line in clean.split('\n') {
-        if line.trim().is_empty() {
-            blank += 1;
-            continue;
-        }
-        push_blank(&mut lines, blank);
-        blank = 0;
-        lines.push(elide(spaces(line).trim_end(), MAX_PERMISSION_LINE, notes));
-    }
-    elide_lines(lines, MAX_PERMISSION_BODY, notes)
-}
-
-/// `blank` empty lines, or one marker for more than [`MAX_BLANK_LINES`].
-fn push_blank(lines: &mut Vec<String>, blank: usize) {
-    if blank > MAX_BLANK_LINES {
-        lines.push(format!("[… {blank} lignes vides …]"));
-    } else {
-        lines.extend(std::iter::repeat_n(String::new(), blank));
-    }
-}
-
-/// `text` if it has at most `max` characters; else its head and its tail around a marker
-/// counting what was left out.
-fn elide(text: &str, max: usize, notes: &mut Notes) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        return text.to_owned();
-    }
-    notes.truncated = true;
-    let room = max.saturating_sub(MARKER);
-    let head = room / 2;
-    let tail = room - head;
-    let omitted = chars.len() - head - tail;
-    let head: String = chars[..head].iter().collect();
-    let tail: String = chars[chars.len() - tail..].iter().collect();
-    format!("{head}[… {omitted} caractères omis …]{tail}")
-}
-
-/// `lines` joined, if that has at most `max` characters; else the first and the last lines
-/// that fit around a marker counting what was left out.
-fn elide_lines(lines: Vec<String>, max: usize, notes: &mut Notes) -> String {
-    let joined = lines.join("\n");
-    let total = joined.chars().count();
-    if total <= max {
-        return joined;
-    }
-    notes.truncated = true;
-    let budget = max.saturating_sub(MARKER + 2) / 2;
-    let size = |line: &String| line.chars().count() + 1;
-    let (mut head, mut used) = (0, 0);
-    while head < lines.len() && used + size(&lines[head]) <= budget {
-        used += size(&lines[head]);
-        head += 1;
-    }
-    let (mut tail, mut tail_used) = (lines.len(), 0);
-    while tail > head && tail_used + size(&lines[tail - 1]) <= budget {
-        tail_used += size(&lines[tail - 1]);
-        tail -= 1;
-    }
-    let omitted: usize = lines[head..tail].iter().map(size).sum();
-    let mut kept: Vec<String> = lines[..head].to_vec();
-    kept.push(format!("[… {omitted} caractères omis …]"));
-    kept.extend(lines[tail..].iter().cloned());
-    kept.join("\n")
+    block(text, MAX_PERMISSION_LINE, MAX_PERMISSION_BODY, notes)
 }
 
 #[cfg(test)]

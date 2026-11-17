@@ -7,8 +7,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use request::{
-    Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Keep, KeyPlace, Outcome, PermissionChoice,
-    PermissionKind, Remember, RequestId, Response, SecretValue, ToolKind,
+    Card, ChoiceAnswer, ChoiceOption, Field, FieldValue, Invalid, Keep, KeyPlace, Outcome,
+    PermissionChoice, PermissionKind, Remember, RequestId, Response, SecretValue, TextFormat,
+    ToolKind,
 };
 
 /// State of a tool call shown in the conversation.
@@ -197,7 +198,8 @@ mod tests {
                                 selected: vec!["Mealie".into()],
                                 other: Some("Paperless".into()),
                                 note: Some("le soir".into()),
-                            },
+                            }
+                            .into(),
                         )]
                         .into(),
                     },
@@ -264,6 +266,8 @@ mod tests {
             message: String::new(),
             fields: Vec::new(),
             submit: None,
+            truncated: false,
+            replaced: false,
         };
         let asked = Event::Request {
             id: 4,

@@ -21,6 +21,7 @@ tw_merge.workspace = true
 futures.workspace = true
 gloo-net.workspace = true
 gloo-timers.workspace = true
+js-sys.workspace = true
 wasm-bindgen.workspace = true
 web-sys = { workspace = true, features = ["Document", "Element", "HtmlElement", "HtmlInputElement", "Location", "VisibilityState", "Window"] }
 

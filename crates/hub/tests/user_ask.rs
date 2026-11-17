@@ -291,7 +291,10 @@ async fn user_ask_returns_typed_answers() {
         other,
         required,
         ..
-    } = &fields[0];
+    } = &fields[0]
+    else {
+        unreachable!()
+    };
     assert_eq!(key, "q1");
     assert_eq!(header.as_deref(), Some("Appli"));
     assert_eq!(
@@ -304,7 +307,9 @@ async fn user_ask_returns_typed_answers() {
         }
     );
     assert!(!multi && *other && *required);
-    let Field::Choice { multi, .. } = &fields[1];
+    let Field::Choice { multi, .. } = &fields[1] else {
+        unreachable!()
+    };
     assert!(multi);
 
     // An answer that does not fit is refused; the call keeps waiting.
@@ -314,7 +319,8 @@ async fn user_ask_returns_typed_answers() {
             ChoiceAnswer {
                 selected: vec!["Nextcloud".into()],
                 ..ChoiceAnswer::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     };
@@ -329,7 +335,8 @@ async fn user_ask_returns_typed_answers() {
                     selected: vec![],
                     other: Some(" Tandoor ".into()),
                     note: Some("pour la famille".into()),
-                },
+                }
+                .into(),
             ),
             (
                 "q2".to_owned(),
@@ -337,7 +344,8 @@ async fn user_ask_returns_typed_answers() {
                     selected: vec!["Jellyfin".into(), "Immich".into()],
                     other: None,
                     note: Some("  ".into()),
-                },
+                }
+                .into(),
             ),
         ]
         .into(),
@@ -396,7 +404,8 @@ async fn user_ask_retry_shows_one_card() {
             ChoiceAnswer {
                 selected: vec!["Seerr".into()],
                 ..ChoiceAnswer::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     };
@@ -432,7 +441,8 @@ async fn user_ask_reused_id_gets_no_old_answer() {
             ChoiceAnswer {
                 selected: vec!["Seerr".into()],
                 ..ChoiceAnswer::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     };
@@ -464,7 +474,9 @@ async fn user_ask_preview_keeps_its_lines() {
     let Card::Form { fields, .. } = &card else {
         panic!("not a question card: {card:?}");
     };
-    let Field::Choice { options, .. } = &fields[0];
+    let Field::Choice { options, .. } = &fields[0] else {
+        unreachable!()
+    };
     assert_eq!(options[0].preview.as_deref(), Some("| A | B |\n|\tC |"));
     bench.requests.cancel(id).await.unwrap();
     result(call).await;

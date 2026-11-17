@@ -79,6 +79,8 @@ tw_merge = "0.1"
 wiremock = "0.6"
 uuid = { version = "1", features = ["v4"] }
 wasm-bindgen = "0.2"
+# The browser's clock and time zone, for a date and time typed in a card.
+js-sys = "0.3"
 webpki-roots = "1"
 zeroize = "1"
 web-sys = "0.3"

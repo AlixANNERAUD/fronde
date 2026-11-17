@@ -934,8 +934,11 @@ async fn requests_are_shown_in_the_conversation() {
             multi: false,
             other: false,
             required: true,
+            note: true,
         }],
         submit: None,
+        truncated: false,
+        replaced: false,
     };
     let waiter = requests
         .ask(Ask {
@@ -957,7 +960,8 @@ async fn requests_are_shown_in_the_conversation() {
             ChoiceAnswer {
                 selected: vec!["Perso".into()],
                 ..ChoiceAnswer::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     };
@@ -1008,8 +1012,11 @@ fn question_card() -> fronde_protocol::Card {
             multi: false,
             other: true,
             required: true,
+            note: true,
         }],
         submit: None,
+        truncated: false,
+        replaced: false,
     }
 }
 

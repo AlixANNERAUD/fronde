@@ -102,8 +102,11 @@ fn question() -> Card {
             multi: false,
             other: true,
             required: true,
+            note: true,
         }],
         submit: None,
+        truncated: false,
+        replaced: false,
     }
 }
 
@@ -127,7 +130,8 @@ fn pick(label: &str) -> Response {
             ChoiceAnswer {
                 selected: vec![label.into()],
                 ..ChoiceAnswer::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     }
@@ -316,7 +320,8 @@ async fn answer_is_validated() {
             ChoiceAnswer {
                 selected: vec!["Mealie".into(), "Seerr".into()],
                 ..ChoiceAnswer::default()
-            },
+            }
+            .into(),
         )]
         .into(),
     };
@@ -403,7 +408,9 @@ fn other_question(mut ask: Ask) -> Ask {
     let Card::Form { fields, .. } = &mut ask.card else {
         unreachable!("a question");
     };
-    let Field::Choice { question, .. } = &mut fields[0];
+    let Field::Choice { question, .. } = &mut fields[0] else {
+        unreachable!()
+    };
     *question = "Et laquelle ensuite ?".into();
     ask
 }
@@ -774,8 +781,11 @@ async fn every_card_is_checked_before_it_is_written() {
             multi: false,
             other: false,
             required: true,
+            note: true,
         }],
         submit: None,
+        truncated: false,
+        replaced: false,
     };
     let error = requests.ask(hidden).await.unwrap_err();
     assert!(format!("{error:#}").contains("U+200B"), "{error:#}");
