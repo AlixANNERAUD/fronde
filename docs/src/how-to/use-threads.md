@@ -66,9 +66,10 @@ is a link to the sub-agent's thread. The parent agent then answers on its own wi
 sub-agent found: you do not have to ask. If the parent was in the middle of a reply, it finishes
 that reply first. Cards shown during such an answer say *Tour lancé par le résultat du
 sous-agent* with its title: that turn follows the sub-agent's text, not yours, so its permission
-cards offer no "always" option and it cannot ask you for a secret. Stop interrupts that answer
-only; the sub-agents keep working. Results that were waiting, and those that come after, then
-wait for your next message, which carries them. After ten such answers in a row without a
+cards offer no "always" option and it cannot ask you for a secret; nor can the sub-agents it
+starts or sends to. Stop interrupts that answer only; the sub-agents keep working. Results that
+were waiting when you pressed Stop, and those that come after, then wait for your next message,
+which carries them, and its cards say *Ce tour transmet N résultats de sous-agents*. After ten such answers in a row without a
 message from you, the next results wait the same way, and the chat says how many. An archived
 thread is not woken, nor are the threads under it. Archiving a sub-agent itself shows a
 *Sous-agent archivé* line in its parent's chat.

@@ -435,7 +435,8 @@ impl Threads {
     /// Opens the threads stored in `db`: first imports the files that held the conversation in
     /// `data_dir` before the database, then makes sure the main thread exists, moving the
     /// agent's session id there from the key-value table. Other threads open when first needed,
-    /// or now if a stop left their last turn open, so that it is closed. Every thread's agent
+    /// or now if a stop left their last turn open, so that it is closed, or left the owner's
+    /// late answers waiting, so that they are given. Every thread's agent
     /// is started by `connector`, on its first message: the main thread's from `spec`, another
     /// thread's from `spec` with that thread's [`thread_dirs`].
     pub async fn open(
@@ -522,13 +523,14 @@ impl Threads {
                 threads.assistant(row.id).await?;
                 continue;
             }
-            match turn_left_open(&threads.db, &row.topic).await {
+            match left_waiting(&threads.db, &row.topic).await {
                 Ok(true) => {
                     threads.assistant(row.id).await?;
                 }
                 Ok(false) => {}
                 Err(error) => tracing::warn!(
-                    "cannot tell whether thread {} was stopped in the middle of a turn: {error:#}",
+                    "cannot tell whether thread {} was stopped in the middle of a turn or with \
+                     late answers waiting: {error:#}",
                     row.id
                 ),
             }
@@ -1250,19 +1252,25 @@ async fn read_tail(db: &DatabaseConnection, topic: &str) -> anyhow::Result<Tail>
     Ok(Tail { outcome: None, at })
 }
 
-/// Whether the stream `topic` ends in a turn a stop left open, reading from its newest entry
-/// back to the last turn's start or end.
-async fn turn_left_open(db: &DatabaseConnection, topic: &str) -> anyhow::Result<bool> {
+/// Whether the stream `topic` ends in a turn a stop left open, or holds late answers of the
+/// owner's that no message gave yet, reading from its newest entry back to its last message.
+/// A late answer is logged during a turn and given by the next message, logged as soon as
+/// that turn ends: one after the last message is waiting.
+async fn left_waiting(db: &DatabaseConnection, topic: &str) -> anyhow::Result<bool> {
     let mut pages = stream_entries::Entity::find()
         .filter(stream_entries::Column::Topic.eq(topic))
         .order_by_desc(stream_entries::Column::Seq)
         .paginate(db, SCAN_PAGE);
+    let mut ended = false;
     while let Some(rows) = pages.fetch_and_next().await? {
         for row in rows {
             let event: Event = serde_json::from_value(row.event)
                 .with_context(|| format!("entry {} of {topic} is not readable", row.seq))?;
-            if let Some(open) = assistant::turn_open_at(&event) {
-                return Ok(open);
+            match event {
+                Event::LateAnswer { .. } => return Ok(true),
+                Event::User { .. } => return Ok(!ended),
+                Event::TurnEnded { .. } => ended = true,
+                _ => {}
             }
         }
     }

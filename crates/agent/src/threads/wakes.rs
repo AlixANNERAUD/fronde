@@ -12,14 +12,20 @@
 //!   result reached the agent and is never given again;
 //! - wakes are bounded: once `[threads] wakes_without_owner` turns were woken since the owner's
 //!   last message (`Woken` entries after the last `User` entry the owner wrote), the results
-//!   coming next are held, and so are those waiting when the owner stops a turn, or when a wake
-//!   turn ends before its prompt went out: [`Event::WakesHeld`] says so, and from then on every
-//!   result is held until the next message, which carries them all to the agent;
+//!   coming next are held, and so are those waiting when the owner stops a turn while results
+//!   wait, or when a wake turn ends before its prompt went out: [`Event::WakesHeld`] says so,
+//!   and from then on every result is held until the next message, which carries them all to
+//!   the agent. A message whose prompt never goes out (its agent did not start) gives back the
+//!   results it carried: they are held again, first ([`Event::WakesHeld`] `returned`);
 //! - at the next start, a wake turn left open before its `Woken` runs again; one left open after
-//!   it is closed as interrupted, as a user's turn is, and the wakes after it run in order.
+//!   it is closed as interrupted, as a user's turn is, and the wakes after it run in order;
+//! - the owner's late answers waiting for a turn's end are in the stream too
+//!   ([`Event::LateAnswer`]), until the owner's message that gives them: at the next start, those
+//!   still waiting go first, as at a turn's end.
 //!
 //! So a result reaches the parent at most once: a stop between the `Woken` entry and the prompt,
-//! or between a sub-agent's end and its `ChildEnded` entry, loses it. An archived parent, or one
+//! between a message carrying held results and its prompt, or between a sub-agent's end and its
+//! `ChildEnded` entry, loses it. An archived parent, or one
 //! under an archived thread, is not woken: no entry is logged for it, and the wakes waiting when
 //! it was archived end at once, cancelled. A `ChildEnded` with the outcome
 //! [`TurnOutcome::Archived`] only tells the parent that the owner archived that sub-agent.
@@ -28,6 +34,7 @@ use std::collections::VecDeque;
 
 use fronde_protocol::text::readable as visible;
 use fronde_protocol::{MAX_ANSWER, MAX_TITLE, WokenBy};
+use fronde_requests::LateAnswer;
 
 use super::{StartedBy, ThreadId, Threads};
 use crate::log::{Entry, Event, TurnOutcome};
@@ -94,6 +101,9 @@ pub(crate) struct Queue {
     pub(crate) holding: bool,
     /// The wake turns given since the owner's last message.
     pub(crate) since_owner: usize,
+    /// A result came during the running turn whose thread could not be checked (a database
+    /// error): the turn's end holds the results waiting rather than waking the thread.
+    pub(crate) hold_at_end: bool,
 }
 
 impl Queue {
@@ -107,6 +117,7 @@ impl Queue {
     /// until the next message, every result is held. How many results are held.
     pub(crate) fn hold(&mut self, open: Option<Wake>) -> usize {
         self.holding = true;
+        self.hold_at_end = false;
         self.held.extend(open);
         self.held.extend(self.waiting.drain(..));
         self.held.len()
@@ -121,6 +132,14 @@ impl Queue {
         self.holding = false;
         std::mem::take(&mut self.held)
     }
+
+    /// The results `carried` by the last message, whose prompt never went out, are held again,
+    /// before those held since, after `open`'s own if that wake never gave its prompt either:
+    /// [`Queue::hold`].
+    pub(crate) fn hold_again(&mut self, carried: Vec<Wake>, open: Option<Wake>) -> usize {
+        self.held.splice(0..0, carried);
+        self.hold(open)
+    }
 }
 
 /// Where a thread's stream leaves its turns and wakes.
@@ -129,6 +148,8 @@ pub(crate) struct Replay {
     /// The turn left open, if any.
     pub(crate) open: Option<Opened>,
     pub(crate) queue: Queue,
+    /// The owner's late answers logged since the last message: not given yet.
+    pub(crate) late: Vec<LateAnswer>,
 }
 
 /// Reads `entries`, a whole stream, as the turns and wakes were run under the budget of
@@ -136,12 +157,26 @@ pub(crate) struct Replay {
 pub(crate) fn replay(entries: &[Entry], wakes_without_owner: usize) -> Replay {
     let mut replay = Replay::default();
     let queue = &mut replay.queue;
+    // The results the last message carried, given back if its prompt never went out.
+    let mut carried = Vec::new();
     for entry in entries {
         match &entry.event {
             Event::User { by, .. } => {
-                queue.message(by.is_none());
+                carried = queue.message(by.is_none());
+                // A late answer is pending until a message: the one that gives it, since no
+                // other is logged before (see `Assistant::answer_late`).
+                replay.late.clear();
                 replay.open = Some(Opened::User { seq: entry.seq });
             }
+            Event::LateAnswer {
+                request,
+                text,
+                note,
+            } => replay.late.push(LateAnswer {
+                request: *request,
+                text: text.clone(),
+                note: note.clone(),
+            }),
             Event::ChildEnded { .. } => {
                 let Some(wake) = Wake::of(entry) else {
                     continue;
@@ -169,7 +204,7 @@ pub(crate) fn replay(entries: &[Entry], wakes_without_owner: usize) -> Replay {
                     queue.since_owner += 1;
                 }
             }
-            Event::WakesHeld { .. } => {
+            Event::WakesHeld { returned, .. } => {
                 // A wake turn that never gave its prompt is held with the others.
                 let undelivered = match replay.open.take() {
                     Some(Opened::Wake {
@@ -182,7 +217,12 @@ pub(crate) fn replay(entries: &[Entry], wakes_without_owner: usize) -> Replay {
                         None
                     }
                 };
-                queue.hold(undelivered);
+                let returned = if *returned {
+                    std::mem::take(&mut carried)
+                } else {
+                    Vec::new()
+                };
+                queue.hold_again(returned, undelivered);
             }
             Event::TurnEnded { .. } => {
                 replay.open = if queue.holds(wakes_without_owner) {
@@ -425,7 +465,13 @@ mod tests {
     }
 
     fn held(seq: u64, count: u32) -> Entry {
-        entry(seq, Event::WakesHeld { count })
+        entry(
+            seq,
+            Event::WakesHeld {
+                count,
+                returned: false,
+            },
+        )
     }
 
     fn held_seqs(replay: &Replay) -> Vec<u64> {
@@ -505,6 +551,69 @@ mod tests {
         assert_eq!(seqs(&replay), (None, vec![]));
         assert_eq!(held_seqs(&replay), [3, 4, 7]);
         assert_eq!(replay.queue.since_owner, 0, "no wake turn ran");
+    }
+
+    /// A message whose prompt never went out gives back the results it carried: they are held
+    /// again, first, and the next message carries them.
+    #[test]
+    fn a_message_that_never_went_out_gives_its_results_back() {
+        let mut entries = vec![
+            user(1),
+            ended(2),
+            child(3, 7),
+            held(4, 1),
+            user(5),
+            child(6, 8),
+            entry(
+                7,
+                Event::WakesHeld {
+                    count: 2,
+                    returned: true,
+                },
+            ),
+            entry(
+                8,
+                Event::TurnEnded {
+                    outcome: TurnOutcome::Error,
+                },
+            ),
+        ];
+        let replay = super::replay(&entries, 10);
+        assert_eq!(seqs(&replay), (None, vec![]));
+        assert_eq!(held_seqs(&replay), [3, 6]);
+        assert!(replay.queue.holding);
+        // Without the mark, they went with the message.
+        let mut plain = entries.clone();
+        plain[6] = held(7, 1);
+        assert_eq!(held_seqs(&super::replay(&plain, 10)), [6]);
+        entries.push(user(9));
+        assert_eq!(held_seqs(&super::replay(&entries, 10)), Vec::<u64>::new());
+    }
+
+    fn late(seq: u64, request: u64) -> Entry {
+        entry(
+            seq,
+            Event::LateAnswer {
+                request,
+                text: format!("Réponse {request}"),
+                note: None,
+            },
+        )
+    }
+
+    /// A late answer waits until a message, which gives it.
+    #[test]
+    fn late_answers_wait_for_the_next_message() {
+        let entries = [user(1), late(2, 4), late(3, 5), ended(4)];
+        let replay = replay(&entries, 10);
+        let requests: Vec<u64> = replay.late.iter().map(|late| late.request).collect();
+        assert_eq!(requests, [4, 5]);
+        assert_eq!(replay.late[0].text, "Réponse 4");
+        let given = [user(1), late(2, 4), ended(3), user(4)];
+        assert!(super::replay(&given, 10).late.is_empty());
+        // Logged during a wake's turn, it waits too.
+        let woken = [child(1, 7), woken(2, 1), late(3, 4)];
+        assert_eq!(super::replay(&woken, 10).late.len(), 1);
     }
 
     /// The owner archived a sub-agent: its parent is told, not woken.

@@ -131,6 +131,11 @@ impl EphemeralSecrets {
 
     /// The value behind `reference`, for a consumer acting in `scope`. A single-use secret is
     /// removed by this call. Any refusal is the same [`RefError`].
+    ///
+    /// No tool takes a reference yet. The first one must refuse it in a thread's turn of wake
+    /// origin (`Assistant::turn_and_wake`), as a secret card is refused there: that turn follows
+    /// a sub-agent's text, not the owner's, and a reference given earlier in the conversation
+    /// still works in it.
     pub fn take(&self, reference: &str, scope: &EphemeralScope) -> Result<SecretString, RefError> {
         self.take_at(reference, scope, Utc::now())
     }

@@ -142,7 +142,7 @@ impl Pause {
         }
     }
 
-    async fn hold(&self) {
+    pub(crate) async fn hold(&self) {
         self.reached.notify_one();
         self.release.notified().await;
     }
@@ -197,7 +197,8 @@ pub struct TurnResult {
 /// - a call that stops waiting (timeout, given up, a card, its turn over)
 ///   [`Handoff::withdraw`]s: if the result was handed over meanwhile, it gets it then, so that
 ///   a result marked delivered is never lost; a call whose caller is gone gives it back
-///   ([`Handoff::give_back`]), and it wakes the parent instead.
+///   ([`Handoff::give_back`]), and it wakes the parent instead, unless another call it was
+///   handed to returns it ([`Handoff::returned`]): the last of those calls to settle decides.
 ///
 /// It also remembers which child each `(parent, client_request_id)` started, in which of the
 /// parent's turns, so that a retry joins it only in that turn; those entries go when that turn
@@ -218,11 +219,22 @@ struct HandoffState {
     next: u64,
     /// The calls waiting, by thread and turn.
     waiting: HashMap<(ThreadId, u64), Waiting>,
-    /// The last turns of each thread whose end was decided, by seq: whether a waiting call
-    /// took the result (or the turn was settled), else it went to the parent as a wake.
-    ended: HashMap<ThreadId, std::collections::BTreeMap<u64, bool>>,
+    /// The last turns of each thread whose end was decided, by seq.
+    ended: HashMap<ThreadId, std::collections::BTreeMap<u64, Fate>>,
     /// `(parent, client_request_id)` → (child, the parent's turn that started it).
     retries: HashMap<(ThreadId, String), (ThreadId, u64)>,
+}
+
+/// What became of an ended turn's result.
+#[derive(Clone, Copy, Debug, Default)]
+struct Fate {
+    /// A waiting call took the result (or the turn was settled); else it went to the parent as
+    /// a wake.
+    taken: bool,
+    /// The calls it was handed to that have not said yet whether they return it.
+    handed: usize,
+    /// One of those calls returned it to its caller: it is taken for good.
+    returned: bool,
 }
 
 /// The turn's end was decided before the call registered: its result is in the stream.
@@ -247,7 +259,7 @@ impl Handoff {
             && ended.last_key_value().is_some_and(|(last, _)| *last >= seq)
         {
             return Err(AlreadyEnded {
-                taken: ended.get(&seq).copied(),
+                taken: ended.get(&seq).map(|fate| fate.taken),
             });
         }
         state.next += 1;
@@ -306,32 +318,59 @@ impl Handoff {
         state
             .retries
             .retain(|(parent, _), (_, turn)| !(*parent == thread && *turn <= seq));
-        let mut delivered = false;
+        let mut handed = 0;
         for (_, sender) in state.waiting.remove(&(thread, seq)).unwrap_or_default() {
-            delivered |= sender.send(result.clone()).is_ok();
+            if sender.send(result.clone()).is_ok() {
+                handed += 1;
+            }
         }
+        let delivered = handed > 0;
         let ended = state.ended.entry(thread).or_default();
-        ended.insert(seq, delivered || settled);
+        ended.insert(
+            seq,
+            Fate {
+                taken: delivered || settled,
+                handed,
+                returned: false,
+            },
+        );
         while ended.len() > ENDS_KEPT {
             ended.pop_first();
         }
         delivered || settled
     }
 
-    /// The result of turn `seq` of `thread` was handed to a call whose caller is gone: it is
-    /// no longer taken, and goes to the parent as a wake. Whether it was taken.
+    /// The result of turn `seq` of `thread` was handed to a call whose caller is gone: unless
+    /// another call it was handed to returned it, or may still, it is no longer taken, and goes
+    /// to the parent as a wake. Whether it goes there now: then the caller wakes the parent.
     pub fn give_back(&self, thread: ThreadId, seq: u64) -> bool {
         let mut state = lock(&self.state);
-        match state
+        let Some(fate) = state
+            .ended
+            .get_mut(&thread)
+            .and_then(|ended| ended.get_mut(&seq))
+        else {
+            return false;
+        };
+        fate.handed = fate.handed.saturating_sub(1);
+        if !fate.taken || fate.returned || fate.handed > 0 {
+            return false;
+        }
+        fate.taken = false;
+        true
+    }
+
+    /// A call handed the result of turn `seq` of `thread` returned it to its caller: it stays
+    /// taken, whatever the other calls handed it do.
+    pub fn returned(&self, thread: ThreadId, seq: u64) {
+        let mut state = lock(&self.state);
+        if let Some(fate) = state
             .ended
             .get_mut(&thread)
             .and_then(|ended| ended.get_mut(&seq))
         {
-            Some(taken) if *taken => {
-                *taken = false;
-                true
-            }
-            _ => false,
+            fate.handed = fate.handed.saturating_sub(1);
+            fate.returned = true;
         }
     }
 
@@ -341,7 +380,7 @@ impl Handoff {
             .ended
             .get(&thread)
             .and_then(|ended| ended.last_key_value())
-            .and_then(|(seq, taken)| taken.then_some(*seq))
+            .and_then(|(seq, fate)| fate.taken.then_some(*seq))
     }
 
     /// How many calls wait for turns of `thread`.
@@ -465,6 +504,8 @@ pub enum Delegation {
     },
     /// A provider other than the configured one.
     Provider { given: String, configured: String },
+    /// The caller's turn that made the call ended before it went through.
+    TurnOver,
 }
 
 impl std::fmt::Display for Delegation {
@@ -516,6 +557,9 @@ impl std::fmt::Display for Delegation {
             Self::Provider { given, configured } => write!(
                 f,
                 "provider {given:?} cannot run sub-agents here; only {configured} is configured"
+            ),
+            Self::TurnOver => f.write_str(
+                "your turn ended before this call went through: nothing was started or sent",
             ),
         }
     }
@@ -785,6 +829,9 @@ impl Threads {
                 child: earlier.id,
             });
         }
+        // The sub-agent's turn follows what the calling turn followed: a turn of wake origin
+        // gives its own to it (see `Assistant::origin_of`).
+        let origin = self.opened(parent).await?.origin_of(turn).await?;
         // Under the start lock: two starts never both pass.
         let limits = self.limits();
         let kept = self.kept_children(parent).await?;
@@ -835,7 +882,7 @@ impl Threads {
         }
         let sent = match self.opened(row.id).await {
             Ok(assistant) => assistant
-                .try_send(child.task, Some(parent_row.title.clone()))
+                .try_send_from(child.task, Some(parent_row.title.clone()), origin)
                 .await
                 .map_err(|refused| match refused {
                     Refused::Busy => anyhow::Error::new(Delegation::Busy),
@@ -915,11 +962,13 @@ impl Threads {
             .map(|(seq, _)| seq))
     }
 
-    /// Sends `text` to `caller`'s sub-agent `target`, as a new turn written by `caller`: the
-    /// seq of the message. Refused while the sub-agent is in a turn.
+    /// Sends `text` to `caller`'s sub-agent `target`, as a new turn written by `caller` in its
+    /// turn `turn`: the seq of the message. Refused while the sub-agent is in a turn, and once
+    /// `turn` is over. A turn of wake origin gives its own to the sub-agent's turn.
     pub async fn send_child(
         &self,
         caller: ThreadId,
+        turn: Option<u64>,
         target: ThreadId,
         text: String,
     ) -> anyhow::Result<u64> {
@@ -934,9 +983,10 @@ impl Threads {
             bail!(Delegation::TooManyRunning { limit });
         }
         self.check_turns_today().await?;
+        let origin = self.opened(caller).await?.origin_of(turn).await?;
         let by = self.get(caller).await?.map(|caller| caller.title);
         let assistant = self.opened(row.id).await?;
-        match assistant.try_send(text, by).await {
+        match assistant.try_send_from(text, by, origin).await {
             Ok(Some(seq)) => Ok(seq),
             Ok(None) => bail!("the message to sub-agent {target} could not be logged"),
             Err(Refused::Busy) => bail!(Delegation::Busy),
@@ -1159,6 +1209,7 @@ impl Threads {
                 () = tokio::time::sleep_until(deadline) => break ChildEnd::TimedOut,
                 result = &mut registration.result => match result {
                     Ok(TurnResult { outcome, answer }) => {
+                        handoff.returned(row.id, seq);
                         return Ok(ChildEnd::Ended { outcome, answer });
                     }
                     Err(_) => bail!("the end of sub-agent {target}'s turn was lost"),
@@ -1189,7 +1240,10 @@ impl Threads {
                 }
                 stopped
             }
-            Some(TurnResult { outcome, answer }) => ChildEnd::Ended { outcome, answer },
+            Some(TurnResult { outcome, answer }) => {
+                handoff.returned(row.id, seq);
+                ChildEnd::Ended { outcome, answer }
+            }
             None => stopped,
         })
     }
@@ -1408,6 +1462,56 @@ mod tests {
         assert_eq!(handoff.delivered(child), None);
         assert_eq!(
             handoff.register(child, 5).err(),
+            Some(AlreadyEnded { taken: Some(false) })
+        );
+    }
+
+    /// Two calls handed the same result: once one returns it, it stays taken, whichever gives
+    /// it back; only when every call handed it gives it back does it wake the parent, once.
+    #[test]
+    fn a_result_returned_by_one_of_two_waits_is_never_given_back() {
+        let handoff = Handoff::default();
+        let child = ThreadId(2);
+        // The first gives it back while the second may still return it: no wake yet; the
+        // second returns it.
+        let (first, second) = (
+            handoff.register(child, 5).unwrap(),
+            handoff.register(child, 5).unwrap(),
+        );
+        assert!(handoff.turn_ended(child, 5, result("Deux.")));
+        assert_eq!(handoff.withdraw(child, 5, first), Some(result("Deux.")));
+        assert!(!handoff.give_back(child, 5), "the other wait may return it");
+        assert_eq!(handoff.withdraw(child, 5, second), Some(result("Deux.")));
+        handoff.returned(child, 5);
+        assert_eq!(handoff.delivered(child), Some(5));
+        assert_eq!(
+            handoff.register(child, 5).err(),
+            Some(AlreadyEnded { taken: Some(true) })
+        );
+        // The other order: returned first, then given back.
+        let (first, second) = (
+            handoff.register(child, 7).unwrap(),
+            handoff.register(child, 7).unwrap(),
+        );
+        assert!(handoff.turn_ended(child, 7, result("Trois.")));
+        assert_eq!(handoff.withdraw(child, 7, first), Some(result("Trois.")));
+        handoff.returned(child, 7);
+        assert_eq!(handoff.withdraw(child, 7, second), Some(result("Trois.")));
+        assert!(!handoff.give_back(child, 7), "returned by the first");
+        assert_eq!(handoff.delivered(child), Some(7));
+        // Both give it back: the last one wakes the parent, once.
+        let (first, second) = (
+            handoff.register(child, 9).unwrap(),
+            handoff.register(child, 9).unwrap(),
+        );
+        assert!(handoff.turn_ended(child, 9, result("Quatre.")));
+        assert_eq!(handoff.withdraw(child, 9, first), Some(result("Quatre.")));
+        assert_eq!(handoff.withdraw(child, 9, second), Some(result("Quatre.")));
+        assert!(!handoff.give_back(child, 9));
+        assert!(handoff.give_back(child, 9), "the last one gives it back");
+        assert!(!handoff.give_back(child, 9), "once");
+        assert_eq!(
+            handoff.register(child, 9).err(),
             Some(AlreadyEnded { taken: Some(false) })
         );
     }

@@ -315,11 +315,13 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
   `Read more with threads_read (thread <id>).`, the title quoted and escaped on one line. A wake
   waits for the running turn, wakes run in order, a thread archived or under an archived one is
   not woken, and a result reaches the thread at most once, a restart included. After
-  `wakes_without_owner` woken turns since the user's last message, or after the user's Stop, the
-  results are held and come with the user's next message, before its text, as data. A woken
-  turn may use `threads_start` and `threads_send` (what they return wakes it again, within that
-  budget), but not `user_secret`, which refuses it; its cards name the sub-agent (see
-  [Wakes](../explanation/threads.md#wakes)).
+  `wakes_without_owner` woken turns since the user's last message, or after the user's Stop while
+  results waited, the results are held and come with the user's next message, before its text,
+  as data. A woken turn may use `threads_start` and `threads_send` (what they return wakes it
+  again, within that budget), but not `user_secret`, which refuses it; its cards name the
+  sub-agent, and so do those of the sub-agent turns it starts or sends, which get the same limits
+  (see [Wakes](../explanation/threads.md#wakes)). A `threads_start` or `threads_send` that comes
+  once the calling turn is over is refused.
 - **Retries.** A call retried in the same turn with the same `client_request_id` and the same
   arguments joins the sub-agent the first one started (`joined: true`). The same id for another
   task, title, provider or model, or in another turn, is refused while that sub-agent is not

@@ -69,6 +69,9 @@ pub enum Item {
         server: bool,
         /// The sub-agent whose result started the turn that asks: the card says so.
         woken_by: Option<WokenBy>,
+        /// How many sub-agents' results the owner's message carried in the turn that asks:
+        /// the card says so ([`carries_line`]).
+        carries: u32,
         status: RequestStatus,
         /// Why the server refused this page's last answer, while the request is open.
         refusal: Option<String>,
@@ -312,7 +315,10 @@ impl Chat {
             }
             // The wake's prompt went out: nothing to show.
             Event::Woken { .. } => self.unwoken = false,
-            Event::WakesHeld { count } => {
+            // A late answer waiting for the turn's end: the notice logged with it says so, and
+            // the owner's message that gives it shows it.
+            Event::LateAnswer { .. } => {}
+            Event::WakesHeld { count, .. } => {
                 // Every result waiting is held, a wake turn that never gave its prompt included.
                 self.wakes = 0;
                 if self.unwoken {
@@ -356,6 +362,7 @@ impl Chat {
                 from,
                 server,
                 woken_by,
+                carries,
             } => self.push(
                 seq,
                 Item::Request {
@@ -364,6 +371,7 @@ impl Chat {
                     from,
                     server,
                     woken_by,
+                    carries,
                     status: RequestStatus::Open,
                     refusal: None,
                     by: None,
@@ -409,6 +417,16 @@ impl Chat {
 }
 
 /// Ends a running tool call; any other row is left alone.
+/// What a card says above it when the owner's message carried `count` sub-agents' results to
+/// the agent in the turn that asks: that turn follows their text too.
+pub fn carries_line(count: u32) -> String {
+    if count == 1 {
+        "Ce tour transmet 1 résultat de sous-agent".to_owned()
+    } else {
+        format!("Ce tour transmet {count} résultats de sous-agents")
+    }
+}
+
 /// What the chat says when `count` sub-agents' results wait for the owner's next message.
 pub fn held_notice(count: u32) -> String {
     if count == 1 {
@@ -626,7 +644,16 @@ mod tests {
         let mut chat = Chat::default();
         apply_all(
             &mut chat,
-            [child_ended(1, 7), entry(2, Event::WakesHeld { count: 1 })],
+            [
+                child_ended(1, 7),
+                entry(
+                    2,
+                    Event::WakesHeld {
+                        count: 1,
+                        returned: false,
+                    },
+                ),
+            ],
         );
         assert!(!chat.running(), "held, not woken");
         // Results waiting for a stopped turn are held at its end.
@@ -635,7 +662,13 @@ mod tests {
             [
                 user(3, "Va"),
                 child_ended(4, 8),
-                entry(5, Event::WakesHeld { count: 2 }),
+                entry(
+                    5,
+                    Event::WakesHeld {
+                        count: 2,
+                        returned: false,
+                    },
+                ),
                 ended(6, TurnOutcome::Cancelled),
             ],
         );
@@ -852,6 +885,7 @@ mod tests {
                 from: None,
                 server: false,
                 woken_by: None,
+                carries: 0,
             },
         )
     }
@@ -895,6 +929,7 @@ mod tests {
                         from: None,
                         server: false,
                         woken_by: None,
+                        carries: 0,
                     },
                 ),
             ],

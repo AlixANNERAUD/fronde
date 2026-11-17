@@ -158,6 +158,7 @@ mod tests {
             from: None,
             server: false,
             woken_by: None,
+            carries: 0,
         }
     }
 

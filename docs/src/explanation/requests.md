@@ -284,8 +284,9 @@ are then held and go with it. Like your own message, it carries the sub-agents' 
 you and starts the count of [wake turns](threads.md) again. Several late answers waiting go in
 one message. The agent gets them between two lines its text cannot know, marked as data, never as
 instructions, with how long a `secret_ref` lasts. An archived thread gets nothing. An answer that
-waits for a turn's end lives in memory: if Fronde stops before that turn ends, the card says it
-was answered, but the agent does not get the message.
+waits for a turn's end is written in the thread's stream (shown as nothing but the notice): if
+Fronde stops before it went out, the next start gives it to the agent, once, before any
+sub-agent's result, whether the stop cut the turn or came just after its end.
 
 Only these two kinds of cards get a late answer. An answer meant for an upstream server, for the
 agent's own form or permission, or for an outside MCP client never reaches an agent as a
@@ -344,7 +345,10 @@ changes a few things:
 These use the same requests and cards, and are **not built yet**:
 
 - **Tools that take a `secret_ref`**: integration setup from the chat, and commands that read a
-  secret from a file in threads that have a shell.
+  secret from a file in threads that have a shell. The first of them must refuse a reference in
+  a turn a sub-agent's result started, or one such a turn started, as a secret card is refused
+  there (see [Wakes](threads.md#wakes)): a reference given earlier in the conversation would
+  still work in it.
 - **Forms by URL**: an MCP server's sign-in page, sent as a URL elicitation, shown as a link on a
   card. Today such a form is cancelled.
 - **Notifications on the phone** (Web Push, step 3): a notification for each card, with *Autoriser*

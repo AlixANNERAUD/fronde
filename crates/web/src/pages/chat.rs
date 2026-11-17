@@ -418,6 +418,7 @@ fn RowView(
             from,
             server,
             woken_by,
+            carries,
             status,
             refusal,
             by,
@@ -426,6 +427,12 @@ fn RowView(
             if let Some(woken_by) = woken_by {
                 p { class: "text-muted-foreground px-1 text-xs wrap-break-word",
                     {woken_by_line(&woken_by)}
+                }
+            }
+            // So does one whose message carried sub-agents' results held for it.
+            if carries > 0 {
+                p { class: "text-muted-foreground px-1 text-xs wrap-break-word",
+                    {fronde_client::chat::carries_line(carries)}
                 }
             }
             RequestCard {
@@ -876,6 +883,15 @@ mod tests {
         );
         assert!(!page.contains("<b>"), "{page}");
         let page = render(chat(&[USER, PERMISSION_REQUEST]), Status::Open);
+        assert!(!page.contains("Tour lancé par"), "{page}");
+        assert!(!page.contains("Ce tour transmet"), "{page}");
+        // A card of a turn whose message carried held results says how many.
+        let carried = r#"{"type":"request","id":2,"card":{"kind":"permission","title":"Écrire dans la mémoire","options":[{"id":"allow-once","kind":"allow_once"},{"id":"reject","kind":"reject_once"}]},"carries":2}"#;
+        let page = render(chat(&[USER, carried]), Status::Open);
+        assert!(
+            page.contains("Ce tour transmet 2 résultats de sous-agents"),
+            "{page}"
+        );
         assert!(!page.contains("Tour lancé par"), "{page}");
         // An archived sub-agent is a line of its own.
         let archived =

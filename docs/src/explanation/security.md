@@ -400,10 +400,12 @@ thread's first message, with its own directories, its own sandbox and its own hu
   the sub-agent may have read anywhere: an injection's way into a thread that holds more than
   the sub-agent. Such a turn names its sub-agent on every card it shows, offers no lasting
   ("always") permission option, runs on an agent process that holds none (Fronde restarts the
-  agent first if the owner granted one to the running process, which loads no settings file), and
-  may not ask for a secret. It may start and resend sub-agents, whose results wake the thread
-  again; `wakes_without_owner` ends such a chain, holding the next results for the owner's
-  message, and the owner's Stop holds them too. Archiving a thread retires every thread under
+  agent first if the running process showed a card offering one, whatever the answer, marked
+  when the card is shown so that an answer read late is never missed; it loads no settings
+  file), and may not ask for a secret. The sub-agent turns it starts or sends get the same
+  limits, their agents restarted the same way. It may start and resend sub-agents, whose results
+  wake the thread again; `wakes_without_owner` ends such a chain, holding the next results for
+  the owner's message, and the owner's Stop holds those waiting too. Archiving a thread retires every thread under
   it: each agent's token is revoked at once, and nothing under it is woken or delegates again;
   an archive and a sub-agent's start or message are serialised, so one never slips past the
   other.

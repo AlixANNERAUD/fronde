@@ -56,7 +56,13 @@ impl ThreadControl for Recording {
         })
     }
 
-    async fn send(&self, _: ThreadId, _: ThreadId, _: String) -> Result<u64, ThreadError> {
+    async fn send(
+        &self,
+        _: ThreadId,
+        _: Option<u64>,
+        _: ThreadId,
+        _: String,
+    ) -> Result<u64, ThreadError> {
         self.record("send");
         Ok(1)
     }

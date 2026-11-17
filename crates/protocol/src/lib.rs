@@ -40,7 +40,8 @@ pub enum TurnOutcome {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// A message to the thread's agent. `by`: who wrote it, when it was not the page's user (a
-    /// parent thread's title for a child's task).
+    /// parent thread's title for a child's task). `None` means the owner, whose message resets
+    /// the wake budget: an outside client's message must never be logged so.
     User {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +87,11 @@ pub enum Event {
         /// turn follows text the owner did not write.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         woken_by: Option<WokenBy>,
+        /// How many sub-agents' results, held for the owner's message, that message carried
+        /// to the agent in the turn that asks: the card says so, since the turn follows their
+        /// text too.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        carries: u32,
     },
     /// `by`: the user who answered, when someone did.
     RequestClosed {
@@ -123,7 +129,27 @@ pub enum Event {
     /// carries them to the agent. Logged in the parent's stream.
     WakesHeld {
         count: u32,
+        /// The message logged last never reached the agent (its agent did not start): the
+        /// results it carried are held again, first.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        returned: bool,
     },
+    /// The owner answered one of the thread's cards once nobody waited for it, while a turn
+    /// ran: the answer waits for that turn's end, then goes to the agent as the owner's
+    /// message. Kept in the stream so that a restart before then still gives it, once: the
+    /// owner's next [`Event::User`] entry is that message. Pages show nothing of it.
+    LateAnswer {
+        request: RequestId,
+        /// The message, as the thread's stream shows it once given.
+        text: String,
+        /// For the agent only: how long a `secret_ref` lasts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// The sub-agent whose result woke a thread, as a card asked in that wake's turn names it.
@@ -482,6 +508,7 @@ mod tests {
             from: Some("Codex".into()),
             server: false,
             woken_by: None,
+            carries: 0,
         };
         let json = serde_json::to_string(&asked).unwrap();
         assert_eq!(
@@ -496,6 +523,7 @@ mod tests {
             from: Some("github".into()),
             server: true,
             woken_by: None,
+            carries: 0,
         };
         let json = serde_json::to_string(&served).unwrap();
         assert_eq!(
@@ -753,10 +781,31 @@ mod tests {
         let json = serde_json::to_string(&woken).unwrap();
         assert_eq!(json, r#"{"type":"woken","child_ended":4}"#);
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), woken);
-        let held = Event::WakesHeld { count: 2 };
+        let held = Event::WakesHeld {
+            count: 2,
+            returned: false,
+        };
         let json = serde_json::to_string(&held).unwrap();
         assert_eq!(json, r#"{"type":"wakes_held","count":2}"#);
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), held);
+        let again = Event::WakesHeld {
+            count: 2,
+            returned: true,
+        };
+        let json = serde_json::to_string(&again).unwrap();
+        assert_eq!(json, r#"{"type":"wakes_held","count":2,"returned":true}"#);
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), again);
+        let late = Event::LateAnswer {
+            request: 3,
+            text: "Réponse".into(),
+            note: None,
+        };
+        let json = serde_json::to_string(&late).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"late_answer","request":3,"text":"Réponse"}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), late);
         let archived = serde_json::to_string(&TurnOutcome::Archived).unwrap();
         assert_eq!(archived, r#""archived""#);
     }
@@ -779,6 +828,7 @@ mod tests {
                 thread: ThreadId(7),
                 title: "Vols".into(),
             }),
+            carries: 0,
         };
         let json = serde_json::to_string(&asked).unwrap();
         assert!(
@@ -786,6 +836,25 @@ mod tests {
             "{json}"
         );
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), asked);
+        // A card of a turn whose message carried held results says how many.
+        let carried = Event::Request {
+            id: 5,
+            card: Card::Form {
+                message: String::new(),
+                fields: Vec::new(),
+                submit: None,
+                truncated: false,
+                replaced: false,
+                during: Vec::new(),
+            },
+            from: None,
+            server: false,
+            woken_by: None,
+            carries: 2,
+        };
+        let json = serde_json::to_string(&carried).unwrap();
+        assert!(json.ends_with(r#""carries":2}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), carried);
     }
 
     #[test]

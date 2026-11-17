@@ -175,10 +175,12 @@ pub trait ThreadControl: Send + Sync {
         turn: Option<u64>,
         child: NewChild,
     ) -> Result<Started, ThreadError>;
-    /// Sends `text` to `caller`'s sub-agent `thread` as a new turn: the seq of the message.
+    /// Sends `text` to `caller`'s sub-agent `thread` as a new turn, from `caller`'s running
+    /// turn `turn`: the seq of the message.
     async fn send(
         &self,
         caller: ThreadId,
+        turn: Option<u64>,
         thread: ThreadId,
         text: String,
     ) -> Result<u64, ThreadError>;
@@ -406,7 +408,7 @@ async fn send(control: &dyn ThreadControl, context: CallContext, args: SendArgs)
         (Err(message), _) | (_, Err(message)) => return ToolOutput::error(message),
     };
     let thread = ThreadId(args.thread);
-    let seq = match control.send(caller, thread, text).await {
+    let seq = match control.send(caller, context.turn, thread, text).await {
         Ok(seq) => seq,
         Err(error) => return refusal("sending to the sub-agent", error),
     };

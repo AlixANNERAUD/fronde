@@ -77,31 +77,48 @@ summarise.
   `wakes_without_owner` turns (10 by default) are woken since your last message in the thread;
   the results that come next are held, and the thread says how many wait for your next message.
   That message carries them to the agent, before your text and marked as data like a wake's, and
-  starts the count again. A message a parent sends to its sub-agent carries the results held for
-  that sub-agent too, but only yours resets the count. So whatever a sub-agent's answer asks, a
-  chain of wakes stops at the budget: each `threads_start` or `threads_send` of a wake's turn
-  comes back as a wake, which the budget counts.
+  starts the count again; the cards of its turn say so (« Ce tour transmet N résultats de
+  sous-agents »), since that turn follows their text too. If the message never reaches the agent
+  (its agent fails to start, or you stop it before it starts), the results it carried stay held
+  for the next one. A message a parent sends to its sub-agent carries the results held for that
+  sub-agent too, but only yours resets the count, and only yours is logged as yours: when outside
+  MCP clients may write to threads (**planned**), their messages will name their writer and count
+  for nothing here. So whatever a sub-agent's answer asks, a chain of wakes stops at the budget:
+  each `threads_start` or `threads_send` of a wake's turn comes back as a wake, which the budget
+  counts.
 - **Time per wake.** A wake's turn runs at most `child_turn_timeout` once its agent has it, as a
   sub-agent's turn does, even in a thread you started: it is then stopped with « Délai dépassé ».
 - **What a wake's turn may do.** It follows text you did not write: the sub-agent's answer, which
   may come from anything the sub-agent read. Its cards say so (« Tour lancé par le résultat du
-  sous-agent … »), its permission cards offer only one-time options, and if you granted an
-  "always" permission to the running agent earlier, Fronde restarts the agent, resuming its
-  session, before the wake's prompt goes out: the new process starts without that rule, since
-  Fronde loads no settings file into it. It cannot ask you for a secret: `user_secret` is refused
-  there, and the agent is told to ask in the turn your next message starts.
+  sous-agent … »), its permission cards offer only one-time options, and if the running agent
+  showed you a card offering "always" earlier, whatever you answered, Fronde restarts the agent,
+  resuming its session, before the wake's prompt goes out: the new process starts without any
+  rule you may have granted, since Fronde loads no settings file into it. Fronde marks the agent
+  when such a card is shown, not when your answer is read, so an answer read just as the turn
+  stops is never missed. It cannot ask you for a secret: `user_secret` is refused there, and the
+  agent is told to ask in the turn your next message starts. No tool takes a `secret_ref` yet;
+  the first one will refuse it there too, since a reference given earlier in the conversation
+  still works in that turn.
+- **What it hands on.** A sub-agent's turn that a wake's turn starts (`threads_start`) or sends
+  (`threads_send`) follows the same text, so it gets the same limits: its cards name the same
+  sub-agent, offer only one-time options and refuse a secret, and its agent is restarted first
+  if it showed you an "always" option before. A call that comes once the calling turn is over is
+  refused.
 - **Stop.** Stop in the chat ends the parent's running turn, a wake's included, and nothing else:
-  its sub-agents go on. If results were waiting for that turn to end, or if the turn was a wake
-  whose prompt had not gone out yet, they are held, and so is every result after them, until
-  your next message, which runs before any of them and carries them. Stop gives you the floor
-  back.
+  its sub-agents go on. If results were waiting for that turn to end when you pressed Stop, or if
+  the turn was a wake whose prompt had not gone out yet, they are held, and so is every result
+  after them, until your next message, which runs before any of them and carries them. Stop
+  gives you the floor back. With no result waiting, it holds nothing: a result that comes later,
+  even while the stopped turn is still ending, wakes the thread as usual.
 - **Late answers.** Your answer to a card whose asking call is gone (a restart, a cut call) is a
   message from you: it goes before the wakes waiting, which are held and go with it, carries the
   results held and starts the count again (see
-  [Late answers](requests.md#late-answers)).
+  [Late answers](requests.md#late-answers)). One that waits for a turn's end is written in the
+  thread first, so a restart before then still gives it, once, before any wake.
 - **Archive.** An archived thread is not woken, nor is a thread under an archived one: a result
   logs nothing in it, and the wakes waiting when it was archived end at once, without reaching
-  its agent. Archiving also retires its sub-agents (see [Stopping](#stopping)); their own threads
+  its agent. When Fronde cannot tell whether a thread above is archived (a database error), the
+  result is written and held for your next message rather than lost. Archiving also retires its sub-agents (see [Stopping](#stopping)); their own threads
   keep their answers. When you archive a sub-agent itself, its parent's thread notes it in a line
   of its own (*Sous-agent archivé*), which wakes nothing.
 - **Restarts.** The parent's thread is the queue: the entry is written before the wake runs, and
@@ -186,8 +203,9 @@ windows, refusing or holding back background work above a share of your quota, i
   stops it with the rest. An archived sub-agent does not wake its parent: the parent's thread
   only notes it.
 - **Stop** in the chat stops only the thread you are in. On a parent, its sub-agents go on; the
-  results that were waiting for the stopped turn, and every one after them, wait for your next
-  message, while a result that comes when none was waiting still wakes it. On a sub-agent, its parent did not ask for it, so the
+  results that were waiting for the stopped turn when you pressed Stop, and every one after
+  them, wait for your next message, while a result that comes when none was waiting still wakes
+  it. On a sub-agent, its parent did not ask for it, so the
   parent is woken with the outcome `cancelled`, as after a timeout.
 
 ## Compared with T3 Code

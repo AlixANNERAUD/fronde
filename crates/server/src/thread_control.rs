@@ -91,11 +91,12 @@ impl ThreadControl for ThreadBridge {
     async fn send(
         &self,
         caller: ThreadId,
+        turn: Option<u64>,
         thread: ThreadId,
         text: String,
     ) -> Result<u64, ThreadError> {
         self.0
-            .send_child(caller, thread, text)
+            .send_child(caller, turn, thread, text)
             .await
             .map_err(hub_error)
     }
