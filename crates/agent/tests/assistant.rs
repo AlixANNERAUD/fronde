@@ -964,6 +964,7 @@ async fn requests_are_shown_in_the_conversation() {
         submit: None,
         truncated: false,
         replaced: false,
+        during: Vec::new(),
     };
     let waiter = requests
         .ask(Ask {
@@ -975,6 +976,7 @@ async fn requests_are_shown_in_the_conversation() {
             for_user: "alix".into(),
             admin_only: false,
             timeout: WAIT,
+            tied: false,
         })
         .await
         .unwrap();
@@ -1043,6 +1045,7 @@ fn question_card() -> fronde_protocol::Card {
         submit: None,
         truncated: false,
         replaced: false,
+        during: Vec::new(),
     }
 }
 
@@ -1066,6 +1069,7 @@ async fn ask_during_a_turn(
             for_user: "alix".into(),
             admin_only: false,
             timeout: Duration::from_secs(600),
+            tied: false,
         })
         .await
         .unwrap();
@@ -1836,7 +1840,13 @@ async fn withdrawn_elicitation_closes_its_card() {
         }
     )));
     wait_for_turns(&assistant, 1).await;
-    assert_eq!(elicited(&fakes).len(), 1);
+    // The agent withdrew it: it got the cancel it asked for, never an answer.
+    assert_eq!(
+        elicited(&fakes),
+        [Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
+    );
 }
 
 #[tokio::test]
@@ -1861,11 +1871,43 @@ async fn secret_form_is_declined_without_a_card() {
     };
     assert_eq!(response.action, ElicitationAction::Decline);
     let reason = response.meta.unwrap()["fronde/refused"].clone();
-    assert!(
-        reason
-            .as_str()
-            .unwrap()
-            .contains("takes no secret in a form"),
+    // A plain reason, naming neither the field nor the rule.
+    assert_eq!(
+        reason,
+        fronde_requests::elicitation::SECRET_REFUSAL,
         "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn turn_end_closes_the_agents_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = FakeScript {
+        leave_elicitation_pending: true,
+        ..eliciting(ask_user_question_form())
+    };
+    let (assistant, fakes) = open(dir.path(), script).await;
+    assistant.send("Installe".into()).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    let (id, _) = wait_for_form(&assistant).await;
+    // The turn ended on its own: its open form closed before it, and the agent got a cancel.
+    let closed_at = events
+        .iter()
+        .position(|event| *event == closed(id, Outcome::Cancelled))
+        .expect("the form was not closed");
+    assert_eq!(events.len(), closed_at + 2, "{events:?}");
+    assert_eq!(events.last(), Some(&ended(TurnOutcome::Done)));
+    timeout(WAIT, async {
+        while elicited(&fakes).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        elicited(&fakes),
+        [Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
     );
 }

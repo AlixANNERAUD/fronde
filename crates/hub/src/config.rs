@@ -886,6 +886,12 @@ fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
         if name == "hub" {
             bail!("source name \"hub\" is reserved for the hub's own tools; pick another name");
         }
+        // A server's form is headed with its name: never one that reads as Fronde's own.
+        if matches!(name, "fronde" | "assistant") {
+            bail!(
+                "source name {name:?} is reserved: it would read as Fronde's own; pick another name"
+            );
+        }
         if !seen.insert(name) {
             bail!("source name {name:?} is used twice; names must be unique");
         }

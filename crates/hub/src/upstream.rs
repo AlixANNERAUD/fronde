@@ -6,12 +6,18 @@
 //! card for the admin, marked with the server's name, through the rules of
 //! [`fronde_requests::elicitation`]: a form that looks like it asks for a secret is declined
 //! unseen. Without them it advertises nothing, and a form that comes anyway is cancelled.
+//!
+//! A server asks only on behalf of a call: a form is shown only while a call to that server is
+//! in flight, one card at a time per server, and the card closes when the last call ends, when
+//! the server cancels its request, or with the assistant's turn when the assistant alone is
+//! calling. Anything else is cancelled unseen, so that a server cannot fill the chat with cards.
 
 use crate::config::UpstreamConfig;
 use crate::source::{Session, ToolSource, unreachable};
 use crate::tools::{CallContext, ToolDef, ToolHandler, ToolOutput};
 use async_trait::async_trait;
-use fronde_protocol::Response;
+use fronde_protocol::text::{Notes, line};
+use fronde_protocol::{CallBy, Card, Response};
 use fronde_requests::elicitation::{DEFAULT_TIMEOUT, MAX_TIMEOUT, Refused, form};
 use fronde_requests::{Ask, Caller, Requests, Resolution};
 use rmcp::model::{
@@ -24,8 +30,8 @@ use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, ErrorData, RoleClient, ServiceExt};
 use secrecy::ExposeSecret;
 use serde_json::Value;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -57,11 +63,165 @@ impl Asking {
     }
 }
 
+/// The longest a caller's name is on a card.
+const MAX_CALLER: usize = 40;
+
+/// At most one warning a minute per server for the forms it is refused: a server sending forms
+/// in a loop must not fill the log either.
+const WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// One server's calls in flight, who made them, and its one open card.
+#[derive(Default)]
+struct Calls {
+    state: Mutex<CallsState>,
+}
+
+#[derive(Default)]
+struct CallsState {
+    next: u64,
+    flying: Vec<Flying>,
+    /// The open card's number and what closes it.
+    card: Option<(u64, CancellationToken)>,
+    /// When a refusal was last logged, and how many were not since.
+    warned: Option<Instant>,
+    quiet: u64,
+}
+
+/// A call in flight: who made it, and for the assistant its turn and the stream it runs in.
+struct Flying {
+    id: u64,
+    by: Option<CallBy>,
+    turn: Option<(String, u64)>,
+}
+
+/// What a new card gets: what closes it, whose calls it serves, and the assistant's turn (its
+/// stream and seq) when it alone is calling.
+struct Slot {
+    calls: Arc<Calls>,
+    id: u64,
+    gone: CancellationToken,
+    during: Vec<CallBy>,
+    turn: Option<(String, u64)>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut state = self.calls.state();
+        if state.card.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            state.card = None;
+        }
+    }
+}
+
+/// A call in flight until dropped; the last one to end closes the server's open card.
+struct InFlight {
+    calls: Arc<Calls>,
+    id: u64,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut state = self.calls.state();
+        state.flying.retain(|flying| flying.id != self.id);
+        if state.flying.is_empty()
+            && let Some((_, gone)) = state.card.take()
+        {
+            gone.cancel();
+        }
+    }
+}
+
+impl Calls {
+    fn state(&self) -> MutexGuard<'_, CallsState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts a call in flight, made on behalf of `context` when it is known.
+    fn start(self: &Arc<Self>, context: Option<&CallContext>) -> InFlight {
+        let mut state = self.state();
+        state.next += 1;
+        let id = state.next;
+        let (by, turn) = match context.map(|context| (&context.caller, context)) {
+            Some((Caller::Thread(_), context)) => (
+                Some(CallBy::Assistant),
+                context.turn.map(|turn| (context.topic.clone(), turn)),
+            ),
+            Some((Caller::Mcp(name) | Caller::Source(name), _)) => {
+                let name = line(name, MAX_CALLER, &mut Notes::default());
+                (Some(CallBy::Client { name }), None)
+            }
+            None => (None, None),
+        };
+        state.flying.push(Flying { id, by, turn });
+        InFlight {
+            calls: self.clone(),
+            id,
+        }
+    }
+
+    /// The slot of a new card, closed with `server`'s cancel too; or why the form is not shown:
+    /// no call is in flight, or a card is already open.
+    fn open(self: &Arc<Self>, server: &CancellationToken) -> Result<Slot, &'static str> {
+        let mut state = self.state();
+        if state.flying.is_empty() {
+            return Err("asked while no call to it was in flight");
+        }
+        if state.card.is_some() {
+            return Err("asked while one of its forms was still open");
+        }
+        state.next += 1;
+        let id = state.next;
+        let gone = server.child_token();
+        state.card = Some((id, gone.clone()));
+        let mut during: Vec<CallBy> = Vec::new();
+        for by in state.flying.iter().filter_map(|flying| flying.by.clone()) {
+            if !during.contains(&by) {
+                during.push(by);
+            }
+        }
+        let first = state.flying[0].turn.clone();
+        let turn = first.clone().filter(|_| {
+            state
+                .flying
+                .iter()
+                .all(|flying| flying.by == Some(CallBy::Assistant) && flying.turn == first)
+        });
+        Ok(Slot {
+            calls: self.clone(),
+            id,
+            gone,
+            during,
+            turn,
+        })
+    }
+
+    /// Logs a refused form, at most once per [`WARN_EVERY`], saying how many were not.
+    fn warn(&self, source: &str, why: &str) {
+        let mut state = self.state();
+        if state
+            .warned
+            .is_some_and(|warned| warned.elapsed() < WARN_EVERY)
+        {
+            state.quiet += 1;
+            return;
+        }
+        let quiet = std::mem::take(&mut state.quiet);
+        state.warned = Some(Instant::now());
+        drop(state);
+        if quiet > 0 {
+            tracing::warn!("{source}: form refused, {why} ({quiet} more refused, not logged)");
+        } else {
+            tracing::warn!("{source}: form refused, {why}");
+        }
+    }
+}
+
 /// Fronde as an upstream server's client: it answers the server's forms through [`Asking`].
 #[derive(Clone)]
 struct UpstreamClient {
     source: String,
     asking: Option<Asking>,
+    calls: Arc<Calls>,
 }
 
 impl ClientHandler for UpstreamClient {
@@ -93,9 +253,11 @@ impl UpstreamClient {
         cancelled: CancellationToken,
     ) -> ElicitResult {
         let source = &self.source;
+        let cancel = || ElicitResult::new(ElicitationAction::Cancel);
         let Some(asking) = &self.asking else {
-            tracing::warn!("{source}: sent a form while Fronde shows none: cancelled");
-            return ElicitResult::new(ElicitationAction::Cancel);
+            self.calls
+                .warn(source, "Fronde shows no form without the chat");
+            return cancel();
         };
         let ElicitRequestParams::FormElicitationParams {
             message,
@@ -103,39 +265,54 @@ impl UpstreamClient {
             ..
         } = request
         else {
-            tracing::warn!(
-                "{source}: sent a URL elicitation, which Fronde does not show: cancelled"
+            self.calls.warn(
+                source,
+                "it is a URL elicitation, which Fronde does not show",
             );
-            return ElicitResult::new(ElicitationAction::Cancel);
+            return cancel();
         };
-        let elicited = match serde_json::to_value(&requested_schema)
-            .map_err(|error| Refused {
-                reason: format!("the requested schema cannot be read: {error}"),
-                secret: false,
-            })
+        let slot = match self.calls.open(&cancelled) {
+            Ok(slot) => slot,
+            Err(why) => {
+                self.calls.warn(source, why);
+                return cancel();
+            }
+        };
+        let mut elicited = match serde_json::to_value(&requested_schema)
+            .map_err(|error| Refused::new(format!("the requested schema cannot be read: {error}")))
             .and_then(|schema| form(&message, &schema))
         {
             Ok(elicited) => elicited,
             Err(refused) => {
-                tracing::warn!("{source}: refused its form: {refused}");
+                self.calls.warn(source, &refused.detail);
                 return refusal(&refused);
             }
         };
+        if let Card::Form { during, .. } = &mut elicited.card {
+            during.clone_from(&slot.during);
+        }
+        // With the assistant's turn when it alone is calling, in the stream that turn runs in:
+        // Stop and the turn's end close the card with the call it serves. Else in the admin's.
+        let (topic, turn) = match slot.turn.clone() {
+            Some((topic, turn)) => (topic, Some(turn)),
+            None => (asking.topic.clone(), None),
+        };
         let ask = Ask {
-            topic: asking.topic.clone(),
-            turn: None,
+            topic,
+            turn,
             caller: Caller::Source(source.clone()),
             client_request_id: None,
             card: elicited.card.clone(),
             for_user: asking.user.clone(),
             admin_only: true,
             timeout: asking.timeout.min(MAX_TIMEOUT),
+            tied: true,
         };
-        // Given up when the server cancels its request, or when this future is dropped (the
-        // call that waits on an `input_required` round was given up): the card then closes.
-        // The card is asked and awaited in a task of its own, so that a drop in the middle of
-        // showing it cannot leave it open.
-        let gone = cancelled.child_token();
+        // Given up when the server cancels its request, when the last call to the server ends,
+        // or when this future is dropped (the call that waits on an `input_required` round was
+        // given up): the card then closes. The card is asked and awaited in a task of its own,
+        // so that a drop in the middle of showing it cannot leave it open.
+        let gone = slot.gone.clone();
         let _dropped = gone.clone().drop_guard();
         let requests = asking.requests.clone();
         let source = source.clone();
@@ -160,6 +337,7 @@ impl UpstreamClient {
             }
         });
         let resolution = shown.await.unwrap_or(Resolution::Cancelled);
+        drop(slot);
         match resolution {
             Resolution::Answered(Response::Form { values }) => {
                 ElicitResult::new(ElicitationAction::Accept)
@@ -169,7 +347,7 @@ impl UpstreamClient {
             Resolution::Answered(_)
             | Resolution::Saved(_)
             | Resolution::Expired
-            | Resolution::Cancelled => ElicitResult::new(ElicitationAction::Cancel),
+            | Resolution::Cancelled => cancel(),
         }
     }
 }
@@ -202,6 +380,7 @@ struct Link {
     name: String,
     client: Client,
     broken: Notify,
+    calls: Arc<Calls>,
 }
 
 struct Forward {
@@ -236,11 +415,13 @@ fn to_output(r: CallToolResult) -> ToolOutput {
 
 #[async_trait]
 impl ToolHandler for Forward {
-    /// A call its caller gives up is given up upstream too, so that a form the server shows
-    /// meanwhile closes.
+    /// A call its caller gives up is dropped, and with it the request to the server (rmcp sends
+    /// the server a cancel); a form the server shows meanwhile closes once no other call to it
+    /// is in flight.
     async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
+        let _flying = self.link.calls.start(Some(context));
         tokio::select! {
-            output = self.call(args) => output,
+            output = self.forward(args) => output,
             () = context.cancelled.cancelled() => ToolOutput::error(format!(
                 "the call to {} was cancelled; call it again if you still need it",
                 self.tool
@@ -249,6 +430,13 @@ impl ToolHandler for Forward {
     }
 
     async fn call(&self, args: Value) -> ToolOutput {
+        let _flying = self.link.calls.start(None);
+        self.forward(args).await
+    }
+}
+
+impl Forward {
+    async fn forward(&self, args: Value) -> ToolOutput {
         let mut params = CallToolRequestParams::new(self.tool.clone());
         if let Value::Object(map) = args {
             params = params.with_arguments(map);
@@ -327,9 +515,11 @@ impl ToolSource for Upstream {
 
     /// Connect and list the tools; the session ends when the connection is lost.
     async fn start(&self) -> anyhow::Result<Session> {
+        let calls = Arc::new(Calls::default());
         let handler = UpstreamClient {
             source: self.cfg.name.clone(),
             asking: self.asking.clone(),
+            calls: calls.clone(),
         };
         let (client, tools) = connect(&self.cfg, handler).await?;
         let name = self.cfg.name.clone();
@@ -337,6 +527,7 @@ impl ToolSource for Upstream {
             name: name.clone(),
             client,
             broken: Notify::new(),
+            calls,
         });
         let tools = tools
             .into_iter()
@@ -534,6 +725,7 @@ mod tests {
         let handler = UpstreamClient {
             source: "mcphub".into(),
             asking: None,
+            calls: Arc::default(),
         };
         let Err(e) = connect(&cfg(addr), handler).await else {
             panic!("connected to a silent server");
@@ -604,7 +796,7 @@ mod tests {
         /// What the journal saw: a card shown, or a request closed.
         #[derive(Debug)]
         enum Seen {
-            Shown(RequestId, Card, Caller),
+            Shown(RequestId, Card, Caller, String),
             Closed(RequestId, Outcome),
         }
 
@@ -614,12 +806,14 @@ mod tests {
         impl Journal for Seeing {
             async fn announce(
                 &self,
-                _topic: &str,
+                topic: &str,
                 id: RequestId,
                 card: &Card,
                 caller: &Caller,
             ) -> anyhow::Result<u64> {
-                let _ = self.0.send(Seen::Shown(id, card.clone(), caller.clone()));
+                let _ = self
+                    .0
+                    .send(Seen::Shown(id, card.clone(), caller.clone(), topic.into()));
                 Ok(id)
             }
 
@@ -668,9 +862,17 @@ mod tests {
                     .unwrap()
             }
 
+            /// The next card and the stream it is shown in.
+            async fn card_in(&mut self) -> (RequestId, String) {
+                match self.next().await {
+                    Seen::Shown(id, _, _, topic) => (id, topic),
+                    other => panic!("not a card: {other:?}"),
+                }
+            }
+
             async fn card(&mut self) -> (RequestId, Card, Caller) {
                 match self.next().await {
-                    Seen::Shown(id, card, caller) => (id, card, caller),
+                    Seen::Shown(id, card, caller, _) => (id, card, caller),
                     other => panic!("not a card: {other:?}"),
                 }
             }
@@ -737,6 +939,7 @@ mod tests {
                     tool("secret"),
                     tool("brief"),
                     tool("forms"),
+                    tool("flood"),
                 ]))
             }
 
@@ -746,6 +949,17 @@ mod tests {
                 c: RequestContext<RoleServer>,
             ) -> Result<CallToolResponse, ErrorData> {
                 let asked = match r.name.as_ref() {
+                    "flood" => {
+                        let ask = || c.peer.create_elicitation(form("Encore", booking()));
+                        let (a, b, d) = tokio::join!(ask(), ask(), ask());
+                        let answers: Vec<Value> = [a, b, d]
+                            .into_iter()
+                            .map(|asked| serde_json::to_value(asked.unwrap()).unwrap())
+                            .collect();
+                        return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                            ContentBlock::text(Value::Array(answers).to_string()),
+                        ])));
+                    }
                     "forms" => {
                         let forms = c
                             .peer
@@ -884,11 +1098,10 @@ mod tests {
             let reg = connected(Some(bench.asking(DEFAULT_TIMEOUT))).await;
             let answer = result(call(&reg, "mcphub_secret")).await;
             assert_eq!(answer["action"], "decline");
-            assert!(
-                answer["_meta"][REFUSED_META]
-                    .as_str()
-                    .unwrap()
-                    .contains("takes no secret in a form"),
+            // A plain reason, naming neither the field nor the rule.
+            assert_eq!(
+                answer["_meta"][REFUSED_META],
+                fronde_requests::elicitation::SECRET_REFUSAL,
                 "{answer}"
             );
             // No card was shown.
@@ -936,11 +1149,111 @@ mod tests {
                 let (reg, context) = (reg.clone(), context.clone());
                 async move { reg.call_as(&context, "mcphub_book", json!({})).await }
             });
-            bench.card().await;
+            let (id, card, _) = bench.card().await;
+            // The card says whose call the server was serving.
+            let Card::Form { during, .. } = card else {
+                panic!("{card:?}");
+            };
+            assert_eq!(during, [CallBy::Assistant]);
             context.cancelled.cancel();
             let out = tokio::time::timeout(WAIT, call).await.unwrap().unwrap();
             assert!(out.is_error);
             assert!(out.to_text().contains("was cancelled"), "{}", out.to_text());
+            // The last call to the server ended: its card closes, whatever the server does.
+            assert_eq!(bench.closed().await, (id, Outcome::Cancelled));
+        }
+
+        fn context(caller: Caller, turn: Option<u64>) -> CallContext {
+            CallContext {
+                caller,
+                user: "alix".into(),
+                topic: "conversation".into(),
+                turn,
+                cancelled: CancellationToken::new(),
+            }
+        }
+
+        fn call_as(
+            reg: &Arc<Registry>,
+            context: CallContext,
+            tool: &str,
+        ) -> tokio::task::JoinHandle<ToolOutput> {
+            let (reg, tool) = (reg.clone(), tool.to_owned());
+            tokio::spawn(async move { reg.call_as(&context, &tool, json!({})).await })
+        }
+
+        #[tokio::test]
+        async fn stop_closes_the_assistants_upstream_card() {
+            let mut bench = Bench::new().await;
+            let reg = connected(Some(bench.asking(DEFAULT_TIMEOUT))).await;
+            // The agent of another thread than the chat: the card goes to its thread's stream.
+            let mut assistant = context(Caller::Thread(fronde_requests::ThreadId(2)), Some(7));
+            assistant.topic = "thread-2".into();
+            let book = call_as(&reg, assistant, "mcphub_book");
+            // Shown in thread 2's stream, with thread 2's turn: both from its call.
+            let (id, topic) = bench.card_in().await;
+            assert_eq!(topic, "thread-2");
+            // Stop in the main thread, at the same seq, is another turn: the card stays open.
+            assert_eq!(
+                bench.requests.cancel_turn("conversation", 7).await.unwrap(),
+                0
+            );
+            assert!(bench.seen.try_recv().is_err());
+            // Stop in thread 2 closes it.
+            assert_eq!(bench.requests.cancel_turn("thread-2", 7).await.unwrap(), 1);
+            assert_eq!(bench.closed().await, (id, Outcome::Cancelled));
+            let out = tokio::time::timeout(WAIT, book).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(out.value.as_str().unwrap()).unwrap(),
+                json!({"action": "cancel"})
+            );
+
+            // An outside client's call is no turn's: the turn's end leaves its card open.
+            let codex = context(Caller::Mcp("Codex".into()), None);
+            let book = call_as(&reg, codex.clone(), "mcphub_book");
+            let (id, card, _) = bench.card().await;
+            let Card::Form { during, .. } = card else {
+                panic!("{card:?}");
+            };
+            assert_eq!(
+                during,
+                [CallBy::Client {
+                    name: "Codex".into()
+                }]
+            );
+            assert_eq!(
+                bench.requests.cancel_turn("conversation", 7).await.unwrap(),
+                0
+            );
+            codex.cancelled.cancel();
+            assert_eq!(bench.closed().await, (id, Outcome::Cancelled));
+            tokio::time::timeout(WAIT, book).await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn one_card_at_a_time_per_server() {
+            let mut bench = Bench::new().await;
+            let reg = connected(Some(bench.asking(DEFAULT_TIMEOUT))).await;
+            // The server asks three forms at once during one call: one card, two cancels.
+            let flood = call(&reg, "mcphub_flood");
+            let (id, ..) = bench.card().await;
+            bench
+                .requests
+                .answer(id, fronde_protocol::Response::Decline, &admin())
+                .await
+                .unwrap();
+            let answers = result(flood).await;
+            let mut actions: Vec<&str> = answers
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|answer| answer["action"].as_str().unwrap())
+                .collect();
+            actions.sort_unstable();
+            assert_eq!(actions, ["cancel", "cancel", "decline"]);
+            assert_eq!(bench.closed().await.0, id);
+            // No other card was shown.
+            assert!(bench.seen.try_recv().is_err());
         }
 
         #[tokio::test]
@@ -996,8 +1309,8 @@ mod tests {
             }
         }
 
-        /// A client of `Rounds`, in process, on protocol 2026-07-28.
-        fn rounds(asking: Asking) -> Client {
+        /// A link to `Rounds`, in process, on protocol 2026-07-28.
+        fn rounds(asking: Asking) -> Arc<Link> {
             let (server, client) = tokio::io::duplex(8192);
             let mut peer = ClientConfig::default();
             peer.protocol_version = ProtocolVersion::V_2026_07_28;
@@ -1007,21 +1320,37 @@ mod tests {
             });
             let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
             info.protocol_version = ProtocolVersion::V_2026_07_28;
+            let calls = Arc::new(Calls::default());
             let handler = UpstreamClient {
                 source: "rounds".into(),
                 asking: Some(asking),
+                calls: calls.clone(),
             };
-            serve_directly::<RoleClient, _, _, _, _>(handler, client, Some(info.into()))
+            Arc::new(Link {
+                name: "rounds".into(),
+                client: serve_directly::<RoleClient, _, _, _, _>(
+                    handler,
+                    client,
+                    Some(info.into()),
+                ),
+                broken: Notify::new(),
+                calls,
+            })
+        }
+
+        fn book(link: &Arc<Link>) -> tokio::task::JoinHandle<ToolOutput> {
+            let forward = Forward {
+                link: link.clone(),
+                tool: "book".into(),
+            };
+            tokio::spawn(async move { forward.call(json!({})).await })
         }
 
         #[tokio::test]
         async fn mrtr_round_uses_the_same_handler() {
             let mut bench = Bench::new().await;
-            let client = Arc::new(rounds(bench.asking(DEFAULT_TIMEOUT)));
-            let call = tokio::spawn({
-                let client = client.clone();
-                async move { client.call_tool(CallToolRequestParams::new("book")).await }
-            });
+            let link = rounds(bench.asking(DEFAULT_TIMEOUT));
+            let call = book(&link);
             let (id, _, caller) = bench.card().await;
             assert_eq!(caller, Caller::Source("rounds".into()));
             let answer = fill(&[
@@ -1029,26 +1358,38 @@ mod tests {
                 ("nights", FieldValue::Number(1.0)),
             ]);
             bench.requests.answer(id, answer, &admin()).await.unwrap();
-            let done = tokio::time::timeout(WAIT, call)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let text = &done.content[0].as_text().unwrap().text;
+            let done = tokio::time::timeout(WAIT, call).await.unwrap().unwrap();
             assert_eq!(
-                serde_json::from_str::<Value>(text).unwrap(),
+                serde_json::from_str::<Value>(done.value.as_str().unwrap()).unwrap(),
                 json!({"action": "accept", "content": {"name": "Alix", "nights": 1}})
             );
 
             // A call given up while its form is shown closes the card.
-            let call = tokio::spawn({
-                let client = client.clone();
-                async move { client.call_tool(CallToolRequestParams::new("book")).await }
-            });
+            let call = book(&link);
             let (_, _) = bench.closed().await;
             let (id, ..) = bench.card().await;
             call.abort();
             assert_eq!(bench.closed().await, (id, Outcome::Cancelled));
+        }
+
+        #[tokio::test]
+        async fn a_form_with_no_call_in_flight_is_cancelled_unseen() {
+            let mut bench = Bench::new().await;
+            let link = rounds(bench.asking(DEFAULT_TIMEOUT));
+            // Straight to the server, not through a hub tool: no call is in flight for it.
+            let done = tokio::time::timeout(
+                WAIT,
+                link.client.call_tool(CallToolRequestParams::new("book")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let text = &done.content[0].as_text().unwrap().text;
+            assert_eq!(
+                serde_json::from_str::<Value>(text).unwrap(),
+                json!({"action": "cancel"})
+            );
+            assert!(bench.seen.try_recv().is_err());
         }
     }
 }

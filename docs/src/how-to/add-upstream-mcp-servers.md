@@ -32,7 +32,7 @@ Fronde's rights and environment, so only run programs you trust.
 ## Names
 
 `name` must match `^[a-z][a-z0-9_]{0,63}$`, must be unique among all sources, and may not be
-`hub` or overlap the hub's reserved tool prefixes (`code_`, `hub_`, `memory_`, `search_`, `use_`). Each
+`hub`, `fronde` or `assistant` (a server's questions are headed with its name), or overlap the hub's reserved tool prefixes (`code_`, `hub_`, `memory_`, `search_`, `use_`). Each
 upstream tool becomes `<name>_<tool>`, lowercased, with any character outside `a-z`, `0-9` and `_`
 turned into `_`, cut at 64 characters.
 
@@ -47,18 +47,27 @@ found. This keeps the agent's context small however many servers you add.
 A server may ask you to fill a form while one of its tools runs (MCP's `elicitation/create`, or an
 `input_required` round of MCP 2026-07-28). When the chat runs (`[web]`), Fronde tells servers it
 takes forms, and shows each one as a card in the chat, headed with the server's name, such as
-*Question de « github » (serveur MCP)*. Only an admin answers it, whoever's call made the server
-ask. The fields are those of the agent's forms (see
+*Question de « github » (serveur MCP)*, saying whose call the server was serving (*Pendant un
+appel de Fronde*) and, above *Envoyer*, that what you type goes to that server. Only an admin
+answers it, whoever's call made the server ask. The fields are those of the agent's forms (see
 [Forms from the agent](../explanation/requests.md#forms-from-the-agent)): questions, texts,
-numbers and toggles. *Refuser* sends the server a `decline`; a card left for **10 minutes**
-expires, and the server gets a `cancel`. When the server gives up its own request, the card
-closes; so does it when the call that waits on an `input_required` round is given up.
+numbers and toggles.
 
-Fronde never takes a secret in a form. A form with a text or number field named like one
-(*password*, *token*, *key*, *secret*…) is declined without a card, the reason in the answer's
-`_meta` (`fronde/refused`), and `fronde serve` logs a warning. Give such a server its secret
-through its configuration instead, such as its `token` above. A server's forms by URL (a sign-in
-page) are cancelled: Fronde does not show them yet.
+- *Refuser* sends the server a `decline`.
+- A card left for **10 minutes** expires, and the server gets a `cancel`.
+- The card closes, and the server gets a `cancel`, when the server gives up its own request, when
+  the last call to the server ends (its caller gave it up, say), and, when Fronde's assistant
+  alone was calling, when you press *Stop* or its turn ends.
+- A form is shown only while a call to the server is in flight, one at a time per server: a form
+  that comes outside a call, or while another of the server's cards is open, is cancelled
+  unseen. `fronde serve` logs a warning for refused forms, at most once a minute per server.
+- A pending card expires when Fronde restarts.
+
+Fronde never takes a secret in a form. A form whose message or fields read like they ask for one
+(*password*, *token*, *key*, *PIN*, *code*…) is declined without a card, with a plain reason in
+the answer's `_meta` (`fronde/refused`), and `fronde serve` logs which text tripped the rule. Give
+such a server its secret through its configuration instead, such as its `token` above. A server's
+forms by URL (a sign-in page) are cancelled: Fronde does not show them yet.
 
 Without the chat, Fronde does not tell servers it takes forms, and cancels any form one sends
 anyway.

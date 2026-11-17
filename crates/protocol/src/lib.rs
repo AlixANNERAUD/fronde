@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use request::{
-    Card, ChoiceAnswer, ChoiceOption, Field, FieldValue, Invalid, Keep, KeyPlace, Outcome,
+    CallBy, Card, ChoiceAnswer, ChoiceOption, Field, FieldValue, Invalid, Keep, KeyPlace, Outcome,
     PermissionChoice, PermissionKind, Remember, RequestId, Response, SecretValue, TextFormat,
     ToolKind,
 };
@@ -288,6 +288,7 @@ mod tests {
             submit: None,
             truncated: false,
             replaced: false,
+            during: Vec::new(),
         };
         let asked = Event::Request {
             id: 4,

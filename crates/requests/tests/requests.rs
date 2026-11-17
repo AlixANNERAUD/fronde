@@ -113,6 +113,7 @@ fn question() -> Card {
         submit: None,
         truncated: false,
         replaced: false,
+        during: Vec::new(),
     }
 }
 
@@ -126,6 +127,7 @@ fn ask() -> Ask {
         for_user: "alix".into(),
         admin_only: false,
         timeout: Duration::from_secs(600),
+        tied: false,
     }
 }
 
@@ -753,6 +755,64 @@ async fn restart_expires_permissions() {
 }
 
 #[tokio::test]
+async fn restart_expires_elicitations_and_servers_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, _) = open(dir.path()).await;
+    let question = requests.ask(ask()).await.unwrap().id();
+    // The agent's form: only its call waits on it.
+    let agent_form = requests
+        .ask(Ask {
+            tied: true,
+            ..ask()
+        })
+        .await
+        .unwrap()
+        .id();
+    // An upstream server's form, even one asked without the marker.
+    let server_form = requests
+        .ask(Ask {
+            caller: Caller::Source("github".into()),
+            turn: None,
+            admin_only: true,
+            ..ask()
+        })
+        .await
+        .unwrap()
+        .id();
+    drop(requests);
+
+    let (requests, journal) = open(dir.path()).await;
+    for id in [agent_form, server_form] {
+        assert_eq!(row(dir.path(), id).await.status, "expired", "{id}");
+        assert_eq!(
+            requests.answer(id, pick("Mealie"), &alix()).await,
+            Err(Refusal::Closed)
+        );
+    }
+    assert_eq!(
+        journal.shown(),
+        [
+            Shown::Closed {
+                id: agent_form,
+                outcome: Outcome::Expired,
+                by: None
+            },
+            Shown::Closed {
+                id: server_form,
+                outcome: Outcome::Expired,
+                by: None
+            },
+        ]
+    );
+    // A thread's own question, asked through a tool, stays answerable.
+    assert_eq!(row(dir.path(), question).await.status, "pending");
+    requests
+        .answer(question, pick("Mealie"), &alix())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn only_a_threads_agent_asks_for_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let (requests, journal) = open(dir.path()).await;
@@ -797,6 +857,7 @@ async fn every_card_is_checked_before_it_is_written() {
         submit: None,
         truncated: false,
         replaced: false,
+        during: Vec::new(),
     };
     let error = requests.ask(hidden).await.unwrap_err();
     assert!(format!("{error:#}").contains("U+200B"), "{error:#}");

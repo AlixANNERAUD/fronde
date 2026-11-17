@@ -417,6 +417,8 @@ impl Assistant {
                 for_user: owner.name.clone(),
                 admin_only: false,
                 timeout,
+                // The agent's call alone waits on it.
+                tied: true,
             })
             .await;
         let waiter = match asked {

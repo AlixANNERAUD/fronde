@@ -503,21 +503,45 @@ Cards show agents' text as text, never as HTML. See [Requests and cards](request
 ## Forms from agents and servers
 
 The agent's forms (`AskUserQuestion`) and, with the same rules, upstream MCP servers' are cards.
-An upstream server is trusted to ask, not to decide: its card is for the admin only (a family
-member never answers for a server), headed with its name and marked *(serveur MCP)* so that it
-never reads as Fronde's own, and it lasts at most 10 minutes. A form gives a server nothing it
-did not ask for and that the admin did not type or pick. Forms are advertised to servers only when
-the chat runs; otherwise a form sent anyway is cancelled unseen. The forms' texts are the asker's, cleaned and capped as any card's, and checked by `Card::check` before
-they are written. An answer gives back only what the card asked: an offered option's value, a
-text, a number within its bounds, a toggle. The answer is kept in `fronde.db` as an audit trail,
-so a form never carries a secret: a text or number field whose name or title holds a word such as
-*password*, *passwd*, *passphrase*, *secret*, *token*, *key*, *apikey*, *credential* or *otp* (split
-on anything but letters and digits, and between a lower-case and an upper-case letter), or the
-words *mot de passe*, and any field with `format: password`, makes Fronde decline the whole form
-without showing it, and tell the asker to have the owner configure the secret instead. MCP forbids
-sensitive data in form mode. The rule is plain on purpose: it also declines a harmless *token
-count*, which costs the asker a rewording, never a leak. Options and toggles are not checked:
-they carry nothing the asker does not already know.
+Their texts are the asker's, cleaned and capped as any card's, and checked by `Card::check`
+(every text's cap, no hidden character, at most 64 KiB as JSON) before they are written. An
+answer gives back only what the card asked: an offered option's value, a text, a number within
+its bounds, a toggle. Nothing is chosen for you: a toggle starts off whatever the asker suggests,
+a suggested address is filled in only when it is a web address, and a form that is one plain
+choice is sent only once you pick.
+
+An upstream server is trusted to ask, not to decide, and only on behalf of a call:
+
+- Its card is for the admin only (a family member never answers for a server), headed with its
+  name and marked *(serveur MCP)*, so that it never reads as Fronde's own; `fronde` and
+  `assistant` cannot be a source's name.
+- A form is shown only while a call to that server is in flight, and one card at a time per
+  server: any other form is cancelled unseen, and the warnings about refused forms are logged at
+  most once a minute per server, so a server cannot fill the chat or the log.
+- The card says whose call the server was serving (*Pendant un appel de Fronde*, or of an outside
+  client), and closes when the last call to the server ends, when the server cancels its request,
+  after at most 10 minutes, and, when the assistant alone was calling, with the assistant's turn
+  (*Stop* or its end).
+- An upstream server's card, like the agent's own form, expires when Fronde restarts: the call
+  that waited on it is gone, and its answer must never reach anyone else.
+- Forms are advertised to servers only when the chat runs; otherwise a form sent anyway is
+  cancelled unseen.
+
+**A form is not for secrets.** The answer reaches the asker as typed, and stays in `fronde.db` as
+an audit trail. Fronde declines a form unseen, telling the asker only that it does not show it,
+when the text around anything typed reads like it asks for a secret: the message, and the name,
+title and description of every text and number field and of every question that takes free text.
+The rule looks for words such as *password*, *passcode*, *secret*, *token*, *key*, *PIN*, *code*,
+*CVV*, *IBAN*, *OTP*, *2FA*, *mot de passe*, *clé*, *jeton* or *identifiant*, however written:
+after NFKC normalisation and case folding, with digits read as the letters they mimic (`p4ssw0rd`),
+look-alike letters read by their Unicode confusable skeleton (a Cyrillic `а` as `a`), and invisible
+characters ignored, so they cannot split a word. A field with `format: password` is declined too.
+
+This catches an honest asker's mistake, not a hostile one. A server, or a page the agent read,
+can word a question so that no rule sees it, and phish through the card's own text. The card
+says where the answer goes (*Ce que tu saisis est envoyé à « github » (serveur MCP)*) on every
+form that is not Fronde's own. **Never type a password or a code into a card's text box**; a
+secret has its own card, `user_secret`, whose value never reaches the agent.
 
 ## Untrusted content
 

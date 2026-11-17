@@ -211,6 +211,8 @@ fn rejects_reserved_and_duplicate_upstream_names() {
         "memory_extra",
         "search",
         "use",
+        "fronde",
+        "assistant",
     ] {
         let s = format!(
             "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = {name:?}\nurl = \"http://x/mcp\"\n"

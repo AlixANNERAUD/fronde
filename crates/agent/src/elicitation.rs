@@ -19,15 +19,10 @@ pub const REFUSED_META: &str = "fronde/refused";
 /// The card for the agent's form, or why it cannot be shown.
 pub fn card(request: &CreateElicitationRequest) -> Result<Elicited, Refused> {
     let ElicitationMode::Form(mode) = &request.mode else {
-        return Err(Refused {
-            reason: "Fronde shows forms only".into(),
-            secret: false,
-        });
+        return Err(Refused::new("Fronde shows forms only"));
     };
-    let schema = serde_json::to_value(&mode.requested_schema).map_err(|error| Refused {
-        reason: format!("the requested schema cannot be read: {error}"),
-        secret: false,
-    })?;
+    let schema = serde_json::to_value(&mode.requested_schema)
+        .map_err(|error| Refused::new(format!("the requested schema cannot be read: {error}")))?;
     form(&request.message, &schema)
 }
 
@@ -171,11 +166,9 @@ mod tests {
         assert!(refused.secret);
         let answer = serde_json::to_value(refusal(&refused)).unwrap();
         assert_eq!(answer["action"], "decline");
-        assert!(
-            answer["_meta"][REFUSED_META]
-                .as_str()
-                .unwrap()
-                .contains("takes no secret in a form")
+        assert_eq!(
+            answer["_meta"][REFUSED_META],
+            fronde_requests::elicitation::SECRET_REFUSAL
         );
     }
 

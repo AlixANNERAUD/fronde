@@ -256,7 +256,8 @@ description and schema. Its result passes through: structured content as it is, 
 text blocks joined, with images, audio and resources replaced by a placeholder. A form the server
 asks for while the tool runs is a card for the admin (see
 [Add upstream MCP servers](../how-to/add-upstream-mcp-servers.md#when-a-server-asks-you-something)),
-and the tool waits for it. A call its caller gives up is given up with the server too.
+and the tool waits for it. A call its caller gives up is dropped, and rmcp tells the server so;
+the server's card closes once no other call to it is in flight.
 
 ## Agent built-in tools
 

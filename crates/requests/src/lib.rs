@@ -46,6 +46,9 @@ const CANCELLED: &str = "cancelled";
 const SECRET: &str = "secret";
 /// The kind of a permission card's row: it lives only as long as the agent's call it guards.
 const PERMISSION: &str = "permission";
+/// The kind of a form's row whose asker alone waits on it, in its own process: an elicitation
+/// of the agent's or of an upstream server's ([`Ask::tied`]). It lives as long as that asker.
+const ELICITATION: &str = "elicitation";
 /// How long an asker waits past its request's expiry for the timer to close it, before it
 /// gives up on the timer: a database that failed to close the request must not leave the asker
 /// waiting forever.
@@ -133,6 +136,10 @@ pub struct Ask {
     /// `for_user` may answer only while an admin: a card that grants something lasting.
     pub admin_only: bool,
     pub timeout: Duration,
+    /// Only the asker's own call waits on the answer (an elicitation, of the agent's or of an
+    /// upstream server's): after a restart nobody does, so the request expires then, as a
+    /// permission does, rather than stay answerable.
+    pub tied: bool,
 }
 
 /// How a request ended, for the one who asked.
@@ -318,8 +325,8 @@ pub struct Requests {
 
 impl Requests {
     /// Opens the requests stored in `db`, shown by `journal`. Pending requests whose time is up
-    /// expire, and so do pending permissions: the agent's call that waited on one is gone with
-    /// the process that held it. Those never announced (a crash between their row and their
+    /// expire, and so do pending permissions, elicitations ([`Ask::tied`]) and anything an
+    /// upstream server asked: the call that waited on one is gone with the process that held it. Those never announced (a crash between their row and their
     /// entry) are announced; the others get their timer again.
     pub async fn open(
         db: DatabaseConnection,
@@ -350,11 +357,17 @@ impl Requests {
             .await
             .context("cannot read the pending requests")?;
         for row in pending {
-            if row.kind == PERMISSION {
+            // B6 answers a question whose asker is gone by a message to the assistant: never one
+            // of these. An answer meant for an upstream server, or for the agent's own form,
+            // must never reach the assistant as a message; they expire instead.
+            if row.kind == PERMISSION
+                || row.kind == ELICITATION
+                || matches!(Caller::parse(&row.caller), Caller::Source(_))
+            {
                 let id = row_id(&row)?;
                 if let Err(error) = requests.expire(id).await {
                     // Never left pending without a timer: it tries again at once.
-                    tracing::error!("cannot expire permission request {id}, retrying: {error:#}");
+                    tracing::error!("cannot expire request {id}, retrying: {error:#}");
                     requests.expire_at(id, Some(Utc::now()));
                 }
                 continue;
@@ -424,7 +437,10 @@ impl Requests {
             turn: Set(ask.turn.map(i64::try_from).transpose()?),
             caller: Set(caller.clone()),
             client_request_id: Set(ask.client_request_id.clone()),
-            kind: Set(ask.card.kind().to_owned()),
+            kind: Set(match &ask.card {
+                Card::Form { .. } if ask.tied => ELICITATION.to_owned(),
+                card => card.kind().to_owned(),
+            }),
             card: Set(serde_json::to_value(&ask.card)?),
             for_user: Set(ask.for_user.clone()),
             admin_only: Set(ask.admin_only),

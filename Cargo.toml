@@ -75,6 +75,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Which characters a card never shows as they are (format, unassigned, private use…).
 unicode-properties = { version = "0.1.5", default-features = false, features = ["general-category"] }
+# A confusable skeleton (UTS #39) and NFKC, to read a form field's name as a person would.
+unicode-security = "0.1"
+unicode-normalization = "0.1"
 tw_merge = "0.1"
 wiremock = "0.6"
 uuid = { version = "1", features = ["v4"] }

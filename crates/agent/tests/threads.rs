@@ -114,6 +114,7 @@ fn question() -> Card {
         submit: None,
         truncated: false,
         replaced: false,
+        during: Vec::new(),
     }
 }
 
@@ -127,6 +128,7 @@ fn ask(topic: &str) -> Ask {
         for_user: "alix".into(),
         admin_only: false,
         timeout: WAIT,
+        tied: false,
     }
 }
 

@@ -137,7 +137,7 @@ async fn new_session_sends_hub_and_meta() {
 }
 
 #[tokio::test]
-async fn no_builtin_tools_leaves_only_the_hub() {
+async fn no_builtin_tools_leaves_the_hub_and_ask_user_question() {
     let spec = AgentSpec {
         builtin_tools: Vec::new(),
         ..spec()
@@ -778,5 +778,30 @@ async fn withdrawn_elicitation_closes_its_reply() {
         .expect("turn timed out")
         .unwrap()
         .unwrap();
-    assert_eq!(handle.record().elicitation_responses.len(), 1);
+    // The agent withdrew it and gets the cancel it asked for.
+    assert_eq!(
+        handle.record().elicitation_responses,
+        vec![Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
+    );
+}
+
+#[tokio::test]
+async fn a_form_for_another_session_is_cancelled() {
+    let mut form = question_form();
+    form["sessionId"] = json!("someone-elses");
+    let (client, handle, mut rx) = connect(eliciting(form), None).await;
+    assert_eq!(prompt(&client, "Installe").await, TurnEnd::Cancelled);
+    assert_eq!(
+        handle.record().elicitation_responses,
+        vec![Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
+    );
+    assert!(
+        !drain(&mut rx)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Elicitation(_)))
+    );
 }

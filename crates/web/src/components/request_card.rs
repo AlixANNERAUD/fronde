@@ -8,8 +8,9 @@ use dioxus::prelude::*;
 use fronde_client::RequestStatus;
 use fronde_protocol::request::{check, show_number};
 use fronde_protocol::{
-    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, FieldValue, Invalid, Keep, KeyPlace,
-    Outcome, PermissionChoice, Remember, RequestId, Response, SecretValue, TextFormat, ToolKind,
+    CallBy, Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, FieldValue, Invalid, Keep,
+    KeyPlace, Outcome, PermissionChoice, Remember, RequestId, Response, SecretValue, TextFormat,
+    ToolKind,
 };
 use std::collections::BTreeMap;
 
@@ -109,7 +110,7 @@ pub fn RequestCard(
     admin: bool,
     on_send: EventHandler<Outgoing>,
 ) -> Element {
-    let (message, fields, submit, truncated, replaced) = match card {
+    let (message, fields, submit, truncated, replaced, during) = match card {
         Card::Permission {
             title,
             tool,
@@ -141,7 +142,8 @@ pub fn RequestCard(
             submit,
             truncated,
             replaced,
-        } => (message, fields, submit, truncated, replaced),
+            during,
+        } => (message, fields, submit, truncated, replaced, during),
         Card::Secret {
             label,
             reason,
@@ -180,6 +182,9 @@ pub fn RequestCard(
                 submit,
                 truncated,
                 replaced,
+                during,
+                // Who gets what is typed here, when it is not Fronde.
+                goes_to: from.as_deref().map(|name| format!("« {name} » {}", outside(server))),
                 refusal,
                 open,
                 on_send,
@@ -387,6 +392,22 @@ fn secret_asker(from: Option<&str>, server: bool) -> String {
     match from {
         None => "Secret demandé par Fronde".into(),
         Some(name) => format!("Secret demandé par « {name} » {}", outside(server)),
+    }
+}
+
+/// Whose calls an upstream server was serving when it asked, as the card says it.
+fn calls_text(during: &[CallBy]) -> Option<String> {
+    let names: Vec<String> = during
+        .iter()
+        .map(|by| match by {
+            CallBy::Assistant => "Fronde".to_owned(),
+            CallBy::Client { name } => format!("« {name} » (client MCP)"),
+        })
+        .collect();
+    match names.as_slice() {
+        [] => None,
+        [one] => Some(format!("Pendant un appel de {one}")),
+        many => Some(format!("Pendant des appels de {}", many.join(", "))),
     }
 }
 
@@ -792,7 +813,28 @@ fn response(fields: &[Field], radios: &[String], drafts: &[Draft]) -> Result<Res
                 if text.is_empty() {
                     continue;
                 }
-                // A French keyboard types a decimal comma.
+                // A French keyboard types a decimal comma; "1,000" or "1.000" may be a thousand or
+                // one, so the page asks rather than guess.
+                let separators: Vec<usize> = text
+                    .char_indices()
+                    .filter(|(_, c)| matches!(c, ',' | '.'))
+                    .map(|(at, _)| at)
+                    .collect();
+                let ambiguous = match separators.as_slice() {
+                    [] => false,
+                    [at] => {
+                        let decimals = &text[at + 1..];
+                        decimals.len() == 3 && decimals.chars().all(|c| c.is_ascii_digit())
+                    }
+                    _ => true,
+                };
+                if ambiguous {
+                    return Err(Invalid {
+                        key: Some(key.clone()),
+                        message: "Nombre ambigu : écris-le sans séparateur de milliers, comme 1000 ou 3,5."
+                            .into(),
+                    });
+                }
                 match text.replace(',', ".").parse::<f64>() {
                     Ok(number) if number.is_finite() => FieldValue::Number(number),
                     _ => {
@@ -824,10 +866,29 @@ fn with_offset(local: &str) -> String {
     )
 }
 
-/// An RFC 3339 date and time as a `datetime-local` box shows it: its first 16 characters,
-/// `2026-11-17T14:30`, in the offset it was written with.
+/// An RFC 3339 date and time as a `datetime-local` box shows it, `2026-11-17T14:30`: the same
+/// instant in the page's own time. One that does not read as RFC 3339 is left blank.
 fn local_date_time(text: &str) -> String {
-    text.get(..16).unwrap_or(text).to_owned()
+    let Ok(instant) = chrono::DateTime::parse_from_rfc3339(text) else {
+        return String::new();
+    };
+    let minutes = instant_offset_minutes(text);
+    let local = instant.naive_utc() + chrono::Duration::minutes(i64::from(minutes));
+    local.format("%Y-%m-%dT%H:%M").to_string()
+}
+
+/// The browser's offset from UTC at the instant `rfc3339`, in minutes east.
+#[cfg(target_arch = "wasm32")]
+fn instant_offset_minutes(rfc3339: &str) -> i32 {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_str(rfc3339));
+    let west = date.get_timezone_offset();
+    if west.is_finite() { -(west as i32) } else { 0 }
+}
+
+/// Natively there is no browser: UTC.
+#[cfg(not(target_arch = "wasm32"))]
+fn instant_offset_minutes(_rfc3339: &str) -> i32 {
+    0
 }
 
 /// The browser's offset from UTC at the local time `local`, in minutes east.
@@ -855,6 +916,10 @@ fn FormCard(
     truncated: bool,
     /// Hidden characters were replaced.
     replaced: bool,
+    /// For an upstream server's form, whose calls the server was serving.
+    during: Vec<CallBy>,
+    /// Who gets the answer, quoted and marked, when it is not Fronde.
+    goes_to: Option<String>,
     refusal: Option<String>,
     open: bool,
     on_send: EventHandler<Outgoing>,
@@ -874,6 +939,7 @@ fn FormCard(
         submit: submit.clone(),
         truncated,
         replaced,
+        during: during.clone(),
     };
     let send = use_callback({
         let radios = radios.clone();
@@ -934,6 +1000,9 @@ fn FormCard(
                 if !message.is_empty() {
                     p { class: "text-sm whitespace-pre-wrap wrap-break-word", "{message}" }
                 }
+                if let Some(calls) = calls_text(&during) {
+                    p { id: "r{id}-during", class: "text-muted-foreground text-xs", "{calls}" }
+                }
                 if truncated {
                     p { id: "r{id}-truncated", role: "note", class: "text-destructive text-xs font-medium",
                         "Texte tronqué : le milieu est omis."
@@ -972,6 +1041,12 @@ fn FormCard(
                 }
                 if let Some(error) = card_error {
                     FieldError { "{error}" }
+                }
+                // Right above *Envoyer*: an outside asker gets the answer as it is.
+                if let Some(goes_to) = goes_to {
+                    p { id: "r{id}-goes-to", role: "note", class: "text-xs font-medium wrap-break-word",
+                        "Ce que tu saisis est envoyé à {goes_to}. N'y mets jamais de mot de passe ni de code."
+                    }
                 }
             }
             CardFooter { class: "flex-col-reverse items-stretch sm:flex-row sm:items-center sm:justify-end",
@@ -1484,6 +1559,7 @@ mod tests {
             submit: None,
             truncated: false,
             replaced: false,
+            during: Vec::new(),
         }
     }
 
@@ -2755,10 +2831,16 @@ mod tests {
             with_offset("2026-11-17T14:30:05"),
             "2026-11-17T14:30:05+00:00"
         );
+        // The same instant in the page's time (UTC natively), not the asker's wall clock.
         assert_eq!(
             local_date_time("2026-11-17T14:30:00+01:00"),
-            "2026-11-17T14:30"
+            "2026-11-17T13:30"
         );
+        assert_eq!(
+            local_date_time("2026-11-17T23:30:00-02:00"),
+            "2026-11-18T01:30"
+        );
+        assert_eq!(local_date_time("demain"), "");
     }
 
     #[test]
@@ -2834,5 +2916,86 @@ mod tests {
         );
         assert!(!page.contains("client MCP"), "{page}");
         assert!(render(single()).contains("Question de « github » (serveur MCP)"));
+        // Right above the buttons, where the answer goes.
+        assert!(
+            page.contains(
+                "Ce que tu saisis est envoyé à « github » (serveur MCP). N&#39;y mets jamais de mot de passe ni de code."
+            ),
+            "{page}"
+        );
+        assert!(
+            page.find("r7-goes-to").unwrap() < page.find("r7-send").unwrap(),
+            "{page}"
+        );
+        // Whose call the server was serving.
+        let mut card = inputs();
+        if let Card::Form { during, .. } = &mut card {
+            *during = vec![
+                CallBy::Assistant,
+                CallBy::Client {
+                    name: "Codex".into(),
+                },
+            ];
+        }
+        let page = render(card);
+        assert!(
+            page.contains("Pendant des appels de Fronde, « Codex » (client MCP)"),
+            "{page}"
+        );
+        assert_eq!(
+            calls_text(&[CallBy::Assistant]).as_deref(),
+            Some("Pendant un appel de Fronde")
+        );
+        assert_eq!(calls_text(&[]), None);
+    }
+
+    #[test]
+    fn only_an_outside_askers_card_says_where_the_answer_goes() {
+        let page = render_from("Codex", RequestStatus::Open, None);
+        assert!(
+            page.contains("Ce que tu saisis est envoyé à « Codex » (client MCP)."),
+            "{page}"
+        );
+        // Fronde's own question goes to Fronde: no such line.
+        let page = render(props(single()));
+        assert!(tag(&page, "r7-goes-to").is_none(), "{page}");
+        assert!(!page.contains("Ce que tu saisis"), "{page}");
+    }
+
+    #[test]
+    fn an_ambiguous_number_is_asked_again() {
+        for typed in ["1,000", "1.000", "1,000,000", "1.000,5", "2,5.0"] {
+            let mut live = Live::new(props(inputs()));
+            live.type_text("r7-q0-input", "alix@example.com");
+            live.type_text("r7-q1-input", "3");
+            live.type_text("r7-q2-input", typed);
+            live.click("r7-send");
+            assert!(
+                live.html().contains(
+                    "Nombre ambigu : écris-le sans séparateur de milliers, comme 1000 ou 3,5."
+                ),
+                "{typed}: {}",
+                live.html()
+            );
+            assert_eq!(sent(), [], "{typed}");
+        }
+        for (typed, number) in [("1000", 1000.0), ("3,5", 3.5), ("0.25", 0.25), ("12", 12.0)] {
+            let mut live = Live::new(props(inputs()));
+            live.type_text("r7-q0-input", "alix@example.com");
+            live.type_text("r7-q1-input", "3");
+            live.type_text("r7-q2-input", typed);
+            live.click("r7-send");
+            let sent = sent();
+            let [
+                ClientMsg::Answer {
+                    response: Response::Form { values },
+                    ..
+                },
+            ] = sent.as_slice()
+            else {
+                panic!("{typed}: {sent:?}");
+            };
+            assert_eq!(values["price"], FieldValue::Number(number), "{typed}");
+        }
     }
 }

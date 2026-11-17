@@ -187,6 +187,8 @@ async fn user_secret(requests: &Requests, context: CallContext, args: SecretArgs
         for_user: context.user.clone(),
         admin_only: false,
         timeout,
+        // A question or secret outlives the call: B6 brings its late answer to the assistant.
+        tied: false,
     };
     let waiter = match requests.ask(ask).await {
         Ok(waiter) => waiter,
@@ -372,6 +374,8 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
         for_user: context.user.clone(),
         admin_only: false,
         timeout,
+        // A question or secret outlives the call: B6 brings its late answer to the assistant.
+        tied: false,
     };
     let waiter = match requests.ask(ask).await {
         Ok(waiter) => waiter,
@@ -623,6 +627,7 @@ fn check(args: &AskArgs) -> Result<(Card, Duration), String> {
         submit: None,
         truncated: false,
         replaced: false,
+        during: Vec::new(),
     };
     Ok((card, timeout))
 }

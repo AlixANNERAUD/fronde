@@ -45,6 +45,10 @@ pub const MAX_KEY: usize = 64;
 pub const MAX_FIELDS: usize = 12;
 pub const MAX_OPTIONS: usize = 50;
 
+/// The largest card, as JSON, in bytes: whatever its fields, a card stays one small entry of the
+/// conversation and one small message to each page.
+pub const MAX_CARD_BYTES: usize = 64 * 1024;
+
 /// A secret card's texts.
 pub const MAX_SECRET_LABEL: usize = 60;
 pub const MAX_REASON: usize = 300;
@@ -91,6 +95,10 @@ pub enum Card {
         /// Hidden characters were replaced by `�`: the card says so.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         replaced: bool,
+        /// For an upstream server's form, whose calls it was serving when it asked: Fronde's
+        /// own, never a name the server or a client could fake.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        during: Vec<CallBy>,
     },
     /// One secret, typed in a password box. Its value never comes back: not in the card, the
     /// stream, the request's row or the asker's answer.
@@ -150,9 +158,15 @@ impl Card {
                 message,
                 fields,
                 submit,
+                during,
                 ..
             } => {
                 text("message", message, MAX_MESSAGE, true)?;
+                for call in during {
+                    if let CallBy::Client { name } = call {
+                        text("a caller's name", name, MAX_LABEL, false)?;
+                    }
+                }
                 if let Some(submit) = submit {
                     text("submit", submit, MAX_LABEL, false)?;
                 }
@@ -192,6 +206,18 @@ impl Card {
                     text("remember.origin", &remember.origin, MAX_URL, false)?;
                 }
             }
+        }
+        self.check_size()
+    }
+
+    /// [`Card::check`]'s last rule: the whole card, as JSON, fits [`MAX_CARD_BYTES`].
+    fn check_size(&self) -> Result<(), String> {
+        let bytes = serde_json::to_vec(self).map_or(usize::MAX, |json| json.len());
+        if bytes > MAX_CARD_BYTES {
+            return Err(format!(
+                "the card is {bytes} bytes as JSON; keep it under {MAX_CARD_BYTES}: shorten its \
+                 texts and previews, or ask fewer questions or options"
+            ));
         }
         Ok(())
     }
@@ -315,6 +341,14 @@ fn check_field(field: &Field) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Who made a call: Fronde's assistant, or an outside MCP client by the name it gave.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "by", rename_all = "snake_case")]
+pub enum CallBy {
+    Assistant,
+    Client { name: String },
 }
 
 /// One option of a permission card.
@@ -1085,6 +1119,7 @@ mod tests {
             submit: None,
             truncated: false,
             replaced: false,
+            during: Vec::new(),
         }
     }
 
@@ -1133,6 +1168,7 @@ mod tests {
             submit: None,
             truncated: false,
             replaced: false,
+            during: Vec::new(),
         };
         let json = serde_json::to_string(&card).unwrap();
         assert_eq!(
@@ -1886,5 +1922,51 @@ mod tests {
             .map(|n| toggle_field(&format!("b{n}")))
             .collect();
         assert!(form(many).check().unwrap_err().contains("at most 12"));
+    }
+
+    #[test]
+    fn a_card_stays_small_and_says_whose_call_it_serves() {
+        let mut big = choice("q", false, false, false);
+        if let Field::Choice { options, .. } = &mut big {
+            for option in options.iter_mut() {
+                option.preview = Some("p".repeat(MAX_PREVIEW));
+            }
+        }
+        let fields = (0..MAX_FIELDS)
+            .map(|n| {
+                let mut field = big.clone();
+                if let Field::Choice { key, .. } = &mut field {
+                    *key = format!("q{n}");
+                }
+                field
+            })
+            .collect();
+        let error = form(fields).check().unwrap_err();
+        assert!(
+            error.contains("bytes as JSON; keep it under 65536"),
+            "{error}"
+        );
+
+        let mut card = form(vec![toggle_field("b")]);
+        if let Card::Form { during, .. } = &mut card {
+            *during = vec![
+                CallBy::Assistant,
+                CallBy::Client {
+                    name: "Codex".into(),
+                },
+            ];
+        }
+        let json = serde_json::to_string(&card).unwrap();
+        assert!(
+            json.ends_with(r#""during":[{"by":"assistant"},{"by":"client","name":"Codex"}]}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Card>(&json).unwrap(), card);
+        if let Card::Form { during, .. } = &mut card {
+            during[1] = CallBy::Client {
+                name: "Co\u{202e}dex".into(),
+            };
+        }
+        assert!(card.check().unwrap_err().contains("a caller's name"));
     }
 }

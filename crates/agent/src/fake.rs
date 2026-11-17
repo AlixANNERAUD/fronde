@@ -43,9 +43,11 @@ pub struct FakeScript {
     /// After this many updates of each prompt, wait for the notify before sending the rest.
     pub pause: Option<(usize, Arc<Notify>)>,
     /// Ask this `elicitation/create` during each prompt, after the permission if any, its
-    /// `sessionId` filled in: the JSON the agent would send, such as the Claude adapter's form
-    /// for `AskUserQuestion`.
+    /// `sessionId` filled in unless it has one: the JSON the agent would send, such as the Claude
+    /// adapter's form for `AskUserQuestion`.
     pub elicitation: Option<serde_json::Value>,
+    /// End the turn without waiting for the elicitation's answer.
+    pub leave_elicitation_pending: bool,
     /// Withdraw the elicitation with `$/cancel_request` once notified, as the Claude adapter does
     /// when the tool call that asked is aborted.
     pub withdraw_elicitation: Option<Arc<Notify>>,
@@ -66,6 +68,7 @@ impl Default for FakeScript {
             ignore_cancel: false,
             pause: None,
             elicitation: None,
+            leave_elicitation_pending: false,
             withdraw_elicitation: None,
         }
     }
@@ -267,7 +270,10 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
                         }
                         if let Some(form) = &script.elicitation {
                             let mut form = form.clone();
-                            form["sessionId"] = serde_json::Value::String(session.0.to_string());
+                            if form.get("sessionId").is_none() {
+                                form["sessionId"] =
+                                    serde_json::Value::String(session.0.to_string());
+                            }
                             let request: CreateElicitationRequest = serde_json::from_value(form)
                                 .map_err(|error| Error::invalid_params().data(error.to_string()))?;
                             let asked = cx.send_request(request);
@@ -275,16 +281,26 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
                                 gate.notified().await;
                                 asked.cancel()?;
                             }
-                            let response = asked.block_task().await;
-                            if response
-                                .as_ref()
-                                .is_ok_and(|response| response.action == ElicitationAction::Cancel)
-                            {
-                                stop = StopReason::Cancelled;
+                            if script.leave_elicitation_pending {
+                                let record = record.clone();
+                                cx.spawn(async move {
+                                    let response = asked.block_task().await;
+                                    lock(&record)
+                                        .elicitation_responses
+                                        .push(response.map_err(|error| error.to_string()));
+                                    Ok(())
+                                })?;
+                            } else {
+                                let response = asked.block_task().await;
+                                if response.as_ref().is_ok_and(|response| {
+                                    response.action == ElicitationAction::Cancel
+                                }) {
+                                    stop = StopReason::Cancelled;
+                                }
+                                lock(&record)
+                                    .elicitation_responses
+                                    .push(response.map_err(|error| error.to_string()));
                             }
-                            lock(&record)
-                                .elicitation_responses
-                                .push(response.map_err(|error| error.to_string()));
                         }
                         responder.respond(PromptResponse::new(stop))
                     })

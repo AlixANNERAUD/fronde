@@ -8,6 +8,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# A date and time a form suggests, shown in the page's own time.
+chrono.workspace = true
 dioxus.workspace = true
 fronde-client = { path = "../client" }
 fronde-protocol = { path = "../protocol" }

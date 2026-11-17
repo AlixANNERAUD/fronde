@@ -9,12 +9,11 @@ version.workspace = true
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
+# A card's size is its JSON's.
+serde_json.workspace = true
 unicode-properties.workspace = true
 # A secret typed in a card is wiped from memory once used.
 zeroize.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

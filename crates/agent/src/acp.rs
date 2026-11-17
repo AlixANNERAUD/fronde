@@ -7,9 +7,9 @@ use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
     CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, CreateElicitationRequest,
     CreateElicitationResponse, ElicitationAction, ElicitationCapabilities,
-    ElicitationFormCapabilities, ElicitationMode, HttpHeader, Implementation, InitializeRequest,
-    McpServer, McpServerHttp, NewSessionRequest, PermissionOption, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ElicitationFormCapabilities, ElicitationMode, ElicitationScope, HttpHeader, Implementation,
+    InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResumeSessionRequest, SessionCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionModeRequest, StopReason, SystemPrompt, SystemPromptMode, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields,
@@ -459,6 +459,8 @@ struct PermissionState {
     /// The turn's tool calls not finished yet, as their updates described them, by id: a
     /// permission request carries only part of its tool call.
     tools: HashMap<String, ToolCallUpdateFields>,
+    /// Fronde's session, once open: a form for any other is not Fronde's to show.
+    session: Option<SessionId>,
 }
 
 impl Permissions {
@@ -511,15 +513,24 @@ impl Permissions {
         Some((ask, answer))
     }
 
-    /// A reply for an elicitation of the turn, and where its answer arrives; `None` when the
-    /// turn is being cancelled.
+    /// A reply for an elicitation of `scope`, and where its answer arrives; `None` when the
+    /// turn is being cancelled, or when the form is not for Fronde's session.
     fn elicit(
         &self,
+        scope: &ElicitationScope,
     ) -> Option<(
         Arc<Reply<CreateElicitationResponse>>,
         oneshot::Receiver<CreateElicitationResponse>,
     )> {
         let mut state = self.state();
+        let ours = match scope {
+            ElicitationScope::Session(scope) => state.session.as_ref() == Some(&scope.session_id),
+            _ => false,
+        };
+        if !ours {
+            tracing::warn!("the agent sent a form for another session than Fronde's: cancelled");
+            return None;
+        }
         if state.cancelling {
             return None;
         }
@@ -650,7 +661,7 @@ impl Connection {
                             );
                             return responder.respond(cancel());
                         }
-                        let Some((reply, answer)) = permissions.elicit() else {
+                        let Some((reply, answer)) = permissions.elicit(request.scope()) else {
                             return responder.respond(cancel());
                         };
                         // The agent withdraws a request with `$/cancel_request`, as the Claude
@@ -782,6 +793,7 @@ impl Connection {
             tracing::debug!("the agent has no default mode: {error}");
         }
 
+        permissions.state().session = Some(session_id.clone());
         Ok(AgentClient {
             connection,
             session_id,

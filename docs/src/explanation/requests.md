@@ -65,7 +65,9 @@ cannot put a card in another thread. Any other client uses `server.token`: its q
 it connected, quoted and marked as a client, such as *Question de « Codex » (client MCP)*, so a
 card from an outside agent never passes for Fronde's own. An upstream MCP server's form is
 headed with the server's name, marked as a server: *Question de « github » (serveur MCP)*, and is
-for the admin only. Only the token makes a caller one of Fronde's
+for the admin only. On a form from an outside client or a server, a line above *Envoyer* says
+where the answer goes: *Ce que tu saisis est envoyé à « github » (serveur MCP). N'y mets jamais
+de mot de passe ni de code.* Only the token makes a caller one of Fronde's
 agents: a client that calls itself `assistant` is still an outside client. Outside clients' cards
 go to the main thread. Since a client
 chooses its name, the hub refuses to ask the user anything for one named *Fronde* or *assistant*
@@ -178,13 +180,22 @@ The form's schema is a flat object of fields, and maps onto the card's fields:
 
 `AskUserQuestion` therefore reads as one question per field, with *Autre…*, a note and previews,
 like `user_ask`. A question without its `<k>_custom` field offers neither *Autre…* nor a note,
-since nothing would carry them back. A `pattern` is not checked by Fronde: the asker checks its
+since nothing would carry them back. In a form of one question, the message's first line is the
+question and the rest its text; a form that is one plain choice, such as the adapter's offer to
+retry a refused request with another model, is sent only once you pick (*Refuser* keeps the
+refusal). Nothing is chosen for you: a toggle starts off whatever the form suggests, a suggested
+address is filled in only when it is a web address, a suggested date and time shows in your own
+time. A number written with a separator followed by three digits (`1,000`), or with two
+separators, is asked again, since it may mean a thousand or one. A `pattern` is not checked by Fronde: the asker checks its
 own. The form's texts are cleaned as a permission card's are (hidden characters replaced, head
 and tail kept), and the card says so. A form Fronde cannot show is declined at once, with the
 reason in the answer's `_meta` (`fronde/refused`): another type (an object, say), another
 `format`, more than 12 fields, a question with no option or more than 50, two options that read
-the same, a number of picks other than one or any. So is a form that looks like it asks for a
-secret (see [Security](security.md#forms-from-agents-and-servers)).
+the same, a number of picks other than one or any, a card over 64 KiB. So is a form that looks
+like it asks for a secret, with a plain reason (see
+[Security](security.md#forms-from-agents-and-servers)). A form for another session than Fronde's
+is cancelled unseen. An agent's form still pending when Fronde restarts expires: the agent's call
+that waited on it is gone.
 
 The agent gets typed answers: each option's value (never its title), the text, the number (whole
 as an integer), the toggle, and a question's free text and note joined under `<k>_custom`. A
@@ -236,7 +247,8 @@ forget its references (**planned**). No tool takes one yet (see
 ## Restarts and retries
 
 The table is the source of truth. After a restart, a request whose time ran out expires, and so
-does a pending permission; one whose card never reached the conversation, because Fronde stopped
+do a pending permission, a pending form of the agent's and anything an upstream server asked: the
+call that waited on each is gone, and its answer must never reach anyone else; one whose card never reached the conversation, because Fronde stopped
 in between, is shown then; the others stay answerable. A tool call that is retried with the same `client_request_id` joins the
 request it started instead of showing a second card. Secrets kept for a conversation do not
 survive a restart: they live in memory only. A secret card still pending after a restart stays

@@ -15,11 +15,14 @@
 //! - Other strings are text fields (`format` `email`, `uri`, `date`, `date-time`; `minLength`,
 //!   `maxLength`; `pattern` is not checked here, the asker checks its own), `number` and
 //!   `integer` number fields (`minimum`, `maximum`), `boolean` toggles.
-//! - **No secret in a form.** A text or number field whose name or title reads like a secret
-//!   ([`looks_secret`]: a word such as password, token, key or secret) is refused, and so is a
-//!   `format` of `password`. MCP forbids sensitive data in form mode, and a value typed there
-//!   would reach the asker, its logs and the request's row. The heuristic is plain on purpose: it
-//!   also refuses a harmless "token count", which costs the asker a rewording, never a leak.
+//! - **No secret in a form, as far as a plain rule can tell.** MCP forbids sensitive data in
+//!   form mode, and a value typed there reaches the asker, its logs and the request's row. A form
+//!   is declined unseen when the text around anything typed reads like it asks for a secret
+//!   ([`looks_secret`]): the message, and the name, title and description of every text and
+//!   number field and of every question that takes free text (its `<k>_custom` field's too). A
+//!   `format` of `password` is declined as well. This catches an honest asker's mistake. It cannot
+//!   stop a hostile one, which can always word a question so that no rule sees it: the card says
+//!   where the answer goes, and the user never types a password or a code into a card.
 //!
 //! Every text comes from the asker: it is cleaned as a permission card's are (hidden characters
 //! replaced, head and tail kept), and the card says so.
@@ -34,6 +37,9 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::Duration;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
+use unicode_security::confusable_detection::skeleton;
 
 /// How long an elicitation's card waits for an answer: no answer means no.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -47,56 +53,103 @@ const PREVIEW_META: &str = "_claude/askUserQuestionOption";
 /// The suffix of the free-text field the Claude adapter puts beside each question.
 const CUSTOM: &str = "_custom";
 
-/// Words that make a field read like a secret.
+/// Words that, alone, make a text read like it asks for a secret, compared as [`normalize`]d.
 const SECRET_WORDS: &[&str] = &[
     "password",
+    "passwords",
     "passwd",
     "passphrase",
+    "passcode",
+    "pass",
     "pwd",
+    "mdp",
     "secret",
     "secrets",
     "token",
     "tokens",
+    "jeton",
+    "jetons",
     "key",
     "keys",
     "apikey",
+    "clé",
+    "clés",
     "credential",
     "credentials",
+    "identifiant",
+    "identifiants",
     "otp",
-    "mdp",
+    "totp",
+    "2fa",
+    "mfa",
+    "pin",
+    "code",
+    "codes",
+    "cvv",
+    "cvc",
+    "cvv2",
+    "iban",
 ];
 
-/// Why an elicitation cannot be shown, for the asker, in English.
+/// Words written together or apart (`mot de passe`, `api_key`), found in a text's words joined.
+const SECRET_PHRASES: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "passcode",
+    "motdepasse",
+    "codesecret",
+    "apikey",
+    "secretkey",
+    "privatekey",
+    "accesstoken",
+    "authtoken",
+];
+
+/// What the asker learns when its form looks like it asks for a secret: nothing that would help
+/// it reword the form past the rule.
+pub const SECRET_REFUSAL: &str = "Fronde does not show this form: never ask for a secret in a \
+     form; have the owner configure it for you instead";
+
+/// Why an elicitation cannot be shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
+    /// For the asker, in English.
     pub reason: String,
-    /// It asks for what looks like a secret.
+    /// For Fronde's log: the reason, and for a secret which field and text tripped the rule.
+    pub detail: String,
+    /// It looks like it asks for a secret.
     pub secret: bool,
+}
+
+impl Refused {
+    /// A refusal whose reason the asker and the log share.
+    pub fn new(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            detail: reason.clone(),
+            reason,
+            secret: false,
+        }
+    }
 }
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.reason)
+        f.write_str(&self.detail)
     }
 }
 
 impl std::error::Error for Refused {}
 
 fn refuse(reason: impl Into<String>) -> Refused {
-    Refused {
-        reason: reason.into(),
-        secret: false,
-    }
+    Refused::new(reason)
 }
 
-fn refuse_secret(name: &str) -> Refused {
+fn refuse_secret(detail: String) -> Refused {
     Refused {
-        reason: format!(
-            "the field {name:?} looks like it asks for a secret (password, token, key); Fronde \
-             takes no secret in a form, as MCP forbids it: have the owner configure it for you \
-             instead (such as an upstream server's `token` in Fronde's configuration), and rename \
-             the field if it holds no secret"
-        ),
+        reason: SECRET_REFUSAL.into(),
+        detail,
         secret: true,
     }
 }
@@ -206,32 +259,105 @@ impl Elicited {
     }
 }
 
-/// Whether a field named `name`, titled `title`, reads like it asks for a secret: one of its
-/// words (split on anything but letters and digits, and between a lower-case letter and an
-/// upper-case one) is one of [`SECRET_WORDS`], or it says "mot de passe".
-pub fn looks_secret(name: &str, title: Option<&str>) -> bool {
-    [Some(name), title].into_iter().flatten().any(|text| {
-        let mut words = Vec::new();
-        let mut word = String::new();
-        let mut previous_lower = false;
-        for c in text.chars() {
-            if !c.is_alphanumeric() {
-                words.push(std::mem::take(&mut word));
-                previous_lower = false;
-                continue;
-            }
-            if c.is_uppercase() && previous_lower {
-                words.push(std::mem::take(&mut word));
-            }
-            previous_lower = c.is_lowercase();
-            word.extend(c.to_lowercase());
+/// A word as it is compared: NFKC, lower case, common digit-for-letter spellings read as
+/// letters (`p4ssw0rd`), then its UTS #39 confusable skeleton (a Cyrillic `а` reads as `a`),
+/// without accents, in lower case again.
+fn normalize(word: &str) -> String {
+    let unleet: String = word
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            '4' | '@' => 'a',
+            '3' => 'e',
+            '1' => 'i',
+            '0' => 'o',
+            '5' | '$' => 's',
+            '7' => 't',
+            c => c,
+        })
+        .collect();
+    skeleton(&unleet)
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The words of `text`: split on anything but letters, digits, `$` and `@`, and between a
+/// lower-case letter and an upper-case one. Invisible characters join what they sit in
+/// (`pass\u{200b}word` is one word), so that they cannot split a word away from the rule.
+fn words(text: &str) -> Vec<String> {
+    let visible: String = text
+        .chars()
+        .filter(|c| !hidden(*c) || c.is_whitespace())
+        .nfkc()
+        .collect();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut previous_lower = false;
+    for c in visible.chars() {
+        if !(c.is_alphanumeric() || c == '$' || c == '@') {
+            words.push(std::mem::take(&mut word));
+            previous_lower = false;
+            continue;
         }
-        words.push(word);
-        words
+        if c.is_uppercase() && previous_lower {
+            words.push(std::mem::take(&mut word));
+        }
+        previous_lower = c.is_lowercase();
+        word.push(c);
+    }
+    words.push(word);
+    words.retain(|word| !word.is_empty());
+    words
+}
+
+/// Whether `text` reads like it asks for a secret: one of its [`words`] is one of
+/// [`SECRET_WORDS`], or its words joined hold one of [`SECRET_PHRASES`], all compared
+/// [`normalize`]d. Plain on purpose: it also refuses a harmless "code postal".
+pub fn looks_secret(text: &str) -> bool {
+    let words: Vec<String> = words(text).iter().map(|word| normalize(word)).collect();
+    let joined: String = words.concat();
+    SECRET_WORDS
+        .iter()
+        .any(|secret| words.contains(&normalize(secret)))
+        || SECRET_PHRASES
             .iter()
-            .any(|word| SECRET_WORDS.contains(&word.as_str()))
-            || text.to_lowercase().contains("mot de passe")
-    })
+            .any(|phrase| joined.contains(&normalize(phrase)))
+}
+
+/// The first text of a form that reads like it asks for a secret, as `what: text`: the message,
+/// and the name, title and description of each field something is typed into (a text, a number,
+/// a question that takes free text, that free text's own field).
+fn secret_text(
+    message: &str,
+    properties: &Map<String, Value>,
+    folded: &HashSet<&str>,
+) -> Option<String> {
+    if looks_secret(message) {
+        return Some(format!("the message {message:?}"));
+    }
+    for (name, property) in properties {
+        let typed = match kind(property) {
+            Some("number" | "integer") => true,
+            Some("string") if !is_choice(property) => true,
+            _ => folded.contains(format!("{name}{CUSTOM}").as_str()),
+        };
+        if !typed {
+            continue;
+        }
+        if property.get("format").and_then(Value::as_str) == Some("password") {
+            return Some(format!("the field {name:?}, of format password"));
+        }
+        let texts = [
+            Some(name.as_str()),
+            text_of(property, "title"),
+            text_of(property, "description"),
+        ];
+        if let Some(text) = texts.into_iter().flatten().find(|text| looks_secret(text)) {
+            return Some(format!("the field {name:?}: {text:?}"));
+        }
+    }
+    None
 }
 
 /// The card for an elicitation asking `message` with the form `schema`, or why it cannot be
@@ -275,6 +401,11 @@ pub fn form(message: &str, schema: &Value) -> Result<Elicited, Refused> {
             .then_some(name.as_str())
         })
         .collect();
+    if let Some(found) = secret_text(message, properties, &folded) {
+        return Err(refuse_secret(format!(
+            "it looks like it asks for a secret, by {found}"
+        )));
+    }
     let mut notes = Notes::default();
     let mut fields = Vec::new();
     let mut slots = Vec::new();
@@ -307,22 +438,51 @@ pub fn form(message: &str, schema: &Value) -> Result<Elicited, Refused> {
         )));
     }
     let mut message = block(message, MAX_MESSAGE, MAX_MESSAGE, &mut notes);
-    // One question, as Claude's `AskUserQuestion` sends one: the message is its question.
-    // Its own text moves to the chip, unless that would lose it.
+    // One question, as Claude's `AskUserQuestion` sends one: the message's first line is its
+    // question, the rest its body. Its own text moves to the chip, unless that would lose it.
     if let [
         Field::Choice {
-            header, question, ..
+            header,
+            question,
+            other,
+            required,
+            ..
         },
     ] = fields.as_mut_slice()
-        && !message.is_empty()
-        && !message.contains('\n')
-        && message.chars().count() <= MAX_QUESTION
-        && (header.is_some() || question.chars().count() <= MAX_HEADER || *question == message)
     {
-        if header.is_none() && *question != message {
-            *header = Some(question.clone());
+        let (first, body) = message
+            .split_once('\n')
+            .map_or((message.as_str(), ""), |(first, body)| (first, body.trim()));
+        if !first.is_empty()
+            && first.chars().count() <= MAX_QUESTION
+            && (header.is_some()
+                || question.is_empty()
+                || question.chars().count() <= MAX_HEADER
+                || *question == first)
+        {
+            if header.is_none() && !question.is_empty() && *question != first {
+                *header = Some(question.clone());
+            }
+            *question = first.to_owned();
+            message = body.to_owned();
         }
-        *question = std::mem::take(&mut message);
+        // A form that is one plain choice, such as the adapter's offer to retry a refused
+        // request with another model: nothing is sent until the user picks, and *Refuser*
+        // stays the way out.
+        if !*other {
+            *required = true;
+        }
+    }
+    for (field, (name, _)) in fields.iter_mut().zip(
+        properties
+            .iter()
+            .filter(|(name, _)| !folded.contains(name.as_str())),
+    ) {
+        if let Field::Choice { question, .. } = field
+            && question.is_empty()
+        {
+            *question = line(name, MAX_QUESTION, &mut notes);
+        }
     }
     let card = Card::Form {
         message,
@@ -330,6 +490,7 @@ pub fn form(message: &str, schema: &Value) -> Result<Elicited, Refused> {
         submit: None,
         truncated: notes.truncated,
         replaced: notes.replaced,
+        during: Vec::new(),
     };
     // Cleaned texts fit by construction; a check that fails here is a bug to refuse, not show.
     card.check().map_err(refuse)?;
@@ -392,7 +553,8 @@ fn field(
                 clean(&format!("{title} : {description}"), MAX_QUESTION, notes),
             ),
             (Some(text), None) | (None, Some(text)) => (None, clean(text, MAX_QUESTION, notes)),
-            (None, None) => (None, clean(name, MAX_QUESTION, notes)),
+            // Untitled: `form` gives it the message's first line, else its name.
+            (None, None) => (None, String::new()),
         };
         let values = options
             .iter()
@@ -428,7 +590,8 @@ fn field(
                 Some("uri") => Some(TextFormat::Uri),
                 Some("date") => Some(TextFormat::Date),
                 Some("date-time") => Some(TextFormat::DateTime),
-                Some("password") => return Err(refuse_secret(name)),
+                // `secret_text` declined it before.
+                Some("password") => return Err(refuse_secret(format!("{name:?} is a password"))),
                 Some(other) => {
                     return Err(refuse(format!(
                         "the field {name:?} has the format {other:?}, which a card cannot check; \
@@ -436,9 +599,6 @@ fn field(
                     )));
                 }
             };
-            if looks_secret(name, title) {
-                return Err(refuse_secret(name));
-            }
             let length = |key: &str| {
                 property
                     .get(key)
@@ -452,7 +612,15 @@ fn field(
                      at most {MAX_TEXT}"
                 )));
             }
-            let default = text_of(property, "default").map(|text| clean(text, MAX_TEXT, notes));
+            // An address the asker fills in is one a tap could open: web addresses only.
+            let default = text_of(property, "default")
+                .filter(|text| {
+                    format != Some(TextFormat::Uri)
+                        || ["https://", "http://"]
+                            .iter()
+                            .any(|scheme| text.to_ascii_lowercase().starts_with(scheme))
+                })
+                .map(|text| clean(text, MAX_TEXT, notes));
             Ok((
                 Field::Text {
                     key: name.to_owned(),
@@ -471,9 +639,6 @@ fn field(
             ))
         }
         "number" | "integer" => {
-            if looks_secret(name, title) {
-                return Err(refuse_secret(name));
-            }
             let integer = kind == "integer";
             let bound = |key: &str| property.get(key).and_then(Value::as_f64);
             let (min, max) = (bound("minimum"), bound("maximum"));
@@ -497,15 +662,13 @@ fn field(
                 },
             ))
         }
+        // A toggle starts off whatever the asker suggests: turning it on is the user's own tap.
         "boolean" => Ok((
             Field::Toggle {
                 key: name.to_owned(),
                 title: title_text,
                 description,
-                default: property
-                    .get("default")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                default: false,
             },
             Slot::Toggle {
                 key: name.to_owned(),
@@ -692,7 +855,10 @@ mod tests {
             ("client_credentials", None),
             ("otp", None),
         ] {
-            assert!(looks_secret(name, title), "{name} {title:?}");
+            assert!(
+                looks_secret(name) || title.is_some_and(looks_secret),
+                "{name} {title:?}"
+            );
         }
         for (name, title) in [
             ("monkey", None),
@@ -701,8 +867,185 @@ mod tests {
             ("passage", None),
             ("tokenizer", None),
         ] {
-            assert!(!looks_secret(name, title), "{name} {title:?}");
+            assert!(
+                !looks_secret(name) && !title.is_some_and(looks_secret),
+                "{name} {title:?}"
+            );
         }
+    }
+
+    #[test]
+    fn secret_words_are_caught_however_written() {
+        for text in [
+            // Leetspeak, case, width and look-alike letters.
+            "p4ss",
+            "passw0rd",
+            "P4SSW0RD",
+            "\u{ff30}\u{ff41}\u{ff53}\u{ff53}\u{ff57}\u{ff4f}\u{ff52}\u{ff44}",
+            "p\u{430}ssword",
+            "\u{3c1}assword",
+            // Invisible characters join the word they split.
+            "pass\u{200b}word",
+            "pa\u{ad}ss\u{2060}wd",
+            // Words apart or together.
+            "Mot de passe",
+            "mot-de-passe",
+            "motDePasse",
+            "Ton code secret",
+            "Ta clé API",
+            "cle d'acces",
+            "Ton jeton",
+            "Tes identifiants",
+            "Code PIN",
+            "pin",
+            "passcode",
+            "CVV",
+            "cvc",
+            "IBAN",
+            "2FA",
+            "TOTP",
+            "mfa_code",
+            "api_key",
+            "accessToken",
+            "private-key",
+        ] {
+            assert!(looks_secret(text), "{text:?}");
+        }
+        for text in [
+            "monkey",
+            "keyboard layout",
+            "tokenizer",
+            "Ton prénom",
+            "passage",
+            "Nombre de nuits",
+            "Quelle appli installer ?",
+            "Type your own answer, or add a note to the option you chose above (optional).",
+        ] {
+            assert!(!looks_secret(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn every_typed_text_is_scanned_for_a_secret() {
+        let declined = |message: &str, schema: Value| {
+            let error = form(message, &schema).unwrap_err();
+            assert!(error.secret, "{schema}: {error}");
+            // The asker learns only that it was declined, the log which text tripped the rule.
+            assert_eq!(error.reason, SECRET_REFUSAL);
+            error.detail
+        };
+        let one = |property: Value| json!({"type": "object", "properties": {"f": property}});
+        // The message, even above a harmless field.
+        let detail = declined("Saisis ton mot de passe", one(json!({"type": "string"})));
+        assert!(detail.contains("the message"), "{detail}");
+        // A text field's description.
+        let detail = declined(
+            "",
+            one(json!({"type": "string", "description": "Le code reçu par SMS"})),
+        );
+        assert!(detail.contains("\"f\""), "{detail}");
+        // A question that takes free text, as AskUserQuestion's do: its question...
+        let mut ask = ask_user_question();
+        ask["properties"]["question_0"]["description"] = json!("Quel est ton code PIN ?");
+        declined("Please answer the following questions.", ask);
+        // ...and its free-text field.
+        let mut ask = ask_user_question();
+        ask["properties"]["question_1_custom"]["title"] = json!("Password");
+        declined("Please answer the following questions.", ask);
+        // A plain choice takes nothing typed: its words are the asker's own.
+        assert!(
+            form(
+                "",
+                &one(json!({"type": "string", "title": "Key size", "enum": ["2048", "4096"]}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_oversized_card_is_refused() {
+        let options: Vec<Value> = (0..MAX_OPTIONS)
+            .map(|n| json!({"const": format!("o{n}"), "title": format!("Option {n}"), "description": "d".repeat(MAX_DESCRIPTION)}))
+            .collect();
+        let properties: Map<String, Value> = (0..MAX_FIELDS)
+            .map(|n| {
+                (
+                    format!("q{n}"),
+                    json!({"type": "string", "title": "Q", "oneOf": options}),
+                )
+            })
+            .collect();
+        let error = form("m", &json!({"type": "object", "properties": properties})).unwrap_err();
+        assert!(!error.secret);
+        assert!(error.reason.contains("bytes as JSON"), "{error}");
+    }
+
+    #[test]
+    fn defaults_never_choose_for_the_user() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "agree": {"type": "boolean", "title": "D'accord", "default": true},
+                "site": {"type": "string", "format": "uri", "default": "javascript:alert(1)"},
+                "home": {"type": "string", "format": "uri", "default": "https://example.com"},
+            },
+        });
+        let elicited = form("m", &schema).unwrap();
+        let Card::Form { fields, .. } = &elicited.card else {
+            unreachable!()
+        };
+        // A toggle starts off, whatever the asker suggests.
+        assert!(matches!(&fields[0], Field::Toggle { default: false, .. }));
+        // Only a web address is filled in for the user.
+        assert!(matches!(&fields[1], Field::Text { default: None, .. }));
+        assert!(
+            matches!(&fields[2], Field::Text { default: Some(home), .. } if home == "https://example.com")
+        );
+    }
+
+    #[test]
+    fn a_refusal_fallback_reads_as_a_question_to_pick() {
+        // The Claude adapter's `refusalFallbackToCreateRequest` (0.107.0).
+        let schema = json!({
+            "type": "object",
+            "properties": {"choice": {"type": "string", "oneOf": [
+                {"const": "retry_fallback", "title": "Retry with Opus", "description": "The session continues on Opus."},
+                {"const": "cancelled", "title": "Keep the refusal", "description": "You can send a new message."},
+            ]}},
+        });
+        let elicited = form(
+            "Fable declined this request (cyber). Retry with Opus?\n\nSome guidance.",
+            &schema,
+        )
+        .unwrap();
+        let Card::Form {
+            message, fields, ..
+        } = &elicited.card
+        else {
+            unreachable!()
+        };
+        assert_eq!(message, "Some guidance.");
+        let Field::Choice {
+            header,
+            question,
+            required,
+            other,
+            ..
+        } = &fields[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(header, &None);
+        assert_eq!(
+            question,
+            "Fable declined this request (cyber). Retry with Opus?"
+        );
+        // Nothing is chosen until the user picks; sending without a pick is refused.
+        assert!(*required && !*other);
+        let empty = Response::Form {
+            values: BTreeMap::new(),
+        };
+        assert!(check(&elicited.card, &empty).is_err());
     }
 
     #[test]
@@ -761,7 +1104,8 @@ mod tests {
         ));
         assert!(matches!(
             &fields[3],
-            Field::Toggle { key, default: true, .. } if key == "pets"
+            // Starts off whatever the schema suggests (`defaults_never_choose_for_the_user`).
+            Field::Toggle { key, default: false, .. } if key == "pets"
         ));
         assert!(matches!(
             &fields[4],
@@ -1054,8 +1398,9 @@ mod tests {
         ] {
             let error = refused(schema.clone());
             assert!(error.secret, "{schema}");
+            assert_eq!(error.reason, SECRET_REFUSAL);
             assert!(
-                error.reason.contains("takes no secret in a form"),
+                error.detail.contains("looks like it asks for a secret"),
                 "{error}"
             );
         }
