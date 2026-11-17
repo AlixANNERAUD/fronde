@@ -6,7 +6,7 @@
 //! them keeps both; each page draws a [`Workspace`] from plain props.
 
 use dioxus::prelude::*;
-use fronde_client::{Chat, Threads};
+use fronde_client::{Chat, Threads, tab_title};
 use fronde_protocol::ThreadId;
 
 use crate::{
@@ -150,6 +150,9 @@ pub fn Workspace(
         View::List | View::New => None,
     };
     let sidebar = rows.len() + archived.len() > 1;
+    // The shown thread's open cards from its chat, the others' from the list.
+    let tray = model.tray(current);
+    let title = tab_title(tray.count());
     let list = rsx! {
         ThreadList { rows, archived, current, open, on_go, on_send }
     };
@@ -157,7 +160,7 @@ pub fn Workspace(
         let mut threads = threads;
         threads.write().dismiss_refusal();
     };
-    match view {
+    let page = match view {
         View::List => rsx! {
             div { class: "flex h-dvh flex-col",
                 header { class: "shrink-0 border-b pt-[env(safe-area-inset-top)]",
@@ -224,6 +227,7 @@ pub fn Workspace(
                     sidebar,
                     refusal,
                     on_dismiss: Some(EventHandler::new(dismiss)),
+                    elsewhere: tray.elsewhere,
                 }
             };
             rsx! {
@@ -235,6 +239,11 @@ pub fn Workspace(
                 }
             }
         }
+    };
+    rsx! {
+        // « (N) Fronde » while cards wait for an answer, in any thread.
+        document::Title { "{title}" }
+        {page}
     }
 }
 
@@ -864,5 +873,126 @@ mod tests {
         // 44 px targets on a phone.
         assert!(html.contains("min-h-11"), "{html}");
         assert!(html.contains("size-11"), "{html}");
+    }
+
+    thread_local! {
+        /// The tab titles the page under test set, oldest first.
+        static TITLES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A document that keeps the titles set, as a browser tab would show them.
+    struct Tab;
+
+    impl dioxus::document::Document for Tab {
+        fn eval(&self, js: String) -> dioxus::document::Eval {
+            dioxus::document::NoOpDocument.eval(js)
+        }
+
+        fn set_title(&self, title: String) {
+            TITLES.with_borrow_mut(|titles| titles.push(title));
+        }
+    }
+
+    /// The workspace in a tab.
+    #[component]
+    fn InTab(start: Threads, view: View) -> Element {
+        use_context_provider(|| {
+            std::rc::Rc::new(Tab) as std::rc::Rc<dyn dioxus::document::Document>
+        });
+        rsx! {
+            Harness { start, view, status: Status::Open }
+        }
+    }
+
+    fn tab_title() -> String {
+        TITLES.with_borrow(|titles| titles.last().cloned().unwrap_or_default())
+    }
+
+    fn question(id: u64, text: &str) -> Event {
+        Event::Request {
+            id,
+            card: fronde_protocol::Card::Form {
+                message: String::new(),
+                fields: vec![fronde_protocol::Field::Choice {
+                    key: "q1".into(),
+                    header: None,
+                    question: text.into(),
+                    options: vec![fronde_protocol::ChoiceOption {
+                        label: "Perso".into(),
+                        description: None,
+                        preview: None,
+                        recommended: false,
+                    }],
+                    multi: false,
+                    other: false,
+                    required: true,
+                    note: false,
+                }],
+                submit: None,
+                truncated: false,
+                replaced: false,
+                during: Vec::new(),
+            },
+            from: None,
+            server: false,
+            woken_by: None,
+        }
+    }
+
+    /// The tab says how many cards wait for an answer, in every thread not archived; the tray
+    /// above the message box lists this thread's by title, then the other threads that wait.
+    #[test]
+    fn tab_title_counts_open_requests() {
+        TITLES.with_borrow_mut(Vec::clear);
+        let mut garage = summary(2, "Garage", "11:00");
+        garage.open_requests = 2;
+        let mut old = summary(3, "Vacances", "08:00");
+        old.open_requests = 1;
+        old.archived = true;
+        let list = vec![summary(1, "Fronde", "09:00"), garage.clone(), old];
+        let mut page = Live::new(VirtualDom::new_with_props(
+            InTab,
+            InTabProps {
+                start: threads(list.clone()),
+                view: View::Thread(ThreadId::MAIN),
+            },
+        ));
+        assert_eq!(tab_title(), "(2) Fronde");
+        let html = page.html();
+        assert!(html.contains("2 demandes en attente"), "{html}");
+        assert!(html.contains(r#"href="/t/2""#), "{html}");
+        assert!(html.contains("Garage (2)"), "{html}");
+        assert!(!html.contains("Vacances (1)"), "{html}");
+
+        // A card of this thread: counted, and listed by its question; its row is where a tap
+        // scrolls to.
+        receive(&mut page, entry(3, question(7, "Quel agenda ?")));
+        assert_eq!(tab_title(), "(3) Fronde");
+        let html = page.html();
+        assert!(html.contains("3 demandes en attente"), "{html}");
+        let tray = &html[at(&html, r#"aria-label="Demandes en attente""#)..];
+        assert!(tray.contains("Quel agenda ?"), "{tray}");
+        assert!(html.contains(r#"id="request-7""#), "{html}");
+        assert!(at(&html, r#"id="request-7""#) < at(&html, r#"aria-label="Demandes en attente""#));
+
+        // Closed: no longer counted.
+        receive(
+            &mut page,
+            entry(
+                4,
+                Event::RequestClosed {
+                    id: 7,
+                    outcome: fronde_protocol::Outcome::Declined,
+                    by: None,
+                },
+            ),
+        );
+        assert_eq!(tab_title(), "(2) Fronde");
+        // Nothing waits any more: the plain title, and no tray.
+        garage.open_requests = 0;
+        let list = vec![summary(1, "Fronde", "09:00"), garage];
+        receive(&mut page, ServerMsg::Threads { threads: list });
+        assert_eq!(tab_title(), "Fronde");
+        assert!(!page.html().contains("en attente"), "{}", page.html());
     }
 }

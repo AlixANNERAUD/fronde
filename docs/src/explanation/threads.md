@@ -95,6 +95,10 @@ summarise.
   whose prompt had not gone out yet, they are held, and so is every result after them, until
   your next message, which runs before any of them and carries them. Stop gives you the floor
   back.
+- **Late answers.** Your answer to a card whose asking call is gone (a restart, a cut call) is a
+  message from you: it goes before the wakes waiting, which are held and go with it, carries the
+  results held and starts the count again (see
+  [Late answers](requests.md#late-answers)).
 - **Archive.** An archived thread is not woken, nor is a thread under an archived one: a result
   logs nothing in it, and the wakes waiting when it was archived end at once, without reaching
   its agent. Archiving also retires its sub-agents (see [Stopping](#stopping)); their own threads

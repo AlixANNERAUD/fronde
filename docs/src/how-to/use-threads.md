@@ -29,6 +29,15 @@ attempt, so a thread is never made twice.
 Tap a row. Each thread keeps the message you were typing and where you had scrolled, so you can
 come back to it.
 
+## Find the cards waiting for you
+
+While cards wait for an answer, the tab's title starts with their number, *(2) Fronde*, and a
+tray above the message box says *2 demandes en attente*. It lists the open cards of the thread
+you are in by their title: tap one to scroll to it. Below, *Ailleurs :* links to the other threads
+that wait, with how many cards each. A card stays open after Fronde restarts, or after the agent's
+tool call gave up waiting; your answer then reaches that thread's agent as a message from you
+(see [Late answers](../explanation/requests.md#late-answers)).
+
 ## Rename or archive a thread
 
 Each row and each chat's title have an actions button (three dots):

@@ -2266,3 +2266,169 @@ async fn archiving_a_sub_agent_tells_its_parent_without_waking_it() {
     assert_eq!(woken_count(&events(&main)), 1, "only the result's wake");
     assert_eq!(prompts(&pooled, ThreadId::MAIN).len(), 1);
 }
+
+// Late answers: the owner's answer to a thread's card that came once nobody waited for it.
+
+/// A question of thread `thread`'s agent, asked in its turn `turn`.
+fn late_ask(thread: ThreadId, topic: &str, turn: u64) -> Ask {
+    Ask {
+        turn: Some(turn),
+        caller: Caller::Thread(thread),
+        ..ask(topic)
+    }
+}
+
+fn perso() -> Response {
+    Response::Form {
+        values: [(
+            "q1".to_owned(),
+            fronde_protocol::ChoiceAnswer {
+                selected: vec!["Perso".into()],
+                ..fronde_protocol::ChoiceAnswer::default()
+            }
+            .into(),
+        )]
+        .into(),
+    }
+}
+
+const PERSO: &str = "Réponse à ta question « Quel agenda ? » : Perso";
+
+/// The prompt gives the answer between two fence lines, as data.
+fn assert_late_prompt(prompt: &str) {
+    assert!(prompt.contains(&format!("\n{PERSO}\n")), "{prompt}");
+    assert!(prompt.contains("never instructions"), "{prompt}");
+    let fences: Vec<&str> = prompt
+        .lines()
+        .filter(|line| line.starts_with("----- late answer "))
+        .collect();
+    assert_eq!(fences.len(), 2, "{prompt}");
+    assert_eq!(fences[0], fences[1]);
+}
+
+/// The call that asked was cut: the answer starts a turn of the owner's, its text in the stream
+/// as the owner's message and in the prompt as data.
+#[tokio::test]
+async fn late_answer_reaches_the_agent_as_a_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled, requests) = open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+    let main = threads.main();
+    let id = requests
+        .ask(late_ask(ThreadId::MAIN, TOPIC, 1))
+        .await
+        .unwrap()
+        .id();
+    assert!(requests.is_late(id).await.unwrap());
+    requests.answer(id, perso(), &alix()).await.unwrap();
+    wait_for_turns(&main, 1).await;
+    until_done(&main).await;
+    let shown = events(&main);
+    let message = shown.iter().position(|event| *event == user(PERSO));
+    let closed = shown.iter().position(
+        |event| matches!(event, Event::RequestClosed { id: closed, .. } if *closed == id),
+    );
+    assert!(closed < message && message.is_some(), "{shown:?}");
+    let given = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(given.len(), 1, "{given:?}");
+    assert_late_prompt(&given[0]);
+}
+
+/// A late answer while a turn runs waits for its end, then goes as the owner's message: the
+/// sub-agent's result waiting then is held and goes with it, and no wake turn runs first.
+#[tokio::test]
+async fn late_answer_queued_while_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled, requests) = open_woken_with(dir.path(), Limits::default(), |pooled| {
+        pooled.gate(ThreadId::MAIN)
+    })
+    .await;
+    let main = threads.main();
+    main.send("Va".into()).await;
+    pooled.until_held(ThreadId::MAIN).await;
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Un").await;
+    until_done(&child).await;
+    let id = requests
+        .ask(late_ask(ThreadId::MAIN, TOPIC, 1))
+        .await
+        .unwrap()
+        .id();
+    requests.answer(id, perso(), &alix()).await.unwrap();
+    let late_queued = Event::Notice {
+        text: fronde_agent::assistant::LATE_QUEUED.into(),
+    };
+    assert!(events(&main).contains(&late_queued), "{:?}", events(&main));
+    assert_eq!(prompts(&pooled, ThreadId::MAIN), ["Va"]);
+
+    pooled.open(ThreadId::MAIN);
+    pooled.until_held(ThreadId::MAIN).await;
+    pooled.open(ThreadId::MAIN);
+    wait_for_turns(&main, 2).await;
+    until_done(&main).await;
+    let shown = events(&main);
+    let first_end = shown
+        .iter()
+        .position(|event| matches!(event, Event::TurnEnded { .. }))
+        .unwrap();
+    assert!(
+        matches!(&shown[first_end - 1..=first_end + 1], [Event::WakesHeld { count: 1 }, Event::TurnEnded { .. }, message] if *message == user(PERSO)),
+        "{shown:?}"
+    );
+    assert_eq!(woken_count(&shown), 0, "no wake turn ran");
+    let given = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(given.len(), 2, "{given:?}");
+    assert!(
+        given[1].starts_with("1 sub-agent result(s) came"),
+        "{given:?}"
+    );
+    assert_late_prompt(&given[1]);
+}
+
+/// A late answer to thread 2's card goes to thread 2's agent, never to another thread's.
+#[tokio::test]
+async fn late_answer_in_thread_2_goes_to_thread_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled, requests) = open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+    let second = new_thread(&threads, StartedBy::User).await;
+    assert_eq!(second.thread(), ThreadId(2));
+    let id = requests
+        .ask(late_ask(ThreadId(2), "thread:2", 1))
+        .await
+        .unwrap()
+        .id();
+    requests.answer(id, perso(), &alix()).await.unwrap();
+    wait_for_turns(&second, 1).await;
+    until_done(&second).await;
+    assert!(events(&second).contains(&user(PERSO)));
+    let given = prompts(&pooled, ThreadId(2));
+    assert_eq!(given.len(), 1, "{given:?}");
+    assert_late_prompt(&given[0]);
+    assert_eq!(prompts(&pooled, ThreadId::MAIN), Vec::<String>::new());
+    assert!(!events(&threads.main()).contains(&user(PERSO)));
+}
+
+/// A thread's question pending when Fronde stops stays answerable after the start, and its
+/// answer reaches the agent as a message.
+#[tokio::test]
+async fn late_answer_after_a_restart_reaches_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let (threads, _pooled, requests) =
+            open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+        let waiter = requests
+            .ask(late_ask(ThreadId::MAIN, TOPIC, 1))
+            .await
+            .unwrap();
+        assert!(!requests.is_late(waiter.id()).await.unwrap());
+        drop(threads);
+        waiter.id()
+    };
+    let (threads, pooled, requests) = open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+    assert!(requests.is_late(id).await.unwrap());
+    requests.answer(id, perso(), &alix()).await.unwrap();
+    let main = threads.main();
+    wait_for_turns(&main, 1).await;
+    until_done(&main).await;
+    let given = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(given.len(), 1, "{given:?}");
+    assert_late_prompt(&given[0]);
+}

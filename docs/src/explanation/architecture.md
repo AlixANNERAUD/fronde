@@ -141,8 +141,10 @@ Anything that waits on a human is a **request**: a row in the `requests` table, 
 the conversation and answered once, from whichever signed-in page. The agent's permission requests
 and forms (Claude's `AskUserQuestion`, as ACP elicitations) are cards of its running turn,
 `user_ask` asks questions this way, and `user_secret` one secret, which goes to the secret store
-and never to the agent. An upstream MCP server's form is a card for the admin. See
-[Requests and cards](requests.md).
+and never to the agent. An upstream MCP server's form is a card for the admin. A thread's question
+or secret outlives the call that asked: answered after a restart or a cut call, it reaches that
+thread's agent as a message. A tray above the message box and the tab's title count the open
+cards. See [Requests and cards](requests.md).
 
 ## The web interface
 

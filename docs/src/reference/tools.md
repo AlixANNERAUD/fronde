@@ -95,8 +95,12 @@ zero-width or bidirectional character, a separator, a tag character, a variation
 private-use or unassigned code point); only `preview` may hold line breaks and tabs. The error
 names the character as `U+XXXX`. Never use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
 than the question's: Codex, for instance, gives up after `tool_timeout_sec` (60 s by default).
-A call the client cancels closes its card as cancelled, and so does the end of the agent's
-turn, or *Stop*, for the questions that turn asked. A call from one of Fronde's agents that comes
+A call an outside client cancels closes its card as cancelled. A call of one of Fronde's agents
+that its MCP client cuts (a client-side timeout, for instance) leaves its card open: the call
+returns `{"status": "pending"}` to nobody, and the answer, when it comes, reaches that agent as a
+message in its thread (see [Late answers](../explanation/requests.md#late-answers)). The end of
+the agent's turn cancels the questions it still waits on; *Stop* cancels every question that
+turn asked. A call from one of Fronde's agents that comes
 as its turn ends, or after, gets an error and shows no card: no card outlives its turn.
 See [Requests and cards](../explanation/requests.md).
 
@@ -109,7 +113,9 @@ the card shows it as a button naming its host. It must be an `https://` address 
 no user name or password before it (`https://site@evil.example` is refused): `http:`,
 `javascript:`, `data:` and anything else are refused. The texts follow `user_ask`'s rules: no
 hidden character, no line break. The same outside client names are
-refused.
+refused. A call cut short behaves as `user_ask`'s: an outside client's card closes, an agent's
+stays open and its answer (the reference or the stored name, never the value) comes as a
+message.
 
 The user picks how long the secret is kept:
 

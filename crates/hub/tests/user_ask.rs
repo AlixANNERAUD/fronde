@@ -3,16 +3,22 @@ use fronde_hub::source::Tool;
 use fronde_hub::tools::{CallContext, Registry, ToolOutput};
 use fronde_hub::user::user_tools;
 use fronde_protocol::{Card, ChoiceAnswer, ChoiceOption, Field, Outcome, RequestId, Response};
-use fronde_requests::{Caller, Journal, Requests, User};
+use fronde_requests::{Caller, Journal, LateAnswer, Requests, ThreadId, User};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 const WAIT: Duration = Duration::from_secs(10);
 
-/// Hands each card shown to the test.
-struct Shown(mpsc::UnboundedSender<(RequestId, Card, Option<String>)>);
+/// Late answers given: to which thread, in which stream.
+type Late = Arc<Mutex<Vec<(ThreadId, String, LateAnswer)>>>;
+
+/// Hands each card shown to the test, and keeps the late answers given.
+struct Shown(
+    mpsc::UnboundedSender<(RequestId, Card, Option<String>)>,
+    Late,
+);
 
 #[async_trait]
 impl Journal for Shown {
@@ -38,12 +44,26 @@ impl Journal for Shown {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn answered_late(
+        &self,
+        thread: ThreadId,
+        topic: &str,
+        answer: LateAnswer,
+    ) -> anyhow::Result<()> {
+        self.1
+            .lock()
+            .unwrap()
+            .push((thread, topic.to_owned(), answer));
+        Ok(())
+    }
 }
 
 struct Bench {
     registry: Arc<Registry>,
     requests: Arc<Requests>,
     shown: mpsc::UnboundedReceiver<(RequestId, Card, Option<String>)>,
+    late: Late,
     _dir: tempfile::TempDir,
 }
 
@@ -51,7 +71,10 @@ async fn bench() -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let db = fronde_db::open(dir.path()).await.unwrap();
     let (send, shown) = mpsc::unbounded_channel();
-    let requests = Requests::open(db, Arc::new(Shown(send))).await.unwrap();
+    let late = Late::default();
+    let requests = Requests::open(db, Arc::new(Shown(send, late.clone())))
+        .await
+        .unwrap();
     let registry = Arc::new(Registry::new());
     let tools: Vec<Tool> = user_tools(requests.clone(), None);
     assert_eq!(registry.replace_source("hub", tools), 1);
@@ -59,6 +82,7 @@ async fn bench() -> Bench {
         registry,
         requests,
         shown,
+        late,
         _dir: dir,
     }
 }
@@ -533,4 +557,76 @@ async fn outside_client_names_are_checked() {
     assert_eq!(from.as_deref(), Some("Codex"));
     bench.requests.cancel(id).await.unwrap();
     result(call).await;
+}
+
+/// The MCP client cuts a thread's call while its question waits: the card stays open, late, and
+/// its answer goes to that thread's agent as a message. An outside client's cut call closes its
+/// card: nothing could bring it a late answer.
+#[tokio::test]
+async fn cut_tool_call_answer_is_delivered_late() {
+    let mut bench = bench().await;
+    let second = CallContext {
+        caller: Caller::Thread(ThreadId(2)),
+        topic: "thread:2".into(),
+        ..context()
+    };
+    let cut = second.cancelled.clone();
+    let call = {
+        let registry = bench.registry.clone();
+        tokio::spawn(async move { registry.call_as(&second, "user_ask", one_question()).await })
+    };
+    let (id, _, _) = bench.card().await;
+    cut.cancel();
+    let out = result(call).await;
+    assert_eq!(out["result"]["status"], "pending", "{out}");
+    assert!(bench.requests.is_late(id).await.unwrap());
+    assert!(bench.late.lock().unwrap().is_empty());
+    bench
+        .requests
+        .answer(id, pick("Seerr"), &alix())
+        .await
+        .unwrap();
+    let late = bench.late.lock().unwrap().clone();
+    assert_eq!(late.len(), 1, "{late:?}");
+    let (thread, topic, answer) = &late[0];
+    assert_eq!((*thread, topic.as_str()), (ThreadId(2), "thread:2"));
+    assert_eq!(
+        answer.text,
+        "Réponse à ta question « Quelle appli installer ? » : Seerr"
+    );
+
+    // An outside client's cut call: closed, nothing given.
+    let outside = CallContext {
+        caller: Caller::Mcp("Codex".into()),
+        turn: None,
+        ..context()
+    };
+    let cut = outside.cancelled.clone();
+    let call = {
+        let registry = bench.registry.clone();
+        tokio::spawn(async move { registry.call_as(&outside, "user_ask", one_question()).await })
+    };
+    let (id, _, _) = bench.card().await;
+    cut.cancel();
+    assert_eq!(result(call).await["result"]["status"], "cancelled");
+    assert_eq!(
+        bench.requests.answer(id, pick("Seerr"), &alix()).await,
+        Err(fronde_requests::Refusal::Closed)
+    );
+    assert_eq!(bench.late.lock().unwrap().len(), 1);
+}
+
+/// The first question answered with `label`.
+fn pick(label: &str) -> Response {
+    Response::Form {
+        values: [(
+            "q1".to_owned(),
+            ChoiceAnswer {
+                selected: vec![label.into()],
+                ..ChoiceAnswer::default()
+            }
+            .into(),
+        )]
+        .into(),
+    }
 }

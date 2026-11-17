@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_entity::{stream_entries, streams, threads};
 use fronde_protocol::{Card, Outcome, RequestId, ThreadSummary};
-use fronde_requests::{Ask, Caller, Journal, Requests, User, Waiter};
+use fronde_requests::{Ask, Caller, Journal, LateAnswer, Requests, User, Waiter};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
@@ -1300,5 +1300,27 @@ impl Journal for Threads {
         let closed = assistant.close(id, outcome, by).await;
         self.changes.notify();
         closed
+    }
+
+    /// The answer goes to the agent of the thread that asked, in that thread's stream only.
+    async fn answered_late(
+        &self,
+        thread: ThreadId,
+        topic: &str,
+        answer: LateAnswer,
+    ) -> anyhow::Result<()> {
+        let Some(assistant) = self.assistant(thread).await? else {
+            bail!(
+                "no thread {thread} to give the late answer of request {} to",
+                answer.request
+            );
+        };
+        anyhow::ensure!(
+            assistant.topic() == topic,
+            "request {} was asked by thread {thread} in another stream, {topic:?}",
+            answer.request
+        );
+        assistant.answer_late(answer).await;
+        Ok(())
     }
 }

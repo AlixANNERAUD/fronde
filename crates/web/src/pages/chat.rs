@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use dioxus::html::{ScrollBehavior, geometry::PixelsVector2D};
 use dioxus::prelude::*;
-use fronde_client::{Chat, Item, PermissionStatus, Threads, ToolStatus};
+use fronde_client::{Chat, Elsewhere, Item, PermissionStatus, Threads, ToolStatus, Tray};
 use fronde_protocol::{ClientMsg, ThreadId, ThreadSummary, TurnOutcome};
 
 use crate::{
@@ -99,8 +99,15 @@ pub fn ChatView(
     #[props(default)]
     refusal: Option<String>,
     #[props(default)] on_dismiss: Option<EventHandler<()>>,
+    /// The other threads with cards waiting for an answer, for the tray.
+    #[props(default)]
+    elsewhere: Vec<Elsewhere>,
 ) -> Element {
     let open = status == Status::Open;
+    let tray = Tray {
+        here: chat.tray(),
+        elsewhere,
+    };
     let mut renaming = use_signal(|| false);
     let new = matches!(target, Target::New(_));
     let pending = match target {
@@ -226,7 +233,11 @@ pub fn ChatView(
                     aria_label: "Conversation",
                     class: "mx-auto flex w-full max-w-3xl flex-col gap-3 px-4 py-4",
                     for row in chat.rows() {
-                        li { key: "{row.generation}-{row.seq}", class: "flex flex-col",
+                        li {
+                            key: "{row.generation}-{row.seq}",
+                            // Where the tray scrolls to.
+                            id: request_anchor(&row.item),
+                            class: "flex flex-col scroll-mt-4",
                             RowView {
                                 item: row.item.clone(),
                                 open,
@@ -255,6 +266,9 @@ pub fn ChatView(
                 }
             }
             div { class: "shrink-0 border-t px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]",
+                if !tray.is_empty() {
+                    RequestTray { tray, on_go }
+                }
                 if archived {
                     p {
                         role: "status",
@@ -268,6 +282,82 @@ pub fn ChatView(
                         target,
                         kept,
                         on_send,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The id of a request card's row, which the tray scrolls to; `None` for any other row.
+fn request_anchor(item: &Item) -> Option<String> {
+    match item {
+        Item::Request { id, .. } => Some(format!("request-{id}")),
+        _ => None,
+    }
+}
+
+/// Scrolls the page to the element `id`.
+#[cfg(target_arch = "wasm32")]
+fn scroll_to(id: &str) {
+    if let Some(element) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(id))
+    {
+        element.scroll_into_view();
+    }
+}
+
+/// Natively, in tests, there is no page to scroll.
+#[cfg(not(target_arch = "wasm32"))]
+fn scroll_to(_id: &str) {}
+
+const TRAY_LINK: &str = "hover:text-foreground focus-visible:ring-ring/50 inline-flex min-h-11 max-w-full items-center rounded-sm underline underline-offset-2 outline-none focus-visible:ring-[3px] md:min-h-8";
+
+/// Above the message box: « N demande(s) en attente », each open card of this thread by its
+/// title (a tap scrolls to it), then the other threads that wait for an answer.
+#[component]
+fn RequestTray(tray: Tray, on_go: Option<EventHandler<Place>>) -> Element {
+    rsx! {
+        nav {
+            aria_label: "Demandes en attente",
+            class: "mx-auto mb-2 flex max-w-3xl flex-col gap-1",
+            p { role: "status", class: "text-muted-foreground text-xs font-medium", {tray.heading()} }
+            if !tray.here.is_empty() {
+                ul { class: "flex flex-wrap gap-1",
+                    for card in tray.here {
+                        li { key: "{card.id}", class: "min-w-0 max-w-full",
+                            Button {
+                                variant: ButtonVariant::Outline,
+                                size: ButtonSize::Sm,
+                                class: "h-11 max-w-full md:h-8",
+                                onclick: move |_| scroll_to(&format!("request-{}", card.id)),
+                                span { class: "min-w-0 truncate", "{card.title}" }
+                            }
+                        }
+                    }
+                }
+            }
+            if !tray.elsewhere.is_empty() {
+                p { class: "text-muted-foreground flex min-w-0 flex-wrap items-center gap-x-2 text-xs",
+                    span { class: "shrink-0", "Ailleurs :" }
+                    for thread in tray.elsewhere {
+                        if let Some(on_go) = on_go {
+                            PlaceLink {
+                                key: "{thread.thread}",
+                                place: Place::Thread(thread.thread),
+                                on_go,
+                                class: TRAY_LINK,
+                                span { class: "truncate", "{thread.title} ({thread.count})" }
+                            }
+                        } else {
+                            a {
+                                key: "{thread.thread}",
+                                href: Place::Thread(thread.thread).href(),
+                                class: TRAY_LINK,
+                                span { class: "truncate", "{thread.title} ({thread.count})" }
+                            }
+                        }
                     }
                 }
             }

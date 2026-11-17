@@ -576,7 +576,10 @@ An upstream server is trusted to ask, not to decide, and only on behalf of a cal
   after at most 10 minutes, and, when the assistant alone was calling, with the assistant's turn
   (*Stop* or its end).
 - An upstream server's card, like the agent's own form, expires when Fronde restarts: the call
-  that waited on it is gone, and its answer must never reach anyone else.
+  that waited on it is gone, and its answer must never reach anyone else. Only a thread's own
+  `user_ask` and `user_secret` cards get a late answer as a message, in that thread only (see
+  [Late answers](requests.md#late-answers)); an answer to a server's card, to the agent's own
+  form or permission, or to an outside client's card never does.
 - Forms are advertised to servers only when the chat runs; otherwise a form sent anyway is
   cancelled unseen.
 

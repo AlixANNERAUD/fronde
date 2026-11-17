@@ -5,7 +5,7 @@ use fronde_protocol::{
     Response,
 };
 use fronde_requests::{
-    Ask, Caller, Journal, Refusal, Requests, Resolution, Reused, ThreadId, User,
+    Ask, Caller, Journal, LateAnswer, Refusal, Requests, Resolution, Reused, ThreadId, User,
 };
 use sea_orm::{ActiveValue::Set, ConnectionTrait, EntityTrait};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,11 +39,17 @@ struct FakeJournal {
     /// When set, showing an end waits for this notify, `holding` set meanwhile.
     hold_close: Mutex<Option<Arc<Notify>>>,
     holding: AtomicBool,
+    /// The late answers given, with the thread and stream they went to.
+    late: Mutex<Vec<(ThreadId, String, LateAnswer)>>,
 }
 
 impl FakeJournal {
     fn shown(&self) -> Vec<Shown> {
         self.shown.lock().unwrap().clone()
+    }
+
+    fn late(&self) -> Vec<(ThreadId, String, LateAnswer)> {
+        self.late.lock().unwrap().clone()
     }
 }
 
@@ -87,6 +93,19 @@ impl Journal for FakeJournal {
             outcome: outcome.clone(),
             by: by.map(str::to_owned),
         });
+        Ok(())
+    }
+
+    async fn answered_late(
+        &self,
+        thread: ThreadId,
+        topic: &str,
+        answer: LateAnswer,
+    ) -> anyhow::Result<()> {
+        self.late
+            .lock()
+            .unwrap()
+            .push((thread, topic.to_owned(), answer));
         Ok(())
     }
 }
@@ -976,12 +995,13 @@ async fn one_unreadable_row_does_not_stop_the_start() {
     let (requests, _) = open(dir.path()).await;
     let good = requests.ask(ask()).await.unwrap().id();
     drop(requests);
-    // A row a later version wrote, never shown, with a card this version cannot read.
+    // A row a later version wrote, never shown, with a card this version cannot read. A
+    // thread's: an outside client's would expire at start without being read.
     let db = fronde_db::open(dir.path()).await.unwrap();
     let unreadable = requests::ActiveModel {
         topic: Set(TOPIC.into()),
         turn: Set(None),
-        caller: Set("mcp:Codex".into()),
+        caller: Set("thread:1".into()),
         client_request_id: Set(None),
         kind: Set("hologram".into()),
         card: Set(serde_json::json!({"kind": "hologram"})),
@@ -1109,12 +1129,13 @@ async fn unannounced_row_is_announced_at_start() {
     assert!(format!("{error:#}").contains("disk full"), "{error:#}");
     drop(requests);
 
-    // A crash between the row and its entry: the row is pending and was never shown.
+    // A crash between the row and its entry: the row is pending and was never shown. A
+    // thread's: an outside client's expires at start, its caller gone.
     let db = fronde_db::open(dir.path()).await.unwrap();
     let crashed = requests::ActiveModel {
         topic: Set(TOPIC.into()),
         turn: Set(None),
-        caller: Set("mcp:Codex".into()),
+        caller: Set("thread:1".into()),
         client_request_id: Set(None),
         kind: Set("form".into()),
         card: Set(serde_json::to_value(question()).unwrap()),
@@ -1155,7 +1176,7 @@ async fn unannounced_row_is_announced_at_start() {
     assert!(
         shown.contains(&Shown::Announced {
             id: crashed,
-            from: Some("Codex".into())
+            from: None
         }),
         "{shown:?}"
     );
@@ -1173,6 +1194,261 @@ async fn unannounced_row_is_announced_at_start() {
         .answer(crashed, pick("Seerr"), &alix())
         .await
         .unwrap();
+}
+
+/// Waits until the journal got `count` late answers; they come from a task when an asker drops
+/// an answer unread.
+async fn until_late(journal: &FakeJournal, count: usize) -> Vec<(ThreadId, String, LateAnswer)> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let late = journal.late();
+            if late.len() >= count {
+                return late;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{count} late answer(s) never came: {:?}", journal.late()))
+}
+
+const MEALIE: &str = "Réponse à ta question « Laquelle ? » : Mealie";
+
+/// A thread's question pending when Fronde stops stays open, late; its answer closes it as
+/// usual, then goes to the thread's agent as a message.
+#[tokio::test]
+async fn restart_keeps_questions_answerable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, _) = open(dir.path()).await;
+    let waiter = requests.ask(ask()).await.unwrap();
+    let id = waiter.id();
+    assert!(!requests.is_late(id).await.unwrap(), "its asker waits");
+    drop(requests);
+    drop(waiter);
+
+    let (requests, journal) = open(dir.path()).await;
+    assert_eq!(row(dir.path(), id).await.status, "pending");
+    assert!(requests.is_late(id).await.unwrap());
+    // Not announced again, and nothing given yet.
+    assert_eq!(journal.shown(), []);
+    assert_eq!(journal.late(), []);
+    requests.answer(id, pick("Mealie"), &alix()).await.unwrap();
+    assert_eq!(row(dir.path(), id).await.status, "answered");
+    assert!(!requests.is_late(id).await.unwrap(), "closed");
+    assert!(matches!(
+        journal.shown()[..],
+        [Shown::Closed { id: closed, outcome: Outcome::Answered { .. }, .. }] if closed == id
+    ));
+    let late = journal.late();
+    assert_eq!(late.len(), 1, "{late:?}");
+    let (thread, topic, answer) = &late[0];
+    assert_eq!((*thread, topic.as_str()), (ThreadId::MAIN, TOPIC));
+    assert_eq!(answer.request, id);
+    assert_eq!(answer.text, MEALIE);
+    // A second answer is refused, and gives nothing.
+    assert_eq!(
+        requests.answer(id, pick("Seerr"), &alix()).await,
+        Err(Refusal::Closed)
+    );
+    assert_eq!(journal.late().len(), 1);
+
+    // A decline is an answer too.
+    let id = requests.ask(ask()).await.unwrap().id();
+    requests
+        .answer(id, Response::Decline, &alix())
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.late()[1].2.text,
+        "Réponse à ta question « Laquelle ? » : je préfère ne pas répondre."
+    );
+}
+
+/// An outside client's request pending at a stop expires: nothing can bring it its answer.
+#[tokio::test]
+async fn outside_caller_requests_expire_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, _) = open(dir.path()).await;
+    let outside = requests
+        .ask(Ask {
+            caller: Caller::Mcp("Codex".into()),
+            turn: None,
+            ..ask()
+        })
+        .await
+        .unwrap()
+        .id();
+    drop(requests);
+
+    let (requests, journal) = open(dir.path()).await;
+    assert_eq!(row(dir.path(), outside).await.status, "expired");
+    assert!(!requests.is_late(outside).await.unwrap());
+    assert_eq!(
+        journal.shown(),
+        [Shown::Closed {
+            id: outside,
+            outcome: Outcome::Expired,
+            by: None
+        }]
+    );
+    assert_eq!(
+        requests.answer(outside, pick("Mealie"), &alix()).await,
+        Err(Refusal::Closed)
+    );
+    assert_eq!(journal.late(), []);
+}
+
+/// The asker gave the call up (its waiter dropped) while the question was pending: the answer
+/// goes to the thread's agent as a message, once. The turn's end keeps such a question open;
+/// Stop cancels it.
+#[tokio::test]
+async fn cut_tool_call_answer_is_delivered_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let cut = requests.ask(ask()).await.unwrap();
+    let id = cut.id();
+    let live = requests
+        .ask(Ask {
+            card: Card::Form {
+                message: String::new(),
+                fields: vec![Field::Choice {
+                    key: "q1".into(),
+                    header: None,
+                    question: "Encore ?".into(),
+                    options: vec![option("Oui"), option("Non")],
+                    multi: false,
+                    other: false,
+                    required: true,
+                    note: false,
+                }],
+                submit: None,
+                truncated: false,
+                replaced: false,
+                during: Vec::new(),
+            },
+            ..ask()
+        })
+        .await
+        .unwrap();
+    drop(cut);
+    assert!(requests.is_late(id).await.unwrap());
+    assert!(!requests.is_late(live.id()).await.unwrap());
+    // The turn ends: the question still waited on is cancelled, the cut one stays open.
+    assert_eq!(requests.end_turn(TOPIC, 1).await.unwrap(), 1);
+    assert_eq!(resolved(live).await, Resolution::Cancelled);
+    assert_eq!(row(dir.path(), id).await.status, "pending");
+    requests.answer(id, pick("Mealie"), &alix()).await.unwrap();
+    let late = journal.late();
+    assert_eq!(late.len(), 1, "{late:?}");
+    assert_eq!(late[0].2.text, MEALIE);
+
+    // Answered while its asker still waits, then dropped unread: given once, late.
+    let waiter = requests.ask(ask()).await.unwrap();
+    let id = waiter.id();
+    requests.answer(id, pick("Seerr"), &alix()).await.unwrap();
+    assert_eq!(journal.late().len(), 1, "its asker took it");
+    drop(waiter);
+    let late = until_late(&journal, 2).await;
+    assert_eq!(late[1].2.request, id);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(journal.late().len(), 2);
+
+    // Read by its asker: never given again.
+    let waiter = requests.ask(ask()).await.unwrap();
+    requests
+        .answer(waiter.id(), pick("Mealie"), &alix())
+        .await
+        .unwrap();
+    assert!(matches!(resolved(waiter).await, Resolution::Answered(_)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(journal.late().len(), 2);
+
+    // Stop cancels a cut question too.
+    let id = requests.ask(ask()).await.unwrap().id();
+    assert_eq!(requests.cancel_turn(TOPIC, 1).await.unwrap(), 1);
+    assert_eq!(row(dir.path(), id).await.status, "cancelled");
+    assert_eq!(journal.late().len(), 2);
+}
+
+/// An answer meant for an upstream server, for the agent's own form or permission, or for an
+/// outside client never reaches a thread's agent as a message, whether its asker gave up or
+/// dropped the answer unread.
+#[tokio::test]
+async fn late_answer_to_a_server_or_an_elicitation_never_reaches_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let asks = [
+        // The agent's own form (ACP elicitation).
+        Ask {
+            tied: true,
+            ..ask()
+        },
+        // An upstream server's form, even one not marked tied.
+        Ask {
+            caller: Caller::Source("github".into()),
+            turn: None,
+            admin_only: true,
+            ..ask()
+        },
+        // An outside client's question.
+        Ask {
+            caller: Caller::Mcp("Codex".into()),
+            turn: None,
+            ..ask()
+        },
+    ];
+    for asked in asks.clone() {
+        // Given up before the answer.
+        let id = requests.ask(asked.clone()).await.unwrap().id();
+        assert!(!requests.is_late(id).await.unwrap(), "{id}");
+        requests.answer(id, pick("Mealie"), &alix()).await.unwrap();
+        // Answered, then dropped unread.
+        let waiter = requests.ask(asked).await.unwrap();
+        requests
+            .answer(waiter.id(), Response::Decline, &alix())
+            .await
+            .unwrap();
+        drop(waiter);
+    }
+    // The agent's permission.
+    let permission = requests
+        .ask(Ask {
+            card: permission(),
+            ..ask()
+        })
+        .await
+        .unwrap();
+    let allow = Response::Permission {
+        choice: "allow-once".into(),
+    };
+    requests
+        .answer(permission.id(), allow, &alix())
+        .await
+        .unwrap();
+    drop(permission);
+    // Their ends are still shown as usual.
+    assert_eq!(
+        journal
+            .shown()
+            .iter()
+            .filter(|shown| matches!(shown, Shown::Closed { .. }))
+            .count(),
+        7
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(journal.late(), []);
+    // The turn's end cancels the agent's form like any card still waited on: only a thread's
+    // own questions stay open, late.
+    let form = requests
+        .ask(Ask {
+            tied: true,
+            ..ask()
+        })
+        .await
+        .unwrap()
+        .id();
+    assert_eq!(requests.end_turn(TOPIC, 1).await.unwrap(), 1);
+    assert_eq!(row(dir.path(), form).await.status, "cancelled");
 }
 
 mod secrets {
@@ -1486,6 +1762,33 @@ mod secrets {
         let retry = bench.requests.ask(first).await.unwrap();
         assert_eq!(retry.id(), id);
         assert_eq!(resolved(retry).await, saved);
+    }
+
+    /// A secret card answered once nobody waits gives its reference to the thread's agent as a
+    /// message, never the value.
+    #[tokio::test]
+    async fn late_secret_answer_gives_the_reference() {
+        let bench = bench().await;
+        let id = bench.requests.ask(ask_secret(false)).await.unwrap().id();
+        assert!(bench.requests.is_late(id).await.unwrap());
+        bench
+            .requests
+            .answer(id, secret(CANARY, Keep::Conversation), &alix())
+            .await
+            .unwrap();
+        let late = bench.journal.late();
+        assert_eq!(late.len(), 1, "{late:?}");
+        let answer = &late[0].2;
+        let reference = answer
+            .text
+            .strip_prefix("Secret enregistré : secret_ref ")
+            .and_then(|rest| rest.strip_suffix(" (pour cette conversation)"))
+            .unwrap_or_else(|| panic!("{}", answer.text));
+        assert!(reference.starts_with("sr_"), "{reference}");
+        assert!(!format!("{answer:?}").contains(CANARY));
+        // The reference works for the thread that asked, once.
+        let value = bench.ephemeral.take(reference, &assistant_scope()).unwrap();
+        assert_eq!(value.expose_secret(), CANARY);
     }
 
     #[tokio::test]

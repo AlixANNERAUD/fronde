@@ -429,10 +429,14 @@ async fn user_secret_decline_expiry_and_cancel() {
     bench.card().await;
     assert_eq!(result(call).await["result"]["status"], "expired");
 
-    // The caller gives up: the card closes.
-    let context = context();
-    let cancelled = context.cancelled.clone();
-    let call = bench.call(context, args());
+    // An outside client gives up: the card closes.
+    let outside = CallContext {
+        caller: Caller::Mcp("Codex".into()),
+        turn: None,
+        ..context()
+    };
+    let cancelled = outside.cancelled.clone();
+    let call = bench.call(outside, args());
     let (id, _, _) = bench.card().await;
     cancelled.cancel();
     assert_eq!(result(call).await["result"]["status"], "cancelled");
@@ -443,6 +447,22 @@ async fn user_secret_decline_expiry_and_cancel() {
             .await,
         Err(fronde_requests::Refusal::Closed)
     );
+    assert!(bench.ephemeral.is_empty());
+
+    // A thread's call is cut: the card stays open, late; its answer goes to the agent as a
+    // message (see the requests' tests).
+    let context = context();
+    let cancelled = context.cancelled.clone();
+    let call = bench.call(context, args());
+    let (id, _, _) = bench.card().await;
+    cancelled.cancel();
+    assert_eq!(result(call).await["result"]["status"], "pending");
+    assert!(bench.requests.is_late(id).await.unwrap());
+    bench
+        .requests
+        .answer(id, Response::Decline, &alix())
+        .await
+        .unwrap();
     assert!(bench.ephemeral.is_empty());
 }
 

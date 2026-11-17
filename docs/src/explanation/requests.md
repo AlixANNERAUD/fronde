@@ -22,7 +22,7 @@ A request ends in one of four ways:
 | `answered` | You sent an answer | *Réponse : …*, or for a secret where it was kept |
 | `declined` | You pressed *Refuser* on a question or secret card | *Refusée* |
 | `expired` | Its time ran out | *Expirée* (*Expirée, refusée* for a permission) |
-| `cancelled` | The asker gave up (its tool call was cancelled), the agent's turn that asked ended or was stopped, or the request could not be shown | *Annulée* |
+| `cancelled` | An outside client gave up (its tool call was cancelled), the agent's turn that asked was stopped or ended while it still waited, or the request could not be shown | *Annulée* |
 
 The row is closed before the one who asked is told, and a closed request never reopens. Every
 request expires: no answer means no. The row keeps who asked (`thread:<id>` for a thread's agent;
@@ -252,12 +252,53 @@ forget its references (**planned**). No tool takes one yet (see
 ## Restarts and retries
 
 The table is the source of truth. After a restart, a request whose time ran out expires, and so
-do a pending permission, a pending form of the agent's and anything an upstream server asked: the
-call that waited on each is gone, and its answer must never reach anyone else; one whose card never reached the conversation, because Fronde stopped
-in between, is shown then; the others stay answerable. A tool call that is retried with the same `client_request_id` joins the
-request it started instead of showing a second card. Secrets kept for a conversation do not
-survive a restart: they live in memory only. A secret card still pending after a restart stays
-answerable.
+do a pending permission, a pending form of the agent's, anything an upstream server asked and
+anything an outside MCP client asked: the call that waited on each is gone, nothing can bring it
+the answer, and that answer must never reach anyone else. A question or a secret card a thread's
+agent asked with `user_ask` or `user_secret` stays answerable, *late*: its answer reaches that
+agent as a message (see [Late answers](#late-answers)). One whose card never reached the
+conversation, because Fronde stopped in between, is shown then. A tool call that is retried with
+the same `client_request_id` joins the request it started instead of showing a second card.
+Secrets kept for a conversation do not survive a restart: they live in memory only. A secret card
+still pending after a restart stays answerable, and the secret given then is kept as usual.
+
+## Late answers
+
+A thread's question or secret card is *late* once nobody waits for its answer any more: Fronde
+restarted since it was shown, or the agent's MCP client cut the tool call that asked (a
+client-side timeout, for instance). The card stays open, and the end of the turn that asked
+leaves it open (*Stop* still cancels it). When you answer it, the request closes as usual, then
+the answer goes to the agent of the thread that asked, in that thread only, as a message from
+you:
+
+- *Réponse à ta question « … » : …* for a question (one line per question, with *Autre…* and the
+  note), or *: je préfère ne pas répondre.* when you pressed *Refuser*;
+- *Secret enregistré : secret_ref … (pour cette conversation)* for a secret kept for the
+  conversation, or *Secret enregistré sous le nom « … », pour … seulement* for one kept for an
+  origin; never the value.
+
+The message shows in the thread as yours. It starts a turn at once when none runs. While a turn
+runs, the thread says *Ta réponse partira à l'agent à la fin du tour en cours.*, and the answer
+goes when that turn ends, even after *Stop*, before any sub-agent's result waiting; those results
+are then held and go with it. Like your own message, it carries the sub-agents' results held for
+you and starts the count of [wake turns](threads.md) again. Several late answers waiting go in
+one message. The agent gets them between two lines its text cannot know, marked as data, never as
+instructions, with how long a `secret_ref` lasts. An archived thread gets nothing. An answer that
+waits for a turn's end lives in memory: if Fronde stops before that turn ends, the card says it
+was answered, but the agent does not get the message.
+
+Only these two kinds of cards get a late answer. An answer meant for an upstream server, for the
+agent's own form or permission, or for an outside MCP client never reaches an agent as a
+message: those cards expire at a restart, and an answer given after their call ended goes
+nowhere.
+
+## The tray and the tab's title
+
+Above the message box, a tray says *N demande(s) en attente* while cards wait for an answer: each
+open card of the thread shown, by its title on one line (a tap scrolls to the card), then
+*Ailleurs :* with a link to each other thread that has open cards, and how many. Archived threads
+are left out. The tab's title is *(N) Fronde* while N cards wait in all, and *Fronde* otherwise,
+so a tab in the background shows that Fronde waits for you.
 
 The id alone proves nothing: an agent reuses ids from one turn to the next, and outside
 clients choose their names, so two of them can share one. A retry therefore joins a request only
@@ -306,6 +347,6 @@ These use the same requests and cards, and are **not built yet**:
   secret from a file in threads that have a shell.
 - **Forms by URL**: an MCP server's sign-in page, sent as a URL elicitation, shown as a link on a
   card. Today such a form is cancelled.
-- **Late answers**: an answer to a question whose asker is gone (after a restart, or a tool call
-  cut short) reaches the assistant as a message. Today such an answer is saved but goes nowhere.
-- **A tray** above the message box listing the open cards, and their count in the tab's title.
+- **Notifications on the phone** (Web Push, step 3): a notification for each card, with *Autoriser*
+  and *Refuser* for a permission and the options of a question with one answer, to answer without
+  opening the page. Never for a secret: a secret needs the card's box.

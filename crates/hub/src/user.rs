@@ -187,19 +187,32 @@ pub fn user_tools(requests: Arc<Requests>, threads: Option<Arc<dyn ThreadControl
     tools
 }
 
-/// Waits for the request's end, or cancels it when the caller gives the call up: the card must
-/// not stay open for an answer nobody reads.
-async fn wait(requests: &Requests, context: &CallContext, waiter: Waiter) -> Resolution {
+/// Waits for the request's end; `None` when the caller gives the call up first. A thread's card
+/// then stays open, late: its answer goes to that thread's agent as a message. An outside
+/// client's is cancelled: nothing can bring it a late answer, and the card must not stay open
+/// for an answer nobody reads.
+async fn wait(requests: &Requests, context: &CallContext, waiter: Waiter) -> Option<Resolution> {
     let id = waiter.id();
     tokio::select! {
-        resolution = waiter.wait() => resolution,
+        resolution = waiter.wait() => Some(resolution),
         () = context.cancelled.cancelled() => {
+            if matches!(context.caller, Caller::Thread(_)) {
+                tracing::info!("the call that asked request {id} was cut: its answer will come as a message");
+                return None;
+            }
             if let Err(error) = requests.cancel(id).await {
                 tracing::error!("cannot cancel request {id}: {error:#}");
             }
-            Resolution::Cancelled
+            Some(Resolution::Cancelled)
         }
     }
+}
+
+/// What a thread's call that was cut returns: nobody reads it, but it says what happens.
+fn given_up() -> ToolOutput {
+    ToolOutput::ok(json!({"status": "pending"})).with_next(
+        "The call was cut before the answer came; the card stays open, and its answer will come to you as a message.",
+    )
 }
 
 async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) -> ToolOutput {
@@ -244,7 +257,7 @@ async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) ->
         for_user: context.user.clone(),
         admin_only: false,
         timeout,
-        // A question or secret outlives the call: B6 brings its late answer to the assistant.
+        // A question or secret outlives the call: a late answer reaches the thread's agent.
         tied: false,
     };
     let waiter = match asking.open("user_secret", &context, ask).await {
@@ -266,7 +279,10 @@ async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) ->
             );
         }
     };
-    match wait(requests, &context, waiter).await {
+    let Some(resolution) = wait(requests, &context, waiter).await else {
+        return given_up();
+    };
+    match resolution {
         Resolution::Saved(Saved::Conversation {
             secret_ref,
             expires_at,
@@ -437,7 +453,7 @@ async fn user_ask(asking: &Asking, context: CallContext, args: AskArgs) -> ToolO
         for_user: context.user.clone(),
         admin_only: false,
         timeout,
-        // A question or secret outlives the call: B6 brings its late answer to the assistant.
+        // A question or secret outlives the call: a late answer reaches the thread's agent.
         tied: false,
     };
     let waiter = match asking.open("user_ask", &context, ask).await {
@@ -459,7 +475,10 @@ async fn user_ask(asking: &Asking, context: CallContext, args: AskArgs) -> ToolO
             );
         }
     };
-    match wait(requests, &context, waiter).await {
+    let Some(resolution) = wait(requests, &context, waiter).await else {
+        return given_up();
+    };
+    match resolution {
         Resolution::Answered(Response::Form { values }) => {
             let answers: Vec<Value> = questions
                 .iter()

@@ -10,8 +10,15 @@
 //! where it was kept comes back to the asker ([`Saved`]): an ephemeral reference for the
 //! conversation, or the name it was stored under. The value never reaches the request's row, the
 //! journal, the asker or the log.
+//!
+//! An answer that comes once nobody waits for it any more (Fronde restarted, or the tool call
+//! that asked was cut) goes on as a [`LateAnswer`], for a thread's own questions and secrets
+//! only: see [`late`].
 
 pub mod elicitation;
+pub mod late;
+
+pub use late::LateAnswer;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -43,6 +50,8 @@ const ANSWERED: &str = "answered";
 const DECLINED: &str = "declined";
 const EXPIRED: &str = "expired";
 const CANCELLED: &str = "cancelled";
+/// The kind of a question card's row (`user_ask`), whose answer outlives the call that asked.
+const FORM: &str = "form";
 /// The kind of a secret card's row, whose answer is where the secret was kept.
 const SECRET: &str = "secret";
 /// The kind of a permission card's row: it lives only as long as the agent's call it guards.
@@ -263,9 +272,27 @@ pub trait Journal: Send + Sync {
         outcome: &Outcome,
         by: Option<&str>,
     ) -> anyhow::Result<()>;
+
+    /// Gives `answer` to the agent of `thread`, whose stream is `topic`, as a message: its
+    /// request was answered once nobody waited for it any more. A journal without threads has
+    /// nobody to give it to.
+    async fn answered_late(
+        &self,
+        thread: ThreadId,
+        topic: &str,
+        answer: LateAnswer,
+    ) -> anyhow::Result<()> {
+        let _ = topic;
+        anyhow::bail!(
+            "no agent of thread {thread} to give the late answer of request {} to",
+            answer.request
+        )
+    }
 }
 
-/// The asker's side of a request: resolves once the request ends.
+/// The asker's side of a request: resolves once the request ends. Dropped unread with the end
+/// already sent (the call was cut just then), it hands that end back: a question's answer then
+/// goes on as a [`LateAnswer`], as it does when it comes after the drop.
 #[derive(Debug)]
 pub struct Waiter {
     id: RequestId,
@@ -280,29 +307,26 @@ impl Waiter {
         self.id
     }
 
-    pub async fn wait(self) -> Resolution {
-        let Self {
-            id,
-            mut resolution,
-            deadline,
-            requests,
-        } = self;
-        let Some(deadline) = deadline else {
-            return resolution.await.unwrap_or(Resolution::Cancelled);
+    pub async fn wait(mut self) -> Resolution {
+        let id = self.id;
+        let Some(deadline) = self.deadline else {
+            return (&mut self.resolution)
+                .await
+                .unwrap_or(Resolution::Cancelled);
         };
         tokio::select! {
             // The service went away with the request still open: nobody can answer it any more.
-            resolved = &mut resolution => return resolved.unwrap_or(Resolution::Cancelled),
+            resolved = &mut self.resolution => return resolved.unwrap_or(Resolution::Cancelled),
             () = tokio::time::sleep_until(deadline) => {}
         }
         // The timer could not close the request: try once more, and expire anyway.
-        let closed = match requests.upgrade() {
+        let closed = match self.requests.upgrade() {
             Some(requests) => requests.expire(id).await,
             None => Ok(false),
         };
         match closed {
             // Closed now, by this call or by an answer that came just before: its outcome.
-            Ok(_) => tokio::time::timeout(EXPIRY_GRACE, resolution)
+            Ok(_) => tokio::time::timeout(EXPIRY_GRACE, &mut self.resolution)
                 .await
                 .ok()
                 .and_then(Result::ok)
@@ -312,6 +336,29 @@ impl Waiter {
                 Resolution::Expired
             }
         }
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        // No end can come any more; one that came before is read here, never twice.
+        self.resolution.close();
+        let resolution = match self.resolution.try_recv() {
+            Ok(
+                resolution
+                @ (Resolution::Answered(_) | Resolution::Saved(_) | Resolution::Declined),
+            ) => resolution,
+            // Nothing came, or nothing to give: an expiry, a cancel.
+            _ => return,
+        };
+        let (Some(requests), Ok(runtime)) = (
+            self.requests.upgrade(),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            return;
+        };
+        let id = self.id;
+        runtime.spawn(async move { requests.unread(id, resolution).await });
     }
 }
 
@@ -333,8 +380,10 @@ pub struct Requests {
 impl Requests {
     /// Opens the requests stored in `db`, shown by `journal`. Pending requests whose time is up
     /// expire, and so do pending permissions, elicitations ([`Ask::tied`]) and anything an
-    /// upstream server asked: the call that waited on one is gone with the process that held it. Those never announced (a crash between their row and their
-    /// entry) are announced; the others get their timer again.
+    /// upstream server or an outside client asked: the call that waited on one is gone with the
+    /// process that held it. A thread's own questions and secrets stay open, late: their answer
+    /// goes to that thread's agent as a message ([`LateAnswer`]). Those never announced (a crash
+    /// between their row and their entry) are announced; the others get their timer again.
     pub async fn open(
         db: DatabaseConnection,
         journal: Arc<dyn Journal>,
@@ -365,12 +414,16 @@ impl Requests {
             .await
             .context("cannot read the pending requests")?;
         for row in pending {
-            // B6 answers a question whose asker is gone by a message to the assistant: never one
-            // of these. An answer meant for an upstream server, or for the agent's own form,
-            // must never reach the assistant as a message; they expire instead.
+            // A thread's question or secret stays open: its answer goes to that thread's agent as
+            // a message (see `late`). Nothing else may reach an agent so: an answer meant for an
+            // upstream server, for the agent's own form or permission, or for an outside client
+            // (which cannot be reached any more) expires instead.
             if row.kind == PERMISSION
                 || row.kind == ELICITATION
-                || matches!(Caller::parse(&row.caller), Caller::Source(_))
+                || matches!(
+                    Caller::parse(&row.caller),
+                    Caller::Source(_) | Caller::Mcp(_)
+                )
             {
                 let id = row_id(&row)?;
                 if let Err(error) = requests.expire(id).await {
@@ -395,6 +448,13 @@ impl Requests {
                     Err(error) => tracing::error!("request {}: {error:#}", row.id),
                 }
                 continue;
+            }
+            if let Some(thread) = late_thread(&row) {
+                tracing::info!(
+                    "request {} stays open: its answer will reach thread {thread}'s agent as a \
+                     message",
+                    row.id
+                );
             }
             // One row this version cannot show must not keep Fronde from starting.
             if let Err(error) = requests.reopen(&row).await {
@@ -574,7 +634,9 @@ impl Requests {
         if !won {
             return Err(Refusal::Closed);
         }
-        self.wake(id, resolution);
+        if !self.wake(id, resolution.clone()) {
+            self.deliver_late(&row, &card, &resolution).await;
+        }
         Ok(())
     }
 
@@ -598,7 +660,7 @@ impl Requests {
             return Err(refused("Seul un administrateur peut garder un secret."));
         }
         let value = secret_string(value);
-        let _saving = self.saving.lock().await;
+        let saving = self.saving.lock().await;
         // Another page may have answered while this one waited.
         let current = self.find(id).await.map_err(failed)?;
         if current.is_none_or(|current| current.status != PENDING) {
@@ -698,8 +760,69 @@ impl Requests {
             }
             return Err(won.map_err(failed).err().unwrap_or(Refusal::Closed));
         }
-        self.wake(id, Resolution::Saved(saved));
+        drop(saving);
+        let resolution = Resolution::Saved(saved);
+        if !self.wake(id, resolution.clone()) {
+            self.deliver_late(row, card, &resolution).await;
+        }
         Ok(())
+    }
+
+    /// Gives the answer `resolution` to request `row`, which no asker took, to the agent of the
+    /// thread that asked, as a message: only for a thread's own question or secret
+    /// ([`late_thread`]), and only an answer or a decline. A failure is logged: the request is
+    /// closed already, and its card says how.
+    async fn deliver_late(&self, row: &requests::Model, card: &Card, resolution: &Resolution) {
+        let Some(thread) = late_thread(row) else {
+            return;
+        };
+        let Ok(id) = row_id(row) else {
+            return;
+        };
+        let Some(answer) = late::answer(id, card, resolution) else {
+            return;
+        };
+        tracing::info!(
+            "request {id} was answered once nobody waited for it: the answer goes to thread \
+             {thread}'s agent as a message"
+        );
+        if let Err(error) = self.journal.answered_late(thread, &row.topic, answer).await {
+            tracing::error!("cannot give the late answer of request {id}: {error:#}");
+        }
+    }
+
+    /// The end `resolution` of request `id` reached an asker that gave up before reading it:
+    /// it goes on as a late answer, as it would have, had it come a moment later.
+    async fn unread(&self, id: RequestId, resolution: Resolution) {
+        let row = match self.find(id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!("cannot give the late answer of request {id}: {error:#}");
+                return;
+            }
+        };
+        let Ok(card) = serde_json::from_value::<Card>(row.card.clone()) else {
+            return;
+        };
+        self.deliver_late(&row, &card, &resolution).await;
+    }
+
+    /// Whether request `id` is late: still pending, a thread's own question or secret, and no
+    /// asker waits for it any more (Fronde restarted, or the call was cut). Its answer will go to
+    /// that thread's agent as a message.
+    pub async fn is_late(&self, id: RequestId) -> anyhow::Result<bool> {
+        let Some(row) = self.find(id).await? else {
+            return Ok(false);
+        };
+        Ok(row.status == PENDING && late_thread(&row).is_some() && !self.waited_on(id))
+    }
+
+    /// Whether an asker still waits on request `id`.
+    fn waited_on(&self, id: RequestId) -> bool {
+        self.waiters()
+            .get(&id)
+            .is_some_and(|waiters| waiters.iter().any(|waiter| !waiter.is_closed()))
     }
 
     /// Cancels the request `id`, never shown, without showing its end.
@@ -726,8 +849,19 @@ impl Requests {
 
     /// Cancels the pending requests of `turn` in `topic`; returns how many. Once it returns,
     /// the end of every request of the turn is shown, whoever closed it: the turn's own end
-    /// may follow.
+    /// may follow. What *Stop* does.
     pub async fn cancel_turn(&self, topic: &str, turn: u64) -> anyhow::Result<usize> {
+        self.close_turn(topic, turn, false).await
+    }
+
+    /// [`Requests::cancel_turn`], at the turn's own end, but for its late requests
+    /// ([`Requests::is_late`]): a question or secret whose call was cut stays open, and its
+    /// answer goes to the agent as a message.
+    pub async fn end_turn(&self, topic: &str, turn: u64) -> anyhow::Result<usize> {
+        self.close_turn(topic, turn, true).await
+    }
+
+    async fn close_turn(&self, topic: &str, turn: u64, keep_late: bool) -> anyhow::Result<usize> {
         let rows = requests::Entity::find()
             .filter(requests::Column::Status.eq(PENDING))
             .filter(requests::Column::Topic.eq(topic))
@@ -736,7 +870,11 @@ impl Requests {
             .await?;
         let mut cancelled = 0;
         for row in rows {
-            cancelled += usize::from(self.cancel(row_id(&row)?).await?);
+            let id = row_id(&row)?;
+            if keep_late && late_thread(&row).is_some() && !self.waited_on(id) {
+                continue;
+            }
+            cancelled += usize::from(self.cancel(id).await?);
         }
         // A request an answer, an expiry or another cancel closed before the read above may not
         // show its end yet: that close holds the lock until it does.
@@ -903,11 +1041,14 @@ impl Requests {
         }
     }
 
-    fn wake(&self, id: RequestId, resolution: Resolution) {
+    /// Tells the askers of request `id` how it ended; whether one was still there to be told.
+    fn wake(&self, id: RequestId, resolution: Resolution) -> bool {
+        let mut told = false;
         for waiter in self.waiters().remove(&id).unwrap_or_default() {
             // An asker that gave up is not an error.
-            let _ = waiter.send(resolution.clone());
+            told |= waiter.send(resolution.clone()).is_ok();
         }
+        told
     }
 
     /// Expires the request at `expires_at`, unless it ended before.
@@ -963,6 +1104,16 @@ fn retries(ask: &Ask, row: &requests::Model, now: chrono::DateTime<Utc>) -> bool
         Caller::Unknown(_) => false,
     };
     same_question && still_current
+}
+
+/// The thread whose agent gets the late answer to request `row`, if it gets one: a thread's own
+/// question (`user_ask`) or secret (`user_secret`). Never an upstream server's, an outside
+/// client's or anyone's permission or elicitation: those answers belong to the call that asked.
+fn late_thread(row: &requests::Model) -> Option<ThreadId> {
+    match Caller::parse(&row.caller) {
+        Caller::Thread(thread) if row.kind == FORM || row.kind == SECRET => Some(thread),
+        _ => None,
+    }
 }
 
 fn row_id(row: &requests::Model) -> anyhow::Result<RequestId> {
