@@ -1,7 +1,11 @@
 //! Types shared by the conversation log, the server and the frontend.
 
+pub mod request;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+pub use request::{Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Outcome, RequestId, Response};
 
 /// State of a tool call shown in the conversation.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,7 +44,7 @@ pub enum Event {
         state: ToolState,
     },
     /// `id` is the seq of this entry: unique for the life of the log, whatever the agent's own
-    /// numbering. The page answers with it.
+    /// numbering. The page answers with it, with [`Response::Permission`].
     Permission {
         id: u64,
         title: String,
@@ -54,6 +58,21 @@ pub enum Event {
     },
     Notice {
         text: String,
+    },
+    /// A request to the user, open until its [`Event::RequestClosed`], whatever the turns do.
+    /// `from` names an asker other than Fronde's assistant, such as an outside MCP client.
+    Request {
+        id: RequestId,
+        card: Card,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
+    /// `by`: the user who answered, when someone did.
+    RequestClosed {
+        id: RequestId,
+        outcome: Outcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
     },
 }
 
@@ -85,9 +104,10 @@ pub enum ClientMsg {
         text: String,
     },
     Cancel,
+    /// Answers the request `id`; the first answer wins.
     Answer {
-        id: u64,
-        allow: bool,
+        id: RequestId,
+        response: Response,
     },
 }
 
@@ -103,6 +123,12 @@ pub enum ServerMsg {
         last_seq: u64,
     },
     Entry(Entry),
+    /// The answer to the request `id` was refused, for this page only: the request did not
+    /// change. `reason` is French, for the page.
+    Refused {
+        id: RequestId,
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -143,10 +169,27 @@ mod tests {
             ),
             (r#"{"type":"cancel"}"#, ClientMsg::Cancel),
             (
-                r#"{"type":"answer","id":7,"allow":false}"#,
+                r#"{"type":"answer","id":7,"response":{"type":"decline"}}"#,
                 ClientMsg::Answer {
                     id: 7,
-                    allow: false,
+                    response: Response::Decline,
+                },
+            ),
+            (
+                r#"{"type":"answer","id":8,"response":{"type":"form","values":{"q1":{"selected":["Mealie"],"other":"Paperless","note":"le soir"}}}}"#,
+                ClientMsg::Answer {
+                    id: 8,
+                    response: Response::Form {
+                        values: [(
+                            "q1".to_owned(),
+                            ChoiceAnswer {
+                                selected: vec!["Mealie".into()],
+                                other: Some("Paperless".into()),
+                                note: Some("le soir".into()),
+                            },
+                        )]
+                        .into(),
+                    },
                 },
             ),
         ];
@@ -190,11 +233,59 @@ mod tests {
         let Event::Permission { id, .. } = asked else {
             unreachable!()
         };
-        let answer = ClientMsg::Answer { id, allow: true };
+        let answer = ClientMsg::Answer {
+            id,
+            response: Response::Permission {
+                choice: "allow_once".into(),
+            },
+        };
+        let json = serde_json::to_string(&answer).unwrap();
         assert_eq!(
-            serde_json::to_string(&answer).unwrap(),
-            r#"{"type":"answer","id":7,"allow":true}"#
+            json,
+            r#"{"type":"answer","id":7,"response":{"type":"permission","choice":"allow_once"}}"#
         );
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), answer);
+    }
+
+    #[test]
+    fn request_ids_are_numbers_both_ways() {
+        let card = Card::Form {
+            message: String::new(),
+            fields: Vec::new(),
+            submit: None,
+        };
+        let asked = Event::Request {
+            id: 4,
+            card,
+            from: Some("Codex".into()),
+        };
+        let json = serde_json::to_string(&asked).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"request","id":4,"card":{"kind":"form","fields":[]},"from":"Codex"}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), asked);
+        let closed = Event::RequestClosed {
+            id: 4,
+            outcome: Outcome::Declined,
+            by: Some("alix".into()),
+        };
+        let json = serde_json::to_string(&closed).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"request_closed","id":4,"outcome":{"type":"declined"},"by":"alix"}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), closed);
+        let refused = ServerMsg::Refused {
+            id: 4,
+            reason: "Cette demande est close.".into(),
+        };
+        let json = serde_json::to_string(&refused).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"refused","id":4,"reason":"Cette demande est close."}"#
+        );
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), refused);
     }
 
     #[test]

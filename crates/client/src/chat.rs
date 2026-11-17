@@ -116,6 +116,8 @@ impl Chat {
                 self.log_id = Some(log_id.clone());
             }
             ServerMsg::Entry(entry) => self.apply_entry(entry.clone()),
+            // Requests have no card on the page yet.
+            ServerMsg::Refused { .. } => {}
         }
     }
 
@@ -195,6 +197,7 @@ impl Chat {
                 }
             }
             Event::Notice { text } => self.push(seq, Item::Notice { text }),
+            Event::Request { .. } | Event::RequestClosed { .. } => {}
         }
     }
 

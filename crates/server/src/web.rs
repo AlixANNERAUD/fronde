@@ -10,6 +10,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use fronde_agent::assistant::Assistant;
+use fronde_requests::Requests;
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroize;
 use serde::Deserialize;
@@ -37,6 +38,9 @@ const NOT_BUILT: &str = "Interface non construite : lance `mise run web-build`."
 
 pub struct Web {
     pub assistant: Arc<Assistant>,
+    pub requests: Arc<Requests>,
+    /// Who signs in with the password: the owner, the one user so far.
+    pub user: String,
     pub password: SecretString,
     pub throttle: Mutex<Throttle>,
 }

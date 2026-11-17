@@ -83,7 +83,8 @@ Some plain copies remain:
 - An upstream MCP token is handed to the MCP client library as a `String`, which keeps it for the
   life of the connection.
 - The `Authorization` header Fronde gives its agent for `/mcp` is a plain string in the ACP
-  request, and the agent process holds the token.
+  request, and the agent process holds the token. That token is the assistant's own, not
+  `server.token`: it is made at each start, never written anywhere, and dies with the process.
 - A `{ env = "…" }` value stays in Fronde's environment, and the agent inherits that environment
   for now (an explicit agent environment is planned).
 - A sign-in form's body, and each `/mcp` request's `Authorization` header, are read into buffers
@@ -116,9 +117,11 @@ encrypted: see above, and below.
 
 ## Two doors
 
-- **`/mcp`** needs the bearer token, compared in constant time. It is at least 32 characters, so
-  it cannot be guessed. `/mcp` skips the `Host` check against DNS rebinding: a page that rebinds
-  a name to Fronde still cannot send the token.
+- **`/mcp`** needs a bearer token, compared in constant time: `server.token`, at least 32
+  characters, for outside clients, or the assistant's own random token. Which one a call carries
+  tells the hub who asks, so a card an outside client opens is labelled with that client's name
+  and is never mistaken for Fronde's own question. `/mcp` skips the `Host` check against DNS
+  rebinding: a page that rebinds a name to Fronde still cannot send a token.
 - **The chat** needs the password. A wrong one is answered after a second, and five in a row lock
   sign-in for a minute for everyone: there is a single password to guess, so the throttle is
   global. Passwords are compared as SHA-256 digests in constant time, so neither their content

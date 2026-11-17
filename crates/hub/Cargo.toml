@@ -10,6 +10,8 @@ version.workspace = true
 anyhow.workspace = true
 fronde-db = { path = "../db" }
 fronde-fs = { path = "../fs" }
+fronde-protocol = { path = "../protocol" }
+fronde-requests = { path = "../requests" }
 async-trait.workspace = true
 backon.workspace = true
 chrono.workspace = true

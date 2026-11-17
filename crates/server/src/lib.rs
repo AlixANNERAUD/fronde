@@ -20,8 +20,9 @@ use fronde_agent::acp::AgentSpec;
 use fronde_agent::assistant::{Assistant, Connector, process_connector};
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
-use fronde_hub::mcp::HubServer;
+use fronde_hub::mcp::{HubServer, McpCaller};
 use fronde_hub::source::ToolSource;
+use fronde_requests::Requests;
 use fronde_wasm::{Checks, ComponentHost, ComponentSource, PythonSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -55,9 +56,16 @@ pub(crate) fn same_secret(given: &[u8], expected: &SecretString) -> bool {
     bool::from(given.as_slice().ct_eq(expected.as_slice()))
 }
 
+/// The tokens `/mcp` accepts: `server.token`, for outside clients, and the assistant's own,
+/// which tells the hub that a call comes from Fronde's assistant and from which turn.
+struct Gate {
+    token: SecretString,
+    assistant: Option<(SecretString, Arc<Assistant>)>,
+}
+
 async fn require_token(
-    State(token): State<Arc<SecretString>>,
-    req: Request,
+    State(gate): State<Arc<Gate>>,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let given = req
@@ -66,14 +74,30 @@ async fn require_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
-    if same_secret(given.as_bytes(), &token) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
+    // Both compared, so the time taken does not tell which token was close.
+    let outside = same_secret(given.as_bytes(), &gate.token);
+    let assistant = gate
+        .assistant
+        .as_ref()
+        .filter(|(token, _)| same_secret(given.as_bytes(), token));
+    let caller = match (outside, assistant) {
+        (_, Some((_, assistant))) => McpCaller::Assistant {
+            turn: assistant.current_turn().await,
+        },
+        (true, None) => McpCaller::Outside,
+        (false, None) => return Err(StatusCode::UNAUTHORIZED),
+    };
+    // rmcp hands the request's parts, extensions included, to the tool call.
+    req.extensions_mut().insert(caller);
+    Ok(next.run(req).await)
 }
 
-pub fn router(hub: Arc<Hub>, token: SecretString) -> Router {
+/// `/health` and `/mcp`. `assistant`: the assistant and the token it holds, when the chat runs.
+pub fn router(
+    hub: Arc<Hub>,
+    token: SecretString,
+    assistant: Option<(SecretString, Arc<Assistant>)>,
+) -> Router {
     // Host checks are off: every /mcp request must carry the token, which a rebinding page cannot know.
     let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
     let mcp = StreamableHttpService::new(
@@ -85,7 +109,7 @@ pub fn router(hub: Arc<Hub>, token: SecretString) -> Router {
         .nest_service("/mcp", mcp)
         // Only /mcp: unknown paths stay 404 and other routers can be merged in.
         .route_layer(middleware::from_fn_with_state(
-            Arc::new(token),
+            Arc::new(Gate { token, assistant }),
             require_token,
         ));
     Router::new()
@@ -280,29 +304,51 @@ pub async fn start_with(
             purge_every(db.clone(), sessions.clone(), PURGE_EVERY)
         })
     };
-    let hub = Arc::new(Hub::start(config, db.clone(), components).await?);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot listen on {listen}"))?;
     let addr = listener.local_addr()?;
-    let mut app = router(hub, token.clone());
-    if let Some((password, secure_cookie)) = password {
-        let cwd = data_dir.join("agent");
-        fronde_hub::private::create_dir_all(&cwd)
-            .with_context(|| format!("cannot create the agent dir {}", cwd.display()))?;
-        let spec = AgentSpec {
-            command: agent.command,
-            env: agent.env.into_iter().collect(),
-            cwd,
-            hub_url: format!("http://{}/mcp", reachable(addr)),
-            hub_token: token,
-            system_prompt: system_prompt(&user),
-            builtin_tools: agent.builtin_tools,
-        };
-        let assistant = Assistant::open(spec, &data_dir, db, connector).await?;
+    // The chat's assistant and its requests come first: the hub's tools ask through them.
+    let chat = match password {
+        Some((password, secure_cookie)) => {
+            let cwd = data_dir.join("agent");
+            fronde_hub::private::create_dir_all(&cwd)
+                .with_context(|| format!("cannot create the agent dir {}", cwd.display()))?;
+            // The assistant's own token, made at each start and only ever in memory: the hub
+            // tells its calls from outside clients' by it.
+            let assistant_token = SecretString::from(init::random_token()?);
+            let spec = AgentSpec {
+                command: agent.command,
+                env: agent.env.into_iter().collect(),
+                cwd,
+                hub_url: format!("http://{}/mcp", reachable(addr)),
+                hub_token: assistant_token.clone(),
+                system_prompt: system_prompt(&user),
+                builtin_tools: agent.builtin_tools,
+            };
+            let assistant = Assistant::open(spec, &data_dir, db.clone(), connector).await?;
+            let requests = Requests::open(db.clone(), assistant.clone()).await?;
+            Some((
+                assistant,
+                assistant_token,
+                requests,
+                password,
+                secure_cookie,
+            ))
+        }
+        None => None,
+    };
+    let hub = Arc::new(Hub::start(config, db.clone(), components).await?);
+    let own = chat
+        .as_ref()
+        .map(|(assistant, token, ..)| (token.clone(), assistant.clone()));
+    let mut app = router(hub, token, own);
+    if let Some((assistant, _, requests, password, secure_cookie)) = chat {
         app = app.merge(web::router(
             web::Web {
                 assistant,
+                requests,
+                user,
                 password,
                 throttle: Default::default(),
             },

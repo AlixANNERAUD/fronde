@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fronde_agent::assistant::Assistant;
 use fronde_protocol::{CLOSE_SIGNED_OUT, ClientMsg, Entry, ServerMsg};
+use fronde_requests::User;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tower_sessions::Session;
@@ -31,9 +32,11 @@ pub async fn upgrade(
         });
     }
     renew(&session);
-    let assistant = web.assistant.clone();
-    upgrade.on_upgrade(move |socket| chat(socket, assistant))
+    upgrade.on_upgrade(move |socket| chat(socket, web))
 }
+
+/// The answer a page gives a permission entry of the log to allow it.
+const ALLOW_ONCE: &str = "allow_once";
 
 /// True when `Origin` names the host the request was sent to.
 fn same_origin(headers: &HeaderMap) -> bool {
@@ -46,7 +49,13 @@ fn same_origin(headers: &HeaderMap) -> bool {
 }
 
 /// Streams the log once the page said hello, and passes the page's messages to Fronde.
-async fn chat(mut socket: WebSocket, assistant: Arc<Assistant>) {
+async fn chat(mut socket: WebSocket, web: Arc<Web>) {
+    let assistant = &web.assistant;
+    // Whoever signed in is the owner, the one user so far, and an admin.
+    let user = User {
+        name: web.user.clone(),
+        admin: true,
+    };
     let mut live: Option<broadcast::Receiver<Entry>> = None;
     let mut last_sent = 0;
     loop {
@@ -72,15 +81,35 @@ async fn chat(mut socket: WebSocket, assistant: Arc<Assistant>) {
                             last_seq: newest,
                         };
                         if send(&mut socket, &hello).await.is_err()
-                            || replay(&mut socket, &assistant, &mut last_sent).await.is_err()
+                            || replay(&mut socket, assistant, &mut last_sent).await.is_err()
                         {
                             return;
                         }
                     }
                     Ok(ClientMsg::Send { text }) => assistant.send(text).await,
                     Ok(ClientMsg::Cancel) => assistant.cancel().await,
-                    Ok(ClientMsg::Answer { id, allow }) => assistant.answer(id, allow).await,
-                    Err(error) => tracing::debug!("ignoring a bad chat message: {error}"),
+                    // Until the agent's permissions are requests, they answer the log's
+                    // permission entries; anything but an allow refuses.
+                    Ok(ClientMsg::Answer { id, response: fronde_protocol::Response::Permission { choice } }) => {
+                        assistant.answer(id, choice == ALLOW_ONCE).await;
+                    }
+                    Ok(ClientMsg::Answer { id, response }) => {
+                        // A refusal is for this page alone: the request did not change.
+                        if let Err(refusal) = web.requests.answer(id, response, &user).await {
+                            let refused = ServerMsg::Refused { id, reason: refusal.to_string() };
+                            if send(&mut socket, &refused).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    // serde's message can quote the input, which may be an answer: only where
+                    // and what kind of error.
+                    Err(error) => tracing::debug!(
+                        "ignoring a bad chat message: {:?} error at line {} column {}",
+                        error.classify(),
+                        error.line(),
+                        error.column()
+                    ),
                 }
             }
             entry = next_live(&mut live) => {
@@ -90,7 +119,7 @@ async fn chat(mut socket: WebSocket, assistant: Arc<Assistant>) {
                         send(&mut socket, &ServerMsg::Entry(entry)).await
                     }
                     Ok(_) => Ok(()),
-                    Err(RecvError::Lagged(_)) => replay(&mut socket, &assistant, &mut last_sent).await,
+                    Err(RecvError::Lagged(_)) => replay(&mut socket, assistant, &mut last_sent).await,
                     Err(RecvError::Closed) => return,
                 };
                 if sent.is_err() {

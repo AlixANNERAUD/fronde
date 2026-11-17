@@ -41,7 +41,10 @@ hundreds of tool schemas in the model's context on every turn.
 With `[web]`, Fronde also runs an agent for its own chat (`crates/agent`). On the first message it
 starts `claude-agent-acp`, the Claude Code ACP adapter, and opens a session with it over standard
 input and output. The session gets the hub as an MCP server named `fronde`, reached over the
-loopback with the same token, and a short system prompt. The session id is saved, so a restart
+loopback with a token of its own, made at each start and kept only in memory, and a short system
+prompt. The hub tells the assistant's calls from those of outside clients by that token: a call
+from the assistant belongs to its conversation and its running turn, a call with `server.token`
+to an outside client, named from the `clientInfo` it gave. The session id is saved, so a restart
 resumes the same conversation.
 
 Each turn streams back as events: text, tool calls, permission requests, the end of the turn.
@@ -49,6 +52,30 @@ Fronde numbers them and saves each one in the database, committed to disk, befor
 it to every open page: a page never shows an entry a crash could lose. A page that reconnects
 says which entry it saw last and gets only what it missed. The conversation is one stream of the
 database, the topic `conversation`; the session id is saved there too.
+
+## Requests
+
+Anything that waits on a human is a **request**: a row in the `requests` table, shown as a card in
+the conversation, answered once. The row is written first, then the card is announced as an entry
+of the stream (`request`), and the row is closed before the asker wakes, then the card is closed
+too (`request_closed`). Every change of status is a compare-and-set on `pending`: the first answer
+wins, from whichever signed-in page, and a closed request never reopens. A request ends
+`answered`, `declined`, `expired` or `cancelled`. Each has an expiry, and no answer means no.
+
+A page answers with one message, `answer`, whatever the card. The server checks the answer
+against the card (offered options only, one pick for a single choice, required questions
+answered) and against the user: only the user the request is for may answer it, and a card
+marked for admins only an admin. A refused answer leaves the request as it was and is told to
+that page only. The page runs the same checks before sending, from the same code
+(`fronde_protocol::request::check`).
+
+The table is the source of truth. A request survives a restart: one whose time ran out expires,
+and one whose card never made it to the stream (a crash in between) is announced again. A retried
+call that gives the same `client_request_id` gets the same request rather than a second card. The
+row keeps who answered, when, and a summary of the answer, never a secret.
+
+The agent's permission requests still go through their own path, answered with the same `answer`
+message, until they become requests too.
 
 ## The web interface
 

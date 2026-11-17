@@ -16,6 +16,7 @@ fronde-agent = { path = "../agent" }
 fronde-db = { path = "../db" }
 fronde-hub = { path = "../hub" }
 fronde-protocol = { path = "../protocol" }
+fronde-requests = { path = "../requests" }
 fronde-wasm = { path = "../wasm" }
 getrandom.workspace = true
 iana-time-zone.workspace = true

@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 use fronde_client::{Chat, Item, PermissionStatus, ToolStatus};
-use fronde_protocol::ClientMsg;
+use fronde_protocol::{ClientMsg, Response};
 
 use crate::{
     components::icons::{ArrowUp, Check, LogOut, Square, Wrench, X},
@@ -142,8 +142,14 @@ fn PermissionCard(
     let answered = use_callback(move |()| sent.set(true));
     let disabled = sent() || !open;
     let answer = move |allow: bool| {
+        let choice = if allow { "allow_once" } else { "reject_once" };
         on_send.call(Outgoing {
-            message: ClientMsg::Answer { id, allow },
+            message: ClientMsg::Answer {
+                id,
+                response: Response::Permission {
+                    choice: choice.into(),
+                },
+            },
             sent: Some(answered),
         });
     };

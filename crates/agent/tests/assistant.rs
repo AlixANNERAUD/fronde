@@ -811,3 +811,90 @@ async fn open_imports_the_files_from_before_fronde() {
     assert!(dir.path().join("jarvis.jsonl.imported").exists());
     assert!(dir.path().join("jarvis.session.imported").exists());
 }
+
+#[tokio::test]
+async fn requests_are_shown_in_the_conversation() {
+    use fronde_protocol::{Card, ChoiceAnswer, ChoiceOption, Field, Outcome, Response};
+    use fronde_requests::{Ask, Caller, Requests, Resolution, User};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, _fakes) = open(dir.path(), asking()).await;
+    assert_eq!(assistant.current_turn().await, None);
+    assistant.send("Mon agenda ?".into()).await;
+    let permission = wait_for_permission(&assistant).await;
+    // The turn runs while the agent waits for the permission.
+    assert_eq!(assistant.current_turn().await, Some(1));
+
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, assistant.clone()).await.unwrap();
+    let option = |label: &str| ChoiceOption {
+        label: label.into(),
+        description: None,
+        preview: None,
+        recommended: false,
+    };
+    let card = Card::Form {
+        message: String::new(),
+        fields: vec![Field::Choice {
+            key: "q1".into(),
+            header: None,
+            question: "Quel agenda ?".into(),
+            options: vec![option("Perso"), option("Travail")],
+            multi: false,
+            other: false,
+            required: true,
+        }],
+        submit: None,
+    };
+    let waiter = requests
+        .ask(Ask {
+            topic: TOPIC.into(),
+            turn: assistant.current_turn().await,
+            caller: Caller::Mcp("Codex".into()),
+            client_request_id: None,
+            card: card.clone(),
+            for_user: "alix".into(),
+            admin_only: false,
+            timeout: WAIT,
+        })
+        .await
+        .unwrap();
+    let id = waiter.id();
+    let response = Response::Form {
+        values: [(
+            "q1".to_owned(),
+            ChoiceAnswer {
+                selected: vec!["Perso".into()],
+                ..ChoiceAnswer::default()
+            },
+        )]
+        .into(),
+    };
+    let alix = User {
+        name: "alix".into(),
+        admin: true,
+    };
+    requests.answer(id, response.clone(), &alix).await.unwrap();
+    assert_eq!(waiter.wait().await, Resolution::Answered(response));
+
+    assistant.answer(permission, true).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    assert_eq!(
+        events[2..4],
+        [
+            Event::Request {
+                id,
+                card,
+                from: Some("Codex".into())
+            },
+            Event::RequestClosed {
+                id,
+                outcome: Outcome::Answered {
+                    summary: "Perso".into()
+                },
+                by: Some("alix".into())
+            },
+        ]
+    );
+    assert_eq!(assistant.current_turn().await, None);
+}

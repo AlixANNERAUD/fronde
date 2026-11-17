@@ -5,6 +5,7 @@ use crate::search::ToolIndex;
 use crate::source::Tool;
 use anyhow::bail;
 use async_trait::async_trait;
+use fronde_requests::Caller;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -72,9 +73,27 @@ impl ToolOutput {
     }
 }
 
+/// Who calls a tool, and on whose behalf: a tool that asks the user puts its card in `topic`,
+/// for `user`, tied to `turn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallContext {
+    pub caller: Caller,
+    /// The user the caller acts for.
+    pub user: String,
+    /// The stream where that user sees what the call asks.
+    pub topic: String,
+    /// The seq of the user message of the turn calling, for Fronde's assistant.
+    pub turn: Option<u64>,
+}
+
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
     async fn call(&self, args: Value) -> ToolOutput;
+
+    /// The call, knowing who makes it. Only tools that need to know override this.
+    async fn call_as(&self, _context: &CallContext, args: Value) -> ToolOutput {
+        self.call(args).await
+    }
 }
 
 struct Typed<A, F, Fut> {
@@ -90,15 +109,79 @@ where
     Fut: Future<Output = ToolOutput> + Send,
 {
     async fn call(&self, args: Value) -> ToolOutput {
-        match serde_path_to_error::deserialize::<_, A>(args) {
+        match parse::<A>(args) {
             Ok(a) => (self.f)(a).await,
-            Err(e) => ToolOutput::error(format!(
-                "invalid arguments at `{}`: {}; fix them to match the tool's input schema",
-                e.path(),
-                e.inner()
-            )),
+            Err(error) => error,
         }
     }
+}
+
+fn parse<A: DeserializeOwned>(args: Value) -> Result<A, ToolOutput> {
+    serde_path_to_error::deserialize::<_, A>(args).map_err(|e| {
+        ToolOutput::error(format!(
+            "invalid arguments at `{}`: {}; fix them to match the tool's input schema",
+            e.path(),
+            e.inner()
+        ))
+    })
+}
+
+fn schema_of<A: JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(A)).unwrap_or(json!({"type": "object"}))
+}
+
+struct WithContext<A, F, Fut> {
+    f: F,
+    _types: PhantomData<fn(A) -> Fut>,
+}
+
+#[async_trait]
+impl<A, F, Fut> ToolHandler for WithContext<A, F, Fut>
+where
+    A: DeserializeOwned + Send,
+    F: Fn(CallContext, A) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolOutput> + Send,
+{
+    async fn call(&self, _args: Value) -> ToolOutput {
+        ToolOutput::error(
+            "this tool needs to know who calls it; call it through Fronde's MCP server",
+        )
+    }
+
+    async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
+        match parse::<A>(args) {
+            Ok(a) => (self.f)(context.clone(), a).await,
+            Err(error) => error,
+        }
+    }
+}
+
+/// [`typed_tool`] for a tool that needs to know who calls it: `f` gets the call's context.
+pub fn typed_tool_with_context<A, F, Fut>(
+    name: &str,
+    description: &str,
+    deferred: bool,
+    f: F,
+) -> (ToolDef, Arc<dyn ToolHandler>)
+where
+    A: DeserializeOwned + JsonSchema + Send + 'static,
+    F: Fn(CallContext, A) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ToolOutput> + Send + 'static,
+{
+    let def = ToolDef {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: schema_of::<A>(),
+        deferred,
+        source: "hub".to_string(),
+    };
+    (
+        def,
+        Arc::new(WithContext {
+            f,
+            _types: PhantomData,
+        }),
+    )
 }
 
 /// Build a tool whose arguments are deserialized into `A` and whose schema comes from `A`.
@@ -113,12 +196,10 @@ where
     F: Fn(A) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ToolOutput> + Send + 'static,
 {
-    let schema =
-        serde_json::to_value(schemars::schema_for!(A)).unwrap_or(json!({"type": "object"}));
     let def = ToolDef {
         name: name.to_string(),
         description: description.to_string(),
-        input_schema: schema,
+        input_schema: schema_of::<A>(),
         deferred,
         source: "hub".to_string(),
     };
@@ -261,19 +342,33 @@ impl Registry {
             .map(|(d, _)| d.clone())
     }
 
+    /// Calls the tool `name` without saying who calls: a tool that needs to know refuses.
     pub async fn call(&self, name: &str, args: Value) -> ToolOutput {
-        let handler = self
-            .tools
+        match self.handler(name) {
+            Ok(h) => h.call(args).await,
+            Err(unknown) => unknown,
+        }
+    }
+
+    /// Calls the tool `name` on behalf of `context`.
+    pub async fn call_as(&self, context: &CallContext, name: &str, args: Value) -> ToolOutput {
+        match self.handler(name) {
+            Ok(h) => h.call_as(context, args).await,
+            Err(unknown) => unknown,
+        }
+    }
+
+    fn handler(&self, name: &str) -> Result<Arc<dyn ToolHandler>, ToolOutput> {
+        self.tools
             .read()
             .expect("registry lock")
             .get(name)
-            .map(|(_, h)| h.clone());
-        match handler {
-            Some(h) => h.call(args).await,
-            None => ToolOutput::error(format!(
-                "unknown tool {name:?}; call search_tools with your need to find the right one"
-            )),
-        }
+            .map(|(_, h)| h.clone())
+            .ok_or_else(|| {
+                ToolOutput::error(format!(
+                    "unknown tool {name:?}; call search_tools with your need to find the right one"
+                ))
+            })
     }
 }
 
@@ -292,6 +387,41 @@ struct UseArgs {
     /// Arguments matching that tool's input schema.
     #[serde(default)]
     arguments: Value,
+}
+
+/// `use_tool`: calls the tool named on behalf of whoever calls it.
+struct UseTool(std::sync::Weak<Registry>);
+
+impl UseTool {
+    async fn forward(&self, context: Option<&CallContext>, args: Value) -> ToolOutput {
+        let a = match parse::<UseArgs>(args) {
+            Ok(a) => a,
+            Err(error) => return error,
+        };
+        let Some(r) = self.0.upgrade() else {
+            return ToolOutput::error("hub is shutting down");
+        };
+        if a.name == "use_tool" {
+            return ToolOutput::error(
+                "use_tool cannot call itself; pass the name of the tool you need",
+            );
+        }
+        match context {
+            Some(context) => r.call_as(context, &a.name, a.arguments).await,
+            None => r.call(&a.name, a.arguments).await,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for UseTool {
+    async fn call(&self, args: Value) -> ToolOutput {
+        self.forward(None, args).await
+    }
+
+    async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
+        self.forward(Some(context), args).await
+    }
 }
 
 /// `search_tools` and `use_tool`, over `registry`.
@@ -324,26 +454,14 @@ pub fn meta_tools(registry: &Arc<Registry>) -> Vec<Tool> {
         },
     );
     let search = (def, h);
-    let r = Arc::downgrade(registry);
-    let (def, h) = typed_tool(
-        "use_tool",
-        "Call a tool found with search_tools.",
-        false,
-        move |a: UseArgs| {
-            let r = r.clone();
-            async move {
-                let Some(r) = r.upgrade() else {
-                    return ToolOutput::error("hub is shutting down");
-                };
-                if a.name == "use_tool" {
-                    return ToolOutput::error(
-                        "use_tool cannot call itself; pass the name of the tool you need",
-                    );
-                }
-                r.call(&a.name, a.arguments).await
-            }
-        },
-    );
+    let def = ToolDef {
+        name: "use_tool".to_string(),
+        description: "Call a tool found with search_tools.".to_string(),
+        input_schema: schema_of::<UseArgs>(),
+        deferred: false,
+        source: "hub".to_string(),
+    };
+    let h: Arc<dyn ToolHandler> = Arc::new(UseTool(Arc::downgrade(registry)));
     vec![search, (def, h)]
 }
 

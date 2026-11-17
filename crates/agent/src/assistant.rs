@@ -3,8 +3,11 @@
 use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
 use crate::legacy;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
+use async_trait::async_trait;
 use fronde_db::DatabaseConnection;
+use fronde_protocol::{Card, Outcome, RequestId};
+use fronde_requests::Journal;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::Path;
@@ -61,8 +64,14 @@ pub struct Assistant {
     /// Permission requests shown in the log and not answered yet, by their id in the log: the
     /// client that asked and its own id for the request.
     pending: Mutex<HashMap<u64, (Weak<AgentClient>, u64)>>,
-    /// Cancels the running turn; `None` when idle.
-    turn: tokio::sync::Mutex<Option<CancellationToken>>,
+    /// The running turn; `None` when idle.
+    turn: tokio::sync::Mutex<Option<Turn>>,
+}
+
+struct Turn {
+    cancel: CancellationToken,
+    /// The seq of its user message, if it was logged.
+    seq: Option<u64>,
 }
 
 /// A connected agent and the task recording its events.
@@ -144,8 +153,19 @@ impl Assistant {
                 self.append(Event::Notice { text: BUSY.into() }).await;
                 return;
             }
-            self.append(Event::User { text: text.clone() }).await;
-            turn.insert(CancellationToken::new()).clone()
+            let seq = match self.log.append(Event::User { text: text.clone() }).await {
+                Ok(entry) => Some(entry.seq),
+                Err(error) => {
+                    tracing::error!("cannot write the conversation log: {error:#}");
+                    None
+                }
+            };
+            let cancel = CancellationToken::new();
+            *turn = Some(Turn {
+                cancel: cancel.clone(),
+                seq,
+            });
+            cancel
         };
         let assistant = self.clone();
         tokio::spawn(async move {
@@ -169,9 +189,15 @@ impl Assistant {
 
     /// Stops the running turn, if any.
     pub async fn cancel(&self) {
-        if let Some(cancel) = self.turn.lock().await.as_ref() {
-            cancel.cancel();
+        if let Some(turn) = self.turn.lock().await.as_ref() {
+            turn.cancel.cancel();
         }
+    }
+
+    /// The seq of the running turn's user message, `None` when idle: what a request asked
+    /// during the turn is tied to.
+    pub async fn current_turn(&self) -> Option<u64> {
+        self.turn.lock().await.as_ref().and_then(|turn| turn.seq)
     }
 
     /// Answers the permission request `id` shown in the log.
@@ -444,6 +470,51 @@ fn notice_for(error: &anyhow::Error) -> &'static str {
         Failure::NotInstalled => NOT_INSTALLED,
         Failure::SignedOut => SIGNED_OUT,
         Failure::Other => FAILED,
+    }
+}
+
+/// Requests are shown in the conversation, the only stream so far.
+#[async_trait]
+impl Journal for Assistant {
+    async fn announce(
+        &self,
+        topic: &str,
+        id: RequestId,
+        card: &Card,
+        from: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        if topic != TOPIC {
+            bail!("no stream {topic:?} to show request {id} in");
+        }
+        let entry = self
+            .log
+            .append(Event::Request {
+                id,
+                card: card.clone(),
+                from: from.map(str::to_owned),
+            })
+            .await?;
+        Ok(entry.seq)
+    }
+
+    async fn close(
+        &self,
+        topic: &str,
+        id: RequestId,
+        outcome: &Outcome,
+        by: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if topic != TOPIC {
+            bail!("no stream {topic:?} to close request {id} in");
+        }
+        self.log
+            .append(Event::RequestClosed {
+                id,
+                outcome: outcome.clone(),
+                by: by.map(str::to_owned),
+            })
+            .await?;
+        Ok(())
     }
 }
 

@@ -2331,6 +2331,7 @@ dependencies = [
  "fronde-hub",
  "fronde-migration",
  "fronde-protocol",
+ "fronde-requests",
  "fronde-wasm",
  "futures",
  "getrandom 0.4.3",
@@ -2367,11 +2368,13 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "async-trait",
  "chrono",
  "fronde-agent",
  "fronde-db",
  "fronde-entity",
  "fronde-protocol",
+ "fronde-requests",
  "futures",
  "sea-orm",
  "secrecy",
@@ -2443,6 +2446,8 @@ dependencies = [
  "etcetera",
  "fronde-db",
  "fronde-fs",
+ "fronde-protocol",
+ "fronde-requests",
  "http",
  "rmcp",
  "rustix",
@@ -2474,6 +2479,23 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "fronde-requests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "fronde-db",
+ "fronde-entity",
+ "fronde-protocol",
+ "sea-orm",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

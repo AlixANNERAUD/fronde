@@ -2,6 +2,8 @@
 
 use crate::Hub;
 use crate::guide::instructions;
+use crate::tools::CallContext;
+use fronde_requests::Caller;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
@@ -11,6 +13,19 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::Value;
 use std::sync::Arc;
 
+/// The stream where the owner sees what tools ask: the chat's conversation.
+pub const TOPIC: &str = "conversation";
+
+/// Who holds the bearer token of an HTTP request to `/mcp`, as the server's gate found it and
+/// put it in the request's extensions. Without it, a caller is an outside client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpCaller {
+    /// Fronde's assistant, with the seq of its running turn's user message.
+    Assistant { turn: Option<u64> },
+    /// Any other MCP client, holding `server.token`.
+    Outside,
+}
+
 #[derive(Clone)]
 pub struct HubServer {
     hub: Arc<Hub>,
@@ -19,6 +34,38 @@ pub struct HubServer {
 impl HubServer {
     pub fn new(hub: Arc<Hub>) -> Self {
         Self { hub }
+    }
+}
+
+impl HubServer {
+    /// rmcp's streamable HTTP server puts the request's `http::request::Parts` in the
+    /// context's extensions, and the gate put its [`McpCaller`] in theirs. An outside client is
+    /// named from the `clientInfo` it gave at initialisation.
+    fn call_context(&self, context: &RequestContext<RoleServer>) -> CallContext {
+        let holder = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<McpCaller>())
+            .copied()
+            .unwrap_or(McpCaller::Outside);
+        let (caller, turn) = match holder {
+            McpCaller::Assistant { turn } => (Caller::Assistant, turn),
+            McpCaller::Outside => {
+                let name = context
+                    .peer
+                    .peer_info()
+                    .map(|info| info.client_info.name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "MCP".to_owned());
+                (Caller::Mcp(name), None)
+            }
+        };
+        CallContext {
+            caller,
+            user: self.hub.config.data.user.clone(),
+            topic: TOPIC.to_owned(),
+            turn,
+        }
     }
 }
 
@@ -61,13 +108,18 @@ impl ServerHandler for HubServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let args = request
             .arguments
             .map(Value::Object)
             .unwrap_or(Value::Object(Default::default()));
-        let out = self.hub.registry.call(&request.name, args).await;
+        let context = self.call_context(&context);
+        let out = self
+            .hub
+            .registry
+            .call_as(&context, &request.name, args)
+            .await;
         let content = vec![ContentBlock::text(out.to_text())];
         let result = if out.is_error {
             CallToolResult::error(content)
@@ -233,6 +285,57 @@ mod tests {
             std::fs::read_to_string(dir.path().join("memory/MEMORY.md"))
                 .unwrap()
                 .contains("owns a bike")
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_caller_is_named_from_its_client_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = start_hub(dir.path()).await;
+        let (d, h) = crate::tools::typed_tool_with_context(
+            "test_whoami",
+            "Who calls.",
+            true,
+            |context: CallContext, _: serde_json::Value| async move {
+                ToolOutput::ok(serde_json::json!({
+                    "caller": context.caller.id(),
+                    "user": context.user,
+                    "topic": context.topic,
+                    "turn": context.turn,
+                }))
+            },
+        );
+        hub.registry.register(d, h).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let running = HubServer::new(hub).serve(a).await.unwrap();
+            let _ = running.waiting().await;
+        });
+        let mut info = rmcp::model::ClientConfig::default();
+        info.client_info = Implementation::new("Codex", "1.0");
+        let client = info.serve(b).await.unwrap();
+        // Through use_tool too: the context follows the call.
+        let args = serde_json::json!({"name": "test_whoami", "arguments": {}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let r = client
+            .call_tool(CallToolRequestParams::new("use_tool").with_arguments(args))
+            .await
+            .unwrap();
+        let text = match &r.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("{other:?}"),
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["result"],
+            serde_json::json!({
+                "caller": "mcp:Codex",
+                "user": "alix",
+                "topic": "conversation",
+                "turn": null,
+            })
         );
     }
 

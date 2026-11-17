@@ -2,7 +2,7 @@ use fronde::sessions::Sessions;
 use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::Connector;
 use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
-use fronde_protocol::{ClientMsg, Entry, Event, ServerMsg, TurnOutcome};
+use fronde_protocol::{ClientMsg, Entry, Event, Response, ServerMsg, TurnOutcome};
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE,
@@ -412,7 +412,9 @@ async fn ws_send_runs_a_turn() {
         &mut socket,
         ClientMsg::Answer {
             id: 99,
-            allow: true,
+            response: Response::Permission {
+                choice: "allow_once".into(),
+            },
         },
     )
     .await;
@@ -430,7 +432,22 @@ async fn ws_send_runs_a_turn() {
         spec.hub_url,
         format!("http://127.0.0.1:{}/mcp", addr.port())
     );
-    assert_eq!(secrecy::ExposeSecret::expose_secret(&spec.hub_token), TOKEN);
+    // The assistant holds a token of its own, not the one outside clients use.
+    let hub_token = secrecy::ExposeSecret::expose_secret(&spec.hub_token).to_owned();
+    assert_ne!(hub_token, TOKEN);
+    assert!(hub_token.len() >= 32, "{hub_token}");
+    let mcp = |token: String| {
+        client()
+            .post(format!("http://{addr}/mcp"))
+            .header("authorization", format!("Bearer {token}"))
+            .header(CONTENT_TYPE, "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#)
+            .send()
+    };
+    assert_eq!(mcp(hub_token).await.unwrap().status(), 200);
+    assert_eq!(mcp(TOKEN.into()).await.unwrap().status(), 200);
+    assert_eq!(mcp("x".repeat(64)).await.unwrap().status(), 401);
     assert_eq!(spec.cwd, dir.path().join("data").join("agent"));
     assert!(spec.cwd.is_dir());
     assert_eq!(
@@ -1178,6 +1195,56 @@ async fn session_survives_restart() {
     second.kill();
     let third = Server::spawn(dir.path(), "info");
     assert_eq!(get(third.addr, "/", Some(&cookie)).await.status(), 303);
+}
+
+#[tokio::test]
+async fn bad_answer_is_a_notice_not_a_log_line() {
+    const CANARY: &str = "canary-7f3a9c";
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::spawn(dir.path(), "debug");
+    let addr = server.addr;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+
+    // An answer that does not parse: dropped, without quoting it.
+    let malformed = format!(r#"{{"type":"answer","id":1,"response":{{"type":"{CANARY}"}}}}"#);
+    timeout(WAIT, socket.send(Message::text(malformed)))
+        .await
+        .unwrap()
+        .unwrap();
+    // An answer to no request: refused, to this page only.
+    let answer = Response::Form {
+        values: [(
+            "q1".to_owned(),
+            fronde_protocol::ChoiceAnswer {
+                selected: vec![CANARY.into()],
+                ..Default::default()
+            },
+        )]
+        .into(),
+    };
+    say(
+        &mut socket,
+        ClientMsg::Answer {
+            id: 41,
+            response: answer,
+        },
+    )
+    .await;
+    assert_eq!(
+        next_message(&mut socket).await,
+        ServerMsg::Refused {
+            id: 41,
+            reason: "Cette demande n'existe pas.".into()
+        }
+    );
+    // Nothing went into the conversation.
+    let mut other = open_chat(addr, &cookie).await;
+    assert_eq!(hello(&mut other, 0, None).await.1, 0);
+    let log = server.kill();
+    assert!(log.contains("ignoring a bad chat message"), "{log}");
+    assert!(!log.contains(CANARY), "{log}");
 }
 
 #[tokio::test]
