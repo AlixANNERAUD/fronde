@@ -260,11 +260,16 @@ tools. It loads none of Claude Code's settings, so your plugins, MCP servers, ho
 rules on the same machine do not reach it. Its permission mode asks before acting, and any request
 it makes is a permission card in the chat (see
 [Requests and cards](requests.md#permission-cards)): only the user it is for answers it, and only
-an admin is offered an option that lasts, and nobody one that switches the agent's mode (out of
-plan mode into a mode that asks less); a card left unanswered refuses after 30 minutes, and
-*Stop* or the end of the turn cancels it. The card's texts come from the agent, so they are capped
-and stripped of control and bidirectional characters, which could otherwise make a command read
-as another. *Toujours autoriser* lasts only as long as the agent's process: Fronde keeps no grant,
+an admin is offered an option that lasts, and only one whose effect Fronde knows (an allow rule
+for the tool at hand; never Claude Code's *always* on an edit, which may switch the session to
+accepting every edit), and nobody one that switches the agent's mode (out of plan mode into a mode
+that asks less); a card left unanswered refuses after 30 minutes, and *Stop* or the end of the
+turn cancels it, as does a request coming after its turn. The card's texts come from the agent,
+so every hidden character (controls, format and zero-width characters, separators, tag
+characters, variation selectors) is replaced and the card says so, they are shown left to right
+character by character, so that right-to-left letters cannot reorder a command's arguments, and a
+text too long keeps both its head and its tail, so that padding cannot hide the end of a
+command. *Toujours autoriser* lasts only as long as the agent's process: Fronde keeps no grant,
 and the agent loads no settings where one could persist. Adding a built-in tool beyond the two
 web ones is refused by the configuration check: widening it is a deliberate code change.
 

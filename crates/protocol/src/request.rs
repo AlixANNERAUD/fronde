@@ -23,6 +23,30 @@ pub const MAX_PERMISSION_TITLE: usize = 200;
 /// The longest body of a permission card (what the tool would do), in characters.
 pub const MAX_PERMISSION_BODY: usize = 4000;
 
+/// The longest line of a permission card's body, in characters.
+pub const MAX_PERMISSION_LINE: usize = 300;
+
+/// The longest detail of a permission option (the agent's own words for it), in characters.
+pub const MAX_OPTION_DETAIL: usize = 160;
+
+/// The longest id of a permission option: agents use short words such as `allow-once`.
+pub const MAX_OPTION_ID: usize = 128;
+
+/// A question card's texts, short enough for a phone.
+pub const MAX_QUESTION: usize = 300;
+pub const MAX_HEADER: usize = 12;
+pub const MAX_LABEL: usize = 60;
+pub const MAX_DESCRIPTION: usize = 200;
+pub const MAX_PREVIEW: usize = 4000;
+pub const MAX_MESSAGE: usize = 2000;
+pub const MAX_KEY: usize = 64;
+
+/// A secret card's texts.
+pub const MAX_SECRET_LABEL: usize = 60;
+pub const MAX_REASON: usize = 300;
+pub const MAX_PLACEHOLDER: usize = 60;
+pub const MAX_URL: usize = 2000;
+
 /// What a request's card shows. Never a secret.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -41,6 +65,12 @@ pub enum Card {
         body: Option<String>,
         /// The agent's own options, in its order.
         options: Vec<PermissionChoice>,
+        /// Part of the title or the body was left out to fit: the card says so.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        /// Hidden characters were replaced by `�`: the card says so.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replaced: bool,
     },
     /// Questions to answer together, then sent at once.
     Form {
@@ -72,6 +102,113 @@ pub enum Card {
 }
 
 impl Card {
+    /// Checks that every text of the card fits its cap and holds no hidden character (see
+    /// [`crate::text::hidden`]; line breaks and tabs only where a text may span lines), and that
+    /// a permission's options are offered once each: the server's last word on what a card may
+    /// show, whoever built it. The error says what to fix, in English, for the asker.
+    pub fn check(&self) -> Result<(), String> {
+        let text = |what: &str, text: &str, max: usize, multiline: bool| {
+            let length = text.chars().count();
+            if length > max {
+                return Err(format!("{what} has {length} characters; use at most {max}"));
+            }
+            match crate::text::first_hidden(text, multiline) {
+                Some(c) => Err(format!(
+                    "{what} contains the hidden character U+{:04X}; remove it",
+                    u32::from(c)
+                )),
+                None => Ok(()),
+            }
+        };
+        match self {
+            Self::Permission {
+                title,
+                body,
+                options,
+                ..
+            } => {
+                text("title", title, MAX_PERMISSION_TITLE, false)?;
+                if let Some(body) = body {
+                    text("body", body, MAX_PERMISSION_BODY, true)?;
+                    for line in body.lines() {
+                        text("a line of the body", line, MAX_PERMISSION_LINE, true)?;
+                    }
+                }
+                if options.is_empty() {
+                    return Err("a permission card needs at least one option".into());
+                }
+                let mut ids = BTreeSet::new();
+                for option in options {
+                    if option.id.is_empty() || !ids.insert(&option.id) {
+                        return Err(format!("option id {:?} is empty or repeated", option.id));
+                    }
+                    text("an option id", &option.id, MAX_OPTION_ID, false)?;
+                    if let Some(detail) = &option.detail {
+                        text("an option detail", detail, MAX_OPTION_DETAIL, false)?;
+                    }
+                }
+            }
+            Self::Form {
+                message,
+                fields,
+                submit,
+            } => {
+                text("message", message, MAX_MESSAGE, true)?;
+                if let Some(submit) = submit {
+                    text("submit", submit, MAX_LABEL, false)?;
+                }
+                let mut keys = BTreeSet::new();
+                for field in fields {
+                    let Field::Choice {
+                        key,
+                        header,
+                        question,
+                        options,
+                        ..
+                    } = field;
+                    if key.is_empty() || !keys.insert(key) {
+                        return Err(format!("field key {key:?} is empty or repeated"));
+                    }
+                    text("a field key", key, MAX_KEY, false)?;
+                    if let Some(header) = header {
+                        text("header", header, MAX_HEADER, false)?;
+                    }
+                    text("question", question, MAX_QUESTION, false)?;
+                    for option in options {
+                        text("label", &option.label, MAX_LABEL, false)?;
+                        if let Some(description) = &option.description {
+                            text("description", description, MAX_DESCRIPTION, false)?;
+                        }
+                        if let Some(preview) = &option.preview {
+                            text("preview", preview, MAX_PREVIEW, true)?;
+                        }
+                    }
+                }
+            }
+            Self::Secret {
+                label,
+                reason,
+                placeholder,
+                url,
+                remember,
+            } => {
+                text("label", label, MAX_SECRET_LABEL, false)?;
+                text("reason", reason, MAX_REASON, false)?;
+                if let Some(placeholder) = placeholder {
+                    text("placeholder", placeholder, MAX_PLACEHOLDER, false)?;
+                }
+                if let Some(url) = url {
+                    text("url", url, MAX_URL, false)?;
+                }
+                if let Some(remember) = remember {
+                    text("remember.name", &remember.name, MAX_KEY, false)?;
+                    text("remember.origin", &remember.origin, MAX_URL, false)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The card's kind, as stored with its request.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -877,6 +1014,8 @@ mod tests {
                     detail: None,
                 },
             ],
+            truncated: false,
+            replaced: false,
         }
     }
 
@@ -906,6 +1045,83 @@ mod tests {
             serde_json::to_string(&pick("reject")).unwrap(),
             r#"{"type":"permission","choice":"reject"}"#
         );
+    }
+
+    #[test]
+    fn cards_are_checked_whoever_built_them() {
+        assert_eq!(permission_card().check(), Ok(()));
+        assert_eq!(form(vec![choice("q1", false, true, true)]).check(), Ok(()));
+        assert_eq!(secret_card(true).check(), Ok(()));
+        let with = |change: &dyn Fn(&mut Card)| {
+            let mut card = permission_card();
+            change(&mut card);
+            card.check().expect_err("the card should be refused")
+        };
+        fn fields(
+            card: &mut Card,
+        ) -> (&mut String, &mut Option<String>, &mut Vec<PermissionChoice>) {
+            let Card::Permission {
+                title,
+                body,
+                options,
+                ..
+            } = card
+            else {
+                unreachable!()
+            };
+            (title, body, options)
+        }
+        let error = with(&|card| *fields(card).0 = "t".repeat(MAX_PERMISSION_TITLE + 1));
+        assert!(error.contains("title has 201 characters"), "{error}");
+        let error = with(&|card| *fields(card).0 = "mv a\u{202e}b".into());
+        assert!(error.contains("U+202E"), "{error}");
+        let error = with(&|card| *fields(card).1 = Some("a\u{2028}b".into()));
+        assert!(error.contains("U+2028"), "{error}");
+        let error = with(&|card| *fields(card).1 = Some("x".repeat(MAX_PERMISSION_LINE + 1)));
+        assert!(error.contains("a line of the body"), "{error}");
+        let error = with(&|card| fields(card).2.clear());
+        assert!(error.contains("at least one option"), "{error}");
+        let error = with(&|card| {
+            let options = fields(card).2;
+            options[1].id = options[0].id.clone();
+        });
+        assert!(error.contains("repeated"), "{error}");
+        let error = with(&|card| fields(card).2[0].detail = Some("ok\u{200b}".into()));
+        assert!(error.contains("U+200B"), "{error}");
+        // Lines and tabs only where a text spans lines.
+        let mut preview = choice("q1", false, true, true);
+        let Field::Choice { options, .. } = &mut preview;
+        options[0].preview = Some("a\n\tb".into());
+        assert_eq!(form(vec![preview.clone()]).check(), Ok(()));
+        let Field::Choice { options, .. } = &mut preview;
+        options[0].label = "Mea\u{e0041}lie".into();
+        let error = form(vec![preview]).check().unwrap_err();
+        assert!(
+            error.contains("label contains the hidden character U+E0041"),
+            "{error}"
+        );
+        let mut secret = secret_card(false);
+        if let Card::Secret { reason, .. } = &mut secret {
+            *reason = "ligne\nsuivante".into();
+        }
+        assert!(secret.check().unwrap_err().contains("U+000A"));
+        // What a cleaned card says about itself travels with it.
+        let mut card = permission_card();
+        if let Card::Permission {
+            truncated,
+            replaced,
+            ..
+        } = &mut card
+        {
+            *truncated = true;
+            *replaced = true;
+        }
+        let json = serde_json::to_string(&card).unwrap();
+        assert!(
+            json.ends_with(r#""truncated":true,"replaced":true}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Card>(&json).unwrap(), card);
     }
 
     #[test]

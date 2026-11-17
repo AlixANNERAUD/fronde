@@ -698,6 +698,8 @@ fn permission() -> Card {
                 detail: None,
             },
         ],
+        truncated: false,
+        replaced: false,
     }
 }
 
@@ -735,6 +737,68 @@ async fn restart_expires_permissions() {
         .answer(question, pick("Mealie"), &alix())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn only_the_assistant_asks_for_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    for caller in [Caller::Mcp("Codex".into()), Caller::Source("github".into())] {
+        let mut asked = ask();
+        asked.card = permission();
+        asked.caller = caller;
+        let error = requests.ask(asked).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("only the assistant"),
+            "{error:#}"
+        );
+    }
+    // Nothing was written or shown.
+    assert_eq!(journal.shown(), []);
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    assert!(requests::Entity::find().all(&db).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn every_card_is_checked_before_it_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let mut hidden = ask();
+    hidden.card = Card::Form {
+        message: String::new(),
+        fields: vec![Field::Choice {
+            key: "q1".into(),
+            header: None,
+            question: "Laquelle\u{200b} ?".into(),
+            options: vec![option("Mealie"), option("Seerr")],
+            multi: false,
+            other: false,
+            required: true,
+        }],
+        submit: None,
+    };
+    let error = requests.ask(hidden).await.unwrap_err();
+    assert!(format!("{error:#}").contains("U+200B"), "{error:#}");
+    let mut long = ask();
+    let mut card = permission();
+    if let Card::Permission { title, .. } = &mut card {
+        *title = "t".repeat(201);
+    }
+    long.card = card;
+    let error = requests.ask(long).await.unwrap_err();
+    assert!(format!("{error:#}").contains("title has 201"), "{error:#}");
+    assert_eq!(journal.shown(), []);
+}
+
+#[tokio::test]
+async fn a_card_never_shown_shows_no_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    *journal.refuse.lock().unwrap() = true;
+    requests.ask(ask()).await.unwrap_err();
+    // Cancelled, without a close for a card nobody saw.
+    assert_eq!(journal.shown(), []);
+    assert_eq!(row(dir.path(), 1).await.status, "cancelled");
 }
 
 #[tokio::test]

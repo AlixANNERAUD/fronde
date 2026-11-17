@@ -1653,3 +1653,71 @@ async fn permission_card_over_websocket() {
         .unwrap();
     assert_eq!(answers, [Some(serde_json::to_string(&allow).unwrap())]);
 }
+
+#[tokio::test]
+async fn turn_end_closes_a_permission_card() {
+    let dir = tempfile::tempdir().unwrap();
+    // The agent ends its turn without waiting for its permission.
+    let (connector, _) = fake_connector_with(FakeScript {
+        ask_permission: true,
+        leave_permission_pending: true,
+        ..FakeScript::default()
+    });
+    let addr = start_with(config(dir.path(), true), connector, &site(dir.path())).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Mon agenda ?".into(),
+        },
+    )
+    .await;
+    let turn: Vec<Event> = until_turn_ended(&mut socket)
+        .await
+        .into_iter()
+        .map(|entry| entry.event)
+        .collect();
+    let id = turn
+        .iter()
+        .find_map(|event| match event {
+            Event::Request {
+                id,
+                card: fronde_protocol::Card::Permission { .. },
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .expect("the permission card");
+    // The page learns that the card closed before the turn's end, from the server alone.
+    let closed = turn
+        .iter()
+        .position(|event| {
+            *event
+                == Event::RequestClosed {
+                    id,
+                    outcome: fronde_protocol::Outcome::Cancelled,
+                    by: None,
+                }
+        })
+        .expect("the card closed");
+    assert_eq!(closed, turn.len() - 2, "{turn:?}");
+    say(
+        &mut socket,
+        ClientMsg::Answer {
+            id,
+            response: Response::Permission {
+                choice: "allow-once".into(),
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        next_message(&mut socket).await,
+        ServerMsg::Refused {
+            id,
+            reason: "Cette demande est déjà close.".into()
+        }
+    );
+}

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
+use tokio_util::sync::CancellationToken;
 
 /// The variable that carries the hub's token to an agent Fronde starts, and that Claude Code
 /// expands in the session's MCP header: the header itself then holds no secret, since the
@@ -109,26 +110,42 @@ pub struct PermissionAsk {
 /// Where the answer to a permission request goes: the first answer is the one the agent gets.
 /// Dropped unanswered, the agent gets `Cancelled`; so does a request still open when its turn
 /// is stopped or ends.
-pub struct Reply(Mutex<Option<oneshot::Sender<RequestPermissionOutcome>>>);
+pub struct Reply {
+    sender: Mutex<Option<oneshot::Sender<RequestPermissionOutcome>>>,
+    answered: CancellationToken,
+}
 
 impl Reply {
-    fn new() -> (Arc<Self>, oneshot::Receiver<RequestPermissionOutcome>) {
+    /// A reply, and where the agent's side receives its answer.
+    pub fn new() -> (Arc<Self>, oneshot::Receiver<RequestPermissionOutcome>) {
         let (sender, receiver) = oneshot::channel();
-        (Arc::new(Self(Mutex::new(Some(sender)))), receiver)
+        let reply = Self {
+            sender: Mutex::new(Some(sender)),
+            answered: CancellationToken::new(),
+        };
+        (Arc::new(reply), receiver)
     }
 
     /// Answers the agent; false if it was already answered.
     pub fn send(&self, outcome: RequestPermissionOutcome) -> bool {
-        let sender = lock(&self.0).take();
+        let sender = lock(&self.sender).take();
         // The agent may already have given up on the request: answered all the same.
-        sender.is_some_and(|sender| {
+        let sent = sender.is_some_and(|sender| {
             let _ = sender.send(outcome);
             true
-        })
+        });
+        self.answered.cancel();
+        sent
     }
 
     pub fn is_answered(&self) -> bool {
-        lock(&self.0).is_none()
+        self.answered.is_cancelled()
+    }
+
+    /// Resolves once the agent got an answer, from whichever side: a card that outlives it
+    /// must close.
+    pub async fn answered(&self) {
+        self.answered.cancelled().await;
     }
 }
 

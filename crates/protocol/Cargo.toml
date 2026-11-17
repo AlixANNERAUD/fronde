@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
+unicode-properties.workspace = true
 # A secret typed in a card is wiped from memory once used.
 zeroize.workspace = true
 

@@ -331,7 +331,9 @@ impl Requests {
             if row.kind == PERMISSION {
                 let id = row_id(&row)?;
                 if let Err(error) = requests.expire(id).await {
-                    tracing::error!("cannot expire permission request {id}: {error:#}");
+                    // Never left pending without a timer: it tries again at once.
+                    tracing::error!("cannot expire permission request {id}, retrying: {error:#}");
+                    requests.expire_at(id, Some(Utc::now()));
                 }
                 continue;
             }
@@ -376,8 +378,16 @@ impl Requests {
 
     /// Opens a request, shows its card and returns its waiter. A retry (see
     /// [`Ask::client_request_id`]) gets a waiter on the first request instead, already resolved
-    /// if that one ended. A [`Reused`] error when the id names another pending request.
+    /// if that one ended. A [`Reused`] error when the id names another pending request. Refused
+    /// when the card breaks a card's rules ([`Card::check`]), or for a permission card asked by
+    /// anyone but the assistant: only the agent's own tool calls need one.
     pub async fn ask(&self, ask: Ask) -> anyhow::Result<Waiter> {
+        ask.card
+            .check()
+            .map_err(|error| anyhow::anyhow!("the card cannot be shown: {error}"))?;
+        if matches!(ask.card, Card::Permission { .. }) && ask.caller != Caller::Assistant {
+            anyhow::bail!("only the assistant asks for permissions");
+        }
         let caller = ask.caller.id();
         if let Some(waiter) = self.retried(&ask).await? {
             return Ok(waiter);
@@ -415,8 +425,8 @@ impl Requests {
         // Waiting before the card is shown, so that the quickest answer finds the asker.
         let waiter = self.wait_on(id, Some(expires_at));
         if let Err(error) = self.announce(&row).await {
-            // Nobody can answer a card that is not shown.
-            if let Err(cancel) = self.cancel(id).await {
+            // Nobody can answer a card that is not shown, and no end is shown for it either.
+            if let Err(cancel) = self.abandon(id).await {
                 tracing::error!("cannot cancel request {id}: {cancel:#}");
             }
             return Err(error);
@@ -428,6 +438,27 @@ impl Requests {
     /// Answers the request `id` as `by`: checked against the request's user, then its card,
     /// then saved if it is still pending. The asker wakes once the request is closed.
     pub async fn answer(
+        &self,
+        id: RequestId,
+        response: Response,
+        by: &User,
+    ) -> Result<(), Refusal> {
+        let answered = self.answer_checked(id, response, by).await;
+        // Who tried what, never the answer itself; a failure is logged where it happened.
+        if let Err(refusal) = &answered {
+            let why = match refusal {
+                Refusal::Unknown => "no such request",
+                Refusal::NotYours => "not theirs",
+                Refusal::Closed => "already closed",
+                Refusal::Invalid(_) => "does not fit the card",
+                Refusal::Failed => return answered,
+            };
+            tracing::warn!("refused an answer to request {id} from {}: {why}", by.name);
+        }
+        answered
+    }
+
+    async fn answer_checked(
         &self,
         id: RequestId,
         response: Response,
@@ -595,6 +626,22 @@ impl Requests {
             return Err(won.map_err(failed).err().unwrap_or(Refusal::Closed));
         }
         self.wake(id, Resolution::Saved(saved));
+        Ok(())
+    }
+
+    /// Cancels the request `id`, never shown, without showing its end.
+    async fn abandon(&self, id: RequestId) -> anyhow::Result<()> {
+        let changed = requests::Entity::update_many()
+            .col_expr(requests::Column::Status, Expr::value(CANCELLED))
+            .col_expr(requests::Column::ResolvedAt, Expr::value(Utc::now()))
+            .filter(requests::Column::Id.eq(i64::try_from(id)?))
+            .filter(requests::Column::Status.eq(PENDING))
+            .exec(&self.db)
+            .await
+            .context("cannot cancel the request")?;
+        if changed.rows_affected > 0 {
+            self.wake(id, Resolution::Cancelled);
+        }
         Ok(())
     }
 

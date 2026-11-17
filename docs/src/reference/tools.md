@@ -87,8 +87,10 @@ is headed with the name the client gave (`clientInfo.name`), quoted and marked, 
 *Question de « Codex » (client MCP)*. An outside client named *Fronde* or *assistant* (in any
 case), with a name longer than 40 characters or holding a control character, gets an error asking
 it to connect under another name. Texts are capped: `question` at 300 characters, `label` at 60,
-`description` at 200, `preview` at 4000. None may hold a control character or a bidirectional
-control; only `preview` may hold line breaks and tabs. Never use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
+`description` at 200, `preview` at 4000. None may hold a hidden character (a control, format,
+zero-width or bidirectional character, a separator, a tag character, a variation selector, a
+private-use or unassigned code point); only `preview` may hold line breaks and tabs. The error
+names the character as `U+XXXX`. Never use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
 than the question's: Codex, for instance, gives up after `tool_timeout_sec` (60 s by default).
 A call the client cancels closes its card as cancelled, and so does the end of the assistant's
 turn, or *Stop*, for the questions that turn asked.
@@ -102,7 +104,7 @@ box. `url`, when given, is the sign-in or setup page where the user finds or mak
 the card shows it as a button naming its host. It must be an `https://` address with a host and
 no user name or password before it (`https://site@evil.example` is refused): `http:`,
 `javascript:`, `data:` and anything else are refused. The texts follow `user_ask`'s rules: no
-control character, no bidirectional control, no line break. The same outside client names are
+hidden character, no line break. The same outside client names are
 refused.
 
 The user picks how long the secret is kept:

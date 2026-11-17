@@ -2,7 +2,7 @@ use agent_client_protocol::v1::schema::{
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate, ToolCall, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields,
 };
-use fronde_agent::acp::{AgentClient, AgentSpec};
+use fronde_agent::acp::{AgentClient, AgentEvent, AgentSpec, PermissionAsk, Reply};
 use fronde_agent::assistant::{Assistant, Connector, SESSION, TOPIC, process_connector};
 use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::{Event, ToolState, TurnOutcome};
@@ -215,6 +215,8 @@ fn permission_card() -> Card {
             choice("allow-with-updates", PermissionKind::AllowAlways, None),
             choice("reject", PermissionKind::RejectOnce, None),
         ],
+        truncated: false,
+        replaced: false,
     }
 }
 
@@ -729,8 +731,7 @@ async fn permission_that_cannot_be_saved_is_denied() {
     assert!(!events.iter().any(is_permission), "{events:?}");
     assert_eq!(fakes.allow(1).await, Err(Refusal::Closed));
 
-    assert_eq!(events.first(), Some(&user("Mon agenda ?")));
-    assert_eq!(events.last(), Some(&ended(TurnOutcome::Done)));
+    assert_eq!(events, vec![user("Mon agenda ?"), ended(TurnOutcome::Done)]);
     assert_eq!(
         fakes.handles()[0].record().permission_outcomes,
         vec![selected("reject")]
@@ -1295,7 +1296,11 @@ async fn plan_body_is_shown() {
     assistant.send("Planifie".into()).await;
     let id = wait_for_permission(&assistant).await;
     let Card::Permission {
-        title, tool, body, ..
+        title,
+        tool,
+        body,
+        options,
+        ..
     } = shown_card(&assistant, id).await
     else {
         unreachable!()
@@ -1307,7 +1312,17 @@ async fn plan_body_is_shown() {
         body.as_deref(),
         Some("1. Lire l'agenda\n2. Ajouter le rendez-vous")
     );
-    fakes.allow(id).await.unwrap();
+    // A mode switch: only the refusal is one tap away.
+    let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
+    assert_eq!(ids, ["reject"]);
+    assert_eq!(
+        fakes.allow(id).await,
+        Err(Refusal::Invalid(fronde_protocol::Invalid {
+            key: None,
+            message: "Ce choix n'est pas proposé.".into()
+        }))
+    );
+    fakes.reject(id).await.unwrap();
     wait_for_turns(&assistant, 1).await;
 }
 
@@ -1324,4 +1339,188 @@ async fn permission_without_requests_is_refused() {
         fakes.handles()[0].record().permission_outcomes,
         vec![selected("reject")]
     );
+}
+
+/// Where a test hands the assistant agent events of its own, as the agent's connection would.
+type Inject = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>>;
+
+/// The assistant with its requests, on a fake agent playing `script`, and the way to hand it
+/// events beside the agent's.
+async fn open_injecting(dir: &Path, script: FakeScript) -> (Arc<Assistant>, Arc<Fakes>, Inject) {
+    let fakes = Arc::new(Fakes::default());
+    let inject: Inject = Arc::default();
+    let connector: Connector = Arc::new({
+        let (fakes, inject) = (fakes.clone(), inject.clone());
+        move |spec: &AgentSpec, resume, events| {
+            let (spec, script, fakes) = (spec.clone(), script.clone(), fakes.clone());
+            *inject.lock().unwrap() = Some(events.clone());
+            Box::pin(async move {
+                let (transport, handle) = fake_agent(script);
+                fakes.handles.lock().unwrap().push(handle);
+                AgentClient::connect(transport, &spec, resume, events).await
+            })
+        }
+    });
+    let assistant = open_with(dir, spec(), connector).await;
+    let db = fronde_db::open(dir).await.expect("database");
+    let requests = Requests::open(db, assistant.clone())
+        .await
+        .expect("requests");
+    assistant.set_requests(&requests, alix());
+    *fakes.requests.lock().unwrap() = Some(requests);
+    (assistant, fakes, inject)
+}
+
+/// A permission request the test answers in the agent's place.
+fn injected_ask() -> (
+    PermissionAsk,
+    tokio::sync::oneshot::Receiver<RequestPermissionOutcome>,
+) {
+    use agent_client_protocol::v1::schema::{PermissionOption, PermissionOptionKind};
+    let (reply, answer) = Reply::new();
+    let ask = PermissionAsk {
+        tool_call: ToolCallUpdateFields::new()
+            .title("Lire l'agenda".to_owned())
+            .name("Read".to_owned()),
+        options: vec![
+            PermissionOption::new("allow-once", "Yes", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("reject", "No", PermissionOptionKind::RejectOnce),
+        ],
+        reply,
+    };
+    (ask, answer)
+}
+
+fn inject(inject: &Inject, event: AgentEvent) {
+    let events = inject.lock().unwrap().clone().expect("not connected");
+    events.send(event).expect("the assistant stopped listening");
+}
+
+/// A turn that waits for `gate` after its first text, "Je regarde".
+fn held(gate: &Arc<Notify>) -> FakeScript {
+    FakeScript {
+        updates: vec![text_chunk("Je regarde"), text_chunk(" Voilà.")],
+        pause: Some((1, gate.clone())),
+        ..FakeScript::default()
+    }
+}
+
+fn looking() -> Event {
+    Event::Assistant {
+        text: "Je regarde".into(),
+    }
+}
+
+/// The ids of the requests still pending in the database.
+async fn pending(dir: &Path) -> Vec<i64> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let db = fronde_db::open(dir).await.unwrap();
+    fronde_entity::requests::Entity::find()
+        .filter(fronde_entity::requests::Column::Status.eq("pending"))
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_permission_answered_on_the_wire_closes_its_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Notify::new());
+    let (assistant, fakes, injector) = open_injecting(dir.path(), held(&gate)).await;
+    assistant.send("Mon agenda ?".into()).await;
+    wait_until(&assistant, |events| events.contains(&looking())).await;
+
+    // The card shows, then the agent's side cancels the request (a cancel on the wire) before
+    // the turn's requests are cancelled.
+    let (ask, answer) = injected_ask();
+    let reply = ask.reply.clone();
+    inject(&injector, AgentEvent::Permission(Box::new(ask)));
+    let id = wait_for_permission(&assistant).await;
+    assert!(reply.send(RequestPermissionOutcome::Cancelled));
+    assert_eq!(answer.await.unwrap(), RequestPermissionOutcome::Cancelled);
+
+    // The card closes at once, so no answer is recorded as given.
+    wait_until(&assistant, |events| {
+        events.contains(&closed(id, Outcome::Cancelled))
+    })
+    .await;
+    assert_eq!(fakes.allow(id).await, Err(Refusal::Closed));
+    assert_eq!(pending(dir.path()).await, Vec::<i64>::new());
+    gate.notify_one();
+    wait_for_turns(&assistant, 1).await;
+}
+
+#[tokio::test]
+async fn a_permission_answered_before_its_card_shows_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Notify::new());
+    let (assistant, _fakes, injector) = open_injecting(dir.path(), held(&gate)).await;
+    assistant.send("Mon agenda ?".into()).await;
+    wait_until(&assistant, |events| events.contains(&looking())).await;
+
+    let (ask, answer) = injected_ask();
+    assert!(ask.reply.send(RequestPermissionOutcome::Cancelled));
+    inject(&injector, AgentEvent::Permission(Box::new(ask)));
+    // Events are recorded in order: once the next one shows, the request was handled.
+    inject(&injector, AgentEvent::Text("Ensuite".into()));
+    let after = Event::Assistant {
+        text: "Ensuite".into(),
+    };
+    let events = wait_until(&assistant, |events| events.contains(&after)).await;
+    assert!(!events.iter().any(is_permission), "{events:?}");
+    assert_eq!(answer.await.unwrap(), RequestPermissionOutcome::Cancelled);
+    assert_eq!(pending(dir.path()).await, Vec::<i64>::new());
+    gate.notify_one();
+    wait_for_turns(&assistant, 1).await;
+}
+
+#[tokio::test]
+async fn a_permission_after_its_turn_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, _fakes, injector) = open_injecting(dir.path(), FakeScript::default()).await;
+    assistant.send("Mon agenda ?".into()).await;
+    wait_for_turns(&assistant, 1).await;
+
+    // A background task of the agent's asks once the turn is over: no card can belong to it.
+    let (ask, answer) = injected_ask();
+    inject(&injector, AgentEvent::Permission(Box::new(ask)));
+    assert_eq!(
+        timeout(WAIT, answer).await.unwrap().unwrap(),
+        selected("reject")
+    );
+    let events = events(&assistant);
+    assert!(!events.iter().any(is_permission), "{events:?}");
+    assert_eq!(pending(dir.path()).await, Vec::<i64>::new());
+}
+
+#[tokio::test]
+async fn no_card_outlives_its_turn() {
+    // The agent's requests race the end of the turn: whatever the order, the agent is answered
+    // and no card is left open.
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Notify::new());
+        let (assistant, _fakes, injector) = open_injecting(dir.path(), held(&gate)).await;
+        assistant.send("Mon agenda ?".into()).await;
+        wait_until(&assistant, |events| events.contains(&looking())).await;
+        let (ask, answer) = injected_ask();
+        gate.notify_one();
+        inject(&injector, AgentEvent::Permission(Box::new(ask)));
+        wait_for_turns(&assistant, 1).await;
+        let answered = timeout(WAIT, answer).await.unwrap().unwrap();
+        assert!(
+            answered == RequestPermissionOutcome::Cancelled || answered == selected("reject"),
+            "{answered:?}"
+        );
+        timeout(WAIT, async {
+            while !pending(dir.path()).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a card outlived its turn");
+    }
 }

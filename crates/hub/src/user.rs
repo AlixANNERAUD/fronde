@@ -4,6 +4,12 @@ use crate::config::is_valid_name;
 use crate::origin::Origin;
 use crate::source::Tool;
 use crate::tools::{CallContext, ToolOutput, typed_tool_with_context};
+// Card texts stay short enough for a phone, and a card small enough for the chat's messages:
+// the caps the requests enforce on every card.
+use fronde_protocol::request::{
+    MAX_DESCRIPTION, MAX_HEADER, MAX_LABEL, MAX_PLACEHOLDER, MAX_PREVIEW, MAX_QUESTION, MAX_REASON,
+    MAX_SECRET_LABEL, MAX_URL,
+};
 use fronde_protocol::{Card, ChoiceOption, Field, Remember, Response};
 use fronde_requests::{Ask, Caller, Requests, Resolution, Reused, Saved, Waiter};
 use schemars::JsonSchema;
@@ -20,23 +26,11 @@ const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_QUESTIONS: usize = 4;
 const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 4;
-const MAX_HEADER: usize = 12;
 const MAX_CLIENT_REQUEST_ID: usize = 128;
-/// Card texts stay short enough for a phone, and a card small enough for the chat's messages.
-const MAX_QUESTION: usize = 300;
-const MAX_LABEL: usize = 60;
-const MAX_DESCRIPTION: usize = 200;
-const MAX_PREVIEW: usize = 4000;
 /// The longest name an outside client may show on a card.
 const MAX_CLIENT_NAME: usize = 40;
 /// Names an outside client may not take: a card headed with them would pass for Fronde's own.
 const RESERVED_CLIENT_NAMES: [&str; 2] = ["fronde", "assistant"];
-
-/// A secret card's texts.
-const MAX_SECRET_LABEL: usize = 60;
-const MAX_REASON: usize = 300;
-const MAX_PLACEHOLDER: usize = 60;
-const MAX_URL: usize = 2000;
 
 const SECRET_DESCRIPTION: &str = "Ask the user for one secret (password, token, key) in a private card and wait. The value never reaches you: you get a one-use secret_ref for this conversation, or, if the owner keeps it, the name it is stored under. One secret per call; never ask for a secret in chat or in user_ask. Blocks up to timeout_ms (default 10 min).";
 
@@ -454,13 +448,10 @@ fn check_asker(caller: &Caller) -> Result<(), String> {
 }
 
 /// The first control character of `text`, as `U+XXXX`; line breaks and tabs are allowed when
-/// `multiline`. Bidirectional controls count too: they can make a name or a label read as
-/// another.
+/// `multiline`. Any character a card never shows as it is counts (format, invisible,
+/// bidirectional, separator, unassigned): it can make a name or a label read as another.
 fn control_char(text: &str, multiline: bool) -> Option<String> {
-    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
-    text.chars()
-        .find(|&c| (c.is_control() || bidi(c)) && !(multiline && matches!(c, '\n' | '\t')))
-        .map(|c| format!("U+{:04X}", u32::from(c)))
+    fronde_protocol::text::first_hidden(text, multiline).map(|c| format!("U+{:04X}", u32::from(c)))
 }
 
 /// What to fix in one text of the card: too long, or holding a control character.

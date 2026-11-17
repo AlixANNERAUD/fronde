@@ -5,11 +5,12 @@ use crate::confine::Confine;
 use crate::legacy;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
+use agent_client_protocol::v1::schema::RequestPermissionOutcome;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use fronde_db::DatabaseConnection;
 use fronde_protocol::{Card, Outcome, RequestId};
-use fronde_requests::{Ask, Caller, Journal, Requests, User};
+use fronde_requests::{Ask, Caller, Journal, Requests, Resolution, User};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::Path;
@@ -85,6 +86,8 @@ struct Turn {
     cancel: CancellationToken,
     /// The seq of its user message, if it was logged.
     seq: Option<u64>,
+    /// Its requests are being cancelled: it asks nothing more.
+    ending: bool,
 }
 
 /// A connected agent and the task recording its events.
@@ -197,6 +200,7 @@ impl Assistant {
             *turn = Some(Turn {
                 cancel: cancel.clone(),
                 seq,
+                ending: false,
             });
             (cancel, seq)
         };
@@ -214,7 +218,12 @@ impl Assistant {
                     TurnOutcome::Error
                 }
             };
-            // Nobody waits for the answers any more, and their cards close before the turn.
+            // Nobody waits for the answers any more, and their cards close before the turn. A
+            // request coming in meanwhile (a background task of the agent's) finds the turn
+            // over rather than one whose requests were already cancelled.
+            if let Some(turn) = assistant.turn.lock().await.as_mut() {
+                turn.ending = true;
+            }
             assistant.cancel_requests(seq).await;
             let mut turn = assistant.turn.lock().await;
             assistant.append(Event::TurnEnded { outcome }).await;
@@ -245,10 +254,15 @@ impl Assistant {
         }
     }
 
-    /// The seq of the running turn's user message, `None` when idle: what a request asked
-    /// during the turn is tied to.
+    /// The seq of the running turn's user message, `None` when idle or ending: what a request
+    /// asked during the turn is tied to.
     pub async fn current_turn(&self) -> Option<u64> {
-        self.turn.lock().await.as_ref().and_then(|turn| turn.seq)
+        self.turn
+            .lock()
+            .await
+            .as_ref()
+            .filter(|turn| !turn.ending)
+            .and_then(|turn| turn.seq)
     }
 
     fn requests(&self) -> Option<Arc<Requests>> {
@@ -266,6 +280,10 @@ impl Assistant {
             options,
             reply,
         } = ask;
+        // Answered on the wire meanwhile (a cancel): there is nothing left to ask.
+        if reply.is_answered() {
+            return;
+        }
         let deny = || {
             reply.send(permission::denial(&options));
         };
@@ -282,6 +300,7 @@ impl Assistant {
             tracing::warn!("a permission request offered nothing the card can show: refused");
             return deny();
         };
+        let offered = permission::offered(&card);
         let timeout = *lock(&self.permission_timeout);
         let asked = requests
             .ask(Ask {
@@ -302,10 +321,37 @@ impl Assistant {
                 return deny();
             }
         };
+        let id = waiter.id();
+        // The turn may have ended while the card was being shown, after its requests were
+        // cancelled: this one must not outlive it.
+        if self.current_turn().await != Some(turn) {
+            if let Err(error) = requests.cancel(id).await {
+                tracing::error!("cannot cancel permission request {id}: {error:#}");
+            }
+            reply.send(RequestPermissionOutcome::Cancelled);
+            return;
+        }
         // Waiting here would hold up the agent's next events.
         tokio::spawn(async move {
-            let resolution = waiter.wait().await;
-            reply.send(permission::outcome(&resolution, &options));
+            tokio::select! {
+                resolution = waiter.wait() => {
+                    let outcome = permission::outcome(&resolution, &options, &offered);
+                    if !reply.send(outcome) && matches!(resolution, Resolution::Answered(_)) {
+                        tracing::warn!(
+                            "permission request {id} was answered after the agent got its answer: the agent did not get this one"
+                        );
+                    }
+                }
+                // The agent got its answer elsewhere (a cancel on the wire): the card closes,
+                // so that no later answer is recorded as given.
+                () = reply.answered() => match requests.cancel(id).await {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        "permission request {id} was closed after the agent got its answer: the agent did not get this one"
+                    ),
+                    Err(error) => tracing::error!("cannot cancel permission request {id}: {error:#}"),
+                },
+            }
         });
     }
 

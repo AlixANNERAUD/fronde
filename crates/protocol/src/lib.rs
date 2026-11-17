@@ -1,6 +1,7 @@
 //! Types shared by the conversation log, the server and the frontend.
 
 pub mod request;
+pub mod text;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

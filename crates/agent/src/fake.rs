@@ -21,7 +21,8 @@ pub const FAKE_SESSION_ID: &str = "fake-session-1";
 pub struct FakeScript {
     /// Updates streamed during each prompt, before any permission request.
     pub updates: Vec<SessionUpdate>,
-    /// Ask one permission (options `allow-once`, `allow-with-updates`, `reject`) during each prompt.
+    /// Ask one permission to use the tool `Read` (options `allow-once`, `allow-with-updates`,
+    /// `reject`, as the Claude adapter offers them) during each prompt.
     pub ask_permission: bool,
     /// Stop reason of each prompt, unless the permission request was cancelled.
     pub stop: StopReason,
@@ -263,7 +264,9 @@ fn permission_request(
         session,
         ToolCallUpdate::new(
             "tool-1",
-            ToolCallUpdateFields::new().title("Lire l'agenda".to_owned()),
+            ToolCallUpdateFields::new()
+                .title("Lire l'agenda".to_owned())
+                .name("Read".to_owned()),
         ),
         vec![
             PermissionOption::new("allow-once", "Allow", PermissionOptionKind::AllowOnce),

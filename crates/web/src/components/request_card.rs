@@ -40,6 +40,9 @@ const CARD_CLASS: &str = "w-full sm:max-w-[85%]";
 const BUTTON_CLASS: &str = "h-11 w-full sm:h-9 sm:w-auto";
 /// How many lines of a permission's body show before the rest is folded away.
 const BODY_LINES: usize = 6;
+/// A permission's texts read left to right, character after character: right-to-left letters
+/// cannot reorder a command's arguments, whatever the agent wrote.
+const IN_ORDER: &str = "[unicode-bidi:bidi-override]";
 
 /// What the user did with one question so far.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -74,6 +77,8 @@ pub fn RequestCard(
             tool,
             body,
             options,
+            truncated,
+            replaced,
         } => {
             return rsx! {
                 PermissionCard {
@@ -82,6 +87,8 @@ pub fn RequestCard(
                     tool,
                     body,
                     options,
+                    truncated,
+                    replaced,
                     status,
                     refusal,
                     by,
@@ -167,6 +174,10 @@ fn PermissionCard(
     tool: Option<ToolKind>,
     body: Option<String>,
     options: Vec<PermissionChoice>,
+    /// Part of the title or the body was left out.
+    truncated: bool,
+    /// Hidden characters were replaced.
+    replaced: bool,
     status: RequestStatus,
     refusal: Option<String>,
     by: Option<String>,
@@ -188,9 +199,24 @@ fn PermissionCard(
         }
     };
     let content = rsx! {
-        p { class: "text-sm font-medium wrap-break-word", "{title}" }
+        p {
+            id: "r{id}-title",
+            dir: "ltr",
+            class: "text-sm font-medium wrap-break-word {IN_ORDER}",
+            "{title}"
+        }
         if let Some(body) = &body {
             {permission_body(id, body)}
+        }
+        if truncated {
+            p { id: "r{id}-truncated", role: "note", class: "text-destructive text-xs font-medium",
+                "Texte tronqué : le milieu est omis, vérifie le début et la fin."
+            }
+        }
+        if replaced {
+            p { id: "r{id}-replaced", role: "note", class: "text-destructive text-xs font-medium",
+                "Caractères cachés remplacés par �."
+            }
         }
     };
     match status {
@@ -255,11 +281,11 @@ fn PermissionCard(
 
 /// What the tool would do, in monospace: its first lines, the rest folded away.
 fn permission_body(id: RequestId, body: &str) -> Element {
-    const PRE: &str = "bg-muted max-h-96 overflow-auto rounded-md p-2 font-mono text-xs whitespace-pre-wrap wrap-break-word";
+    const PRE: &str = "bg-muted max-h-96 overflow-auto rounded-md p-2 font-mono text-xs whitespace-pre-wrap wrap-break-word [unicode-bidi:bidi-override]";
     let lines: Vec<&str> = body.lines().collect();
     if lines.len() <= BODY_LINES {
         return rsx! {
-            pre { id: "r{id}-body", class: PRE, "{body}" }
+            pre { id: "r{id}-body", dir: "ltr", class: PRE, "{body}" }
         };
     }
     let head = format!("{}\n…", lines[..BODY_LINES].join("\n"));
@@ -268,12 +294,12 @@ fn permission_body(id: RequestId, body: &str) -> Element {
     rsx! {
         details { id: "r{id}-body", class: "group",
             summary { class: "cursor-pointer list-none",
-                pre { class: "{PRE} group-open:hidden", "{head}" }
+                pre { dir: "ltr", class: "{PRE} group-open:hidden", "{head}" }
                 span { class: "text-muted-foreground inline-flex min-h-11 items-center text-xs sm:min-h-0 sm:py-1",
                     "Afficher tout ({count} lignes)"
                 }
             }
-            pre { class: PRE, "{body}" }
+            pre { dir: "ltr", class: PRE, "{body}" }
         }
     }
 }
@@ -2101,6 +2127,8 @@ mod tests {
                 ),
                 choice("reject", PermissionKind::RejectOnce, None),
             ],
+            truncated: false,
+            replaced: false,
         }
     }
 
@@ -2154,10 +2182,65 @@ mod tests {
                 kind: PermissionKind::AllowOnce,
                 detail: None,
             }],
+            truncated: false,
+            replaced: false,
         };
         let page = render(props(bare));
         assert!(tag(&page, "r7-body").is_none(), "{page}");
         assert!(!page.contains("Commande"), "{page}");
+        // Nothing was cut or replaced: no warning.
+        assert!(tag(&page, "r7-truncated").is_none(), "{page}");
+        assert!(tag(&page, "r7-replaced").is_none(), "{page}");
+    }
+
+    #[test]
+    fn permission_texts_read_in_order_and_say_what_was_changed() {
+        // Right-to-left letters cannot reorder the arguments of a command: the title and the
+        // body are shown left to right, character after character.
+        let mut card = permission(Some("$ mv א ב"));
+        let Card::Permission {
+            title,
+            truncated,
+            replaced,
+            ..
+        } = &mut card
+        else {
+            unreachable!()
+        };
+        *title = "mv א ב".into();
+        *truncated = true;
+        *replaced = true;
+        let page = render(props(card.clone()));
+        for id in ["r7-title", "r7-body"] {
+            let tag = tag(&page, id).unwrap_or_else(|| panic!("no {id}"));
+            assert!(tag.contains(r#"dir="ltr""#), "{tag}");
+            assert!(
+                class_of(&page, id).contains("[unicode-bidi:bidi-override]"),
+                "{tag}"
+            );
+        }
+        assert!(page.contains("mv א ב"), "{page}");
+        let truncated = tag(&page, "r7-truncated").expect("the truncation warning");
+        assert!(truncated.contains(r#"role="note""#), "{truncated}");
+        assert!(page.contains("Texte tronqué"), "{page}");
+        assert!(tag(&page, "r7-replaced").is_some(), "{page}");
+        assert!(page.contains("Caractères cachés remplacés"), "{page}");
+        // A folded body reads in order too, folded or not.
+        let lines: Vec<String> = (1..=10).map(|n| format!("mv א{n} ב")).collect();
+        let page = render(props(permission(Some(&lines.join("\n")))));
+        let pres: Vec<&str> = page.split("<pre").skip(1).collect();
+        assert_eq!(pres.len(), 2, "{page}");
+        for pre in pres {
+            assert!(pre.contains(r#"dir="ltr""#), "{pre}");
+            assert!(pre.contains("[unicode-bidi:bidi-override]"), "{pre}");
+        }
+        // The warnings stay on the closed card.
+        let page = render(HarnessProps {
+            status: RequestStatus::Closed(Outcome::Cancelled),
+            ..props(card)
+        });
+        assert!(page.contains("Texte tronqué"), "{page}");
+        assert!(page.contains("Caractères cachés remplacés"), "{page}");
     }
 
     #[test]

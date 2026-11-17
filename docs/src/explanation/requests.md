@@ -56,9 +56,13 @@ chooses its name, the hub refuses to ask the user anything for one named *Fronde
 character.
 
 A card's texts are capped so that it stays readable on a phone and small on the wire: a question
-at most 300 characters, a label 60, a description 200, a preview 4000. None may hold a control
-character (a preview may hold line breaks and tabs), nor a bidirectional control that would make
-it read as something else. Each refusal tells the agent how to fix its call. The chat's WebSocket
+at most 300 characters, a label 60, a description 200, a preview 4000. None may hold a hidden
+character (a preview may hold line breaks and tabs): a control or format character (bidirectional
+controls, zero-width characters, the soft hyphen), a line or paragraph separator, a tag
+character, a variation selector, a private-use or unassigned code point, or any other code point
+Unicode lets a renderer show as nothing. Such a character could make a text read as another.
+Each refusal tells the agent how to fix its call. The server checks every card against these
+rules before it writes it, whoever built it. The chat's WebSocket
 takes messages of at most 64 KiB, and closes on a bigger one.
 
 A closed card says how it ended, and who answered when it was not you.
@@ -71,28 +75,58 @@ Fronde's assistant asks before it acts: each time the agent asks to use a tool (
 
 - the tool call's title, in one line of at most 200 characters, and its kind (*Lecture*,
   *Modification*, *Commande*, *Accès web*…);
-- what it would do, in monospace: the command, the files and the address it names, its text (a
-  plan), and for each file it would change a summary such as `notes.md : -1 +3 ligne(s)`, at
-  most 4000 characters, folded after six lines;
+- what it would do, in monospace: the command, the files and the address it names (or, for a
+  tool such as an MCP server's, its arguments as JSON), its text (a plan), and for each file it
+  would change a summary such as `notes.md : -1 +3 ligne(s)` with its first eight changed lines,
+  each line at most 300 characters and the whole at most 4000, folded after six lines;
 - one button per option the agent offers, in its order, named by kind (*Autoriser une fois*,
   *Toujours autoriser*, *Refuser*, *Toujours refuser*), with the agent's own words for the option
   under the button when they say more, such as what *always* covers.
 
-All of these texts come from the agent, which may have read them from a web page. Fronde caps
-them and replaces every control and bidirectional character with `�` before the card is written,
-so a command cannot hide its end behind a right-to-left override or an escape sequence, and the
-page shows them as text, never markup. Options that last (`allow_always`, `reject_always`) are
-shown only to an admin, and never on a tool call that switches the session's mode: there, Claude
-Code's lasting options leave plan mode for a mode that asks less (auto mode, accepting edits), and
-such a switch must never be one tap away, so the card offers only *Autoriser une fois* and
-*Refuser*. The server refuses any option the card does not offer.
+All of these texts come from the agent, which may have read them from a web page, so the card
+never lets one hide what it does:
+
+- **Hidden characters** (the list above) become `�`, and the card then says *Caractères cachés
+  remplacés par �*. A command cannot hide its end behind a right-to-left override, an escape
+  sequence or a zero-width space.
+- **Order.** The title and the body are shown left to right, character after character
+  (`dir="ltr"`, `unicode-bidi: bidi-override`): right-to-left letters, which are not hidden,
+  cannot reorder the arguments of `mv <hebrew> <hebrew>`.
+- **Length.** A text too long keeps its head and its tail around `[… N caractères omis …]`, line
+  by line and as a whole, and the card then says *Texte tronqué : le milieu est omis, vérifie le
+  début et la fin*. Padding cannot push the end of a command or of a plan out of sight. A run of
+  more than eight spaces shows as `[… N espaces …]`, and more than two blank lines as `[… N
+  lignes vides …]`. Nothing is refused for being long: a long plan is legitimate, and refusing
+  it would only refuse the agent.
+- The page shows these texts as text, never markup.
+
+Options are offered as follows:
+
+- One-time options (*Autoriser une fois*, *Refuser*) as the agent gives them.
+- A lasting option only to an admin, and only one whose effect Fronde knows. With the Claude
+  adapter, that is the allow rule its *always* adds for the tool at hand: Read, Glob and Grep
+  (reading, for the session), Bash and PowerShell (a command prefix), WebFetch (a domain), a
+  network host, an MCP tool, a skill. Not on Edit, Write or NotebookEdit, where the same option
+  may also switch the session to accepting every edit, and never another agent's: what it would
+  grant cannot be told.
+- On a tool call that switches the session's mode (leaving plan mode, entering it), only
+  *Yes, manually approve edits* and *No*: every other option there may switch to a mode that asks
+  less (auto mode, accepting every edit), which must never be one tap away.
+- An option id the agent gives with two different kinds is left out.
+
+The server refuses any option the card does not offer, and the agent only ever gets one the card
+offered.
 
 The answer is the same `answer` message as any card's, checked by the same code, and the first
-one wins. The agent then gets the option chosen. It gets a refusal (the agent's *reject once*, or
+one wins. Only Fronde's assistant may ask for a permission. A refused answer (not yours, already
+closed, not an option of the card) is logged as a warning naming the user and the request, never
+the answer. The agent then gets the option chosen. It gets a refusal (the agent's *reject once*, or
 a cancel if it offered none) when the card expires after **30 minutes** or is declined: no answer
 means no. It gets a cancel when you press *Stop* or the turn ends: both close the turn's open
-cards. A permission still pending when Fronde stops expires at the next start, since the agent's
-call that waited on it is gone with the agent's process.
+cards; a request that comes after its turn ended is refused at once, so no card outlives its
+turn. When the agent's side cancels a request first, its card closes too, so a late tap is never
+recorded as granted. A permission still pending when Fronde stops expires at the next start,
+since the agent's call that waited on it is gone with the agent's process.
 
 *Toujours autoriser* is the agent's own option, and Fronde passes it on without keeping anything.
 With Claude Code, it adds an allow rule to the running agent process: it lasts until that process
