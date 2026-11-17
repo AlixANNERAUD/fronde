@@ -1,13 +1,19 @@
-//! `/`: the chat. The server only serves it with a session; the conversation comes over `/ws`.
+//! `/` and `/t/<id>`: a thread's chat; `/new`: a chat whose first message makes a thread. The
+//! server only serves them with a session; the conversation comes over `/ws`.
 
+use std::collections::HashMap;
+
+use dioxus::html::{ScrollBehavior, geometry::PixelsVector2D};
 use dioxus::prelude::*;
-use fronde_client::{Chat, Item, PermissionStatus, ToolStatus};
-use fronde_protocol::ClientMsg;
+use fronde_client::{Chat, Item, PermissionStatus, Threads, ToolStatus};
+use fronde_protocol::{ClientMsg, ThreadId, ThreadSummary};
 
 use crate::{
-    components::icons::{ArrowUp, Check, LogOut, Square, Wrench, X},
+    components::icons::{ArrowUp, Check, LogOut, Menu, Plus, Square, Wrench, X},
     components::request_card::RequestCard,
+    components::thread_list::{ICON_LINK, Place, PlaceLink, Renamer, ThreadMenu},
     components::ui::{
+        alert::{Alert, AlertDescription, AlertVariant},
         badge::{Badge, BadgeVariant},
         bubble::{Bubble, BubbleAlign, BubbleContent, BubbleVariant},
         button::{Button, ButtonSize, ButtonVariant},
@@ -17,42 +23,205 @@ use crate::{
         scroll_area::ScrollAreaViewport,
         spinner::Spinner,
     },
-    socket::{Outgoing, Status, use_chat_socket},
+    socket::{Outgoing, Status},
 };
 
-#[component]
-pub fn ChatPage() -> Element {
-    let chat = use_signal(Chat::default);
-    let status = use_signal(|| Status::Connecting);
-    let socket = use_chat_socket(chat, status);
-    rsx! {
-        ChatView { chat: chat(), status: status(), on_send: move |outgoing| socket.send(outgoing) }
+/// Whom the composer writes to.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Target {
+    /// The main thread, unnamed, as a page without threads writes to it.
+    #[default]
+    Main,
+    Thread(ThreadId),
+    /// The thread the first message makes, through the page's threads.
+    New(Signal<Threads>),
+}
+
+impl Target {
+    /// Thread `id`'s; the main thread's stays unnamed.
+    pub fn of(id: ThreadId) -> Self {
+        if id == ThreadId::MAIN {
+            Self::Main
+        } else {
+            Self::Thread(id)
+        }
+    }
+
+    /// Whose draft and scroll the chat keeps: `None` for a thread not made yet.
+    fn kept(self) -> Option<ThreadId> {
+        match self {
+            Self::Main => Some(ThreadId::MAIN),
+            Self::Thread(id) => Some(id),
+            Self::New(_) => None,
+        }
+    }
+
+    /// The `thread` of the messages sent.
+    fn thread(self) -> Option<ThreadId> {
+        match self {
+            Self::Thread(id) => Some(id),
+            Self::Main | Self::New(_) => None,
+        }
     }
 }
 
-/// The chat as drawn from its model: no socket, so it renders anywhere.
+/// The key of a new thread's first message, shown while the server makes the thread; no row's
+/// key (`<generation>-<seq>`) looks like it.
+const PENDING: &str = "pending";
+
+/// What the page keeps of each thread while it shows another: the draft (`None`: a new
+/// thread's) and where the chat was scrolled.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Kept {
+    pub drafts: HashMap<Option<ThreadId>, String>,
+    pub scrolls: HashMap<ThreadId, f64>,
+}
+
+/// The chat as drawn from its model: no socket, so it renders anywhere. Without `on_go` it is
+/// the page of before threads: the main thread, no links.
 #[component]
-pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> Element {
+pub fn ChatView(
+    chat: Chat,
+    status: Status,
+    on_send: EventHandler<Outgoing>,
+    #[props(default)] target: Target,
+    /// The thread as the list has it: its title and menu in the header; read-only if archived.
+    #[props(default)]
+    summary: Option<ThreadSummary>,
+    #[props(default)] kept: Option<Signal<Kept>>,
+    /// Links to the thread list and to a new thread.
+    #[props(default)]
+    on_go: Option<EventHandler<Place>>,
+    /// The list sits beside the chat from `md` up: its link hides there.
+    #[props(default)]
+    sidebar: bool,
+    /// A thread message the server refused, and how to dismiss it.
+    #[props(default)]
+    refusal: Option<String>,
+    #[props(default)] on_dismiss: Option<EventHandler<()>>,
+) -> Element {
     let open = status == Status::Open;
+    let mut renaming = use_signal(|| false);
+    let new = matches!(target, Target::New(_));
+    let pending = match target {
+        Target::New(threads) => threads.read().creating_text().map(str::to_owned),
+        _ => None,
+    };
+    let archived = summary.as_ref().is_some_and(|summary| summary.archived);
+    let title = if new {
+        rsx! {
+            h1 { class: "min-w-0 truncate font-semibold", "Nouvelle conversation" }
+        }
+    } else if let Some(summary) = &summary {
+        if renaming() {
+            rsx! {
+                Renamer {
+                    field_id: "th-{summary.id}-title",
+                    id: summary.id,
+                    title: summary.title.clone(),
+                    open,
+                    on_send,
+                    on_done: move |()| renaming.set(false),
+                }
+            }
+        } else {
+            rsx! {
+                h1 { class: "min-w-0 truncate font-semibold", "{summary.title}" }
+                ThreadMenu {
+                    prefix: "th-{summary.id}",
+                    id: summary.id,
+                    title: summary.title.clone(),
+                    archived,
+                    open,
+                    on_rename: move |()| renaming.set(true),
+                    on_send,
+                }
+            }
+        }
+    } else {
+        rsx! {
+            span { class: "font-semibold", "Fronde" }
+        }
+    };
+    let list_link = if sidebar {
+        format!("{ICON_LINK} md:hidden")
+    } else {
+        ICON_LINK.to_owned()
+    };
+    let scrolled = target.kept().filter(|_| kept.is_some());
     rsx! {
-        div { class: "flex h-dvh flex-col",
+        div { class: "flex h-dvh min-w-0 flex-1 flex-col",
             header { class: "shrink-0 border-b pt-[env(safe-area-inset-top)]",
-                div { class: "mx-auto flex h-12 max-w-3xl items-center gap-3 px-4",
-                    span { class: "font-semibold", "Fronde" }
-                    form { method: "post", action: "/auth/sign-out", class: "ml-auto",
-                        Button {
-                            variant: ButtonVariant::Ghost,
-                            size: ButtonSize::Sm,
-                            button_type: "submit",
-                            aria_label: "Se déconnecter",
-                            LogOut {}
-                            "Se déconnecter"
+                div { class: "mx-auto flex h-12 max-w-3xl items-center gap-1 px-4",
+                    if let Some(on_go) = on_go {
+                        PlaceLink {
+                            place: Place::List,
+                            on_go,
+                            class: list_link,
+                            aria_label: "Conversations",
+                            Menu {}
+                        }
+                    }
+                    {title}
+                    div { class: "ml-auto flex items-center gap-1",
+                        if let Some(on_go) = on_go.filter(|_| !new) {
+                            PlaceLink {
+                                place: Place::New,
+                                on_go,
+                                class: ICON_LINK,
+                                aria_label: "Nouvelle conversation",
+                                Plus {}
+                            }
+                        }
+                        form { method: "post", action: "/auth/sign-out",
+                            Button {
+                                variant: ButtonVariant::Ghost,
+                                size: ButtonSize::Sm,
+                                button_type: "submit",
+                                aria_label: "Se déconnecter",
+                                LogOut {}
+                                "Se déconnecter"
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = refusal {
+                div { class: "mx-auto w-full max-w-3xl shrink-0 px-4 pt-3",
+                    Alert {
+                        variant: AlertVariant::Destructive,
+                        class: "flex items-center gap-2",
+                        AlertDescription { class: "min-w-0 flex-1", "{reason}" }
+                        if let Some(on_dismiss) = on_dismiss {
+                            Button {
+                                variant: ButtonVariant::Ghost,
+                                size: ButtonSize::Icon,
+                                class: "size-11 md:size-9",
+                                aria_label: "Fermer",
+                                onclick: move |_| on_dismiss.call(()),
+                                X {}
+                            }
                         }
                     }
                 }
             }
             // Reversed, so the view starts at the end and stays there as the chat grows.
-            ScrollAreaViewport { class: "flex min-h-0 flex-1 flex-col-reverse",
+            ScrollAreaViewport {
+                class: "flex min-h-0 flex-1 flex-col-reverse",
+                onscroll: move |event: ScrollEvent| {
+                    if let (Some(mut kept), Some(id)) = (kept, scrolled) {
+                        kept.write().scrolls.insert(id, event.data().scroll_top());
+                    }
+                },
+                onmounted: move |event: MountedEvent| async move {
+                    let top = kept
+                        .zip(scrolled)
+                        .and_then(|(kept, id)| kept.peek().scrolls.get(&id).copied());
+                    if let Some(top) = top.filter(|top| *top != 0.0) {
+                        let to = PixelsVector2D::new(0.0, top);
+                        let _ = event.data().scroll(to, ScrollBehavior::Instant).await;
+                    }
+                },
                 ol {
                     aria_label: "Conversation",
                     class: "mx-auto flex w-full max-w-3xl flex-col gap-3 px-4 py-4",
@@ -61,10 +230,40 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
                             RowView { item: row.item.clone(), open, admin: chat.admin(), on_send }
                         }
                     }
+                    if let Some(text) = pending {
+                        li { key: "{PENDING}", class: "flex flex-col gap-1",
+                            RowView {
+                                item: Item::User { text, by: None },
+                                open,
+                                admin: chat.admin(),
+                                on_send,
+                            }
+                            p {
+                                role: "status",
+                                class: "text-muted-foreground flex items-center justify-end gap-2 text-xs",
+                                Spinner { class: "size-3" }
+                                "Création de la conversation…"
+                            }
+                        }
+                    }
                 }
             }
             div { class: "shrink-0 border-t px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]",
-                Composer { running: chat.running(), status, on_send }
+                if archived {
+                    p {
+                        role: "status",
+                        class: "text-muted-foreground mx-auto max-w-3xl py-2 text-center text-sm",
+                        "Conversation archivée : désarchive-la pour lui écrire."
+                    }
+                } else {
+                    Composer {
+                        running: chat.running(),
+                        status,
+                        target,
+                        kept,
+                        on_send,
+                    }
+                }
             }
         }
     }
@@ -73,9 +272,13 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
 #[component]
 fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>) -> Element {
     match item {
-        Item::User { text, .. } => rsx! {
+        Item::User { text, by } => rsx! {
             Message { align: MessageAlign::End,
                 MessageContent {
+                    // A sub-agent's task, written by its parent thread.
+                    if let Some(by) = by {
+                        p { class: "text-muted-foreground text-right text-xs", "Écrit par {by}" }
+                    }
                     Bubble { align: BubbleAlign::End,
                         BubbleContent { class: "whitespace-pre-wrap", "{text}" }
                     }
@@ -179,33 +382,83 @@ fn LegacyPermissionCard(title: String, status: PermissionStatus) -> Element {
     }
 }
 
-/// The message box: Enter sends, Shift+Enter adds a line; Stop while a turn runs.
+/// A new thread's `client_id`: random, so that no two pages ever share one.
+#[cfg(target_arch = "wasm32")]
+fn client_id() -> String {
+    let random = || (js_sys::Math::random() * 2f64.powi(52)) as u64;
+    format!("{:013x}{:013x}", random(), random())
+}
+
+/// Natively, in tests: one after the other.
+#[cfg(not(target_arch = "wasm32"))]
+fn client_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("page-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The message box: Enter sends, Shift+Enter adds a line; Stop while a turn runs. Its draft is
+/// kept in `kept` for when the page comes back to its thread.
 #[component]
-fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> Element {
-    let mut draft = use_signal(String::new);
+fn Composer(
+    running: bool,
+    status: Status,
+    target: Target,
+    kept: Option<Signal<Kept>>,
+    on_send: EventHandler<Outgoing>,
+) -> Element {
+    let key = target.kept();
+    let mut draft = use_signal(|| {
+        kept.and_then(|kept| kept.peek().drafts.get(&key).cloned())
+            .unwrap_or_default()
+    });
+    use_effect(move || {
+        let text = draft();
+        if let Some(mut kept) = kept {
+            kept.write().drafts.insert(key, text);
+        }
+    });
     // The draft goes only once the message went out.
     let delivered = use_callback(move |()| draft.set(String::new()));
     let open = status == Status::Open;
+    let creating = match target {
+        Target::New(threads) => threads.read().creating(),
+        _ => false,
+    };
     let submit = move || {
         // The server refuses a message while a turn runs: the draft stays for later.
-        if running || !open {
+        if running || !open || creating {
             return;
         }
         let text = draft.peek().trim().to_owned();
-        if !text.is_empty() {
-            on_send.call(Outgoing {
-                message: ClientMsg::Send { text, thread: None },
-                sent: Some(delivered),
-                dropped: None,
-            });
+        if text.is_empty() {
+            return;
         }
+        let message = match target {
+            Target::New(mut threads) => threads.write().create(client_id(), text),
+            _ => ClientMsg::Send {
+                text,
+                thread: target.thread(),
+            },
+        };
+        on_send.call(Outgoing {
+            message,
+            sent: Some(delivered),
+            dropped: None,
+        });
+    };
+    let placeholder = if matches!(target, Target::New(_)) {
+        "Écris le premier message…"
+    } else {
+        "Écris à Fronde…"
     };
     rsx! {
         div { class: "mx-auto max-w-3xl",
             InputPrompt {
                 InputPromptTextarea {
+                    id: "message",
                     value: draft,
-                    placeholder: "Écris à Fronde…",
+                    placeholder,
                     aria_label: "Message",
                     // 16 px at least on phones, or iOS zooms in on focus.
                     class: "text-base md:text-sm",
@@ -230,7 +483,9 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> E
                             aria_label: "Stop",
                             onclick: move |_| {
                                 on_send.call(Outgoing {
-                                    message: ClientMsg::Cancel { thread: None },
+                                    message: ClientMsg::Cancel {
+                                        thread: target.thread(),
+                                    },
                                     sent: None,
                                     dropped: None,
                                 })
@@ -240,7 +495,7 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> E
                         }
                     } else {
                         InputPromptSubmit {
-                            disabled: !open || draft().trim().is_empty(),
+                            disabled: !open || creating || draft().trim().is_empty(),
                             aria_label: "Envoyer",
                             onclick: move |_| submit(),
                             ArrowUp {}

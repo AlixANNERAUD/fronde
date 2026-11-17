@@ -113,6 +113,12 @@ one marked *Recommandé*, and *Autre…* for an answer in your own words. Pick o
 Fronde carries on from it. The card stays answerable from any page where you are signed in, your
 phone included, until it is answered or expires.
 
+Each conversation is a thread. Tap the plus button at the top right to start another one: its
+first message names it. The list button at the top left (three lines) shows them all, the most
+recent first, with a badge *attend ta réponse* on any that waits for you; on a wide screen the
+list sits beside the chat once you have two. [Use several conversations](../how-to/use-threads.md)
+covers renaming and archiving them.
+
 ## What you built
 
 A Fronde server with its memory in `~/.local/share/fronde`, a chat behind a password, and an MCP server at

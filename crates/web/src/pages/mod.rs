@@ -2,3 +2,4 @@
 
 pub mod chat;
 pub mod sign_in;
+pub mod threads;

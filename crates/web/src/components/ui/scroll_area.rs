@@ -16,6 +16,10 @@ pub fn ScrollArea(#[props(into, optional)] class: Option<String>, children: Elem
 #[component]
 pub fn ScrollAreaViewport(
     #[props(into, optional)] class: Option<String>,
+    // fronde: where the view was scrolled, and the view once mounted, so that a thread opens
+    // where it was left.
+    #[props(optional)] onscroll: Option<EventHandler<ScrollEvent>>,
+    #[props(optional)] onmounted: Option<EventHandler<MountedEvent>>,
     children: Element,
 ) -> Element {
     let merged = tw_merge!(
@@ -23,7 +27,22 @@ pub fn ScrollAreaViewport(
         class.as_deref().unwrap_or("")
     );
     rsx! {
-        div { "data-name": "ScrollAreaViewport", class: "{merged}", {children} }
+        div {
+            "data-name": "ScrollAreaViewport",
+            class: "{merged}",
+            // fronde: see `onscroll`.
+            onscroll: move |e| {
+                if let Some(handler) = &onscroll {
+                    handler.call(e);
+                }
+            },
+            onmounted: move |e| {
+                if let Some(handler) = &onmounted {
+                    handler.call(e);
+                }
+            },
+            {children}
+        }
     }
 }
 

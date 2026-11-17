@@ -1,5 +1,6 @@
 //! The chat's WebSocket to `/ws`, run by `fronde_client::Connection`: it says hello with what the
-//! chat has, applies what the server sends, sends what the page asks while it is open, retries
+//! shown thread's chat has, asks again for a thread whose making it did not hear back about,
+//! applies what the server sends to the threads, sends what the page asks while it is open, retries
 //! after 1 s then up to every 30 s (at once when the page comes back to the foreground), and goes
 //! to the sign-in page when the server closes with 4401.
 //!
@@ -8,8 +9,8 @@
 //! no stale timer or socket can act on the chat.
 
 use dioxus::prelude::*;
-use fronde_client::Chat;
-use fronde_protocol::ClientMsg;
+use fronde_client::Threads;
+use fronde_protocol::{ClientMsg, ThreadId};
 
 /// What the page shows of the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,16 +44,23 @@ impl Outgoing {
     }
 }
 
-/// Connects the chat; messages sent to the returned coroutine go to the server.
-pub fn use_chat_socket(chat: Signal<Chat>, status: Signal<Status>) -> Coroutine<Outgoing> {
-    use_coroutine(move |commands: UnboundedReceiver<Outgoing>| imp::run(chat, status, commands))
+/// Connects the threads; messages sent to the returned coroutine go to the server.
+/// `on_created` is told the thread the server made for this page, once it streams it.
+pub fn use_chat_socket(
+    threads: Signal<Threads>,
+    status: Signal<Status>,
+    on_created: Callback<ThreadId>,
+) -> Coroutine<Outgoing> {
+    use_coroutine(move |commands: UnboundedReceiver<Outgoing>| {
+        imp::run(threads, status, on_created, commands)
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use dioxus::prelude::*;
-    use fronde_client::{Action, Chat, Connection};
-    use fronde_protocol::{ClientMsg, ServerMsg};
+    use fronde_client::{Action, Connection, Threads};
+    use fronde_protocol::{ClientMsg, ServerMsg, ThreadId};
     use futures::{FutureExt, SinkExt, StreamExt, future::poll_fn, select};
     use gloo_net::websocket::{Message, State, WebSocketError, futures::WebSocket};
     use gloo_timers::future::TimeoutFuture;
@@ -64,8 +72,9 @@ mod imp {
     const ABNORMAL_CLOSURE: u16 = 1006;
 
     pub async fn run(
-        chat: Signal<Chat>,
+        threads: Signal<Threads>,
         mut status: Signal<Status>,
+        on_created: Callback<ThreadId>,
         mut commands: UnboundedReceiver<Outgoing>,
     ) {
         let mut connection = Connection::default();
@@ -76,8 +85,9 @@ mod imp {
                     talk(
                         socket,
                         &mut connection,
-                        chat,
+                        threads,
                         status,
+                        on_created,
                         &mut commands,
                         &mut visible,
                     )
@@ -107,8 +117,9 @@ mod imp {
     async fn talk(
         mut socket: WebSocket,
         connection: &mut Connection,
-        mut chat: Signal<Chat>,
+        mut threads: Signal<Threads>,
         mut status: Signal<Status>,
+        on_created: Callback<ThreadId>,
         commands: &mut UnboundedReceiver<Outgoing>,
         visible: &mut UnboundedReceiver<()>,
     ) -> u16 {
@@ -125,9 +136,14 @@ mod imp {
         if !matches!(socket.state(), State::Open) {
             return close_code(socket).await;
         }
-        let hello = connection.on_open(&chat.peek());
+        let hello = connection.on_open(threads.peek().chat());
+        // A reply lost with the last socket must not make a second thread: same `client_id`.
+        let create = threads.peek().pending_create();
         status.set(Status::Open);
         send(&mut socket, &hello).await;
+        if let Some(create) = create {
+            send(&mut socket, &create).await;
+        }
         loop {
             select! {
                 incoming = socket.next().fuse() => match incoming {
@@ -136,7 +152,14 @@ mod imp {
                             if matches!(message, ServerMsg::Hello { .. }) {
                                 connection.on_hello();
                             }
-                            chat.write().apply(&message);
+                            let reply = threads.write().apply(&message);
+                            // The hello of the thread just made: the page shows it.
+                            if let Some(reply) = reply {
+                                send(&mut socket, &reply).await;
+                                if let ServerMsg::Created { thread, .. } = message {
+                                    on_created.call(thread);
+                                }
+                            }
                         }
                     }
                     Some(Err(WebSocketError::ConnectionClose(event))) => return event.code,
@@ -248,15 +271,17 @@ mod imp {
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use dioxus::prelude::*;
-    use fronde_client::Chat;
+    use fronde_client::Threads;
+    use fronde_protocol::ThreadId;
 
     use super::{Outgoing, Status};
 
     pub async fn run(
-        chat: Signal<Chat>,
+        threads: Signal<Threads>,
         status: Signal<Status>,
+        on_created: Callback<ThreadId>,
         commands: UnboundedReceiver<Outgoing>,
     ) {
-        let _ = (chat, status, commands);
+        let _ = (threads, status, on_created, commands);
     }
 }

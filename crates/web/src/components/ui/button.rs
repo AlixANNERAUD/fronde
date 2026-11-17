@@ -79,6 +79,9 @@ pub fn Button(
     #[props(optional)] onpointercancel: Option<EventHandler<PointerEvent>>,
     #[props(into, optional)] aria_label: Option<String>,
     #[props(into, optional)] title: Option<String>,
+    // fronde: a button that shows and hides a menu says whether it is shown, and which.
+    #[props(into, optional)] aria_expanded: Option<String>,
+    #[props(into, optional)] aria_controls: Option<String>,
     children: Element,
 ) -> Element {
     let merged_class = tw_merge!(
@@ -107,6 +110,9 @@ pub fn Button(
                 r#type: button_type.as_deref().unwrap_or("button"),
                 disabled,
                 "aria-label": aria_label.as_deref(),
+                // fronde: see `aria_expanded`.
+                "aria-expanded": aria_expanded.as_deref(),
+                "aria-controls": aria_controls.as_deref(),
                 title: title.as_deref(),
                 onclick: move |e| {
                     if let Some(handler) = &onclick {

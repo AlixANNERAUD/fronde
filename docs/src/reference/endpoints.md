@@ -14,7 +14,10 @@ another site cannot know.
 
 | Method and path | Answer |
 | --- | --- |
-| `GET /` | The chat. Without a session, a redirect to `/sign-in`. |
+| `GET /` | The chat of the main thread. Without a session, a redirect to `/sign-in`. |
+| `GET /t/<id>` | The chat of thread `<id>`. Without a session, a redirect to `/sign-in`. |
+| `GET /threads` | The thread list, full screen (on a wide screen it also sits beside the chat). Without a session, a redirect to `/sign-in`. |
+| `GET /new` | An empty chat whose first message starts a thread. Without a session, a redirect to `/sign-in`. |
 | `GET /sign-in` | The sign-in page. |
 | `POST /auth/sign-in` | Form field `password`. Right: a new session and a redirect to `/`. Wrong: a redirect to `/sign-in?error=1`, after one second. |
 | `POST /auth/sign-out` | Ends the session, then redirects to `/sign-in`. |
@@ -22,7 +25,7 @@ another site cannot know.
 | `GET /assets/…` | The interface's files, cached for a year: their names change with their content. |
 | Other paths | Files of the built interface, else `404`. |
 
-`/` and `/sign-in` serve the same page, the Dioxus app, which shows the right screen. When the
+These pages and `/sign-in` serve the same page, the Dioxus app, which shows the right screen. When the
 interface is not built, they answer `503` and say to run `mise run web-build`. Files are sent
 compressed with Brotli or gzip when the browser accepts it.
 

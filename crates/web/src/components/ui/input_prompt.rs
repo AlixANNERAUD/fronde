@@ -36,8 +36,9 @@ pub fn InputPromptTextarea(
     #[props(into, optional)] placeholder: Option<String>,
     #[props(into, optional)] class: Option<String>,
     #[props(optional)] on_submit: Option<EventHandler<()>>,
-    // fronde: the textarea's accessible name.
+    // fronde: the textarea's accessible name, and its id.
     #[props(into, optional)] aria_label: Option<String>,
+    #[props(into, optional)] id: Option<String>,
 ) -> Element {
     let placeholder = placeholder.unwrap_or_else(|| "Write a message...".to_string());
     let merged = tw_merge!(
@@ -53,6 +54,8 @@ pub fn InputPromptTextarea(
             class: "{merged}",
             placeholder: "{placeholder}",
             "aria-label": aria_label,
+            // fronde: see `id`.
+            id: id,
             value: "{value()}",
             oninput: move |ev| value.set(ev.value()),
             onkeydown: move |ev| {

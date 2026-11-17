@@ -107,11 +107,13 @@ pub fn router(web: Web, sessions: Sessions, secure_cookie: bool, site_root: &Pat
     let assets = Router::new()
         .nest_service("/assets", static_files(&site_root.join("assets")))
         .route_layer(middleware::map_response(cache_forever));
+    // The signed-in pages: the main thread, any thread, the thread list, a new thread.
+    let signed_in = get(page.clone()).route_layer(middleware::from_fn(require_session));
     Router::new()
-        .route(
-            "/",
-            get(page.clone()).route_layer(middleware::from_fn(require_session)),
-        )
+        .route("/", signed_in.clone())
+        .route("/t/{id}", signed_in.clone())
+        .route("/threads", signed_in.clone())
+        .route("/new", signed_in)
         .route("/sign-in", get(page))
         // The forms post under `/auth`, apart from the pages, so that in development dx serves the
         // pages and passes only these to the server (crates/web/Dioxus.toml).

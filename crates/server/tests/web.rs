@@ -665,12 +665,18 @@ async fn root_redirects_without_session() {
     let (addr, _) = start(dir.path()).await;
 
     for cookie in [None, Some("fronde_session=forged"), Some(FORGED)] {
-        let page = get(addr, "/", cookie).await;
-        assert_eq!(page.status(), 303);
-        assert_eq!(page.headers()[LOCATION], "/sign-in");
-        assert_security_headers(&page);
+        for path in SIGNED_IN_PAGES {
+            let page = get(addr, path, cookie).await;
+            assert_eq!(page.status(), 303, "{path}");
+            assert_eq!(page.headers()[LOCATION], "/sign-in");
+            assert_security_headers(&page);
+        }
     }
 }
+
+/// The interface's pages for signed-in users: the main thread, a thread, the thread list and a
+/// new thread.
+const SIGNED_IN_PAGES: [&str; 4] = ["/", "/t/7", "/threads", "/new"];
 
 #[tokio::test]
 async fn root_serves_index_when_signed_in() {
@@ -678,7 +684,9 @@ async fn root_serves_index_when_signed_in() {
     let (addr, _) = start(dir.path()).await;
     let cookie = sign_in(addr).await;
 
-    assert_index(get(addr, "/", Some(&cookie)).await).await;
+    for path in SIGNED_IN_PAGES {
+        assert_index(get(addr, path, Some(&cookie)).await).await;
+    }
 }
 
 #[tokio::test]

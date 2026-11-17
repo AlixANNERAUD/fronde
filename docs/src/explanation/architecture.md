@@ -115,7 +115,8 @@ or a card opens or closes in it. Each thread's status is computed live: waiting 
 running, or how its last turn ended, read from the thread's stream for a thread not open yet.
 Every thread id a page sends is checked against the signed-in user, never trusted as an
 identity: a thread that does not exist and one the user may not see are refused alike, and an
-archived thread is read-only. The web interface's thread list is planned.
+archived thread is read-only. The page lists the threads, a sub-agent's under its parent's, and
+moves between them without loading again (see [Use several conversations](../how-to/use-threads.md)).
 
 At most `[threads] max_running` agent processes run at once (3 by default), the main thread's
 included: the **pool**. A turn whose thread has no agent running takes a slot before its agent

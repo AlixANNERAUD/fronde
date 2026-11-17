@@ -4,6 +4,8 @@ mod app;
 mod components;
 mod pages;
 mod socket;
+#[cfg(test)]
+mod testing;
 
 fn main() {
     dioxus::launch(app::App);

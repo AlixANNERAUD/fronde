@@ -8,6 +8,7 @@
 
 # How-to guides
 
+- [Use several conversations](how-to/use-threads.md)
 - [Run in Docker](how-to/run-in-docker.md)
 - [Run as a systemd service](how-to/run-as-a-service.md)
 - [Sign Fronde in to Claude](how-to/sign-in-to-claude.md)

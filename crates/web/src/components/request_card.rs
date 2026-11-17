@@ -1485,7 +1485,7 @@ mod secret_box {
 
 /// Moves the keyboard focus to the element `id`.
 #[cfg(target_arch = "wasm32")]
-fn focus(id: &str) {
+pub(crate) fn focus(id: &str) {
     use wasm_bindgen::JsCast;
     let element = web_sys::window()
         .and_then(|window| window.document())
@@ -1498,7 +1498,7 @@ fn focus(id: &str) {
 
 /// Natively there is no focus to move.
 #[cfg(not(target_arch = "wasm32"))]
-fn focus(_id: &str) {}
+pub(crate) fn focus(_id: &str) {}
 
 #[cfg(test)]
 mod tests {

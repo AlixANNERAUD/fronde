@@ -36,8 +36,9 @@ pub struct Threads {
     /// differs from `current` between a switch and the server's answer.
     streamed: Option<ThreadId>,
     chats: HashMap<ThreadId, Chat>,
-    /// The `client_id` of the thread being made, until the server says which it is.
-    creating: Option<String>,
+    /// The thread being made: its `client_id` and first message, until the server says which
+    /// it is.
+    creating: Option<(String, String)>,
     refusal: Option<ThreadRefusal>,
 }
 
@@ -90,6 +91,22 @@ impl Threads {
     /// A thread is being made: the page waits for the server to name it.
     pub fn creating(&self) -> bool {
         self.creating.is_some()
+    }
+
+    /// The first message of the thread being made, to show while the server makes it.
+    pub fn creating_text(&self) -> Option<&str> {
+        self.creating.as_ref().map(|(_, text)| text.as_str())
+    }
+
+    /// The `Create` to send again on a new socket while the server has not said which thread it
+    /// made: the same `client_id`, so that a create the server already did is not done twice.
+    pub fn pending_create(&self) -> Option<ClientMsg> {
+        self.creating
+            .as_ref()
+            .map(|(client_id, text)| ClientMsg::Create {
+                client_id: client_id.clone(),
+                text: text.clone(),
+            })
     }
 
     /// The last thread message the server refused, until dismissed.
@@ -194,12 +211,12 @@ impl Threads {
     /// same if the page sends it again. The server answers which thread it made, and the page
     /// shows it then.
     pub fn create(&mut self, client_id: String, text: String) -> ClientMsg {
-        self.creating = Some(client_id.clone());
+        self.creating = Some((client_id.clone(), text.clone()));
         ClientMsg::Create { client_id, text }
     }
 
     /// Renames thread `id`, if `title` is one; else why not, in French.
-    pub fn rename(&self, id: ThreadId, title: &str) -> Result<ClientMsg, &'static str> {
+    pub fn rename(id: ThreadId, title: &str) -> Result<ClientMsg, &'static str> {
         Ok(ClientMsg::Rename {
             thread: id,
             title: check_title(title)?,
@@ -207,7 +224,7 @@ impl Threads {
     }
 
     /// Archives thread `id`, or brings it back; `None` for the main thread, which never is.
-    pub fn archive(&self, id: ThreadId, archived: bool) -> Option<ClientMsg> {
+    pub fn archive(id: ThreadId, archived: bool) -> Option<ClientMsg> {
         (id != ThreadId::MAIN).then_some(ClientMsg::Archive {
             thread: id,
             archived,
@@ -239,7 +256,7 @@ impl Threads {
             }
             ServerMsg::Threads { threads } => self.list = threads.clone(),
             ServerMsg::Created { client_id, thread } => {
-                if self.creating.as_ref() == Some(client_id) {
+                if self.creating.as_ref().map(|(id, _)| id) == Some(client_id) {
                     self.creating = None;
                     return Some(self.open(*thread));
                 }
@@ -249,7 +266,9 @@ impl Threads {
                 client_id,
                 reason,
             } => {
-                if client_id.is_some() && self.creating == *client_id {
+                if client_id.is_some()
+                    && self.creating.as_ref().map(|(id, _)| id) == client_id.as_ref()
+                {
                     self.creating = None;
                 }
                 self.refusal = Some(ThreadRefusal {
@@ -426,6 +445,15 @@ mod tests {
             }
         );
         assert!(threads.creating());
+        assert_eq!(threads.creating_text(), Some("Range le garage"));
+        // A new socket sends it again, under the same id.
+        assert_eq!(
+            threads.pending_create(),
+            Some(ClientMsg::Create {
+                client_id: "c1".into(),
+                text: "Range le garage".into(),
+            })
+        );
         // Another page's thread: not this one.
         assert_eq!(
             threads.apply(&ServerMsg::Created {
@@ -448,6 +476,7 @@ mod tests {
         );
         assert_eq!(threads.current(), ThreadId(4));
         assert!(!threads.creating());
+        assert_eq!(threads.pending_create(), None);
     }
 
     #[test]
@@ -460,6 +489,7 @@ mod tests {
             reason: "Identifiant de conversation invalide.".into(),
         });
         assert!(!threads.creating());
+        assert_eq!(threads.pending_create(), None);
         assert_eq!(
             threads.refusal().map(|refusal| refusal.reason.as_str()),
             Some("Identifiant de conversation invalide.")
@@ -470,19 +500,18 @@ mod tests {
 
     #[test]
     fn rename_checks_the_title_and_main_is_never_archived() {
-        let threads = Threads::default();
         assert_eq!(
-            threads.rename(ThreadId(2), "  Garage "),
+            Threads::rename(ThreadId(2), "  Garage "),
             Ok(ClientMsg::Rename {
                 thread: ThreadId(2),
                 title: "Garage".into(),
             })
         );
-        assert!(threads.rename(ThreadId(2), "a\u{202E}b").is_err());
-        assert!(threads.rename(ThreadId(2), &"x".repeat(81)).is_err());
-        assert_eq!(threads.archive(ThreadId::MAIN, true), None);
+        assert!(Threads::rename(ThreadId(2), "a\u{202E}b").is_err());
+        assert!(Threads::rename(ThreadId(2), &"x".repeat(81)).is_err());
+        assert_eq!(Threads::archive(ThreadId::MAIN, true), None);
         assert_eq!(
-            threads.archive(ThreadId(2), true),
+            Threads::archive(ThreadId(2), true),
             Some(ClientMsg::Archive {
                 thread: ThreadId(2),
                 archived: true,

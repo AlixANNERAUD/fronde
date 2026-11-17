@@ -19,7 +19,7 @@ and, separately, a key file.
 | `*.imported` | Files an earlier version kept the conversation in, once imported into the database (see below). Fronde no longer reads them: keep them as a backup or delete them. |
 | `agent/` | The main thread's agent's working directory. It starts empty. |
 | `home/` | The main thread's agent's home (`HOME`): Claude's sign-in and settings (`.claude.json`, `.claude/`), its sessions' transcripts, and `tmp/`, its `TMPDIR`. Your own `~/.claude` is never used. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
-| `threads/<id>/work/` | Thread `<id>`'s agent's working directory, for every thread but the main one. Created private (0700) when that thread's agent first starts. Threads other than the main one are planned: today the chat shows only the main thread. |
+| `threads/<id>/work/` | Thread `<id>`'s agent's working directory, for every thread but the main one. Created private (0700) when that thread's agent first starts. |
 | `threads/<id>/home/` | Thread `<id>`'s agent's home, with its `tmp/`: its own Claude settings and transcripts, never another thread's. It starts empty, so the agent signs in with `[agent] oauth_token` only. |
 | `threads/<id>.old-<time>/` | A thread directory a new thread found already there (from a database restored from a backup, or made anew), moved aside so that the new thread starts clean. Fronde never reads it: keep it or delete it. |
 
