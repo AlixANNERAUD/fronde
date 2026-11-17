@@ -186,7 +186,8 @@ fn init(config: &std::path::Path, force: bool) -> anyhow::Result<()> {
     );
     println!();
     println!("Next:");
-    if adapter.is_none() {
+    // The image puts the adapter on PATH: only a checkout without it needs installing.
+    if adapter.is_none() && !fronde_agent::acp::installed("claude-agent-acp", &[]) {
         println!("  mise run agent   (installs the Claude adapter in agent/node_modules)");
     }
     println!("  fronde serve --config {}", created.config.display());
