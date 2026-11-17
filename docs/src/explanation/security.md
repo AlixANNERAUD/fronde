@@ -176,10 +176,16 @@ of its own beside `RUST_LOG`'s directives, so no directive can turn those target
 longer prefix (`tungstenite:=trace`), not a span (`[span]=trace`).
 
 A secret kept **for this conversation** lives in Fronde's memory only: never on disk, gone at the
-next restart. Its reference, `sr_` and 128 random bits, works for the asker that got it, in that
-conversation, once, for one hour (at most a day); every refusal gives the same message, so a
-probe learns nothing. Expired ones are wiped at the next use of the store and every hour, all of
-them when Fronde stops. No tool takes a reference yet.
+next restart. Its reference, `sr_` and 128 random bits, works for the whole conversation, not
+only the turn that asked: in that conversation, for the asker that got it, once, for one hour (at
+most a day). Every refusal gives the same message, so a probe learns nothing. Expired ones are
+wiped at the next use of the store and every hour, all of them when Fronde stops. Starting a new
+conversation will forget that conversation's references (**planned**: nothing starts a new
+conversation yet). No tool takes a reference yet.
+
+The asker is the assistant, or an outside MCP client by the name it gave in `clientInfo`.
+Outside clients that give the same name share one asker, and so the references given to it: they
+all hold `server.token`, and Fronde trusts them as one.
 
 A secret **kept for an origin** is sealed like one stored with `fronde secret set`, and only an
 admin can choose that: the box is shown to admins only, and the server refuses it from anyone

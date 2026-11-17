@@ -108,8 +108,8 @@ refused.
 The user picks how long the secret is kept:
 
 - **For this conversation** (always offered, the default). The secret stays in Fronde's memory
-  only, for the asker that asked, in this conversation, for one hour, and is used up by its first
-  use. The call returns a reference:
+  only, for the asker that asked, in this conversation (any later turn of it too), for one hour,
+  and is used up by its first use. The call returns a reference:
 
   ```json
   {"result": {"status": "saved", "secret_ref": "sr_k3Jq…", "expires_at": "2026-11-17T11:00:00Z"},

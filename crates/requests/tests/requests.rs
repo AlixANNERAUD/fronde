@@ -968,11 +968,10 @@ mod secrets {
         }
     }
 
-    fn assistant_scope(turn: Option<u64>) -> EphemeralScope {
+    fn assistant_scope() -> EphemeralScope {
         EphemeralScope {
             topic: TOPIC.into(),
             asker: "assistant".into(),
-            turn,
         }
     }
 
@@ -1015,18 +1014,18 @@ mod secrets {
         bench.assert_on_no_disk(CANARY);
 
         // Only for the asker in this conversation, once.
-        let mut codex = assistant_scope(None);
+        let mut codex = assistant_scope();
         codex.asker = "mcp:Codex".into();
         assert!(bench.ephemeral.take(&secret_ref, &codex).is_err());
         let value = bench
             .ephemeral
-            .take(&secret_ref, &assistant_scope(Some(2)))
+            .take(&secret_ref, &assistant_scope())
             .unwrap();
         assert_eq!(value.expose_secret(), CANARY);
         assert!(
             bench
                 .ephemeral
-                .take(&secret_ref, &assistant_scope(Some(2)))
+                .take(&secret_ref, &assistant_scope())
                 .is_err()
         );
         // Nothing sealed.

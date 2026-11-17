@@ -512,7 +512,6 @@ impl Requests {
                 let scope = EphemeralScope {
                     topic: row.topic.clone(),
                     asker: row.caller.clone(),
-                    turn: None,
                 };
                 let (reference, expires_at) = store
                     .ephemeral

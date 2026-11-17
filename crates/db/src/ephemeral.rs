@@ -1,8 +1,11 @@
 //! Ephemeral secrets: values held in Fronde's memory only, never in the database, a log or the
-//! conversation, each behind an opaque reference (`sr_` and 128 random bits) that works only in
-//! the conversation and for the asker it was given to, until it expires (1 hour by default, 24
-//! at most) and, when single use, once. Values are `SecretString`s, wiped when they are taken,
-//! expire, are forgotten with their conversation or turn, and when the store is dropped.
+//! conversation, each behind an opaque reference (`sr_` and 128 random bits). A reference is
+//! conversation-wide by design: it works in the conversation it was given in, in any later turn
+//! of it, for the asker it was given to (the assistant, or an outside MCP client by its name),
+//! until it expires (1 hour by default, 24 at most) and, when single use, once. Values are
+//! `SecretString`s, wiped when they are taken, expire, are forgotten, and when the store is
+//! dropped. [`EphemeralSecrets::forget_topic`] is for starting a new conversation, which nothing
+//! does yet: until then a reference outlives its turn and lasts until it is used or expires.
 //!
 //! Every refusal is the same [`RefError`], so a probe learns nothing about which references
 //! exist.
@@ -24,23 +27,12 @@ pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 const PREFIX: &str = "sr_";
 
-/// Whose secret it is: the stream (conversation) it was given in, the asker it was given to
-/// (`assistant`, `mcp:<client>`), and, when it is for one turn only, that turn.
+/// Whose secret it is: the stream (conversation) it was given in and the asker it was given to
+/// (`assistant`, `mcp:<client>`). Not a turn: a secret serves the whole conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EphemeralScope {
     pub topic: String,
     pub asker: String,
-    pub turn: Option<u64>,
-}
-
-impl EphemeralScope {
-    /// Whether a consumer acting in `scope` may take a secret held for `self`: the same
-    /// conversation and asker, and the same turn when the secret is for one turn.
-    fn admits(&self, scope: &Self) -> bool {
-        self.topic == scope.topic
-            && self.asker == scope.asker
-            && (self.turn.is_none() || self.turn == scope.turn)
-    }
 }
 
 /// The reference an asker gets instead of the value: `sr_` and 22 base64url characters.
@@ -152,7 +144,7 @@ impl EphemeralSecrets {
         let mut held = self.held();
         sweep(&mut held, now);
         let entry = held.get(reference).ok_or(RefError)?;
-        if !entry.scope.admits(scope) {
+        if entry.scope != *scope {
             return Err(RefError);
         }
         if entry.once {
@@ -164,14 +156,13 @@ impl EphemeralSecrets {
         Ok(entry.value.clone())
     }
 
-    /// Forgets the secrets held for one turn of `topic`; returns how many.
-    pub fn forget_turn(&self, topic: &str, turn: u64) -> usize {
-        self.forget_where(|scope| scope.topic == topic && scope.turn == Some(turn))
-    }
-
-    /// Forgets every secret of `topic`, when its conversation starts over; returns how many.
+    /// Forgets every secret of `topic`, for when its conversation starts over (nothing starts a
+    /// new conversation yet); returns how many.
     pub fn forget_topic(&self, topic: &str) -> usize {
-        self.forget_where(|scope| scope.topic == topic)
+        let mut held = self.held();
+        let before = held.len();
+        held.retain(|_, held| held.scope.topic != topic);
+        before - held.len()
     }
 
     /// Forgets the secret behind `reference`, whoever holds it; true if there was one. For the
@@ -199,13 +190,6 @@ impl EphemeralSecrets {
         self.held().is_empty()
     }
 
-    fn forget_where(&self, matches: impl Fn(&EphemeralScope) -> bool) -> usize {
-        let mut held = self.held();
-        let before = held.len();
-        held.retain(|_, held| !matches(&held.scope));
-        before - held.len()
-    }
-
     fn held(&self) -> MutexGuard<'_, HashMap<String, Held>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -222,11 +206,10 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret as _;
 
-    fn scope(topic: &str, turn: Option<u64>) -> EphemeralScope {
+    fn scope(topic: &str) -> EphemeralScope {
         EphemeralScope {
             topic: topic.into(),
             asker: "assistant".into(),
-            turn,
         }
     }
 
@@ -242,7 +225,7 @@ mod tests {
         let store = EphemeralSecrets::new();
         let (reference, expires_at) = store
             .put(
-                scope("conversation", None),
+                scope("conversation"),
                 SecretString::from("s3cret"),
                 DEFAULT_TTL,
                 false,
@@ -257,14 +240,13 @@ mod tests {
         );
         let left = expires_at - Utc::now();
         assert!(left <= chrono::Duration::hours(1) && left > chrono::Duration::minutes(59));
-        // Any turn of the conversation, when the secret is for the conversation.
-        let value = store.take(text, &scope("conversation", Some(4))).unwrap();
+        let value = store.take(text, &scope("conversation")).unwrap();
         assert_eq!(value.expose_secret(), "s3cret");
         // Not single use: still there.
-        assert!(store.take(text, &scope("conversation", None)).is_ok());
+        assert!(store.take(text, &scope("conversation")).is_ok());
         assert!(!format!("{reference:?}").contains(&text[3..]));
         assert_ne!(
-            put(&store, scope("conversation", None), "x", true),
+            put(&store, scope("conversation"), "x", true),
             text,
             "each reference is new"
         );
@@ -273,35 +255,34 @@ mod tests {
     #[test]
     fn ephemeral_ref_other_conversation_refused() {
         let store = EphemeralSecrets::new();
-        let reference = put(&store, scope("conversation", Some(2)), "s3cret", true);
+        let reference = put(&store, scope("conversation"), "s3cret", true);
         let other_asker = EphemeralScope {
             asker: "mcp:Codex".into(),
-            ..scope("conversation", Some(2))
+            ..scope("conversation")
         };
-        for wrong in [
-            scope("other", Some(2)),
-            scope("conversation", Some(3)),
-            scope("conversation", None),
-            other_asker,
-        ] {
+        let both_other = EphemeralScope {
+            asker: "mcp:Codex".into(),
+            ..scope("other")
+        };
+        let assistant_named = EphemeralScope {
+            asker: "mcp:assistant".into(),
+            ..scope("conversation")
+        };
+        for wrong in [scope("other"), other_asker, both_other, assistant_named] {
             assert_eq!(store.take(&reference, &wrong).unwrap_err(), RefError);
         }
         // A refused take does not use it up.
-        assert!(
-            store
-                .take(&reference, &scope("conversation", Some(2)))
-                .is_ok()
-        );
+        assert!(store.take(&reference, &scope("conversation")).is_ok());
     }
 
     #[test]
     fn ephemeral_ref_expires() {
         let store = EphemeralSecrets::new();
-        let reference = put(&store, scope("conversation", None), "s3cret", false);
+        let reference = put(&store, scope("conversation"), "s3cret", false);
         let later = Utc::now() + chrono::Duration::hours(1) + chrono::Duration::seconds(1);
         assert_eq!(
             store
-                .take_at(&reference, &scope("conversation", None), later)
+                .take_at(&reference, &scope("conversation"), later)
                 .unwrap_err(),
             RefError
         );
@@ -310,7 +291,7 @@ mod tests {
         assert!(
             store
                 .put(
-                    scope("conversation", None),
+                    scope("conversation"),
                     SecretString::from("x"),
                     MAX_TTL + Duration::from_secs(1),
                     true
@@ -320,7 +301,7 @@ mod tests {
         assert!(
             store
                 .put(
-                    scope("conversation", None),
+                    scope("conversation"),
                     SecretString::from("x"),
                     Duration::ZERO,
                     true
@@ -329,7 +310,7 @@ mod tests {
         );
         let (_, expires_at) = store
             .put(
-                scope("conversation", None),
+                scope("conversation"),
                 SecretString::from("x"),
                 Duration::from_millis(1),
                 true,
@@ -344,15 +325,11 @@ mod tests {
     #[test]
     fn ephemeral_ref_once_is_used_once() {
         let store = EphemeralSecrets::new();
-        let reference = put(&store, scope("conversation", Some(1)), "s3cret", true);
-        let value = store
-            .take(&reference, &scope("conversation", Some(1)))
-            .unwrap();
+        let reference = put(&store, scope("conversation"), "s3cret", true);
+        let value = store.take(&reference, &scope("conversation")).unwrap();
         assert_eq!(value.expose_secret(), "s3cret");
         assert_eq!(
-            store
-                .take(&reference, &scope("conversation", Some(1)))
-                .unwrap_err(),
+            store.take(&reference, &scope("conversation")).unwrap_err(),
             RefError
         );
         assert!(store.is_empty());
@@ -361,7 +338,7 @@ mod tests {
     #[test]
     fn ephemeral_ref_forged_refused() {
         let store = EphemeralSecrets::new();
-        let reference = put(&store, scope("conversation", None), "s3cret", true);
+        let reference = put(&store, scope("conversation"), "s3cret", true);
         let mut forged = reference.clone();
         forged.pop();
         forged.push(if reference.ends_with('A') { 'B' } else { 'A' });
@@ -371,7 +348,7 @@ mod tests {
             "",
             &reference[3..],
         ] {
-            let error = store.take(wrong, &scope("conversation", None)).unwrap_err();
+            let error = store.take(wrong, &scope("conversation")).unwrap_err();
             // The same message for every refusal.
             assert_eq!(
                 error.to_string(),
@@ -383,30 +360,27 @@ mod tests {
     }
 
     #[test]
-    fn cancel_forgets_turn_secrets() {
+    fn forget_topic_forgets_its_conversation_only() {
         let store = EphemeralSecrets::new();
-        let turn = put(&store, scope("conversation", Some(5)), "a", true);
-        let other_turn = put(&store, scope("conversation", Some(6)), "b", true);
-        let conversation = put(&store, scope("conversation", None), "c", true);
-        assert_eq!(store.forget_turn("conversation", 5), 1);
-        assert!(store.take(&turn, &scope("conversation", Some(5))).is_err());
-        assert!(
-            store
-                .take(&other_turn, &scope("conversation", Some(6)))
-                .is_ok()
-        );
-        let elsewhere = put(&store, scope("other", None), "d", true);
-        let dropped = put(&store, scope("other", None), "e", true);
+        let first = put(&store, scope("conversation"), "a", true);
+        let second = put(&store, scope("conversation"), "b", false);
+        let codex = EphemeralScope {
+            asker: "mcp:Codex".into(),
+            ..scope("conversation")
+        };
+        let outside = put(&store, codex.clone(), "c", true);
+        let elsewhere = put(&store, scope("other"), "d", true);
+        let dropped = put(&store, scope("other"), "e", true);
         assert!(store.forget(&dropped) && !store.forget(&dropped));
-        assert_eq!(store.forget_topic("conversation"), 1);
-        assert!(
-            store
-                .take(&conversation, &scope("conversation", None))
-                .is_err()
-        );
+        // Every asker's secrets of that conversation, and nothing else.
+        assert_eq!(store.forget_topic("conversation"), 3);
+        assert_eq!(store.forget_topic("conversation"), 0);
+        assert!(store.take(&first, &scope("conversation")).is_err());
+        assert!(store.take(&second, &scope("conversation")).is_err());
+        assert!(store.take(&outside, &codex).is_err());
         assert_eq!(store.len(), 1);
         store.clear();
-        assert!(store.take(&elsewhere, &scope("other", None)).is_err());
+        assert!(store.take(&elsewhere, &scope("other")).is_err());
         assert!(store.is_empty());
     }
 }

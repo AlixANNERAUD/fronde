@@ -108,8 +108,8 @@ by its host), and a masked box that neither checks spelling nor fills itself in;
 what you typed, *Masquer* hides it again. *Enregistrer* sends it, *Refuser* declines.
 
 By default the secret is kept **for this conversation**: in Fronde's memory only, never in
-`fronde.db`, for the agent that asked and in this conversation only, for one hour, and used up by
-its first use. When the agent proposes a name and an origin, an admin also gets a box *Garder pour
+`fronde.db`, for the agent that asked and in this conversation only (any later turn of it, not
+only the one that asked), for one hour, and used up by its first use. When the agent proposes a name and an origin, an admin also gets a box *Garder pour
 <origin>*: ticked, the secret is sealed in `fronde.db` under that name, to be sent to that origin
 only, as `fronde secret set` would store it. Nobody else sees the box, and the server refuses a
 kept secret from anyone but an admin.
@@ -126,7 +126,9 @@ and the agent gets the reference or the name. Two pages answering at once keep o
 is refused before anything is kept.
 
 A `secret_ref` is useless outside its conversation and to another asker, and every refusal says
-the same thing, so a guess learns nothing. No tool takes one yet (see
+the same thing, so a guess learns nothing. Outside clients that give the same name share one
+asker (see [Security](security.md#secrets-given-in-a-card)). Starting a new conversation will
+forget its references (**planned**). No tool takes one yet (see
 [Tools](../reference/tools.md#user_secret)); the stored name is what a component can use today.
 
 ## Restarts and retries

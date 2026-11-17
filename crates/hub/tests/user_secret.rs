@@ -288,7 +288,6 @@ async fn user_secret_returns_a_reference_not_the_value() {
     let scope = EphemeralScope {
         topic: "conversation".into(),
         asker: "assistant".into(),
-        turn: Some(4),
     };
     assert_eq!(
         bench
