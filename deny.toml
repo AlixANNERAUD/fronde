@@ -15,6 +15,11 @@ ignore = [
   { id = "RUSTSEC-2026-0370", reason = "zvariant (merged into zbus 6) comes through keyring-core's Secret Service store, on zbus 5; oo7 0.7 is on zbus 6 but no keyring-core store uses it yet; revisit by 2027-03" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names (merged into zbus 6) comes through keyring-core's Secret Service store, on zbus 5; oo7 0.7 is on zbus 6 but no keyring-core store uses it yet; revisit by 2027-03" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive (merged into zbus 6) comes through keyring-core's Secret Service store, on zbus 5; oo7 0.7 is on zbus 6 but no keyring-core store uses it yet; revisit by 2027-03" },
+  # chrono and chrono-tz are marked unmaintained (no known flaw). They come through SeaORM, sqlx,
+  # calcard and Fronde's own code; moving Fronde's code to jiff does not remove them while those
+  # depend on chrono. Revisit by 2027-03.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no known flaw; required by SeaORM, sqlx and calcard; revisit by 2027-03" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, no known flaw; used with chrono for the user's time zone; revisit by 2027-03" },
 ]
 
 [licenses]
