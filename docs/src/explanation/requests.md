@@ -82,7 +82,10 @@ All of these texts come from the agent, which may have read them from a web page
 them and replaces every control and bidirectional character with `�` before the card is written,
 so a command cannot hide its end behind a right-to-left override or an escape sequence, and the
 page shows them as text, never markup. Options that last (`allow_always`, `reject_always`) are
-shown only to an admin; the server refuses any option the card does not offer.
+shown only to an admin, and never on a tool call that switches the session's mode: there, Claude
+Code's lasting options leave plan mode for a mode that asks less (auto mode, accepting edits), and
+such a switch must never be one tap away, so the card offers only *Autoriser une fois* and
+*Refuser*. The server refuses any option the card does not offer.
 
 The answer is the same `answer` message as any card's, checked by the same code, and the first
 one wins. The agent then gets the option chosen. It gets a refusal (the agent's *reject once*, or

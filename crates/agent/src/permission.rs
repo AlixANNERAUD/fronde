@@ -23,6 +23,10 @@ const MAX_DETAIL: usize = 160;
 /// The longest option id kept: the agent's ids are short words such as `allow-once`.
 const MAX_OPTION_ID: usize = 128;
 
+/// The prefix of the Claude adapter's options for leaving plan mode, which name the mode the
+/// session switches to: caught even when the request does not say its tool's kind.
+const EXIT_PLAN: &str = "exit-plan-";
+
 /// What the agent calls an option when it says nothing more than the option's kind.
 const PLAIN_NAMES: &[&str] = &[
     "yes",
@@ -39,20 +43,26 @@ const PLAIN_NAMES: &[&str] = &[
 ];
 
 /// The card for a permission request on the tool call `tool`, with the agent's `options`.
-/// Options that last (`*_always`) are left out unless the user is an admin. `None` when no
-/// option is left to offer.
+/// Options that last (`*_always`) are left out unless the user is an admin, and always when the
+/// tool call switches the session's mode: there, Claude's lasting options leave plan mode for a
+/// mode that asks less (auto, accept edits, bypass), which must never be one tap away. `None`
+/// when no option is left to offer.
 pub fn card(
     tool: &ToolCallUpdateFields,
     options: &[PermissionOption],
     admin: bool,
 ) -> Option<Card> {
+    let switches_mode = tool.kind == Some(AcpToolKind::SwitchMode)
+        || options
+            .iter()
+            .any(|option| option.option_id.0.starts_with(EXIT_PLAN));
     let mut choices: Vec<PermissionChoice> = Vec::new();
     for option in options {
         let Some(kind) = kind(option.kind) else {
             continue;
         };
         let id = option.option_id.0.to_string();
-        if kind.lasts() && !admin
+        if kind.lasts() && (!admin || switches_mode)
             || id.is_empty()
             || id.chars().count() > MAX_OPTION_ID
             || choices.iter().any(|choice| choice.id == id)
@@ -321,6 +331,63 @@ mod tests {
         // Nothing left to offer: no card.
         let always = [option("a", "Always", PermissionOptionKind::AllowAlways)];
         assert_eq!(super::card(&tool, &always, false), None);
+    }
+
+    #[test]
+    fn a_mode_switch_is_never_one_tap_away() {
+        // The Claude adapter's options for leaving plan mode, as it builds them.
+        let exit_plan = [
+            option(
+                "exit-plan-clear-auto",
+                "Yes, clear context (12% used) and use auto mode",
+                PermissionOptionKind::AllowAlways,
+            ),
+            option(
+                "exit-plan-auto",
+                "Yes, and use auto mode",
+                PermissionOptionKind::AllowAlways,
+            ),
+            option(
+                "exit-plan-accept-edits",
+                "Yes, auto-accept edits",
+                PermissionOptionKind::AllowAlways,
+            ),
+            option(
+                "exit-plan-default",
+                "Yes, manually approve edits",
+                PermissionOptionKind::AllowOnce,
+            ),
+            option(
+                "reject",
+                "No, keep planning",
+                PermissionOptionKind::RejectOnce,
+            ),
+        ];
+        let expected = [
+            (
+                "exit-plan-default".to_owned(),
+                PermissionKind::AllowOnce,
+                Some("Yes, manually approve edits".to_owned()),
+            ),
+            (
+                "reject".to_owned(),
+                PermissionKind::RejectOnce,
+                Some("No, keep planning".to_owned()),
+            ),
+        ];
+        let plan = ToolCallUpdateFields::new()
+            .title("Ready to code?".to_owned())
+            .kind(AcpToolKind::SwitchMode);
+        // Even for an admin, with or without the tool's kind.
+        let card = card(&plan, &exit_plan, true).unwrap();
+        assert_eq!(choices(&card), expected);
+        let untyped = ToolCallUpdateFields::new().title("Ready to code?".to_owned());
+        let card = super::card(&untyped, &exit_plan, true).unwrap();
+        assert_eq!(choices(&card), expected);
+        // Any agent's mode switch, by the tool's kind alone.
+        let card = super::card(&plan, &claude_options(), true).unwrap();
+        let ids: Vec<String> = choices(&card).into_iter().map(|(id, ..)| id).collect();
+        assert_eq!(ids, ["allow-once", "reject"]);
     }
 
     #[test]

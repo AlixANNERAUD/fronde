@@ -247,7 +247,8 @@ tools. It loads none of Claude Code's settings, so your plugins, MCP servers, ho
 rules on the same machine do not reach it. Its permission mode asks before acting, and any request
 it makes is a permission card in the chat (see
 [Requests and cards](requests.md#permission-cards)): only the user it is for answers it, and only
-an admin is offered an option that lasts; a card left unanswered refuses after 30 minutes, and
+an admin is offered an option that lasts, and nobody one that switches the agent's mode (out of
+plan mode into a mode that asks less); a card left unanswered refuses after 30 minutes, and
 *Stop* or the end of the turn cancels it. The card's texts come from the agent, so they are capped
 and stripped of control and bidirectional characters, which could otherwise make a command read
 as another. *Toujours autoriser* lasts only as long as the agent's process: Fronde keeps no grant,
