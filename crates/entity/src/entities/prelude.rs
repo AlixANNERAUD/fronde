@@ -6,3 +6,4 @@ pub use super::requests::Entity as Requests;
 pub use super::secrets::Entity as Secrets;
 pub use super::stream_entries::Entity as StreamEntries;
 pub use super::streams::Entity as Streams;
+pub use super::threads::Entity as Threads;

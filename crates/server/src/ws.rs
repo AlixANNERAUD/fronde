@@ -53,7 +53,8 @@ fn same_origin(headers: &HeaderMap) -> bool {
 
 /// Streams the log once the page said hello, and passes the page's messages to Fronde.
 async fn chat(mut socket: WebSocket, web: Arc<Web>) {
-    let assistant = &web.assistant;
+    // The main thread only, until the page can name a thread.
+    let assistant = &web.threads.main();
     // Whoever signed in is the owner, the one user so far, and an admin.
     let user = User {
         name: web.user.clone(),

@@ -93,6 +93,23 @@ pub struct Entry {
     pub event: Event,
 }
 
+/// A thread, one conversation over a stream of its own. Not a secret: every access is checked
+/// against who asks, never against knowing an id.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[serde(transparent)]
+pub struct ThreadId(pub i64);
+
+impl ThreadId {
+    /// The main thread: the chat as it was before threads, over the topic `conversation`.
+    pub const MAIN: Self = Self(1);
+}
+
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// The close code of a chat WebSocket opened without a session: the page must sign in again.
 /// Browsers show a refused upgrade only as 1006, like a network failure.
 pub const CLOSE_SIGNED_OUT: u16 = 4401;

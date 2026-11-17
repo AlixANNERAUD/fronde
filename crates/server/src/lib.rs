@@ -23,6 +23,7 @@ use fronde_agent::confine::{
     url_port,
 };
 use fronde_agent::scope::{Limits, SLICE, Scope};
+use fronde_agent::threads::Threads;
 use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
@@ -692,23 +693,16 @@ pub async fn start_with(
                 system_prompt: system_prompt(&user),
                 builtin_tools: agent.builtin_tools,
             };
-            let assistant = Assistant::open(spec, &data_dir, db.clone(), connector).await?;
-            let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
-            let requests =
-                Requests::open_with(db.clone(), assistant.clone(), Some(secrets)).await?;
             // The one user so far is the owner, an admin.
             let owner = fronde_requests::User {
                 name: user.clone(),
                 admin: true,
             };
-            assistant.set_requests(&requests, owner);
-            Some((
-                assistant,
-                assistant_token,
-                requests,
-                password,
-                secure_cookie,
-            ))
+            let threads = Threads::open(db.clone(), &data_dir, spec, connector, owner).await?;
+            let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
+            let requests = Requests::open_with(db.clone(), threads.clone(), Some(secrets)).await?;
+            threads.set_requests(&requests).await;
+            Some((threads, assistant_token, requests, password, secure_cookie))
         }
         None => None,
     };
@@ -716,12 +710,12 @@ pub async fn start_with(
     let hub = Arc::new(Hub::start(config, db.clone(), components, requests).await?);
     let own = chat
         .as_ref()
-        .map(|(assistant, token, ..)| (token.clone(), assistant.clone()));
+        .map(|(threads, token, ..)| (token.clone(), threads.main()));
     let mut app = router(hub, token, own);
-    if let Some((assistant, _, requests, password, secure_cookie)) = chat {
+    if let Some((threads, _, requests, password, secure_cookie)) = chat {
         app = app.merge(web::router(
             web::Web {
-                assistant,
+                threads,
                 requests,
                 user,
                 password,

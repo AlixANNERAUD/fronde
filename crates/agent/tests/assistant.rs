@@ -4,11 +4,13 @@ use agent_client_protocol::v1::schema::{
     ToolCallUpdate, ToolCallUpdateFields,
 };
 use fronde_agent::acp::{AgentClient, AgentEvent, AgentSpec, PermissionAsk, Reply};
-use fronde_agent::assistant::{Assistant, Connector, SESSION, TOPIC, process_connector};
+use fronde_agent::assistant::{Assistant, Connector, TOPIC, process_connector};
 use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::{Event, ToolState, TurnOutcome};
+use fronde_agent::threads::{ThreadId, Threads};
 use fronde_protocol::{Card, Outcome, PermissionChoice, PermissionKind, RequestId, Response};
 use fronde_requests::{Refusal, Requests, User};
+use sea_orm::EntityTrait;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -105,31 +107,49 @@ async fn open(dir: &Path, script: FakeScript) -> (Arc<Assistant>, Arc<Fakes>) {
     open_for(dir, script, alix()).await
 }
 
-/// The assistant with its requests, for `owner`.
+/// The main thread's assistant with its requests, for `owner`.
 async fn open_for(dir: &Path, script: FakeScript, owner: User) -> (Arc<Assistant>, Arc<Fakes>) {
     let (connector, fakes) = fake_connector(script, None);
-    let assistant = open_with(dir, spec(), connector).await;
-    let db = fronde_db::open(dir).await.expect("database");
-    let requests = Requests::open(db, assistant.clone())
-        .await
-        .expect("requests");
-    assistant.set_requests(&requests, owner);
-    *fakes.requests.lock().unwrap() = Some(requests);
-    (assistant, fakes)
+    let threads = open_threads(dir, spec(), connector, owner).await;
+    with_requests(dir, &threads, &fakes).await;
+    (threads.main(), fakes)
 }
 
-async fn open_with(dir: &Path, spec: AgentSpec, connector: Connector) -> Arc<Assistant> {
+/// The threads stored in `dir`, for `owner`.
+async fn open_threads(
+    dir: &Path,
+    spec: AgentSpec,
+    connector: Connector,
+    owner: User,
+) -> Arc<Threads> {
     let db = fronde_db::open(dir).await.expect("database");
-    Assistant::open(spec, dir, db, connector)
+    Threads::open(db, dir, spec, connector, owner)
         .await
         .expect("open")
 }
 
-/// The agent session id saved in the database.
+/// Gives the threads their requests, kept in `fakes`.
+async fn with_requests(dir: &Path, threads: &Arc<Threads>, fakes: &Fakes) {
+    let db = fronde_db::open(dir).await.expect("database");
+    let requests = Requests::open(db, threads.clone()).await.expect("requests");
+    threads.set_requests(&requests).await;
+    *fakes.requests.lock().unwrap() = Some(requests);
+}
+
+/// The main thread's assistant, without requests.
+async fn open_with(dir: &Path, spec: AgentSpec, connector: Connector) -> Arc<Assistant> {
+    open_threads(dir, spec, connector, alix()).await.main()
+}
+
+/// The main thread's agent session id saved in the database.
 async fn saved_session(dir: &Path) -> Option<String> {
     let db = fronde_db::open(dir).await.unwrap();
-    let id = fronde_db::kv::get(&db, SESSION.0, SESSION.1).await.unwrap();
-    id.map(|id| String::from_utf8(id).unwrap())
+    fronde_entity::threads::Entity::find_by_id(ThreadId::MAIN.0)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("main thread")
+        .session_id
 }
 
 fn events(assistant: &Assistant) -> Vec<Event> {
@@ -490,11 +510,12 @@ async fn restart_resumes_or_starts_fresh() {
         "{events:?}"
     );
 
-    // An agent that cannot resume it starts a new conversation, and says so.
+    // An agent that cannot resume it starts a new conversation, and says so. The session was
+    // saved where it was kept before threads.
     let dir = tempfile::tempdir().unwrap();
     {
         let db = fronde_db::open(dir.path()).await.unwrap();
-        fronde_db::kv::set(&db, SESSION.0, SESSION.1, b"earlier-session".to_vec(), None)
+        fronde_db::kv::set(&db, "agent", "session", b"earlier-session".to_vec(), None)
             .await
             .unwrap();
     }
@@ -1371,14 +1392,9 @@ async fn open_injecting(dir: &Path, script: FakeScript) -> (Arc<Assistant>, Arc<
             })
         }
     });
-    let assistant = open_with(dir, spec(), connector).await;
-    let db = fronde_db::open(dir).await.expect("database");
-    let requests = Requests::open(db, assistant.clone())
-        .await
-        .expect("requests");
-    assistant.set_requests(&requests, alix());
-    *fakes.requests.lock().unwrap() = Some(requests);
-    (assistant, fakes, inject)
+    let threads = open_threads(dir, spec(), connector, alix()).await;
+    with_requests(dir, &threads, &fakes).await;
+    (threads.main(), fakes, inject)
 }
 
 /// A permission request the test answers in the agent's place.

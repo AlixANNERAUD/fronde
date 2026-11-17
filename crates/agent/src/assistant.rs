@@ -1,4 +1,4 @@
-//! Fronde's conversation: one agent session, its turns recorded in the conversation log.
+//! One thread's conversation: its agent session, its turns recorded in the thread's stream.
 
 use crate::acp::{
     AgentClient, AgentEvent, AgentSpec, ElicitationAsk, Failure, PermissionAsk, Reply, TurnEnd,
@@ -6,18 +6,17 @@ use crate::acp::{
 };
 use crate::confine::Confine;
 use crate::elicitation;
-use crate::legacy;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
+use crate::threads::{self, ThreadId};
 use agent_client_protocol::v1::schema::CreateElicitationResponse;
-use anyhow::{anyhow, bail};
-use async_trait::async_trait;
+use anyhow::anyhow;
 use fronde_db::DatabaseConnection;
 use fronde_protocol::{Card, Outcome, RequestId};
-use fronde_requests::{Ask, Caller, Journal, Requests, Resolution, User};
+use fronde_requests::{Ask, Caller, Requests, Resolution, User};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
-use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -33,10 +32,9 @@ const SIGNED_OUT: &str =
     "L'agent n'est pas connecté à Claude : voir le README (claude setup-token).";
 const FAILED: &str = "L'agent a rencontré une erreur.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
-/// The conversation's stream in the database.
+const ARCHIVED: &str = "Cette conversation est archivée : elle ne reçoit plus de message.";
+/// The main thread's stream in the database.
 pub const TOPIC: &str = "conversation";
-/// The agent's session id in the database's key-value table: scope, key.
-pub const SESSION: (&str, &str) = ("agent", "session");
 /// How long the agent gets to start and open its session.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the agent gets to end a cancelled turn before it is stopped.
@@ -71,16 +69,21 @@ pub fn confined_connector(confine: Confine) -> Connector {
 }
 
 pub struct Assistant {
+    thread: ThreadId,
+    /// The thread's stream.
+    topic: String,
     spec: AgentSpec,
     connector: Connector,
     log: ConversationLog,
     db: DatabaseConnection,
+    /// The thread is archived: it refuses messages.
+    archived: AtomicBool,
     session: Mutex<Option<Session>>,
     /// The running turn; `None` when idle.
     turn: tokio::sync::Mutex<Option<Turn>>,
     /// The requests a turn asks through, the agent's permissions among them, cancelled when it
-    /// ends or is stopped, and the user they are for. Weak: they hold the assistant as their
-    /// journal.
+    /// ends or is stopped, and the user they are for. Weak: they hold the threads, this one's
+    /// among them, as their journal.
     requests: OnceLock<(Weak<Requests>, User)>,
     /// How long a permission card waits for an answer.
     permission_timeout: Mutex<Duration>,
@@ -114,21 +117,25 @@ impl Session {
 }
 
 impl Assistant {
-    /// Opens the conversation stored in `db`, first importing the files that held it in
-    /// `data_dir` before the database; the agent is started on the first message.
-    pub async fn open(
+    /// Opens the conversation of `thread`, stored in `db` under `topic`; the agent is started on
+    /// the first message. [`Threads`](crate::threads::Threads) opens each thread once.
+    pub(crate) async fn open(
+        thread: ThreadId,
+        topic: String,
         spec: AgentSpec,
-        data_dir: &Path,
         db: DatabaseConnection,
         connector: Connector,
+        archived: bool,
     ) -> anyhow::Result<Arc<Self>> {
-        legacy::import(&db, data_dir, TOPIC, SESSION).await?;
-        let log = ConversationLog::open(&db, TOPIC).await?;
+        let log = ConversationLog::open(&db, &topic).await?;
         let assistant = Arc::new(Self {
+            thread,
+            topic,
             spec,
             connector,
             log,
             db,
+            archived: AtomicBool::new(archived),
             session: Mutex::new(None),
             turn: tokio::sync::Mutex::new(None),
             requests: OnceLock::new(),
@@ -136,17 +143,12 @@ impl Assistant {
             elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
-        let last_turn =
-            assistant
-                .log
-                .since(0)
-                .into_iter()
-                .rev()
-                .find_map(|entry| match entry.event {
-                    Event::User { .. } => Some(true),
-                    Event::TurnEnded { .. } => Some(false),
-                    _ => None,
-                });
+        let last_turn = assistant
+            .log
+            .since(0)
+            .iter()
+            .rev()
+            .find_map(|entry| turn_open_at(&entry.event));
         if last_turn == Some(true) {
             assistant
                 .append(Event::Notice {
@@ -164,6 +166,19 @@ impl Assistant {
 
     pub fn log(&self) -> &ConversationLog {
         &self.log
+    }
+
+    pub fn thread(&self) -> ThreadId {
+        self.thread
+    }
+
+    /// The thread's stream.
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub(crate) fn set_archived(&self, archived: bool) {
+        self.archived.store(archived, Ordering::SeqCst);
     }
 
     /// The requests the assistant's turns ask through, for `owner`: the agent's permissions
@@ -192,8 +207,16 @@ impl Assistant {
         *lock(&self.elicitation_timeout) = timeout.min(fronde_requests::elicitation::MAX_TIMEOUT);
     }
 
-    /// Logs the message and runs the turn in the background; refused while a turn runs.
+    /// Logs the message and runs the turn in the background; refused while a turn runs, and
+    /// when the thread is archived.
     pub async fn send(self: &Arc<Self>, text: String) {
+        if self.archived.load(Ordering::SeqCst) {
+            self.append(Event::Notice {
+                text: ARCHIVED.into(),
+            })
+            .await;
+            return;
+        }
         // The turn is locked while its start or refusal is logged, as it is while its end is
         // logged: a message sent on seeing `TurnEnded` finds the turn over. Locks are always
         // taken turn first, then log.
@@ -262,7 +285,7 @@ impl Assistant {
     async fn cancel_requests(&self, seq: Option<u64>) {
         let requests = self.requests();
         if let (Some(seq), Some(requests)) = (seq, requests)
-            && let Err(error) = requests.cancel_turn(TOPIC, seq).await
+            && let Err(error) = requests.cancel_turn(&self.topic, seq).await
         {
             tracing::error!("cannot cancel the requests of the turn: {error:#}");
         }
@@ -377,7 +400,7 @@ impl Assistant {
         };
         let asked = requests
             .ask(Ask {
-                topic: TOPIC.into(),
+                topic: self.topic.clone(),
                 turn: Some(turn),
                 caller: Caller::Assistant,
                 client_request_id: None,
@@ -513,20 +536,19 @@ impl Assistant {
     }
 
     async fn saved_session_id(&self) -> Option<String> {
-        let (scope, key) = SESSION;
-        match fronde_db::kv::get(&self.db, scope, key).await {
-            Ok(id) => id.and_then(|id| String::from_utf8(id).ok()),
+        match threads::session_id(&self.db, self.thread).await {
+            Ok(id) => id,
             Err(error) => {
-                tracing::warn!("cannot read the agent session id, starting a new session: {error}");
+                tracing::warn!(
+                    "cannot read the agent session id, starting a new session: {error:#}"
+                );
                 None
             }
         }
     }
 
     async fn save_session_id(&self, id: &str) -> anyhow::Result<()> {
-        let (scope, key) = SESSION;
-        fronde_db::kv::set(&self.db, scope, key, id.into(), None).await?;
-        Ok(())
+        threads::set_session_id(&self.db, self.thread, id).await
     }
 
     async fn record(&self, event: AgentEvent, recorder: &mut Recorder) {
@@ -626,19 +648,24 @@ fn notice_for(error: &anyhow::Error) -> &'static str {
     }
 }
 
-/// Requests are shown in the conversation, the only stream so far.
-#[async_trait]
-impl Journal for Assistant {
-    async fn announce(
+/// Whether a turn is open after `event`: `Some(true)` once a message starts one,
+/// `Some(false)` once it ended, `None` for an event within a turn.
+pub(crate) fn turn_open_at(event: &Event) -> Option<bool> {
+    match event {
+        Event::User { .. } => Some(true),
+        Event::TurnEnded { .. } => Some(false),
+        _ => None,
+    }
+}
+
+/// What [`Threads`](crate::threads::Threads) shows of a request asked in this thread.
+impl Assistant {
+    pub(crate) async fn announce(
         &self,
-        topic: &str,
         id: RequestId,
         card: &Card,
         caller: &Caller,
     ) -> anyhow::Result<u64> {
-        if topic != TOPIC {
-            bail!("no stream {topic:?} to show request {id} in");
-        }
         let entry = self
             .log
             .append(Event::Request {
@@ -651,16 +678,12 @@ impl Journal for Assistant {
         Ok(entry.seq)
     }
 
-    async fn close(
+    pub(crate) async fn close(
         &self,
-        topic: &str,
         id: RequestId,
         outcome: &Outcome,
         by: Option<&str>,
     ) -> anyhow::Result<()> {
-        if topic != TOPIC {
-            bail!("no stream {topic:?} to close request {id} in");
-        }
         self.log
             .append(Event::RequestClosed {
                 id,

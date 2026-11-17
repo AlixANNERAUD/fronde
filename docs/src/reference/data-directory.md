@@ -11,7 +11,7 @@ and, separately, a key file.
 | `memory/MEMORY.md` | Facts, preferences and decisions, capped by `memory_limit`. |
 | `memory/journal/YYYY-MM-DD.md` | One file a day, one timed line per entry, append-only. |
 | `memory/.git` | The memory's history, when `[memory] git = true`. |
-| `fronde.db` | The database: one SQLite file, created at the first start and updated to the running version's schema at each start, all of an update or none of it. It holds the chat's conversation (its numbered entries and the log id pages use to notice a new conversation), the id of the agent's session, resumed after a restart when the agent allows it, the web sign-ins (sessions), kept across restarts, the component approvals you gave (see [Configuration](configuration.md#kind--component)), the secrets you stored, encrypted (see [Store a secret](../how-to/store-a-secret.md)), the requests agents made to you, with who answered what and when (see [Requests and cards](../explanation/requests.md)), and the memory's search index, rebuilt from the memory files at each start. Expired sessions and other expired entries are deleted at start and every hour. |
+| `fronde.db` | The database: one SQLite file, created at the first start and updated to the running version's schema at each start, all of an update or none of it. It holds the conversations, one thread each (see below), the web sign-ins (sessions), kept across restarts, the component approvals you gave (see [Configuration](configuration.md#kind--component)), the secrets you stored, encrypted (see [Store a secret](../how-to/store-a-secret.md)), the requests agents made to you, with who answered what and when (see [Requests and cards](../explanation/requests.md)), and the memory's search index, rebuilt from the memory files at each start. Expired sessions and other expired entries are deleted at start and every hour. |
 | `fronde.db-wal`, `fronde.db-shm` | SQLite's write-ahead log and its index, beside the database while Fronde runs. The log holds the latest changes: never delete `fronde.db` without it, and see below for backups. |
 | `master.key` | Only from an earlier version, which kept the master key here. Fronde moves it to its place beside the configuration (or to `[secrets] master_key`) at the next start or `fronde secret` command, and logs it. If both places hold a key and they differ, Fronde refuses to start: keep the one that opens the stored secrets (`fronde check` says) and move the other away. |
 | `fronde.lock` | Locked by `fronde serve` while it runs, and by `fronde secret rotate-key` and `move-key`, so that none of them runs beside another on this data directory; it holds the process id and command of the last one. The system releases the lock when the process ends, crash included; deleting the file while nothing runs is harmless. |
@@ -21,6 +21,14 @@ and, separately, a key file.
 | `home/` | The agent's home (`HOME`): Claude's sign-in and settings (`.claude.json`, `.claude/`), its sessions' transcripts, and `tmp/`, its `TMPDIR`. Your own `~/.claude` is never used. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
 
 Earlier versions kept the memory's search index in `index.sqlite`: Fronde deletes it at start.
+
+Each conversation is a thread: a row of the `threads` table (its title, who started it, its
+parent if another thread started it, the id of its agent session, resumed after a restart when
+the agent allows it, and when it was archived) and a stream of numbered entries, with the log id
+pages use to notice a new conversation. The chat is thread 1, over the stream `conversation`.
+Earlier versions kept the agent's session id apart, in a key-value row: the first start of this
+version moves it to thread 1's row. A directory per thread, `threads/<id>/` with its own working
+directory and home, is planned.
 
 Earlier versions also kept the conversation in `conversation.jsonl` and the agent's session id in
 `agent.session` (`jarvis.jsonl` and `jarvis.session` before that). When the database has no

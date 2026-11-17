@@ -8,3 +8,4 @@ pub mod requests;
 pub mod secrets;
 pub mod stream_entries;
 pub mod streams;
+pub mod threads;

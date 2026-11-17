@@ -17,11 +17,19 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(has_many = "super::stream_entries::Entity")]
     StreamEntries,
+    #[sea_orm(has_one = "super::threads::Entity")]
+    Threads,
 }
 
 impl Related<super::stream_entries::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::StreamEntries.def()
+    }
+}
+
+impl Related<super::threads::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Threads.def()
     }
 }
 

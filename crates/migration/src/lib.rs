@@ -15,6 +15,7 @@ mod m20261117_000004_approvals;
 mod m20261117_000005_secrets;
 mod m20261117_000006_requests;
 mod m20261117_000007_requests_retry_index;
+mod m20261117_000008_threads;
 
 /// Every migration of Fronde, in the order they apply.
 pub struct Migrator;
@@ -30,6 +31,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261117_000005_secrets::Migration),
             Box::new(m20261117_000006_requests::Migration),
             Box::new(m20261117_000007_requests_retry_index::Migration),
+            Box::new(m20261117_000008_threads::Migration),
         ]
     }
 }

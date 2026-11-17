@@ -9,7 +9,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
-use fronde_agent::assistant::Assistant;
+use fronde_agent::threads::Threads;
 use fronde_requests::Requests;
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroize;
@@ -37,7 +37,7 @@ const CACHE_FOREVER: HeaderValue = HeaderValue::from_static("public, max-age=315
 const NOT_BUILT: &str = "Interface non construite : lance `mise run web-build`.";
 
 pub struct Web {
-    pub assistant: Arc<Assistant>,
+    pub threads: Arc<Threads>,
     pub requests: Arc<Requests>,
     /// Who signs in with the password: the owner, the one user so far.
     pub user: String,

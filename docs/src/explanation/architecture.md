@@ -44,8 +44,8 @@ input and output. The session gets the hub as an MCP server named `fronde`, reac
 loopback with a token of its own, made at each start and kept only in memory, and a short system
 prompt. The hub tells the assistant's calls from those of outside clients by that token: a call
 from the assistant belongs to its conversation and its running turn, a call with `server.token`
-to an outside client, named from the `clientInfo` it gave. The session id is saved, so a restart
-resumes the same conversation.
+to an outside client, named from the `clientInfo` it gave. The session id is saved with its
+thread, so a restart resumes the same conversation.
 
 Fronde does not start the adapter itself, but through a chain of programs that each `exec` the
 next, so that the adapter keeps Fronde's pipes and process group:
@@ -64,8 +64,18 @@ adapter. See [Where the agent runs](security.md#where-the-agent-runs).
 Each turn streams back as events: text, tool calls, permission requests, the end of the turn.
 Fronde numbers them and saves each one in the database, committed to disk, before it broadcasts
 it to every open page: a page never shows an entry a crash could lose. A page that reconnects
-says which entry it saw last and gets only what it missed. The conversation is one stream of the
-database, the topic `conversation`; the session id is saved there too.
+says which entry it saw last and gets only what it missed.
+
+## Threads
+
+Each conversation is a **thread**: a row of the `threads` table and a stream of its own in the
+database, with its own agent session, whose id the row keeps. The chat is the main thread,
+thread 1, over the topic `conversation`, the stream it had before threads existed. Fronde opens a
+thread's conversation the first time it is needed, and at start any thread a stop left in the
+middle of a turn, to close that turn. A request is shown in the stream of the thread it was asked
+in. An archived thread refuses messages; the main thread is never archived. Several threads in
+the chat, each with its own agent process and hub identity, and threads that agents start for
+a task, are planned.
 
 ## Requests
 
