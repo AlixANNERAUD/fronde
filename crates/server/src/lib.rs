@@ -1,6 +1,7 @@
 //! HTTP front: /mcp behind a bearer token, /health, and the chat with Fronde when `[web]` is set.
 
 pub mod check;
+pub mod hardening;
 pub mod init;
 pub mod service;
 mod web;
@@ -23,6 +24,7 @@ use fronde_wasm::{Checks, ComponentHost, ComponentSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +38,14 @@ pub fn check_token(token: &SecretString) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Compares digests, so neither the content nor the length of the secret leaks through timing.
+/// The `/mcp` token and the web password are both checked here.
+pub(crate) fn same_secret(given: &[u8], expected: &SecretString) -> bool {
+    let given = Sha256::digest(given);
+    let expected = Sha256::digest(expected.expose_secret().as_bytes());
+    bool::from(given.as_slice().ct_eq(expected.as_slice()))
+}
+
 async fn require_token(
     State(token): State<Arc<SecretString>>,
     req: Request,
@@ -47,7 +57,7 @@ async fn require_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
-    if bool::from(given.as_bytes().ct_eq(token.expose_secret().as_bytes())) {
+    if same_secret(given.as_bytes(), &token) {
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)

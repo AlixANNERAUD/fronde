@@ -33,6 +33,11 @@ Starts the server: opens the memory, registers the tools, connects to upstream M
 background, and serves HTTP on `[server] listen`. With `[web]`, it also serves the chat and runs
 the agent. It stops on Ctrl+C.
 
+On Linux, it first makes its process non-dumpable and sets `RLIMIT_CORE` to 0, so that no core
+dump, ptrace or `/proc/<pid>/mem` read by another process of the same user can reach its secrets
+(see [Security model](../explanation/security.md#core-dumps-and-other-processes)). Set
+`FRONDE_ALLOW_CORE_DUMPS=1` to skip this when debugging a crash.
+
 ## `fronde check`
 
 Validates the configuration and exits. It parses the file, then reads every secret: the server

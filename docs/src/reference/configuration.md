@@ -29,6 +29,10 @@ chmod 600 <path>`. `fronde check` reports it too. For Docker secrets, which are 
 and owned by root, set the environment variable `FRONDE_ALLOW_SHARED_SECRET_FILES=1` to skip
 this check. It is off by default and applies to every secret file.
 
+`fronde serve` keeps secrets out of core dumps and away from other processes of the same user on
+Linux. Set `FRONDE_ALLOW_CORE_DUMPS=1` to turn that off while debugging a crash; see
+[Security model](../explanation/security.md#core-dumps-and-other-processes).
+
 ## `[server]`
 
 Required.

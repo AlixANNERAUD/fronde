@@ -47,7 +47,7 @@ files kept at mode 0600 and owned by uid 65532, as above, need no override.
 ## 3. Run it
 
 ```sh
-docker run -d --name fronde -p 8484:8484 \
+docker run -d --name fronde -p 8484:8484 --ulimit core=0 \
   -v ./fronde.toml:/config/fronde.toml:ro \
   -v ./fronde_token:/run/secrets/fronde_token:ro \
   -v ./fronde_password:/run/secrets/fronde_password:ro \
@@ -57,7 +57,8 @@ docker run -d --name fronde -p 8484:8484 \
 ```
 
 `-e CLAUDE_CODE_OAUTH_TOKEN` passes the variable from your shell without writing it on the command
-line. [Sign Fronde in to Claude](sign-in-to-claude.md) says how to get it.
+line. `--ulimit core=0` keeps a crash from writing a core dump with secrets in it; Fronde also
+turns core dumps off for itself at start. [Sign Fronde in to Claude](sign-in-to-claude.md) says how to get it.
 
 The `fronde-data` volume keeps the memory, the conversation and the agent's home, where Claude
 keeps its settings. Back it up as a whole.
@@ -81,6 +82,8 @@ services:
   fronde:
     image: fronde
     ports: ["8484:8484"]
+    ulimits:
+      core: 0
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN
     volumes:

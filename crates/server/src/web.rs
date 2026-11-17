@@ -8,15 +8,13 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use fronde_agent::assistant::Assistant;
+use secrecy::SecretString;
 use secrecy::zeroize::Zeroize;
-use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
-use subtle::ConstantTimeEq;
 use tokio::time::Instant;
 use tower_http::services::ServeDir;
 use tower_sessions::cookie::SameSite;
@@ -76,13 +74,6 @@ async fn attempt(throttle: &Mutex<Throttle>, right: bool) -> Attempt {
     }
     tokio::time::sleep(FAILURE_DELAY).await;
     Attempt::Wrong
-}
-
-/// Compares digests, so neither the content nor the length of the password leaks through timing.
-fn same_password(given: &str, expected: &SecretString) -> bool {
-    let given = Sha256::digest(given.as_bytes());
-    let expected = Sha256::digest(expected.expose_secret().as_bytes());
-    bool::from(given.as_slice().ct_eq(expected.as_slice()))
 }
 
 /// `site_root` holds what `dx build` writes: `index.html`, the single page of the interface, and
@@ -203,7 +194,7 @@ async fn sign_in(
     session: Session,
     Form(mut form): Form<SignInForm>,
 ) -> Response {
-    let ok = same_password(&form.password, &web.password);
+    let ok = crate::same_secret(form.password.as_bytes(), &web.password);
     form.password.zeroize();
     match attempt(&web.throttle, ok).await {
         Attempt::Accepted => {}

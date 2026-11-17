@@ -16,16 +16,42 @@ secrets, where the runtime sets the file's mode and owner.
 
 ## Secrets in memory
 
-Resolved secrets (the `/mcp` bearer token, the web chat password, upstream MCP tokens and
-component credentials) are held in memory as `secrecy::SecretString` values. They redact when
-formatted with `Debug` and zeroize their memory when dropped. Component `Authorization` headers
-are marked sensitive so HTTP and tracing layers do not print them, and a secret is exposed only
-where it is checked or sent: the `/mcp` token check, the web sign-in check, the ACP MCP header,
-upstream MCP setup and the component HTTP gate.
+Fronde holds the secrets it resolves (the `/mcp` bearer token, the web chat password, upstream MCP
+tokens and component credentials) as `secrecy::SecretString` values. They print as redacted with
+`Debug` and their memory is zeroed when they are dropped. The plain value is read only at a few
+places in the code, each listed in a test (`crates/server/tests/secrets.rs`): the checks of the
+token's length and of the password, the constant-time compare of `/mcp` tokens and sign-in
+passwords (on SHA-256 digests, so the length does not leak either), the component gate, the ACP
+header and the upstream MCP client.
 
-Zeroizing on drop cannot help if the process crashes and writes a core dump, which captures the
-whole address space. Disable core dumps where Fronde runs (`ulimit -c 0`, or `LimitCORE=0` under
-`[Service]` in a systemd unit). `fronde service install` sets `LimitCORE=0` in the generated unit.
+A component's `Authorization` header is built by the gate for each request, marked sensitive (its
+`Debug` prints `Sensitive`) and dropped with the request; between requests only the
+`SecretString` is kept.
+
+Some plain copies remain:
+
+- An upstream MCP token is handed to the MCP client library as a `String`, which keeps it for the
+  life of the connection.
+- The `Authorization` header Fronde gives its agent for `/mcp` is a plain string in the ACP
+  request, and the agent process holds the token.
+- A `{ env = "…" }` value stays in Fronde's environment, and the agent inherits that environment
+  for now (an explicit agent environment is planned).
+- A sign-in form's body, and each `/mcp` request's `Authorization` header, are read into buffers
+  that are freed but not zeroed. The parsed password is zeroed after the compare.
+
+## Core dumps and other processes
+
+Zeroing on drop cannot help if a crash writes a core dump, which holds the whole address space, or
+if another process reads Fronde's memory. On Linux, `fronde serve` makes itself non-dumpable
+(`PR_SET_DUMPABLE` 0) and sets `RLIMIT_CORE` to 0 before it reads any secret. Non-dumpable also
+stops processes of the same user, the agent and the tools it runs among them, from reading
+`/proc/<pid>/environ` and `/proc/<pid>/mem` or attaching to Fronde with ptrace. Root, or a process
+with `CAP_SYS_PTRACE`, still can. To debug a crash, set `FRONDE_ALLOW_CORE_DUMPS=1`: Fronde then
+leaves both settings as they were. On other systems it does nothing.
+
+As belt and braces, disable core dumps outside Fronde too: `fronde service install` writes
+`LimitCORE=0` in its systemd unit, and in Docker, run the container with `--ulimit core=0`
+(`ulimits: { core: 0 }` in Compose). Elsewhere, `ulimit -c 0` before starting Fronde.
 
 ## Personal data on disk
 

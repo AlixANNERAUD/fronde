@@ -3,7 +3,7 @@
 //! is resolved (`dial`).
 
 use crate::dial;
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use fronde_hub::origin::Origin;
@@ -36,6 +36,23 @@ pub enum Credential {
 }
 
 impl Credential {
+    /// Refuses a credential that could not travel in a header, without building one: the header
+    /// is built for each request and dropped with it, so no plain copy lives as long as the
+    /// component.
+    fn check(&self) -> anyhow::Result<()> {
+        match self {
+            // Base64 output is always a valid header value.
+            Self::Basic { .. } => Ok(()),
+            Self::Bearer(token) => {
+                ensure!(
+                    token.expose_secret().bytes().all(header_byte),
+                    "credential is not a valid header value"
+                );
+                Ok(())
+            }
+        }
+    }
+
     fn header(&self) -> anyhow::Result<HeaderValue> {
         let mut text = match self {
             Self::Basic { username, password } => {
@@ -56,6 +73,11 @@ impl Credential {
     }
 }
 
+/// What `HeaderValue::from_str` accepts: visible ASCII, tab, space and obs-text.
+fn header_byte(b: u8) -> bool {
+    b == b'\t' || (b >= 0x20 && b != 0x7f)
+}
+
 /// An origin a component may reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allowed {
@@ -69,7 +91,7 @@ pub struct Allowed {
 struct Grant {
     origin: Origin,
     local: bool,
-    authorization: Option<HeaderValue>,
+    credential: Option<Arc<Credential>>,
 }
 
 /// The origins one component may reach. Shared by every call to that component.
@@ -86,7 +108,7 @@ impl Grants {
             .map(|a| Grant {
                 origin: a.origin.clone(),
                 local: a.local,
-                authorization: None,
+                credential: None,
             })
             .collect();
         for (origin, credential) in credentials {
@@ -99,7 +121,8 @@ impl Grants {
                      accepted only for localhost)"
                 );
             }
-            grant.authorization = Some(credential.header()?);
+            credential.check()?;
+            grant.credential = Some(Arc::new(credential.clone()));
         }
         Ok(Self(grants.into()))
     }
@@ -151,14 +174,30 @@ impl WasiHttpHooks for Egress {
                 Err(wasmtime_wasi_http::Error::HttpRequestDenied)
             });
         };
-        if let Some(value) = &grant.authorization {
-            request.headers_mut().insert(AUTHORIZATION, value.clone());
+        if let Some(credential) = &grant.credential {
+            // Built for this request only, and dropped with it.
+            match credential.header() {
+                Ok(value) => {
+                    request.headers_mut().insert(AUTHORIZATION, value);
+                }
+                // Unreachable after `check`; refused like an unlisted origin all the same.
+                Err(e) => {
+                    tracing::warn!("{}: the credential for {origin}: {e:#}", self.component);
+                    return Box::new(async move {
+                        let mut body = request.into_body();
+                        while let Some(Ok(_)) = body.frame().await {}
+                        Err(Error::InternalError(Some(
+                            "the host could not add the credential".into(),
+                        )))
+                    });
+                }
+            }
         }
         // The host's timeouts replace the guest's. Redirects are not followed: a new location is
         // a new request, checked again here.
         let deadline = Instant::now() + self.request_timeout;
         let local = grant.local;
-        let credential = grant.authorization.is_some();
+        let credential = grant.credential.is_some();
         let component = self.component.clone();
         Box::new(async move {
             let send = dial::send(
@@ -340,6 +379,40 @@ mod tests {
                 Grants::new(&[allowed_origin(&o)], &[(o.clone(), cred())]).is_ok(),
                 "{origin}"
             );
+        }
+    }
+
+    #[test]
+    fn credentials_are_checked_without_building_a_header() {
+        let o: Origin = "https://cal.example".parse().unwrap();
+        let allow = [allowed_origin(&o)];
+        let e = Grants::new(
+            &allow,
+            &[(o.clone(), Credential::Bearer("tok\nen-s3cret".into()))],
+        )
+        .err()
+        .unwrap();
+        let e = format!("{e:#} {e:?}");
+        assert!(e.contains("not a valid header value"), "{e}");
+        assert!(!e.contains("s3cret"), "{e}");
+        // Any username and password make a valid Basic value: base64 is header-safe.
+        let basic = Credential::Basic {
+            username: "al\u{e9}x\n".into(),
+            password: "p\u{0}w\r\n".into(),
+        };
+        let g = Grants::new(&allow, &[(o.clone(), basic)]).unwrap();
+        let (grant, _) = g
+            .find(&"https://cal.example/dav/".parse().unwrap())
+            .unwrap();
+        let header = grant.credential.as_ref().unwrap().header().unwrap();
+        assert!(header.is_sensitive());
+        for byte in [b'\t', b' ', b'~', 0x80, 0xff] {
+            assert!(header_byte(byte), "{byte:#x}");
+            assert!(HeaderValue::from_bytes(&[b'a', byte, b'b']).is_ok());
+        }
+        for byte in [0, b'\n', b'\r', 0x1f, 0x7f] {
+            assert!(!header_byte(byte), "{byte:#x}");
+            assert!(HeaderValue::from_bytes(&[b'a', byte, b'b']).is_err());
         }
     }
 

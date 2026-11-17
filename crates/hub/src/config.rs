@@ -292,9 +292,17 @@ impl Secret {
                 Ok(SecretString::from(trimmed))
             }
             Secret::Env { env } => {
-                let value = std::env::var(env).with_context(|| {
-                    format!(
+                // `std::env::var` would fail with `NotUnicode`, which prints the value.
+                let Some(value) = std::env::var_os(env) else {
+                    bail!(
                         "environment variable {env} is not set; set it or use {{ file = \"…\" }}"
+                    );
+                };
+                // The value is left out of the message: it stays in the environment anyway.
+                let value = value.into_string().map_err(|_| {
+                    anyhow::anyhow!(
+                        "environment variable {env} must be valid UTF-8; fix its value or use \
+                         {{ file = \"…\" }}"
                     )
                 })?;
                 Ok(SecretString::from(value))

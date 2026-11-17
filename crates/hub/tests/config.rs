@@ -145,6 +145,44 @@ fn secret_from_env_and_file() {
     );
 }
 
+/// A value that is not UTF-8 is named, never shown. Setting a variable is unsafe in edition 2024,
+/// so the test runs itself again in a child process that has it.
+#[cfg(unix)]
+#[test]
+fn env_secret_that_is_not_utf8_never_prints() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    const VAR: &str = "FRONDE_TEST_NOT_UTF8_SECRET";
+    const NAME: &str = "env_secret_that_is_not_utf8_never_prints";
+    let value = OsString::from_vec(b"canary-\xff\xfe-s3cret".to_vec());
+
+    if let Some(given) = std::env::var_os(VAR) {
+        assert_eq!(given, value);
+        let e = Secret::Env { env: VAR.into() }.resolve().unwrap_err();
+        let shown = [format!("{e}"), format!("{e:#}"), format!("{e:?}")];
+        let debug = format!("{value:?}");
+        let lossy = value.to_string_lossy().into_owned();
+        for text in &shown {
+            assert!(text.contains(VAR) && text.contains("valid UTF-8"), "{text}");
+            for leak in ["canary", "s3cret", debug.as_str(), lossy.as_str()] {
+                assert!(!text.contains(leak), "{leak:?} in {text}");
+            }
+        }
+        return;
+    }
+
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+        .env(VAR, &value)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    // The child ran this very test, not an empty filter.
+    assert!(stdout.contains("1 passed"), "{stdout}\n{stderr}");
+}
+
 #[test]
 fn missing_secret_explains() {
     let e = Secret::Env {

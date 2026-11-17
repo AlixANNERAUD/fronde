@@ -1,18 +1,8 @@
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use fronde_agent::acp::AgentSpec;
 use fronde_hub::config::{ComponentConfig, Config};
-use fronde_wasm::{Checks, Credential, Hashes, prepare};
-use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
-use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use fronde_wasm::{Checks, Credential, prepare};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use wiremock::matchers::{method, path as url_path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -31,52 +21,108 @@ fn dist(file: &str) -> PathBuf {
     p
 }
 
-/// Strip `#[cfg(test)]` / `#[cfg(all(test, ...))]` items from Rust source so unit tests can
-/// assert on `.expose_secret()` without widening the production call-site allowlist.
-fn strip_test_modules(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut pending_cfg_test = false;
-    let mut skip_depth: usize = 0;
+/// Whether an attribute is `#[cfg(test)]` or `#[cfg(all(test, ...))]`: what only builds for tests.
+/// `cfg(not(test))`, `cfg(any(test, ...))` and feature gates are production code.
+fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let Ok(meta) = attr.parse_args::<syn::Meta>() else {
+            return false;
+        };
+        match meta {
+            syn::Meta::Path(p) => p.is_ident("test"),
+            syn::Meta::List(list) if list.path.is_ident("all") => list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .is_ok_and(|all| {
+                    all.iter()
+                        .any(|m| matches!(m, syn::Meta::Path(p) if p.is_ident("test")))
+                }),
+            _ => false,
+        }
+    })
+}
 
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if skip_depth > 0 {
-            for ch in line.chars() {
-                if ch == '{' {
-                    skip_depth += 1;
-                } else if ch == '}' {
-                    skip_depth -= 1;
-                    if skip_depth == 0 {
-                        break;
+/// Every line where an identifier starting with `expose_secret` appears in `tokens`, macro
+/// bodies included: a method call, `ExposeSecret::expose_secret`, `expose_secret_mut`.
+fn expose_lines(tokens: proc_macro2::TokenStream, out: &mut Vec<usize>) {
+    for tree in tokens {
+        match tree {
+            proc_macro2::TokenTree::Ident(ident) => {
+                if ident.to_string().starts_with("expose_secret") {
+                    out.push(ident.span().start().line);
+                }
+            }
+            proc_macro2::TokenTree::Group(group) => expose_lines(group.stream(), out),
+            _ => {}
+        }
+    }
+}
+
+/// Walks the items that build outside tests, down into inline modules, impls and traits.
+fn production_expose_lines(items: &[syn::Item], out: &mut Vec<usize>) {
+    use quote::ToTokens;
+    for item in items {
+        match item {
+            syn::Item::Mod(m) if is_test_only(&m.attrs) => {}
+            syn::Item::Mod(syn::ItemMod {
+                content: Some((_, items)),
+                ..
+            }) => production_expose_lines(items, out),
+            syn::Item::Impl(i) if !is_test_only(&i.attrs) => {
+                for item in &i.items {
+                    let attrs = match item {
+                        syn::ImplItem::Const(c) => &c.attrs,
+                        syn::ImplItem::Fn(f) => &f.attrs,
+                        syn::ImplItem::Type(t) => &t.attrs,
+                        syn::ImplItem::Macro(m) => &m.attrs,
+                        _ => &Vec::new(),
+                    };
+                    if !is_test_only(attrs) {
+                        expose_lines(item.to_token_stream(), out);
                     }
                 }
             }
-            continue;
-        }
-        if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
-            pending_cfg_test = true;
-            continue;
-        }
-        if pending_cfg_test {
-            if trimmed.starts_with("#[") || trimmed.is_empty() {
-                continue;
+            syn::Item::Trait(t) if !is_test_only(&t.attrs) => {
+                for item in &t.items {
+                    let attrs = match item {
+                        syn::TraitItem::Const(c) => &c.attrs,
+                        syn::TraitItem::Fn(f) => &f.attrs,
+                        syn::TraitItem::Type(t) => &t.attrs,
+                        syn::TraitItem::Macro(m) => &m.attrs,
+                        _ => &Vec::new(),
+                    };
+                    if !is_test_only(attrs) {
+                        expose_lines(item.to_token_stream(), out);
+                    }
+                }
             }
-            let opens = line.chars().filter(|&c| c == '{').count();
-            if opens > 0 {
-                let closes = line.chars().filter(|&c| c == '}').count();
-                skip_depth = opens.saturating_sub(closes);
-                pending_cfg_test = false;
-                continue;
-            }
-            if trimmed.ends_with(';') {
-                pending_cfg_test = false;
-                continue;
+            syn::Item::Impl(_) | syn::Item::Trait(_) => {}
+            other => {
+                let attrs: &[syn::Attribute] = match other {
+                    syn::Item::Const(i) => &i.attrs,
+                    syn::Item::Enum(i) => &i.attrs,
+                    syn::Item::ExternCrate(i) => &i.attrs,
+                    syn::Item::Fn(i) => &i.attrs,
+                    syn::Item::ForeignMod(i) => &i.attrs,
+                    syn::Item::Macro(i) => &i.attrs,
+                    syn::Item::Static(i) => &i.attrs,
+                    syn::Item::Struct(i) => &i.attrs,
+                    syn::Item::TraitAlias(i) => &i.attrs,
+                    syn::Item::Type(i) => &i.attrs,
+                    syn::Item::Union(i) => &i.attrs,
+                    syn::Item::Use(i) => &i.attrs,
+                    _ => &[],
+                };
+                if !is_test_only(attrs) {
+                    expose_lines(other.to_token_stream(), out);
+                }
             }
         }
-        out.push_str(line);
-        out.push('\n');
     }
-    out
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -93,14 +139,27 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `expose_secret` is allowed only at these sites, each justified. A new use is added here on
+/// purpose and reviewed (AGENTS.md).
+const ALLOWED: &[(&str, usize)] = &[
+    // The ACP session's MCP header towards the hub.
+    ("crates/agent/src/acp.rs", 1),
+    // The upstream MCP token handed to rmcp's transport.
+    ("crates/hub/src/upstream.rs", 1),
+    // `check_token`'s length, `check_password`'s emptiness, and `same_secret`'s digest, which
+    // compares the `/mcp` token and the web password in constant time.
+    ("crates/server/src/lib.rs", 3),
+    // The gate: the Basic and Bearer headers built for each request, and the Bearer token's
+    // bytes checked once when the grants are made.
+    ("crates/wasm/src/egress.rs", 3),
+];
+
 #[test]
 fn expose_secret_call_sites() {
     let root = workspace_root();
     let mut files = Vec::new();
     for parent in ["crates", "components"] {
-        let Ok(entries) = std::fs::read_dir(root.join(parent)) else {
-            continue;
-        };
+        let entries = std::fs::read_dir(root.join(parent)).unwrap();
         for entry in entries.flatten() {
             let src = entry.path().join("src");
             if src.is_dir() {
@@ -109,41 +168,76 @@ fn expose_secret_call_sites() {
         }
     }
     files.sort();
+    assert!(
+        files
+            .iter()
+            .any(|f| f.ends_with("crates/wasm/src/egress.rs"))
+            && files.iter().any(|f| f.starts_with(root.join("components"))),
+        "the walk missed the sources: {files:?}"
+    );
 
-    let mut found: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+    let mut found: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for file in files {
         let text = std::fs::read_to_string(&file).unwrap();
-        let prod = strip_test_modules(&text);
-        let hits: Vec<(usize, String)> = prod
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.contains("expose_secret("))
-            .map(|(i, line)| (i + 1, line.trim().to_string()))
-            .collect();
-        if !hits.is_empty() {
+        let parsed = syn::parse_file(&text)
+            .unwrap_or_else(|e| panic!("cannot parse {}: {e}", file.display()));
+        if is_test_only(&parsed.attrs) {
+            continue;
+        }
+        let mut lines = Vec::new();
+        production_expose_lines(&parsed.items, &mut lines);
+        if !lines.is_empty() {
             let rel = file
                 .strip_prefix(&root)
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            found.insert(rel, hits);
+            found.insert(rel, lines);
         }
     }
 
-    let expected: BTreeSet<&str> = [
-        "crates/agent/src/acp.rs",
-        "crates/hub/src/upstream.rs",
-        "crates/server/src/lib.rs",
-        "crates/server/src/web.rs",
-        "crates/wasm/src/egress.rs",
-    ]
-    .into_iter()
-    .collect();
-    let actual: BTreeSet<&str> = found.keys().map(String::as_str).collect();
+    let actual: BTreeMap<&str, usize> = found
+        .iter()
+        .map(|(file, lines)| (file.as_str(), lines.len()))
+        .collect();
+    let expected: BTreeMap<&str, usize> = ALLOWED.iter().copied().collect();
     assert_eq!(
         actual, expected,
-        "expose_secret( call sites changed: {found:#?}"
+        "expose_secret call sites changed (file: lines): {found:#?}"
     );
+}
+
+/// The walk sees what a line search missed, and skips only what builds for tests alone.
+#[test]
+fn expose_secret_walk_sees_macros_and_paths() {
+    let source = r#"
+        use secrecy::ExposeSecret;
+        fn a(s: &S) { tracing::info!("{}", s.expose_secret()); }
+        fn b(s: &S) -> &str { ExposeSecret::expose_secret(s) }
+        fn c(s: &mut S) { s.expose_secret_mut(); }
+        #[cfg(not(test))]
+        fn d(s: &S) { s.expose_secret(); }
+        #[cfg(feature = "x")]
+        fn e(s: &S) { s.expose_secret(); }
+        impl T {
+            fn f(&self) { self.0.expose_secret(); }
+            #[cfg(test)]
+            fn g(&self) { self.0.expose_secret(); }
+        }
+        #[cfg(test)]
+        mod tests { fn h(s: &S) { s.expose_secret(); } }
+        #[cfg(all(test, unix))]
+        mod unix_tests { fn i(s: &S) { s.expose_secret(); } }
+        mod inner {
+            fn j(s: &S) { s.expose_secret(); }
+            #[cfg(test)]
+            fn k(s: &S) { s.expose_secret(); }
+        }
+    "#;
+    let parsed = syn::parse_file(source).unwrap();
+    let mut lines = Vec::new();
+    production_expose_lines(&parsed.items, &mut lines);
+    assert_eq!(lines, [3, 4, 5, 7, 9, 11, 20]);
 }
 
 #[test]
@@ -247,130 +341,4 @@ fn no_secret_in_debug() {
     }
     assert!(format!("{agent_spec:?}").contains("[REDACTED]"));
     assert!(format!("{agent_spec:#?}").contains("[REDACTED]"));
-}
-
-#[tokio::test]
-async fn log_canary_never_appears() {
-    #[derive(Clone, Default)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Buffer {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let caldav_canary = "canary-caldav-secret-9f8e7d6c";
-    let mcp_canary = "canary-mcp-token-0123456789abcdef0123456789";
-    let web_canary = "canary-web-secret-4a5b6c7d";
-    let expected_basic_b64 = STANDARD.encode(format!("alix:{caldav_canary}"));
-    let expected_auth = format!("Basic {expected_basic_b64}");
-
-    let mock_server = MockServer::start().await;
-    let body =
-        r#"<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"></multistatus>"#;
-    Mock::given(method("REPORT"))
-        .and(url_path("/cal/"))
-        .respond_with(ResponseTemplate::new(207).set_body_string(body))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let token_file = dir.path().join("mcp_token");
-    let web_file = dir.path().join("web_pass");
-    let caldav_file = dir.path().join("caldav_pass");
-    fronde_hub::private::write(&token_file, mcp_canary).unwrap();
-    fronde_hub::private::write(&web_file, web_canary).unwrap();
-    fronde_hub::private::write(&caldav_file, format!("{caldav_canary}\n")).unwrap();
-
-    let mut component_cfg: ComponentConfig = toml::from_str(&format!(
-        "name = \"calendar\"\npath = {:?}\nmanifest = {:?}\n",
-        dist("calendar.wasm").display().to_string(),
-        dist("calendar.toml").display().to_string(),
-    ))
-    .unwrap();
-    let hashes = Hashes::of(&component_cfg).unwrap();
-    component_cfg.sha256 = Some(hashes.sha256);
-    component_cfg.manifest_sha256 = Some(hashes.manifest_sha256);
-
-    let origin = mock_server.uri();
-    let toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n\
-         [data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
-         [memory]\ngit = false\n\
-         [web]\npassword = {{ file = {:?} }}\n\
-         [[sources]]\nkind = \"component\"\nname = \"calendar\"\npath = {:?}\nmanifest = {:?}\n\
-         sha256 = {:?}\nmanifest_sha256 = {:?}\n\
-         allow = [{{ origin = {origin:?}, local = true }}]\n\
-         [sources.settings]\nevents_url = \"{origin}/cal/\"\nreminders_url = \"{origin}/tasks/\"\n\
-         [[sources.credentials]]\norigin = {origin:?}\n\
-         basic = {{ username = \"alix\", password = {{ file = {:?} }} }}\n",
-        token_file.display().to_string(),
-        dir.path().join("data").display().to_string(),
-        web_file.display().to_string(),
-        component_cfg.path.display().to_string(),
-        component_cfg.manifest_path().display().to_string(),
-        component_cfg.sha256.unwrap(),
-        component_cfg.manifest_sha256.unwrap(),
-        caldav_file.display().to_string(),
-    );
-    let config: Config = toml::from_str(&toml).unwrap();
-
-    let buffer = Buffer::default();
-    let out = buffer.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(move || out.clone())
-        .with_ansi(false)
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-
-    let (addr, server_handle) = fronde::start(config).await.unwrap();
-    let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
-            .auth_header(mcp_canary),
-    );
-    let client = ().serve(transport).await.unwrap();
-    let args = json!({"from": "2026-11-16", "to": "2026-11-22"})
-        .as_object()
-        .unwrap()
-        .clone();
-    let result = client
-        .call_tool(CallToolRequestParams::new("calendar_list").with_arguments(args))
-        .await
-        .unwrap();
-    assert!(!result.is_error.unwrap_or(false), "{result:?}");
-
-    drop(client);
-    server_handle.abort();
-    drop(guard);
-
-    let requests = mock_server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    let sent_auth = requests[0]
-        .headers
-        .get("authorization")
-        .expect("missing Authorization header on wiremock request")
-        .to_str()
-        .unwrap();
-    assert_eq!(sent_auth, expected_auth);
-
-    let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
-    assert!(!logs.is_empty(), "expected TRACE logs to be captured");
-    for secret in [
-        caldav_canary,
-        &expected_basic_b64,
-        &expected_auth,
-        mcp_canary,
-        web_canary,
-    ] {
-        assert!(
-            !logs.contains(secret),
-            "captured TRACE logs leaked secret {secret:?}:\n{logs}"
-        );
-    }
 }

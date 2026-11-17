@@ -21,7 +21,7 @@ and offers a web chat.
 | `crates/component-sdk` (`fronde-component`) | The guest SDK components depend on: the WIT it targets (a copy of `wit/v0.1`), `export_tool!`, settings, HTTP over WASI, fakes for native tests (`testing` feature). Stands alone: not in the root workspace, no dependency on another Fronde crate, publishable |
 | `wit/` | The components' WIT, one frozen directory per released version of `fronde:component` (`v0.1`): shared `settings` interface, `tool` world |
 | `components/` | Tool components, each a standalone Cargo project built for `wasm32-wasip2`, with its manifest `fronde-component.toml` beside `Cargo.toml` (`echo` is the host's test bench, `calendar` the CalDAV tools, whose tool contract its own tests pin in `tests/snapshots`) |
-| `crates/server` | The `fronde` binary and library: configuration check (`check.rs`, which prints the components' hashes), healthcheck, the component sources it hands the hub, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
+| `crates/server` | The `fronde` binary and library: configuration check (`check.rs`, which prints the components' hashes), `hardening.rs` (on Linux, `serve` makes itself non-dumpable with no core dumps unless `FRONDE_ALLOW_CORE_DUMPS=1`), healthcheck, the component sources it hands the hub, HTTP routes, `/mcp` behind a bearer token, the sign-in forms (`/auth/sign-in`, `/auth/sign-out`), the interface's files and `/ws` |
 
 Components are built by `mise run components`, which builds each project listed in
 `$FRONDE_COMPONENTS` and copies the `.wasm` files to `components/dist`, each with its manifest
@@ -110,6 +110,9 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
   RUSTSEC-2026-0459: drop that ignore as soon as a sqlx release accepts 0.39.
 - Secrets never appear in the configuration file, logs or tool output: `{ file = "…" }` or
   `{ env = "…" }` only.
+- Resolved secrets are `secrecy` types. `expose_secret` is called only at the sites listed, with
+  their count per file, in `crates/server/tests/secrets.rs` (`expose_secret_call_sites`); a new use
+  is added to that list on purpose, and reviewed.
 - Nothing read from an external source (web, email, document) is saved to memory automatically.
 - Never lose calendar data the tools do not model: edits keep every component, property and
   parameter they do not change; only formatting (folding, parameter order, quoting, a text value's

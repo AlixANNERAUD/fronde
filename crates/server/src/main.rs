@@ -137,6 +137,7 @@ async fn healthcheck(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
+    fronde::hardening::harden()?;
     let config = fronde_hub::config::load(path)?;
     let (addr, server) = fronde::start(config).await?;
     tracing::info!("listening on http://{addr} (MCP at /mcp)");

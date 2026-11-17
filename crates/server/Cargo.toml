@@ -32,9 +32,18 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `serve` makes itself non-dumpable and sets RLIMIT_CORE to 0 (hardening.rs).
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 base64.workspace = true
 futures.workspace = true
+# The `expose_secret_call_sites` architecture test parses the sources.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", features = ["full"] }
+tracing-log = "0.2"
 fronde-agent = { path = "../agent", features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
