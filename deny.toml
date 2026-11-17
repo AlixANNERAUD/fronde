@@ -39,3 +39,7 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# The calendar component uses the owner's calcard fork (components/calendar/Cargo.toml). The
+# other projects checked against this file do not, so an unused allowance is no warning.
+allow-git = ["https://github.com/AlixANNERAUD/calcard"]
+unused-allowed-source = "allow"

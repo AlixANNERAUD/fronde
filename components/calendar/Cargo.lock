@@ -68,9 +68,8 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "calcard"
-version = "0.3.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c601473ec15a875626bce73db1a1f0fc81e9c949ca25f1463b714947c0a70a1f"
+version = "0.3.15"
+source = "git+https://github.com/AlixANNERAUD/calcard?tag=v0.3.15-fronde.1#b45415e58c3361049ae21f48e61bb81a83310d53"
 dependencies = [
  "ahash",
  "chrono",

@@ -1218,24 +1218,27 @@ END:VCALENDAR\r\n";
         );
     }
 
-    #[test]
-    fn edit_refuses_data_uri_naming_the_property() {
+    /// `rich.ics` with `lines` added to its event, after a title edit.
+    fn edit_rich_with(lines: &str) -> String {
         let original = fixture("rich.ics").replace(
             "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
-            "IMAGE:data:text/plain,Hello%2C%20world\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            &format!("{lines}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
         );
         let old = parse_events(&original, Paris).unwrap().remove(0);
         let new = Event {
             title: "Autre".into(),
             ..old.clone()
         };
-        let e = update_event_ics(&original, &old, &new)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("IMAGE holds inline data Fronde cannot keep exactly"),
-            "{e}"
-        );
+        update_event_ics(&original, &old, &new).unwrap()
+    }
+
+    /// calcard 0.3.14 rebuilt a percent-encoded data: URI as base64, so this edit was refused; the
+    /// fork keeps the URI as it was read.
+    #[test]
+    fn edit_keeps_a_percent_encoded_data_uri() {
+        let image = "IMAGE:data:text/plain,Hello%2C%20world";
+        let out = edit_rich_with(image);
+        assert_eq!(raw_line(&out, "IMAGE", &[]), [image], "{out}");
     }
 
     #[test]
@@ -1259,29 +1262,37 @@ END:VCALENDAR\r\n";
         }
     }
 
+    /// Attachments calcard 0.3.14 could not keep, so these edits were refused: the fork writes
+    /// each back exactly as it was read.
     #[test]
-    fn edit_refuses_attachments_it_cannot_keep_exactly() {
+    fn edit_keeps_attachments_exactly() {
         for attach in [
-            // calcard keeps neither the charset nor the percent-encoded form.
+            // A charset, and a percent-encoded payload, in a data: URI.
             "ATTACH:data:text/plain;charset=utf-8;base64,SGVsbG8=",
             "ATTACH:data:text/plain,Hello%2C%20world",
-            // Not base64: the parser keeps the payload as text.
-            "ATTACH;ENCODING=BASE64;VALUE=BINARY:not*base64",
         ] {
-            let original = fixture("rich.ics").replace(
-                "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
-                &format!("{attach}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
-            );
-            let old = parse_events(&original, Paris).unwrap().remove(0);
-            let new = Event {
-                title: "Autre".into(),
-                ..old.clone()
-            };
-            let e = update_event_ics(&original, &old, &new)
-                .unwrap_err()
-                .to_string();
-            assert!(e.contains("calendar app"), "{attach}: {e}");
+            let out = edit_rich_with(attach);
+            assert_eq!(raw_line(&out, "ATTACH", &[]), [attach], "{out}");
         }
+    }
+
+    #[test]
+    fn edit_refuses_attachments_it_cannot_keep_exactly() {
+        // Not base64: the parser keeps the payload as text.
+        let attach = "ATTACH;ENCODING=BASE64;VALUE=BINARY:not*base64";
+        let original = fixture("rich.ics").replace(
+            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+            &format!("{attach}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
+        );
+        let old = parse_events(&original, Paris).unwrap().remove(0);
+        let new = Event {
+            title: "Autre".into(),
+            ..old.clone()
+        };
+        let e = update_event_ics(&original, &old, &new)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("calendar app"), "{attach}: {e}");
     }
 
     #[test]

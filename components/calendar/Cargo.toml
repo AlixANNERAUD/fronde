@@ -23,7 +23,12 @@ chrono = "0.4"
 chrono-tz = "0.10"
 fronde-component = { version = "0.1", path = "../../crates/component-sdk" }
 http = "1"
-calcard = { version = "0.3", default-features = false }
+# The owner's fork of calcard (https://github.com/AlixANNERAUD/calcard), until its fixes are
+# upstream: 0.3.14 escapes URI values, decodes inline base64 and drops ENCODING, and loses data:
+# URIs it cannot rebuild, so an edit could change data Fronde does not model. The fork keeps them
+# as read (its README and CHANGELOG list each change) and keeps calcard's licence, MIT or
+# Apache-2.0.
+calcard = { git = "https://github.com/AlixANNERAUD/calcard", tag = "v0.3.15-fronde.1", default-features = false }
 roxmltree = "0.21"
 schemars = "1.1"
 serde = { version = "1", features = ["derive"] }
@@ -37,7 +42,7 @@ uuid = { version = "1", features = ["v4"] }
 # 64-bit tables index with `hash as usize`, which truncates on wasm32 and finds the wrong slot, so
 # calcard would not recognise property names. Host builds (tests) keep the 64-bit default.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-calcard = { version = "0.3", default-features = false, features = ["wasm"] }
+calcard = { git = "https://github.com/AlixANNERAUD/calcard", tag = "v0.3.15-fronde.1", default-features = false, features = ["wasm"] }
 
 [dev-dependencies]
 fronde-component = { version = "0.1", path = "../../crates/component-sdk", features = ["testing"] }
