@@ -112,7 +112,9 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
   `{ env = "…" }` only.
 - Nothing read from an external source (web, email, document) is saved to memory automatically.
 - Never lose calendar data the tools do not model: edits keep every component, property and
-  parameter they do not change; only formatting (folding, parameter order, quoting) may change.
+  parameter they do not change; only formatting (folding, parameter order, quoting, a text value's
+  transfer encoding) may change. The calendar uses the owner's calcard fork, which keeps values
+  as read: fix a loss there, not with a workaround in the component.
 - Tests never touch a real calendar, model or MCP server: use `wiremock`, in-process fakes and
   temporary directories.
 - Rust/UI components are vendored by hand in `crates/web/src/components/ui/`, with
