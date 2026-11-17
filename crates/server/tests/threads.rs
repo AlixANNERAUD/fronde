@@ -1573,13 +1573,16 @@ async fn next_turn(bench: &Bench, id: ThreadId, before: Option<u64>) {
 
 #[tokio::test]
 async fn children_running_at_once_are_capped() {
-    use fronde_agent::threads::{Delegation, MAX_CHILDREN_RUNNING};
+    use fronde_agent::threads::Delegation;
     let bench = held_bench().await;
+    // The documented default, read from the threads as configured.
+    let max_children_running = bench.threads.limits().children_running;
+    assert_eq!(max_children_running, 3);
     let main = bench
         .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
         .await;
     let mut children = Vec::new();
-    for n in 0..MAX_CHILDREN_RUNNING {
+    for n in 0..max_children_running {
         children.push(start_child(&main, &format!("Tâche {n}.")).await);
     }
     for child in &children {
@@ -1596,27 +1599,42 @@ async fn children_running_at_once_are_capped() {
     )
     .await;
     let limit = Delegation::TooManyRunning {
-        limit: MAX_CHILDREN_RUNNING,
+        limit: max_children_running,
     }
     .to_string();
     assert_eq!(refused, json!({"error": limit}), "{refused}");
     assert!(limit.contains("3 sub-agents running"), "{limit}");
+    assert!(limit.contains("[threads] children_running"), "{limit}");
     assert_eq!(
         children_of(&bench, ThreadId::MAIN).await.len(),
-        MAX_CHILDREN_RUNNING
+        max_children_running
     );
     bench.gate.notify_waiters();
 }
 
 #[tokio::test]
 async fn children_kept_are_capped() {
-    use fronde_agent::threads::{Delegation, MAX_CHILDREN_KEPT};
-    let bench = held_bench().await;
+    use fronde_agent::threads::{Delegation, Limits};
+    // The documented default is 200: a guard against clutter. A smaller one, configured, is
+    // enforced the same way.
+    assert_eq!(Limits::default().children_kept, 200);
+    let max_children_kept = 30;
+    let bench = limited(
+        None,
+        Limits {
+            children_kept: max_children_kept,
+            // Every child created here counts in the day's too.
+            children_per_day: 100,
+            ..Limits::default()
+        },
+    )
+    .await;
+    assert_eq!(bench.threads.limits().children_kept, max_children_kept);
     let main = bench
         .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
         .await;
     let mut kept = Vec::new();
-    for n in 0..MAX_CHILDREN_KEPT {
+    for n in 0..max_children_kept {
         let row = bench
             .threads
             .create(
@@ -1636,14 +1654,15 @@ async fn children_kept_are_capped() {
     )
     .await;
     let limit = Delegation::TooManyKept {
-        limit: MAX_CHILDREN_KEPT,
+        limit: max_children_kept,
     }
     .to_string();
     assert_eq!(refused, json!({"error": limit}), "{refused}");
     assert!(limit.contains("30 sub-agents"), "{limit}");
+    assert!(limit.contains("[threads] children_kept"), "{limit}");
     assert_eq!(
         children_of(&bench, ThreadId::MAIN).await.len(),
-        MAX_CHILDREN_KEPT
+        max_children_kept
     );
     // An archived one no longer counts.
     bench.threads.set_archived(kept[0], true).await.unwrap();
@@ -1850,6 +1869,432 @@ async fn a_wait_says_when_the_child_waits_for_an_agent() {
     assert_eq!(
         bench.assistant(second).await.status(),
         fronde_protocol::ThreadStatus::Queued
+    );
+    bench.gate.notify_waiters();
+}
+
+// Limits and cancellation: `[threads]`.
+
+/// [`held_bench`] with `limits`, sub-agents playing `child` when given.
+async fn limited(child: Option<FakeScript>, limits: fronde_agent::threads::Limits) -> Bench {
+    let gate = Arc::new(Notify::new());
+    let mut bench = bench_with(held(&gate), child, Budget { limits, ..many() }).await;
+    bench.gate = gate;
+    bench
+}
+
+/// A sub-agent that asks a permission in each turn and waits for the answer: its turn ends
+/// only when stopped (or answered).
+fn asking() -> FakeScript {
+    FakeScript {
+        updates: vec![text_chunk("Je cherche.")],
+        ask_permission: true,
+        ..FakeScript::default()
+    }
+}
+
+fn events_of(assistant: &Assistant) -> Vec<Event> {
+    assistant
+        .log()
+        .since(0)
+        .into_iter()
+        .map(|entry| entry.event)
+        .collect()
+}
+
+fn children_ended_in(assistant: &Assistant) -> Vec<(ThreadId, fronde_protocol::TurnOutcome)> {
+    events_of(assistant)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::ChildEnded {
+                thread, outcome, ..
+            } => Some((thread, outcome)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn cancelled() -> Event {
+    Event::TurnEnded {
+        outcome: fronde_protocol::TurnOutcome::Cancelled,
+    }
+}
+
+/// The documented defaults are the configuration's, and every `[threads]` value reaches the
+/// threads.
+#[test]
+fn the_limits_come_from_threads_config() {
+    use fronde_agent::threads::Limits;
+    let config = |threads: &str| -> fronde_hub::config::Config {
+        toml::from_str(&format!(
+            "[server]\ntoken = {{ env = \"UNUSED\" }}\n[data]\ndir = \"/nonexistent\"\ntimezone = \"Europe/Paris\"\nuser = \"alix\"\n[memory]\ngit = false\n{threads}"
+        ))
+        .unwrap()
+    };
+    let defaults = fronde::budget(&config(""));
+    assert_eq!(defaults.limits, Limits::default());
+    assert_eq!(
+        defaults.limits,
+        Limits {
+            max_depth: 1,
+            children_running: 3,
+            children_per_day: 30,
+            children_kept: 200,
+            child_turn_timeout: Duration::from_secs(30 * 60),
+        }
+    );
+    assert_eq!(
+        fronde::children_line(&config("")),
+        "your threads may start sub-agents, theirs may not; 3 running at once per thread, 30 a \
+         day in all, 200 kept per thread, 30m per turn"
+    );
+    let set = config(
+        "[threads]\nmax_depth = 2\nchildren_running = 5\nchildren_per_day = 50\nchildren_kept = 80\nchild_turn_timeout = \"1h\"\n",
+    );
+    assert_eq!(
+        fronde::budget(&set).limits,
+        Limits {
+            max_depth: 2,
+            children_running: 5,
+            children_per_day: 50,
+            children_kept: 80,
+            child_turn_timeout: Duration::from_secs(3600),
+        }
+    );
+    assert!(
+        fronde::children_line(&set).starts_with("sub-agents go 2 levels deep"),
+        "{}",
+        fronde::children_line(&set)
+    );
+    assert!(
+        fronde::children_line(&config("[threads]\nmax_depth = 0\n")).starts_with("off"),
+        "max_depth 0"
+    );
+}
+
+/// `max_depth = 0`: no thread may start sub-agents; the tools are hidden and refused, and the
+/// refusal names the setting.
+#[tokio::test]
+async fn max_depth_zero_turns_sub_agents_off() {
+    use fronde_agent::threads::{Delegation, Limits};
+    let bench = limited(
+        None,
+        Limits {
+            max_depth: 0,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let names = tool_names(&main).await;
+    for name in ["threads_start", "threads_send"] {
+        assert!(!names.contains(&name.to_owned()), "{name} offered");
+    }
+    let refused = call(
+        &main,
+        "use_tool",
+        json!({"arguments": {"name": "threads_start", "arguments": {"task": TASK}}}),
+    )
+    .await;
+    let off = Delegation::TooDeep { max_depth: 0 }.to_string();
+    assert_eq!(refused, json!({"error": off}), "{refused}");
+    assert!(off.contains("[threads] max_depth is 0"), "{off}");
+    assert!(children_of(&bench, ThreadId::MAIN).await.is_empty());
+    bench.gate.notify_waiters();
+}
+
+/// A configured `children_running` is the cap, named in the refusal.
+#[tokio::test]
+async fn children_running_limit() {
+    use fronde_agent::threads::{Delegation, Limits};
+    let bench = limited(
+        None,
+        Limits {
+            children_running: 1,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    start_child(&main, TASK).await;
+    let refused = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": "Une de trop."}}),
+    )
+    .await;
+    let limit = Delegation::TooManyRunning { limit: 1 }.to_string();
+    assert_eq!(refused, json!({"error": limit}), "{refused}");
+    assert!(limit.contains("[threads] children_running"), "{limit}");
+    assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 1);
+    bench.gate.notify_waiters();
+}
+
+/// `children_per_day` counts the sub-agents every thread started in 24 hours, archived ones
+/// included: archiving frees no place in it.
+#[tokio::test]
+async fn children_per_day_limit() {
+    use fronde_agent::threads::{Delegation, Limits};
+    let bench = limited(
+        None,
+        Limits {
+            children_per_day: 3,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let other = bench.new_thread().await;
+    for title in ["Hier", "Avant-hier"] {
+        let row = bench
+            .threads
+            .create("alix", StartedBy::Thread(other), Some(other), title)
+            .await
+            .unwrap();
+        bench.threads.set_archived(row.id, true).await.unwrap();
+    }
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    start_child(&main, TASK).await;
+    let limit = Delegation::TooManyToday { limit: 3 }.to_string();
+    assert!(limit.contains("[threads] children_per_day"), "{limit}");
+    let refused = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": "Une de trop."}}),
+    )
+    .await;
+    assert_eq!(refused, json!({"error": limit}), "{refused}");
+    // Another thread is refused too: the count is for all of them.
+    let second = bench
+        .client(&bench.start(other).await, "claude-code", &[])
+        .await;
+    let refused = call(
+        &second,
+        "threads_start",
+        json!({"arguments": {"task": "Une autre."}}),
+    )
+    .await;
+    assert_eq!(refused, json!({"error": limit}), "{refused}");
+    assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 1);
+    bench.gate.notify_waiters();
+}
+
+/// A sub-agent's turn past `child_turn_timeout` is stopped as Stop does: a notice, its card
+/// closed, its end cancelled, and its parent told so in a `ChildEnded` entry. The parent's own
+/// turn, longer, is not a sub-agent's and goes on.
+#[tokio::test]
+async fn child_turn_times_out() {
+    use fronde_agent::threads::Limits;
+    let bench = limited(
+        Some(asking()),
+        Limits {
+            child_turn_timeout: Duration::from_millis(300),
+            ..Limits::default()
+        },
+    )
+    .await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let child = start_child(&main, TASK).await;
+    let assistant = bench.assistant(child).await;
+    until_idle(&assistant).await;
+    let shown = events_of(&assistant);
+    assert!(
+        shown.iter().any(|event| matches!(
+            event,
+            Event::Notice { text } if text.starts_with(fronde_agent::assistant::TIMED_OUT)
+                && text.contains("300ms")
+                && text.contains("[threads] child_turn_timeout")
+        )),
+        "{shown:?}"
+    );
+    assert_eq!(shown.last(), Some(&cancelled()), "{shown:?}");
+    assert!(
+        !bench
+            .requests
+            .pending_by_topic()
+            .await
+            .unwrap()
+            .contains_key(&format!("thread:{child}")),
+        "its card is closed"
+    );
+    let main_assistant = bench.assistant(ThreadId::MAIN).await;
+    assert_eq!(
+        children_ended_in(&main_assistant),
+        [(child, fronde_protocol::TurnOutcome::Cancelled)]
+    );
+    assert!(main_assistant.current_turn().await.is_some());
+    bench.gate.notify_waiters();
+}
+
+/// `threads_cancel` stops the whole tree under the sub-agent named, deepest first, with their
+/// cards; none of the turns stopped wakes a parent. With `max_depth = 2` a sub-agent may start
+/// its own, which may not.
+#[tokio::test]
+async fn cancel_reaches_grandchildren() {
+    use fronde_agent::threads::{Delegation, Limits};
+    let bench = limited(
+        Some(asking()),
+        Limits {
+            max_depth: 2,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let child = start_child(&main, TASK).await;
+    let child_assistant = bench.assistant(child).await;
+    next_request(&child_assistant, 0).await;
+    let child_client = bench
+        .client(&token_of(&bench, child).await, "claude-code", &[])
+        .await;
+    let grandchild = start_child(&child_client, "Une partie de la tâche.").await;
+    let grandchild_assistant = bench.assistant(grandchild).await;
+    next_request(&grandchild_assistant, 0).await;
+    // Two levels under the owner's thread, and no more.
+    let grandchild_client = bench
+        .client(&token_of(&bench, grandchild).await, "claude-code", &[])
+        .await;
+    let refused = call(
+        &grandchild_client,
+        "threads_start",
+        json!({"arguments": {"task": "Encore plus bas."}}),
+    )
+    .await;
+    let too_deep = Delegation::TooDeep { max_depth: 2 }.to_string();
+    assert_eq!(refused, json!({"error": too_deep}), "{refused}");
+    assert!(too_deep.contains("[threads] max_depth"), "{too_deep}");
+
+    let stopped = call(
+        &main,
+        "threads_cancel",
+        json!({"arguments": {"thread": child.0}}),
+    )
+    .await;
+    assert_eq!(stopped["result"]["stopped"], true, "{stopped}");
+    for assistant in [&child_assistant, &grandchild_assistant] {
+        until_idle(assistant).await;
+        let shown = events_of(assistant);
+        assert_eq!(shown.last(), Some(&cancelled()), "{shown:?}");
+    }
+    let pending = bench.requests.pending_by_topic().await.unwrap();
+    for id in [child, grandchild] {
+        assert!(
+            !pending.contains_key(&format!("thread:{id}")),
+            "{pending:?}"
+        );
+    }
+    // Nobody is woken: the one who stopped them knows.
+    let main_assistant = bench.assistant(ThreadId::MAIN).await;
+    assert_eq!(children_ended_in(&child_assistant), []);
+    assert_eq!(children_ended_in(&main_assistant), []);
+    assert!(main_assistant.current_turn().await.is_some());
+    bench.gate.notify_waiters();
+}
+
+/// Archiving a thread stops its sub-agents' turns, which stay, not archived, and wake nobody;
+/// the secrets given in its cards for the conversation are forgotten, another thread's kept.
+#[tokio::test]
+async fn archive_cancels_children_and_forgets_secrets() {
+    use fronde_db::ephemeral::EphemeralScope;
+    let bench = limited(Some(asking()), fronde_agent::threads::Limits::default()).await;
+    let parent = bench.new_thread().await;
+    let parent_client = bench
+        .client(&bench.start(parent).await, "claude-code", &[])
+        .await;
+    let child = start_child(&parent_client, TASK).await;
+    let child_assistant = bench.assistant(child).await;
+    next_request(&child_assistant, 0).await;
+    let ephemeral = bench.requests.secrets().unwrap().ephemeral().clone();
+    let put = |topic: &str| {
+        let scope = EphemeralScope {
+            topic: topic.into(),
+            asker: "claude-code".into(),
+        };
+        let (reference, _) = ephemeral
+            .put(
+                scope.clone(),
+                SecretString::from(CANARY),
+                fronde_db::ephemeral::DEFAULT_TTL,
+                false,
+            )
+            .unwrap();
+        (reference, scope)
+    };
+    let (parents, parent_scope) = put(&format!("thread:{parent}"));
+    let (mains, main_scope) = put("conversation");
+
+    bench.threads.set_archived(parent, true).await.unwrap();
+    until_idle(&child_assistant).await;
+    assert_eq!(events_of(&child_assistant).last(), Some(&cancelled()));
+    let child_row = bench.threads.get(child).await.unwrap().unwrap();
+    assert!(child_row.archived_at.is_none(), "the sub-agent stays");
+    assert_eq!(children_ended_in(&*bench.assistant(parent).await), []);
+    assert!(
+        ephemeral.take(parents.as_str(), &parent_scope).is_err(),
+        "the archived thread's secret is forgotten"
+    );
+    assert!(ephemeral.take(mains.as_str(), &main_scope).is_ok());
+
+    // A sub-agent archived on its own wakes its parent no more.
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let second = start_child(&main, "Une autre tâche.").await;
+    let second_assistant = bench.assistant(second).await;
+    next_request(&second_assistant, 0).await;
+    bench.threads.set_archived(second, true).await.unwrap();
+    until_idle(&second_assistant).await;
+    assert_eq!(events_of(&second_assistant).last(), Some(&cancelled()));
+    assert_eq!(
+        children_ended_in(&*bench.assistant(ThreadId::MAIN).await),
+        []
+    );
+    bench.gate.notify_waiters();
+}
+
+/// Stop on a parent stops its own turn only: its sub-agent goes on. Stop in a sub-agent's own
+/// thread, which its parent did not ask for, ends its turn cancelled and wakes the parent.
+#[tokio::test]
+async fn stop_on_parent_leaves_children_running() {
+    let bench = limited(Some(asking()), fronde_agent::threads::Limits::default()).await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let child = start_child(&main, TASK).await;
+    let child_assistant = bench.assistant(child).await;
+    next_request(&child_assistant, 0).await;
+    let main_assistant = bench.assistant(ThreadId::MAIN).await;
+    main_assistant.cancel().await;
+    bench.gate.notify_waiters();
+    until_idle(&main_assistant).await;
+    assert!(child_assistant.current_turn().await.is_some());
+    assert_eq!(
+        child_assistant.status(),
+        fronde_protocol::ThreadStatus::Running
+    );
+
+    child_assistant.cancel().await;
+    until_idle(&child_assistant).await;
+    assert_eq!(events_of(&child_assistant).last(), Some(&cancelled()));
+    timeout(WAIT, async {
+        while children_ended_in(&main_assistant).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the parent was never told");
+    assert_eq!(
+        children_ended_in(&main_assistant),
+        [(child, fronde_protocol::TurnOutcome::Cancelled)]
     );
     bench.gate.notify_waiters();
 }

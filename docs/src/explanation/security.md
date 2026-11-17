@@ -381,11 +381,14 @@ thread's first message, with its own directories, its own sandbox and its own hu
   the threads it may not reach. A sub-agent starts with only its task, in a new session and its
   own directories, so it reads neither its parent's conversation nor its files, and its
   parent's secrets "for this conversation" are refused in its thread. A sub-agent cannot start or
-  drive sub-agents of its own: the hub does not offer it `threads_start` and `threads_send`, and
-  the threads refuse them, through `use_tool` too. A thread's token lives while its agent idles,
+  drive sub-agents of its own (`[threads] max_depth`, 1): the hub does not offer it
+  `threads_start` and `threads_send`, and the threads refuse them, through `use_tool` too. A thread's token lives while its agent idles,
   and every process the agent starts inherits it: the tools that act (`threads_start`,
   `threads_send`, `threads_read`, `threads_cancel`) work only while the thread is in a turn, and a
-  wait ends with the turn. A thread has at most 3 sub-agents in a turn at once and keeps at most 30.
+  wait ends with the turn. Since a misled agent spends the subscription's quota in the
+  background, `[threads]` bounds it: by default 3 sub-agents of a thread in a turn at once, 30
+  started a day by all threads, 30 minutes per sub-agent turn (and 200 kept per thread, against
+  clutter); a quota-based budget is planned.
   An outside MCP client, which holds
   `server.token`, gets no `threads_*` tool and is refused them. What a sub-agent writes reaches
   its parent capped, with hidden characters shown as U+FFFD and marked as data, not

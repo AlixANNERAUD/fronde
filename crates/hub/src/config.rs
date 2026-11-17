@@ -257,7 +257,10 @@ impl Default for AgentLimits {
     }
 }
 
-/// `[threads]`: how many agent processes run at once, and how long an idle one is kept.
+/// `[threads]`: how many agent processes run at once, how long an idle one is kept, and how far
+/// sub-agents may go. The limits on sub-agents bound what an agent, a prompt-injected one
+/// included, may spend of the subscription's quota in the background; a budget read from the
+/// quota itself is planned to replace the counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ThreadsConfig {
@@ -267,21 +270,63 @@ pub struct ThreadsConfig {
     pub max_running: usize,
     /// How long an agent waits for a message once its turn ended before it is stopped; its
     /// session resumes on the next message.
-    #[serde(deserialize_with = "duration")]
+    #[serde(deserialize_with = "idle_stop")]
     pub idle_stop: std::time::Duration,
+    /// How deep a thread may be and still start sub-agents: 0 lets no thread delegate, 1 lets
+    /// the owner's threads delegate but not their sub-agents; at most [`MAX_DEPTH`].
+    #[serde(deserialize_with = "max_depth")]
+    pub max_depth: u32,
+    /// Sub-agents of one thread in a turn at once, those waiting for an agent included.
+    #[serde(deserialize_with = "children_running")]
+    pub children_running: usize,
+    /// Sub-agents started by all threads together in the last 24 hours, archived ones
+    /// included.
+    #[serde(deserialize_with = "children_per_day")]
+    pub children_per_day: usize,
+    /// Sub-agents one thread keeps not archived: a guard against clutter only.
+    #[serde(deserialize_with = "children_kept")]
+    pub children_kept: usize,
+    /// How long one turn of a sub-agent may run once its agent has it; it is then stopped.
+    #[serde(deserialize_with = "child_turn_timeout")]
+    pub child_turn_timeout: std::time::Duration,
 }
+
+/// The deepest `[threads] max_depth` allowed.
+pub const MAX_DEPTH: u32 = 3;
 
 impl Default for ThreadsConfig {
     fn default() -> Self {
         Self {
             max_running: 3,
             idle_stop: std::time::Duration::from_secs(10 * 60),
+            max_depth: 1,
+            children_running: 3,
+            children_per_day: 30,
+            children_kept: 200,
+            child_turn_timeout: std::time::Duration::from_secs(30 * 60),
         }
     }
 }
 
 fn max_running<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
-    let expected = "max_running: expected a number of agents of at least 1";
+    count(d, "max_running", "a number of agents")
+}
+
+fn children_running<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    count(d, "children_running", "a number of sub-agents")
+}
+
+fn children_per_day<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    count(d, "children_per_day", "a number of sub-agents")
+}
+
+fn children_kept<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    count(d, "children_kept", "a number of sub-agents")
+}
+
+/// A whole number of at least 1, for the key `key`.
+fn count<'de, D: serde::Deserializer<'de>>(d: D, key: &str, what: &str) -> Result<usize, D::Error> {
+    let expected = format!("{key}: expected {what} of at least 1");
     match RawLimit::deserialize(d)? {
         RawLimit::Integer(count) if count >= 1 => {
             usize::try_from(count).map_err(|_| serde::de::Error::custom(expected))
@@ -290,11 +335,34 @@ fn max_running<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error
     }
 }
 
+fn max_depth<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let expected = format!("max_depth: expected a depth from 0 to {MAX_DEPTH}");
+    match RawLimit::deserialize(d)? {
+        RawLimit::Integer(depth) if (0..=i64::from(MAX_DEPTH)).contains(&depth) => {
+            u32::try_from(depth).map_err(|_| serde::de::Error::custom(expected))
+        }
+        _ => Err(serde::de::Error::custom(expected)),
+    }
+}
+
+fn idle_stop<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::time::Duration, D::Error> {
+    duration(d, "idle_stop")
+}
+
+fn child_turn_timeout<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::time::Duration, D::Error> {
+    duration(d, "child_turn_timeout")
+}
+
 /// A duration as humans write it: `"10m"`, `"1h 30m"`, `"90s"`; above zero.
-fn duration<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::time::Duration, D::Error> {
+fn duration<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    key: &str,
+) -> Result<std::time::Duration, D::Error> {
     let expected = "expected a duration above zero such as \"10m\", \"1h\" or \"90s\"";
     let text = String::deserialize(d)
-        .map_err(|_| serde::de::Error::custom(format!("idle_stop: {expected}")))?;
+        .map_err(|_| serde::de::Error::custom(format!("{key}: {expected}")))?;
     let parsed = text
         .parse::<jiff::SignedDuration>()
         .ok()
@@ -303,7 +371,7 @@ fn duration<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::time::Duratio
     match parsed {
         Some(duration) => Ok(duration),
         None => Err(serde::de::Error::custom(format!(
-            "idle_stop: {expected}, not {text:?}"
+            "{key}: {expected}, not {text:?}"
         ))),
     }
 }

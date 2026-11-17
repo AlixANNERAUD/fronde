@@ -8,7 +8,6 @@
 //! start. The caller is always the thread whose token the hub's gate saw, never an argument.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,7 +16,7 @@ use chrono::Utc;
 use fronde_entity::threads;
 use fronde_protocol::{ThreadStatus, ThreadSummary};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +33,21 @@ pub(super) const SYSTEM_PROMPT: &str = "You are a sub-agent of Fronde. Do the ta
 /// starts may delegate, their children may not.
 pub const DEFAULT_MAX_DEPTH: u32 = 1;
 
+/// Sub-agents of one thread in a turn at once, by default, waiting for an agent slot included.
+pub const DEFAULT_CHILDREN_RUNNING: usize = 3;
+
+/// Sub-agents all threads together may start in 24 hours, by default.
+pub const DEFAULT_CHILDREN_PER_DAY: usize = 30;
+
+/// Sub-agents one thread keeps not archived, by default: a guard against clutter only.
+pub const DEFAULT_CHILDREN_KEPT: usize = 200;
+
+/// How long a sub-agent's turn may run once its agent has it, by default.
+pub const DEFAULT_CHILD_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The window [`Limits::children_per_day`] counts in.
+const DAY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
 /// The longest chain of parents walked: more than any depth allowed, and a guard against a
 /// cycle a damaged database could hold.
 const MAX_CHAIN: usize = 64;
@@ -41,16 +55,42 @@ const MAX_CHAIN: usize = 64;
 /// The most sub-agents [`Threads::children`] lists, newest first.
 pub const MAX_LISTED: usize = 50;
 
-/// The most sub-agents of one thread in a turn at once, waiting for an agent slot included.
-pub const MAX_CHILDREN_RUNNING: usize = 3;
+/// What threads may do with sub-agents: `[threads]` in the configuration. Each bounds what an
+/// agent, a prompt-injected one included, may spend of the subscription's quota without the
+/// owner; the hub enforces them, whatever the agent's prompt says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// How deep a thread may be and still start sub-agents: the owner's threads are at depth 0,
+    /// their sub-agents at 1.
+    pub max_depth: u32,
+    /// Sub-agents of one thread in a turn at once, those waiting for an agent slot included.
+    pub children_running: usize,
+    /// Sub-agents started by all threads together in the last 24 hours, archived ones
+    /// included.
+    pub children_per_day: usize,
+    /// Sub-agents one thread keeps not archived.
+    pub children_kept: usize,
+    /// How long a sub-agent's turn may run once its agent has it; it is then stopped, as Stop
+    /// does.
+    pub child_turn_timeout: Duration,
+}
 
-/// The most sub-agents one thread keeps, archived ones left out.
-pub const MAX_CHILDREN_KEPT: usize = 30;
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_depth: DEFAULT_MAX_DEPTH,
+            children_running: DEFAULT_CHILDREN_RUNNING,
+            children_per_day: DEFAULT_CHILDREN_PER_DAY,
+            children_kept: DEFAULT_CHILDREN_KEPT,
+            child_turn_timeout: DEFAULT_CHILD_TURN_TIMEOUT,
+        }
+    }
+}
 
 /// What the registry keeps for sub-agents.
 pub(super) struct Children {
-    /// How deep a thread may be and still start sub-agents.
-    max_depth: AtomicU32,
+    /// What threads may do with sub-agents.
+    limits: Limits,
     /// Held while a sub-agent starts: a retry of the same call finds the first one's child with
     /// its task logged, and two starts never both pass the limits.
     starting: tokio::sync::Mutex<()>,
@@ -59,9 +99,9 @@ pub(super) struct Children {
 }
 
 impl Children {
-    pub(super) fn new(handoff: Arc<Handoff>) -> Self {
+    pub(super) fn new(handoff: Arc<Handoff>, limits: Limits) -> Self {
         Self {
-            max_depth: AtomicU32::new(DEFAULT_MAX_DEPTH),
+            limits,
             starting: tokio::sync::Mutex::new(()),
             handoff,
         }
@@ -177,7 +217,22 @@ impl Handoff {
 
     /// Turn `seq` of `thread` ended, logged as `result`: hands it to every call registered for
     /// it, and forgets the retries the turn started. Whether a call took it.
+    #[cfg(test)]
     pub fn turn_ended(&self, thread: ThreadId, seq: u64, result: TurnResult) -> bool {
+        self.turn_ended_with(thread, seq, result, false)
+    }
+
+    /// [`Handoff::turn_ended`]; `settled`: the turn was stopped by the one its result is for (a
+    /// `threads_cancel` or an archive up its tree), so that its result is marked delivered even
+    /// when no call took it, and wakes nobody: a call registering later reads it from the
+    /// stream. Whether a call took it, or `settled`.
+    pub fn turn_ended_with(
+        &self,
+        thread: ThreadId,
+        seq: u64,
+        result: TurnResult,
+        settled: bool,
+    ) -> bool {
         let mut state = lock(&self.state);
         state.ended.insert(thread, seq);
         state
@@ -187,12 +242,12 @@ impl Handoff {
         for (_, sender) in state.waiting.remove(&(thread, seq)).unwrap_or_default() {
             delivered |= sender.send(result.clone()).is_ok();
         }
-        if delivered {
+        if delivered || settled {
             state.delivered.insert(thread, seq);
         } else {
             state.delivered.remove(&thread);
         }
-        delivered
+        delivered || settled
     }
 
     /// The last turn of `thread` whose result a waiting call took.
@@ -303,6 +358,8 @@ pub enum Delegation {
     TooManyRunning { limit: usize },
     /// The caller keeps as many sub-agents as it may.
     TooManyKept { limit: usize },
+    /// The threads started as many sub-agents in the last 24 hours as they may.
+    TooManyToday { limit: usize },
     /// The caller named its own thread.
     Itself,
     /// The sub-agent is in a turn: one message at a time.
@@ -325,20 +382,27 @@ impl std::fmt::Display for Delegation {
             Self::NoSuchThread => f.write_str(
                 "no such thread among the sub-agents you started; threads_list shows them",
             ),
+            Self::TooDeep { max_depth: 0 } => f.write_str(
+                "sub-agents are turned off here (the setting [threads] max_depth is 0): you cannot start or drive sub-agents; do the task yourself",
+            ),
             Self::TooDeep { max_depth } => write!(
                 f,
-                "you are a sub-agent, and sub-agents go {max_depth} level(s) deep at most: you cannot start or drive sub-agents; do the task yourself"
+                "you are a sub-agent, and sub-agents go {max_depth} level(s) deep at most (the setting [threads] max_depth): you cannot start or drive sub-agents; do the task yourself"
             ),
             Self::CallerArchived => f.write_str(
                 "your thread is archived: it cannot start or drive sub-agents",
             ),
             Self::TooManyRunning { limit } => write!(
                 f,
-                "you already have {limit} sub-agents running or waiting for an agent, the most at once; wait for one to end, or stop one with threads_cancel"
+                "you already have {limit} sub-agents running or waiting for an agent, the most at once (the setting [threads] children_running); wait for one to end, or stop one with threads_cancel"
             ),
             Self::TooManyKept { limit } => write!(
                 f,
-                "you already have {limit} sub-agents, the most a thread keeps; reuse one with threads_send, or ask the user to archive some"
+                "you already have {limit} sub-agents not archived, the most a thread keeps (the setting [threads] children_kept); reuse one with threads_send, or ask the user to archive some"
+            ),
+            Self::TooManyToday { limit } => write!(
+                f,
+                "{limit} sub-agents were started in the last 24 hours, the most allowed (the setting [threads] children_per_day); do the task yourself, or ask the user"
             ),
             Self::Itself => f.write_str("that is your own thread; name one of your sub-agents"),
             Self::Busy => f.write_str(
@@ -401,14 +465,14 @@ pub fn final_answer(entries: &[Entry]) -> String {
 }
 
 impl Threads {
-    /// How deep a thread may be and still start sub-agents.
-    pub fn max_depth(&self) -> u32 {
-        self.children.max_depth.load(Ordering::Relaxed)
+    /// What threads may do with sub-agents.
+    pub fn limits(&self) -> Limits {
+        self.children.limits
     }
 
-    /// Sets how deep a thread may be and still start sub-agents.
-    pub fn set_max_depth(&self, max_depth: u32) {
-        self.children.max_depth.store(max_depth, Ordering::Relaxed);
+    /// How deep a thread may be and still start sub-agents.
+    pub fn max_depth(&self) -> u32 {
+        self.children.limits.max_depth
     }
 
     /// Whether thread `caller` may start sub-agents and send them messages: it exists, is not
@@ -450,6 +514,15 @@ impl Threads {
             .into_iter()
             .map(|row| ThreadId(row.id))
             .collect())
+    }
+
+    /// How many sub-agents all threads together started since `since`, archived ones included.
+    async fn started_since(&self, since: chrono::DateTime<Utc>) -> anyhow::Result<u64> {
+        Ok(threads::Entity::find()
+            .filter(threads::Column::StartedBy.starts_with("thread:"))
+            .filter(threads::Column::CreatedAt.gt(since))
+            .count(&self.db)
+            .await?)
     }
 
     /// How many of `children` are in a turn or waiting for an agent: only an open thread runs
@@ -580,15 +653,22 @@ impl Threads {
             });
         }
         // Under the start lock: two starts never both pass.
+        let limits = self.limits();
         let kept = self.kept_children(parent).await?;
-        if kept.len() >= MAX_CHILDREN_KEPT {
-            bail!(Delegation::TooManyKept {
-                limit: MAX_CHILDREN_KEPT
+        if self.running_among(&kept).await >= limits.children_running {
+            bail!(Delegation::TooManyRunning {
+                limit: limits.children_running
             });
         }
-        if self.running_among(&kept).await >= MAX_CHILDREN_RUNNING {
-            bail!(Delegation::TooManyRunning {
-                limit: MAX_CHILDREN_RUNNING
+        if kept.len() >= limits.children_kept {
+            bail!(Delegation::TooManyKept {
+                limit: limits.children_kept
+            });
+        }
+        let today = self.started_since(Utc::now() - DAY).await?;
+        if today >= u64::try_from(limits.children_per_day).unwrap_or(u64::MAX) {
+            bail!(Delegation::TooManyToday {
+                limit: limits.children_per_day
             });
         }
         let transaction = fronde_db::begin_write(&self.db).await?;
@@ -713,10 +793,9 @@ impl Threads {
         // The sub-agent itself is idle, or the send is refused below as busy.
         let _starting = self.children.starting.lock().await;
         let kept = self.kept_children(caller).await?;
-        if self.running_among(&kept).await >= MAX_CHILDREN_RUNNING {
-            bail!(Delegation::TooManyRunning {
-                limit: MAX_CHILDREN_RUNNING
-            });
+        let limit = self.limits().children_running;
+        if self.running_among(&kept).await >= limit {
+            bail!(Delegation::TooManyRunning { limit });
         }
         let by = self.get(caller).await?.map(|caller| caller.title);
         let assistant = self.opened(row.id).await?;
@@ -791,9 +870,10 @@ impl Threads {
         Ok(found)
     }
 
-    /// Stops the running turn of `caller`'s sub-agent `target`, if any, with its pending cards,
-    /// and those of its own sub-agents; a turn that ended keeps its result. `reason`, if any, is
-    /// shown in the stopped thread. Whether `target` was in a turn.
+    /// Stops the running turn of `caller`'s sub-agent `target`, if any, with its pending cards
+    /// and the wakes waiting for it, and those of every sub-agent under it; a turn that ended
+    /// keeps its result. `reason`, if any, is shown in the stopped thread. The turns stopped so
+    /// wake nobody: the caller asked for it. Whether `target` was in a turn.
     pub async fn cancel_child(
         &self,
         caller: ThreadId,
@@ -801,35 +881,42 @@ impl Threads {
         reason: Option<&str>,
     ) -> anyhow::Result<bool> {
         let row = self.descendant(caller, target).await?;
-        let mut tree = vec![row.clone()];
-        tree.extend(self.descendants(row.id).await?);
+        if let Some(reason) = reason
+            && let Some(assistant) = self.open.lock().await.get(&row.id).cloned()
+            && matches!(
+                assistant.status(),
+                ThreadStatus::Running | ThreadStatus::Queued
+            )
+        {
+            assistant
+                .append(Event::Notice {
+                    text: format!("Arrêté par la conversation parente : {reason}"),
+                })
+                .await;
+        }
+        let stopped = self.cancel_tree(row.id).await?;
+        tracing::info!("thread {caller} stopped its sub-agent {target} and those under it");
+        Ok(stopped)
+    }
+
+    /// Stops the running turn of thread `root` and of every thread under it, deepest first,
+    /// with their pending cards and the wakes waiting for them; none of those turns wakes its
+    /// parent. Deepest first, so that a result coming up meanwhile finds its parent's turn
+    /// still to be stopped. Whether `root` was in a turn.
+    pub(super) async fn cancel_tree(&self, root: ThreadId) -> anyhow::Result<bool> {
+        let mut tree = vec![root];
+        tree.extend(self.descendants(root).await?.into_iter().map(|row| row.id));
         let mut stopped = false;
-        for thread in tree {
-            let Some(assistant) = self.open.lock().await.get(&thread.id).cloned() else {
+        // `descendants` goes level by level: reversed, the deepest come first.
+        for thread in tree.into_iter().rev() {
+            let Some(assistant) = self.open.lock().await.get(&thread).cloned() else {
                 // A thread not open runs no turn.
                 continue;
             };
-            if !matches!(
-                assistant.status(),
-                ThreadStatus::Running | ThreadStatus::Queued
-            ) {
-                continue;
+            if assistant.cancel_quietly().await {
+                stopped |= thread == root;
+                tracing::info!("the turn of thread {thread} was stopped with its tree");
             }
-            if thread.id == row.id {
-                stopped = true;
-                if let Some(reason) = reason {
-                    assistant
-                        .append(Event::Notice {
-                            text: format!("Arrêté par la conversation parente : {reason}"),
-                        })
-                        .await;
-                }
-            }
-            assistant.cancel().await;
-            tracing::info!(
-                "thread {caller} stopped the turn of its sub-agent {}",
-                thread.id
-            );
         }
         Ok(stopped)
     }
@@ -1072,6 +1159,24 @@ mod tests {
             Some(AlreadyEnded { taken: false })
         );
         assert_eq!(handoff.waiting(child), 0);
+    }
+
+    /// A turn stopped with its tree is settled: no call took it, yet it wakes nobody, and a
+    /// call registering afterwards reads it from the stream rather than being told it woke.
+    #[test]
+    fn a_settled_end_wakes_nobody_and_is_read_from_the_stream() {
+        let handoff = Handoff::default();
+        let child = ThreadId(2);
+        assert!(handoff.turn_ended_with(child, 5, result("Arrêté."), true));
+        assert_eq!(handoff.delivered(child), Some(5));
+        assert_eq!(
+            handoff.register(child, 5).err(),
+            Some(AlreadyEnded { taken: true })
+        );
+        // A waiting call still gets it.
+        let waiting = handoff.register(child, 7).unwrap();
+        assert!(handoff.turn_ended_with(child, 7, result("Encore."), true));
+        assert_eq!(handoff.withdraw(child, 7, waiting), Some(result("Encore.")));
     }
 
     #[test]

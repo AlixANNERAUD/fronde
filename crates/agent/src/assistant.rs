@@ -37,6 +37,8 @@ const FAILED: &str = "L'agent a rencontré une erreur.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
 const ARCHIVED: &str = "Cette conversation est archivée : elle ne reçoit plus de message.";
 const WAITING: &str = "En attente : d'autres conversations utilisent l'agent.";
+/// Shown when a sub-agent's turn ran past `[threads] child_turn_timeout`, followed by how long.
+pub const TIMED_OUT: &str = "Délai dépassé : ce tour de sous-agent a été arrêté au bout de";
 /// The main thread's stream in the database.
 pub const TOPIC: &str = "conversation";
 /// How long the agent gets to start and open its session.
@@ -121,6 +123,8 @@ pub struct Assistant {
     permission_timeout: Mutex<Duration>,
     /// How long an elicitation's card waits for an answer.
     elicitation_timeout: Mutex<Duration>,
+    /// How long a turn may run once its agent has it: a sub-agent's, `None` for the others.
+    turn_timeout: Mutex<Option<Duration>>,
     /// Where its turns stand, for the thread list.
     activity: Mutex<Activity>,
     /// Told when [`Assistant::status`] changes.
@@ -163,6 +167,9 @@ struct Turn {
     seq: Option<u64>,
     /// Its requests are being cancelled: it asks nothing more.
     ending: bool,
+    /// Stopped with its thread's tree (`threads_cancel`, archive): its end wakes no parent,
+    /// and the wakes waiting for it end with it.
+    quiet: bool,
 }
 
 /// What a turn starts from.
@@ -245,6 +252,7 @@ impl Assistant {
             requests: OnceLock::new(),
             permission_timeout: Mutex::new(permission::PERMISSION_TIMEOUT),
             elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
+            turn_timeout: Mutex::new(None),
             activity: Mutex::new(Activity::default()),
             changes,
             handoff,
@@ -388,6 +396,13 @@ impl Assistant {
         *lock(&self.elicitation_timeout) = timeout.min(fronde_requests::elicitation::MAX_TIMEOUT);
     }
 
+    /// How long each turn may run once its agent has it, the wait for an agent slot and its
+    /// start left out; past it, the turn is stopped as Stop does, with [`TIMED_OUT`] in its
+    /// stream. `None`, the default, lets a turn run as long as it takes.
+    pub fn set_turn_timeout(&self, timeout: Option<Duration>) {
+        *lock(&self.turn_timeout) = timeout;
+    }
+
     /// Logs the message and runs the turn in the background; refused while a turn runs, and
     /// when the thread is archived.
     pub async fn send(self: &Arc<Self>, text: String) {
@@ -477,6 +492,7 @@ impl Assistant {
             cancel: cancel.clone(),
             seq: start.seq,
             ending: false,
+            quiet: false,
         });
         // A turn keeps its agent: the idle stop waits for its end.
         if let Some(timer) = lock(&self.idle_timer).take() {
@@ -512,9 +528,13 @@ impl Assistant {
             // card being shown holds the lock taken here, and is cancelled below. A request
             // coming in later (a background task of the agent's) finds the turn over rather than
             // one whose requests were already cancelled.
-            if let Some(turn) = self.turn.lock().await.as_mut() {
-                turn.ending = true;
-            }
+            let quiet = match self.turn.lock().await.as_mut() {
+                Some(turn) => {
+                    turn.ending = true;
+                    turn.quiet
+                }
+                None => false,
+            };
             self.cancel_requests(seq).await;
             let mut turn = self.turn.lock().await;
             let mut end = self.append_seq(Event::TurnEnded { outcome }).await;
@@ -527,22 +547,29 @@ impl Assistant {
                     outcome,
                     answer: answer.clone(),
                 };
-                if !self.handoff.turn_ended(self.thread, seq, result) {
+                // Stopped with its tree, the one who stopped it knows: no wake. A call that waits
+                // for the turn afterwards reads its end from the stream.
+                if !self
+                    .handoff
+                    .turn_ended_with(self.thread, seq, result, quiet)
+                {
                     self.wake_parent(outcome, &answer).await;
                 }
             }
-            // The end opens the next wake waiting; an archived thread's end at once.
+            // The end opens the next wake waiting; an archived thread's, or one stopped with its
+            // tree, end at once.
             let mut next = None;
             while let Some(after) = end {
                 let Some(wake) = lock(&self.wakes).pop_front() else {
                     break;
                 };
-                if !self.archived.load(Ordering::SeqCst) {
+                if !quiet && !self.archived.load(Ordering::SeqCst) {
                     next = Some((wake, after));
                     break;
                 }
                 tracing::info!(
-                    "thread {} is archived: the wake of its entry {} is dropped",
+                    "thread {} is archived or was stopped with its tree: the wake of its entry {} \
+                     is dropped",
                     self.thread,
                     wake.seq
                 );
@@ -652,6 +679,22 @@ impl Assistant {
             None => return,
         };
         self.cancel_requests(seq).await;
+    }
+
+    /// Stops the running turn, if any, as [`Assistant::cancel`] does, as part of stopping its
+    /// thread's tree: its end wakes no parent, and the wakes waiting for it end with it.
+    /// Whether a turn was running.
+    pub(crate) async fn cancel_quietly(&self) -> bool {
+        let seq = match self.turn.lock().await.as_mut() {
+            Some(turn) => {
+                turn.quiet = true;
+                turn.cancel.cancel();
+                turn.seq
+            }
+            None => return false,
+        };
+        self.cancel_requests(seq).await;
+        true
     }
 
     /// Cancels the pending requests of the turn whose user message is `seq`.
@@ -872,25 +915,36 @@ impl Assistant {
         }
         let prompt = session.client.prompt(text);
         tokio::pin!(prompt);
+        // From here the agent has the turn: a sub-agent's may last this long.
+        let limit = *lock(&self.turn_timeout);
+        let timed_out = async move {
+            match limit {
+                Some(limit) => tokio::time::sleep(limit).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(timed_out);
         let mut wedged = false;
         let end = tokio::select! {
             // The prompt is polled first so the cancel always reaches the agent after it.
             biased;
             end = &mut prompt => end,
-            () = cancel.cancelled() => {
-                if let Err(error) = session.client.cancel() {
-                    tracing::warn!("cannot cancel the turn: {error:#}");
-                }
-                match tokio::time::timeout(CANCEL_GRACE, &mut prompt).await {
-                    Ok(end) => end,
-                    Err(_) => {
-                        tracing::warn!(
-                            "the agent did not end the cancelled turn within {CANCEL_GRACE:?}; stopping it"
-                        );
-                        wedged = true;
-                        Ok(TurnEnd::Cancelled)
-                    }
-                }
+            () = cancel.cancelled() => stop_prompt(&session, prompt.as_mut(), &mut wedged).await,
+            () = &mut timed_out => {
+                let limit = limit.map(duration_text).unwrap_or_default();
+                tracing::info!(
+                    "the turn of thread {} ran past {limit}: stopped",
+                    self.thread
+                );
+                self.append(Event::Notice {
+                    text: format!("{TIMED_OUT} {limit} ([threads] child_turn_timeout)."),
+                })
+                .await;
+                cancel.cancel();
+                // Stopped, however the agent ends it.
+                stop_prompt(&session, prompt.as_mut(), &mut wedged)
+                    .await
+                    .map(|_| TurnEnd::Cancelled)
             }
         };
         session.flush().await;
@@ -978,10 +1032,10 @@ impl Assistant {
     }
 
     /// Lets the thread's agent go for good, as archiving does: cancels the running turn, if
-    /// any, and revokes the agent's hub token at once; its process stops when the turn has
-    /// ended, or now when no turn runs.
+    /// any, waking no parent, and revokes the agent's hub token at once; its process stops when
+    /// the turn has ended, or now when no turn runs.
     pub(crate) async fn retire(&self) {
-        self.cancel().await;
+        self.cancel_quietly().await;
         if let Some(timer) = lock(&self.idle_timer).take() {
             timer.cancel();
         }
@@ -1163,6 +1217,44 @@ impl std::fmt::Display for StartTimeout {
 impl std::error::Error for StartTimeout {}
 
 /// What the page says about a failed turn; the details go to the server's log.
+/// Tells the agent of `session` to stop the turn of `prompt`, and waits for its end at most
+/// [`CANCEL_GRACE`]; past it, `wedged` is set and the turn is taken as cancelled.
+async fn stop_prompt(
+    session: &Session,
+    prompt: std::pin::Pin<&mut impl Future<Output = anyhow::Result<TurnEnd>>>,
+    wedged: &mut bool,
+) -> anyhow::Result<TurnEnd> {
+    if let Err(error) = session.client.cancel() {
+        tracing::warn!("cannot cancel the turn: {error:#}");
+    }
+    match tokio::time::timeout(CANCEL_GRACE, prompt).await {
+        Ok(end) => end,
+        Err(_) => {
+            tracing::warn!(
+                "the agent did not end the cancelled turn within {CANCEL_GRACE:?}; stopping it"
+            );
+            *wedged = true;
+            Ok(TurnEnd::Cancelled)
+        }
+    }
+}
+
+/// A duration as `[threads]` writes it: `30m`, `1h 30m`, `90s`.
+fn duration_text(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let (hours, minutes, rest) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    let parts: Vec<String> = [(hours, "h"), (minutes, "m"), (rest, "s")]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, unit)| format!("{count}{unit}"))
+        .collect();
+    if parts.is_empty() {
+        format!("{}ms", duration.as_millis())
+    } else {
+        parts.join(" ")
+    }
+}
+
 fn notice_for(error: &anyhow::Error) -> &'static str {
     if error.is::<StartTimeout>() {
         return NO_START;

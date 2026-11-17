@@ -970,6 +970,11 @@ fn threads_default_and_parse() {
         ThreadsConfig {
             max_running: 3,
             idle_stop: Duration::from_secs(600),
+            max_depth: 1,
+            children_running: 3,
+            children_per_day: 30,
+            children_kept: 200,
+            child_turn_timeout: Duration::from_secs(30 * 60),
         }
     );
     let threads = |table: &str| {
@@ -994,6 +999,26 @@ fn threads_default_and_parse() {
         fronde_hub::config::duration_text(Duration::from_secs(600)),
         "10m"
     );
+    // The limits on sub-agents.
+    let t = threads(
+        "max_depth = 3\nchildren_running = 1\nchildren_per_day = 100\nchildren_kept = 5\nchild_turn_timeout = \"2h\"",
+    );
+    assert_eq!(
+        (
+            t.max_depth,
+            t.children_running,
+            t.children_per_day,
+            t.children_kept,
+            t.child_turn_timeout
+        ),
+        (3, 1, 100, 5, Duration::from_secs(2 * 3600))
+    );
+    assert_eq!(threads("max_depth = 0").max_depth, 0);
+    assert_eq!(
+        threads("children_running = 2").child_turn_timeout,
+        Duration::from_secs(30 * 60),
+        "the others keep their defaults"
+    );
     // The example says the defaults.
     let example = load(std::path::Path::new("../../fronde.example.toml")).unwrap();
     assert_eq!(example.threads, ThreadsConfig::default());
@@ -1013,7 +1038,32 @@ fn threads_refuse_bad_values() {
         ("idle_stop = \"0s\"", "idle_stop: expected a duration"),
         ("idle_stop = \"soon\"", "idle_stop: expected a duration"),
         ("idle_stop = 600", "idle_stop: expected a duration"),
-        ("max_depth = 1", "unknown field"),
+        ("max_depth = 4", "max_depth: expected a depth from 0 to 3"),
+        ("max_depth = -1", "max_depth: expected a depth from 0 to 3"),
+        (
+            "max_depth = \"1\"",
+            "max_depth: expected a depth from 0 to 3",
+        ),
+        ("children_running = 0", "children_running: expected"),
+        ("children_running = 2.5", "children_running: expected"),
+        ("children_per_day = 0", "children_per_day: expected"),
+        ("children_per_day = \"30\"", "children_per_day: expected"),
+        ("children_kept = 0", "children_kept: expected"),
+        ("children_kept = -3", "children_kept: expected"),
+        (
+            "child_turn_timeout = \"0s\"",
+            "child_turn_timeout: expected a duration",
+        ),
+        (
+            "child_turn_timeout = 1800",
+            "child_turn_timeout: expected a duration",
+        ),
+        (
+            "child_turn_timeout = \"long\"",
+            "child_turn_timeout: expected a duration",
+        ),
+        // Unknown keys are refused, not ignored.
+        ("max_children = 3", "unknown field"),
     ] {
         let e = refused(&format!("{MIN}\n[threads]\n{table}\n"));
         assert!(e.contains(expected), "{table}: {e}");

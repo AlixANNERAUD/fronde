@@ -451,6 +451,7 @@ pub async fn start_with_helper(
                 limits_line(&config, confine.scope.as_ref())
             );
             tracing::info!("agents: {}", pool_line(&config, confine.scope.as_ref()));
+            tracing::info!("sub-agents: {}", children_line(&config));
             confined_connector(confine)
         }
         // Without `[web]` there is no chat, so no agent to start.
@@ -534,12 +535,40 @@ pub async fn start_scope(config: &Config, path: Option<&std::ffi::OsStr>) -> Opt
     Some(scope)
 }
 
-/// How many agents run at once and how long an idle one is kept: `[threads]`.
+/// How many agents run at once, how long an idle one is kept, and what threads may do with
+/// sub-agents: `[threads]`.
 pub fn budget(config: &Config) -> Budget {
+    let threads = &config.threads;
     Budget {
-        max_running: config.threads.max_running,
-        idle_stop: config.threads.idle_stop,
+        max_running: threads.max_running,
+        idle_stop: threads.idle_stop,
+        limits: fronde_agent::threads::Limits {
+            max_depth: threads.max_depth,
+            children_running: threads.children_running,
+            children_per_day: threads.children_per_day,
+            children_kept: threads.children_kept,
+            child_turn_timeout: threads.child_turn_timeout,
+        },
     }
+}
+
+/// The limits on sub-agents, for the start log and `fronde check`: `your threads may start
+/// sub-agents, theirs may not; 3 running at once per thread, 30 a day in all, 200 kept per
+/// thread, 30m per turn`.
+pub fn children_line(config: &Config) -> String {
+    let threads = &config.threads;
+    let depth = match threads.max_depth {
+        0 => return "off (max_depth = 0): no thread may start sub-agents".to_owned(),
+        1 => "your threads may start sub-agents, theirs may not".to_owned(),
+        depth => format!("sub-agents go {depth} levels deep under your threads"),
+    };
+    format!(
+        "{depth}; {} running at once per thread, {} a day in all, {} kept per thread, {} per turn",
+        threads.children_running,
+        threads.children_per_day,
+        threads.children_kept,
+        fronde_hub::config::duration_text(threads.child_turn_timeout),
+    )
 }
 
 /// The pool of agents and their memory together, for the start log and `fronde check`:

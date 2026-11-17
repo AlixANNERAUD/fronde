@@ -75,8 +75,8 @@ summarise.
 - **Stop.** Stop in the chat ends the parent's running turn, a wake's included, and nothing else:
   its sub-agents go on, and one that ends afterwards still wakes it.
 - **Archive.** An archived thread is not woken: a result logs nothing in it, and the wakes waiting
-  when it was archived end at once, without reaching its agent. Its sub-agents' own threads keep
-  their answers.
+  when it was archived end at once, without reaching its agent. Archiving also stops its
+  sub-agents' turns (see [Stopping](#stopping)); their own threads keep their answers.
 - **Restarts.** The parent's thread is the queue: the entry is written before the wake runs, and
   the wake writes a mark just before its prompt goes to the agent. A wake whose prompt never went
   out (Fronde stopped before it did) runs at the next start, once; one whose prompt went out is
@@ -101,16 +101,54 @@ started holds it too, but neither has a turn. An outside MCP client gets no `thr
   `threads_start` and `threads_send`, and the hub refuses them if it calls them anyway.
 - **Agents at once.** Sub-agents share the pool's slots but one with every other thread you did
   not start (`[threads] max_running`).
-- **Per parent.** A thread has at most 3 sub-agents in a turn at once (waiting for an agent
-  included) and keeps at most 30 sub-agents not archived.
+The real risk of sub-agents is your subscription's quota. A sub-agent spends it in the
+background, while you are not looking, and the agent that starts it may have been steered by
+what it read (a web page, a mail, a file: a prompt injection) rather than by you. Each limit
+below bounds one way an agent could spend it without you; the hub enforces them, whatever the
+agent's prompt says, and a refusal names the `[threads]` setting to change (see
+[Configuration](../reference/configuration.md#threads)).
+
+- **Depth** (`max_depth`, 1). How many levels of sub-agents there may be under your threads. With
+  1, the threads you start may start sub-agents and a sub-agent may not: it is not offered
+  `threads_start` and `threads_send`, and the hub refuses them if it calls them anyway. A deeper
+  tree multiplies what one task can start; 0 turns sub-agents off.
+- **At once** (`children_running`, 3 per thread). How many sub-agents one thread may have in a
+  turn at once, those waiting for an agent included. It bounds the work one agent sets going in
+  parallel, and the queue behind the agent pool.
+- **Agents at once** (`max_running`). Sub-agents share the pool's slots but one with every other
+  thread you did not start, so a thread you talk to always gets one.
+- **Per day** (`children_per_day`, 30). How many sub-agents all threads together may start in 24
+  hours, archived ones included: an agent that keeps starting short tasks is stopped there, even
+  if no more than 3 run at a time.
+- **Time per turn** (`child_turn_timeout`, 30 minutes). A sub-agent's turn that runs longer, once
+  its agent has it, is stopped as Stop does, with « Délai dépassé » in its thread; its parent is
+  woken with the outcome `cancelled`. A stuck or looping sub-agent ends there.
+- **Kept** (`children_kept`, 200 per thread). How many sub-agents a thread keeps not archived. It
+  is a guard against clutter only: a sub-agent that is idle uses neither quota nor an agent
+  process (its agent stops after `idle_stop`), the per-day limit already bounds how many are
+  started, and archiving one frees its place. It was 30 until the per-day limit existed, when it
+  stood in for it; it is now set high rather than dropped, so that one thread cannot fill the list
+  with thousands of rows over months.
 - **Retries.** A call retried in the same turn with the same `client_request_id` joins the
   sub-agent the first one started, so that a lost reply does not start two.
-- **Stopping.** `threads_cancel` stops a sub-agent's running turn, its pending cards and its own
-  sub-agents' turns; what it wrote stays, and its parent is woken with how it ended. Stop in the
-  chat stops only the thread you are in.
 
-Sub-agents started per day, time per turn, configurable limits and depth, and archiving a thread
-stopping its sub-agents are **planned**.
+These limits count tasks and minutes, not tokens. A budget read from the provider's own usage
+windows, refusing or holding back background work above a share of your quota, is **planned**
+(task U1 of the threads plan); it will replace the counts.
+
+## Stopping
+
+- **`threads_cancel`** stops a sub-agent's running turn, its pending cards, the wakes waiting
+  for it, and the same in every sub-agent under it, deepest first. What they wrote stays, and a
+  turn that had ended keeps its result. The turns stopped this way wake nobody: the thread that
+  stopped them knows, and a call already waiting for one gets `cancelled`.
+- **Archive.** Archiving a thread does the same for its sub-agents, then lets its own agent go:
+  its turn stopped, its hub token revoked, its process stopped, and the secrets given in its cards
+  "for this conversation" forgotten. Its sub-agents stay, not archived, with what they wrote;
+  their agents stop once idle. An archived sub-agent does not wake its parent either.
+- **Stop** in the chat stops only the thread you are in. On a parent, its sub-agents go on, and
+  one that ends afterwards still wakes it. On a sub-agent, its parent did not ask for it, so the
+  parent is woken with the outcome `cancelled`, as after a timeout.
 
 ## Compared with T3 Code
 

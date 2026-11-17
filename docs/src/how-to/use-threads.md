@@ -36,7 +36,9 @@ Each row and each chat's title have an actions button (three dots):
 - *Renommer* turns the title into a text box. Type the new title and press Enter to save it, or
   Escape to cancel. A title has 1 to 80 characters on one line, without invisible characters.
 - *Archiver* moves the thread to *Archivées*, folded at the bottom of the list. Its agent stops,
-  and it can be read but not written to. *Désarchiver* brings it back.
+  the secrets you gave in its cards for this conversation are forgotten, and it can be read but
+  not written to. The sub-agents it started stop their work too; they stay in the list with what
+  they wrote. *Désarchiver* brings the thread back, not the work its sub-agents stopped.
 
 When Fronde refuses an action, the reason shows above the chat, with a button to close it.
 
@@ -55,3 +57,25 @@ is a link to the sub-agent's thread. The parent agent then answers on its own wi
 sub-agent found: you do not have to ask. If the parent was in the middle of a reply, it finishes
 that reply first. Stop interrupts that answer only; the sub-agents keep working, and the next one
 to finish wakes the parent again. An archived thread is not woken.
+
+Stop in a sub-agent's own thread stops that sub-agent; its parent is told it ended
+*(interrompu)*. A sub-agent's turn that runs longer than 30 minutes is stopped the same way, with
+*Délai dépassé* in its thread.
+
+## Change the limits on sub-agents
+
+Sub-agents spend your subscription's quota in the background. When an agent says it hit a limit,
+the message names the setting, in `[threads]` of `fronde.toml`:
+
+```toml
+[threads]
+max_depth = 1             # 0: no sub-agents; 2: a sub-agent may start its own
+children_running = 3      # per thread, at once
+children_per_day = 30     # all threads together, in 24 hours
+children_kept = 200       # per thread, not archived
+child_turn_timeout = "30m"
+```
+
+Restart Fronde for a change to apply. Raise a limit only for work you trust: each one bounds what
+an agent misled by something it read could spend without you (see
+[Threads and sub-agents](../explanation/threads.md#limits)).

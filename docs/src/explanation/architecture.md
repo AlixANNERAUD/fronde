@@ -125,8 +125,8 @@ turn); when every agent is in a turn, the message waits, and its thread says so 
 (« En attente : d'autres conversations utilisent l'agent. »). It starts as soon as another turn
 ends; Stop gives up the wait. Threads you did not start (the sub-agents an agent starts with
 `threads_start`; an outside client's are planned) share all the slots but one, so a thread you
-talk to always gets one, and a thread has at most 3 sub-agents in a turn at once (see
-[Threads and sub-agents](threads.md#limits)). An agent idle
+talk to always gets one, and a thread has at most `[threads] children_running` (3) sub-agents in
+a turn at once (see [Threads and sub-agents](threads.md#limits)). An agent idle
 for `[threads] idle_stop` (10 minutes by default) stops, which frees its slot and revokes its
 token; the next message starts it again and resumes its session. Under a systemd user manager,
 `fronde-agents.slice` caps the memory of every agent together (`[agent.limits] total_memory`,

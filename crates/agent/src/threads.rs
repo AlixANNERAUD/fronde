@@ -45,7 +45,8 @@ pub(crate) mod wakes;
 
 pub(crate) use children::Handoff;
 pub use children::{
-    ChildEnd, ChildTask, DEFAULT_MAX_DEPTH, Delegation, MAX_CHILDREN_KEPT, MAX_CHILDREN_RUNNING,
+    ChildEnd, ChildTask, DEFAULT_CHILD_TURN_TIMEOUT, DEFAULT_CHILDREN_KEPT,
+    DEFAULT_CHILDREN_PER_DAY, DEFAULT_CHILDREN_RUNNING, DEFAULT_MAX_DEPTH, Delegation, Limits,
     MAX_LISTED, StartedChild, TurnResult, final_answer, may_access,
 };
 
@@ -176,7 +177,8 @@ pub fn thread_dirs(data_dir: &Path, id: ThreadId) -> ThreadDirs {
     }
 }
 
-/// How many agent processes run at once, and how long an idle one is kept: `[threads]`.
+/// How many agent processes run at once, how long an idle one is kept, and what threads may do
+/// with sub-agents: `[threads]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
     /// Agent processes running at once, the main thread's included; at least 1. Threads the
@@ -184,6 +186,8 @@ pub struct Budget {
     pub max_running: usize,
     /// How long an agent is kept once its turn ended, without a new message.
     pub idle_stop: Duration,
+    /// What threads may do with sub-agents.
+    pub limits: Limits,
 }
 
 impl Default for Budget {
@@ -191,6 +195,7 @@ impl Default for Budget {
         Self {
             max_running: 3,
             idle_stop: Duration::from_secs(10 * 60),
+            limits: Limits::default(),
         }
     }
 }
@@ -498,7 +503,7 @@ impl Threads {
             requests: OnceLock::new(),
             changes,
             tails: Mutex::new(HashMap::new()),
-            children: children::Children::new(handoff),
+            children: children::Children::new(handoff, budget.limits),
             registry: registry.clone(),
         });
         // Set before any thread but the main one opens: a turn's end may wake its parent.
@@ -603,6 +608,9 @@ impl Threads {
         )
         .await?;
         self.pool.register(&assistant);
+        if row.parent.is_some() {
+            assistant.set_turn_timeout(Some(self.limits().child_turn_timeout));
+        }
         if let Some(requests) = self.requests.get().and_then(Weak::upgrade) {
             assistant.set_requests(&requests, self.owner.clone());
         }
@@ -903,7 +911,10 @@ impl Threads {
 
     /// Archives thread `id`, or brings it back; an archived thread refuses messages, and its
     /// agent is let go: its running turn cancelled, its hub token revoked at once, its process
-    /// stopped. The main thread is never archived.
+    /// stopped, the secrets given in its cards "for this conversation" forgotten. Archiving also
+    /// stops the turns of every sub-agent under it, with their cards and the wakes waiting for
+    /// them, as `threads_cancel` does; they stay, not archived, with what they wrote. None of
+    /// the turns stopped so wakes a parent. The main thread is never archived.
     pub async fn set_archived(&self, id: ThreadId, archived: bool) -> anyhow::Result<()> {
         if id == ThreadId::MAIN {
             bail!("the main thread cannot be archived");
@@ -912,10 +923,25 @@ impl Threads {
         self.update(id, threads::Column::ArchivedAt, Expr::value(at))
             .await?;
         let assistant = self.open.lock().await.get(&id).cloned();
-        if let Some(assistant) = assistant {
+        if let Some(assistant) = &assistant {
             assistant.set_archived(archived);
-            if archived {
+        }
+        if archived {
+            // Archived first: a result coming up the tree meanwhile does not wake it.
+            self.cancel_tree(id).await?;
+            if let Some(assistant) = &assistant {
                 assistant.retire().await;
+            }
+            if let Some(row) = self.get(id).await?
+                && let Some(requests) = self.requests.get().and_then(Weak::upgrade)
+                && let Some(secrets) = requests.secrets()
+            {
+                let forgotten = secrets.ephemeral().forget_topic(&row.topic);
+                if forgotten > 0 {
+                    tracing::info!(
+                        "thread {id} is archived: {forgotten} secret(s) given for it forgotten"
+                    );
+                }
             }
         }
         self.changes.notify();

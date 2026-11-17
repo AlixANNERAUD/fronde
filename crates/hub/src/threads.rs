@@ -75,7 +75,7 @@ const READ_DESCRIPTION: &str = "Read a sub-agent you started: its messages and a
 
 const LIST_DESCRIPTION: &str = "List the sub-agents you started, with their status, and the providers and models a sub-agent may run on.";
 
-const CANCEL_DESCRIPTION: &str = "Stop a sub-agent you started: its running turn, its pending cards and its own sub-agents. A finished turn keeps its result.";
+const CANCEL_DESCRIPTION: &str = "Stop a sub-agent you started: its running turn, its pending cards and its own sub-agents' turns. The turns stopped do not wake you. A finished turn keeps its result.";
 
 /// What a thread's agent asks of a new sub-agent, checked.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

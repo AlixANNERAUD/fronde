@@ -114,3 +114,9 @@ tasks = 512
 [threads]
 max_running = 3
 idle_stop = "10m"
+# Sub-agents: what an agent may start in the background, on your subscription's quota.
+max_depth = 1
+children_running = 3
+children_per_day = 30
+children_kept = 200
+child_turn_timeout = "30m"

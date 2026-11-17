@@ -73,6 +73,7 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         let limits = crate::limits_check_line(config, scope.as_ref()).await;
         writeln!(out, "agent limits: {limits}")?;
         writeln!(out, "agents: {}", crate::pool_line(config, scope.as_ref()))?;
+        writeln!(out, "sub-agents: {}", crate::children_line(config))?;
         // A stored token is opened at each start of the agent, with the master key.
         match &config.agent.oauth_token {
             Some(fronde_hub::config::Secret::Stored { stored }) => {
