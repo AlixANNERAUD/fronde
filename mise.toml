@@ -12,6 +12,9 @@ mr-boxington = "latest"
 "github:SeaQL/sea-orm" = { version = "2.0.4", version_prefix = "sea-orm-cli@", bin = "sea-orm-cli" }
 # Builds the documentation in docs/ (mise run docs).
 "github:rust-lang/mdBook" = { version = "0.5.4", bin = "mdbook" }
+# Byte-compiles the Python standard library at build time (mise run python); the binary embeds
+# the wasmtime crate instead.
+wasmtime = "50.0.1"
 
 [env]
 # The web interface has wasm-only dependencies and its own lint and test runs, so server-side
@@ -56,7 +59,7 @@ run = [
 
 [tasks.test]
 description = "Run the test suite"
-depends = ["web-css", "components"]
+depends = ["web-css", "components", "python"]
 run = [
   "cargo nextest run $FRONDE_SERVER_PACKAGES --no-tests=pass",
   "cargo nextest run --package fronde-web",
@@ -85,6 +88,44 @@ run = [
   "rm -rf components/dist && mkdir -p components/dist",
   "set -e; for p in $FRONDE_COMPONENTS; do cargo build --manifest-path $p/Cargo.toml --target wasm32-wasip2 --release; n=$(basename $p | tr - _); cp $p/target/wasm32-wasip2/release/$n.wasm components/dist/; cp $p/fronde-component.toml components/dist/$n.toml; done",
 ]
+
+# CPython for WASI (wasm32-wasip1), built by CPython's WASI maintainer from the release tag with
+# CPython's own Platforms/WASI script, plus the time zone database, which the build lacks. Both
+# archives and the interpreter are checked against pinned hashes; PYTHON_WASM_SHA256 in
+# crates/wasm/src/python.rs pins the same python.wasm, and Fronde refuses any other. The standard
+# library is byte-compiled once here, with unchecked hashes, so that each run skips compiling the
+# modules it imports and the files' mtimes in the image do not matter. -j 0 would need
+# multiprocessing, which WASI lacks. A stamp records the archives installed: the task does nothing
+# when they are already there. Upgrading Python: docs/src/how-to/develop.md.
+[tasks.python]
+description = "Fetch the pinned CPython WASI build into python/"
+run = '''
+set -eu
+python_url=https://github.com/brettcannon/cpython-wasi-build/releases/download/v3.15.2/python-3.15.2-wasi_sdk-33.zip
+python_sha256=b8a63559c56760bbdc310dedb74fd69d10bcbafae26b705bea0ad353ad256888
+tzdata_url=https://files.pythonhosted.org/packages/0a/66/9a06c2227fedfd4919f0eaaa8b94377d9730882a7e4f95823c9a331ab5e1/tzdata-2026.6-py2.py3-none-any.whl
+tzdata_sha256=0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec
+# The same as PYTHON_WASM_SHA256 in crates/wasm/src/python.rs.
+wasm_sha256=dd076791fb6d1286a5dfe105852dfb3367e10562de68ca0a618e615625cdf636
+stamp="$python_sha256 $tzdata_sha256"
+if [ -f python/.installed ] && [ "$(cat python/.installed)" = "$stamp" ]; then
+  exit 0
+fi
+rm -rf python
+mkdir -p python/.work
+curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o python/.work/python.zip "$python_url"
+curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o python/.work/tzdata.whl "$tzdata_url"
+echo "$python_sha256  python/.work/python.zip" | sha256sum --check --strict --quiet
+echo "$tzdata_sha256  python/.work/tzdata.whl" | sha256sum --check --strict --quiet
+unzip -q python/.work/python.zip -d python
+unzip -q python/.work/tzdata.whl 'tzdata/*' -d python/lib/python3.15/site-packages
+unzip -q -j python/.work/tzdata.whl 'tzdata-*.dist-info/licenses/LICENSE' -d python/.work
+mv python/.work/LICENSE python/LICENSE.tzdata
+rm -rf python/.work
+echo "$wasm_sha256  python/python.wasm" | sha256sum --check --strict --quiet
+wasmtime run --dir python/lib::/lib python/python.wasm -I -m compileall -q --invalidation-mode unchecked-hash /lib/python3.15
+echo "$stamp" > python/.installed
+'''
 
 # The SDK and the components use the root deny.toml, which cargo-deny finds from their directories
 # upwards. Passing `--config deny.toml` instead breaks under mr-boxington, which reads it as
@@ -131,11 +172,11 @@ cargo run --package fronde -- serve --config "$dev/fronde.toml"
 
 # The binary carries the hashes of the components in components/dist (crates/wasm/build.rs), which
 # it approves without hashes in their entry: they are built first. One cargo build at a time, so
-# that a small machine does not run out of memory.
+# that a small machine does not run out of memory. The Python runtime ships beside the binary.
 [tasks.build]
-description = "Build the components, the web interface and the release binary"
+description = "Build the components, the web interface and the release binary, and fetch Python"
 depends = ["web-build"]
-run = ["mise run components", "cargo build --release --package fronde"]
+run = ["mise run components", "mise run python", "cargo build --release --package fronde"]
 
 # dx leaves the assets of earlier builds in place; the output starts empty so that only the
 # current ones are served and copied into the image.

@@ -53,14 +53,15 @@ through mr-boxington.
 | `mise run format` | Formats the code, components included |
 | `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server code, the web interface (native and wasm32) and the components (wasm32-wasip2) |
 | `mise run components` | Release build of the components for wasm32-wasip2 into `components/dist` |
-| `mise run test` | The test suite (nextest), after `components` |
+| `mise run python` | Fetches the pinned CPython WASI build (and tzdata) into `python/`, checks its hashes and byte-compiles the stdlib |
+| `mise run test` | The test suite (nextest), after `components` and `python` |
 | `mise run agent` | Installs the locked Claude ACP adapter (`agent/package-lock.json`) into `agent/node_modules`; Node.js comes from mise, which puts the adapter on `PATH` |
 | `mise run deny` | cargo-deny: advisories, licences, bans, sources, for the root workspace and the components |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
 | `mise run dev` | The server on http://127.0.0.1:8484 for `web-dev` (password `fronde`; config and data in `target/dev`) |
 | `mise run web-dev` | The Dioxus interface with hot reload on http://127.0.0.1:8080 (dx serve); `/ws` and `/auth` go to `mise run dev` |
 | `mise run web-build` | Release build of the Dioxus interface into `target/dx/fronde-web/release/web/public` |
-| `mise run build` | Release build: `web-build`, then `target/release/fronde` |
+| `mise run build` | Release build: `web-build`, `components` and `python`, then `target/release/fronde` |
 | `mise run docs` | Builds the user guide (mdBook, `docs/`) into `docs/book` |
 | `mise run entities` | Regenerates `crates/entity` from the migrations with `sea-orm-cli` |
 

@@ -6,3 +6,4 @@ docs/superpowers
 mise.local.toml
 .env
 components/dist
+python

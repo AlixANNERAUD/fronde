@@ -18,13 +18,14 @@ mise run agent   # the Claude adapter, to chat with a real agent
 | `mise run format` | Formats the code, the component SDK and components included |
 | `mise run lint` | rustfmt check and clippy with `-D warnings`, on the server, the web interface (native and wasm32), the component SDK and each component (wasm32-wasip2) |
 | `mise run components` | Builds each Wasm component project into `components/dist` |
-| `mise run test` | The test suite (nextest), after `components` |
+| `mise run python` | Fetches the pinned CPython WASI build into `python/` (see below) |
+| `mise run test` | The test suite (nextest), after `components` and `python` |
 | `mise run deny` | cargo-deny: advisories, licences, bans, sources, for the server, the component SDK and each component |
 | `mise run check` | What CI runs: lint, tests, cargo-deny |
 | `mise run dev` | The server on <http://127.0.0.1:8484>, password `fronde` |
 | `mise run web-dev` | The web interface with hot reload on <http://127.0.0.1:8080> |
 | `mise run web-build` | Release build of the web interface |
-| `mise run build` | Release build: `web-build` and `components`, then `target/release/fronde`, which approves the components of `components/dist` it was built with |
+| `mise run build` | Release build: `web-build`, `components` and `python`, then `target/release/fronde`, which approves the components of `components/dist` it was built with |
 | `mise run docs` | Builds this guide into `docs/book` |
 | `mise run entities` | Regenerates the database entities (`crates/entity`) from the migrations |
 
@@ -44,6 +45,32 @@ Open <http://127.0.0.1:8080>. dx serves the pages and passes the chat's WebSocke
 sign-in forms (`/auth/…`) to the server, so any route only the backend answers must stay under one
 of those. `mise run dev` writes its configuration, a random token and its data under `target/dev`,
 and needs the Claude adapter on the `PATH` to chat.
+
+## The Python runtime
+
+`code_run_python` runs CPython built for WASI (`wasm32-wasip1`). python.org publishes no WASI
+build, so Fronde uses the one CPython's WASI maintainer builds from each release tag with
+CPython's own `Platforms/WASI` script, at
+[brettcannon/cpython-wasi-build](https://github.com/brettcannon/cpython-wasi-build).
+`mise run python` downloads it over https into `python/` (git-ignored), with the
+[tzdata](https://pypi.org/project/tzdata/) wheel for time zones, which the build lacks. It checks
+both archives and `python.wasm` against hashes pinned in `mise.toml`, then byte-compiles the
+standard library with the wasmtime CLI, so that runs do not compile the modules they import. It
+does nothing when the pinned archives are already installed. The tests of `fronde-wasm` load the
+runtime from `python/`, or from `FRONDE_PYTHON_DIR`.
+
+To upgrade Python or tzdata:
+
+1. Read the CPython changelog for WASI changes, and check that the new build still targets the
+   WASI version the host links (`wasm32-wasip1` up to 3.15; 3.16 moves to WASI 0.3 components,
+   which needs a component linker).
+2. In the `python` task of `mise.toml`, change the URLs and the archives' sha256 (the GitHub
+   release lists them, as does PyPI's JSON for the wheel), and the version in the path
+   `lib/python3.15` if it changes.
+3. Run `mise run python`. It stops at the check of `python.wasm`: put the new hash in both
+   `mise.toml` and `PYTHON_WASM_SHA256` in `crates/wasm/src/python.rs`, which Fronde checks
+   before it compiles the module.
+4. Run `mise run test`.
 
 ## Change the database schema
 

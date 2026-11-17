@@ -9,7 +9,7 @@ ARG TARGETARCH
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git build-essential pkg-config \
+        ca-certificates curl git build-essential pkg-config unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # The mise binary is checked against the release's checksums before it runs.
@@ -42,7 +42,8 @@ RUN mise trust --all && mise install
 
 # dx downloads the tools it builds the web interface with (wasm-bindgen, wasm-opt, esbuild) into
 # DX_HOME, cached like Cargo's downloads. `mise run build` builds the components before the
-# binary, which carries their hashes and approves the files copied to /app/components.
+# binary, which carries their hashes and approves the files copied to /app/components. It also
+# fetches the pinned CPython WASI runtime into python/, checked against its hashes.
 COPY . .
 RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
@@ -54,7 +55,8 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     && mkdir -p /out/components \
     && cp target/release/fronde /out/fronde \
     && cp -r target/dx/fronde-web/release/web/public /out/site \
-    && cp components/dist/calendar.wasm components/dist/calendar.toml /out/components/
+    && cp components/dist/calendar.wasm components/dist/calendar.toml /out/components/ \
+    && cp -r python /out/python
 
 # The Claude ACP adapter needs Node.js 22 or later, newer than Debian's. It brings its own Claude
 # Code.
@@ -84,6 +86,8 @@ COPY --from=builder /out/fronde /app/fronde
 COPY --from=builder /out/site /app/site
 # Tool components, each with its manifest beside it; a [[sources]] entry enables one.
 COPY --from=builder /out/components /app/components
+# CPython for WASI and its standard library, for code_run_python ([python] dir = "/app/python").
+COPY --from=builder /out/python /app/python
 
 # HOME is on the volume so the agent's Claude sign-in and settings (~/.claude) survive restarts.
 ENV PATH=/opt/agent/node_modules/.bin:$PATH \

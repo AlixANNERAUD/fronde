@@ -10,6 +10,7 @@ The `Dockerfile` at the root of the repository builds the image. See
 | `/app/fronde` | The server. |
 | `/app/site` | The built web interface (`FRONDE_SITE_ROOT`). |
 | `/app/components` | Tool components with their manifests: `calendar.wasm` and `calendar.toml`. A `[[sources]]` entry enables one; `/app/fronde` approves them without hashes in the entry, being built from the same files. |
+| `/app/python` | CPython 3.15 for WASI (`python.wasm`) and its byte-compiled standard library (`lib/`), with the `tzdata` time zone database, for `code_run_python`. Licences: `LICENSE` (PSF License, CPython) and `LICENSE.tzdata` (Apache-2.0). Fronde refuses a `python.wasm` other than the build it pins. |
 | `/opt/agent` | The Claude ACP adapter, installed from `agent/package-lock.json`. It brings its own Claude Code. |
 | `/usr/local/bin/node` | Node.js 22, for the adapter. |
 
@@ -43,7 +44,9 @@ and `tini`.
 The builder stage installs mise at a pinned version, checked against its release checksums, then
 the toolchain pinned in `mise.toml`, and runs `mise run build`, which builds the components
 before the binary, so that the hashes of the shipped components it carries are those of the
-files copied to `/app/components`. Cargo's registry, the Dioxus CLI's
+files copied to `/app/components`. It also runs `mise run python`, which downloads the pinned
+CPython WASI build and the tzdata wheel over https and checks them against their pinned sha256
+before anything is unpacked. Cargo's registry, the Dioxus CLI's
 downloads and the target directories, the components' included, are cache mounts, per
 architecture. The image builds for
 `amd64` and `arm64`.
