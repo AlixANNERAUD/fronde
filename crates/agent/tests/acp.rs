@@ -3,7 +3,12 @@ use agent_client_protocol::v1::schema::{
     SystemPromptMode, ToolCall, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind,
 };
-use fronde_agent::acp::{AgentClient, AgentEvent, AgentSpec, Failure, PermissionAsk, TurnEnd};
+use agent_client_protocol::v1::schema::{
+    CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationContentValue,
+};
+use fronde_agent::acp::{
+    AgentClient, AgentEvent, AgentSpec, ElicitationAsk, Failure, PermissionAsk, TurnEnd,
+};
 use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use serde_json::json;
 use std::path::PathBuf;
@@ -84,13 +89,14 @@ fn selected(option_id: &str) -> RequestPermissionOutcome {
     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id.to_owned()))
 }
 
-/// The hub and the web tools, allowed up front, and nothing from the owner's Claude settings: no
-/// plugins, MCP servers, hooks or allow rules, and no bypass mode.
+/// The hub and the web tools, allowed up front, `AskUserQuestion` enabled but never allowed up
+/// front, and nothing from the owner's Claude settings: no plugins, MCP servers, hooks or allow
+/// rules, and no bypass mode.
 fn expected_meta() -> serde_json::Value {
     json!({
         "disableBuiltInTools": true,
         "claudeCode": {"options": {
-            "tools": ["WebSearch", "WebFetch"],
+            "tools": ["WebSearch", "WebFetch", "AskUserQuestion"],
             "allowedTools": ["mcp__fronde", "WebSearch", "WebFetch"],
             "settingSources": [],
             "strictMcpConfig": true,
@@ -140,10 +146,11 @@ async fn no_builtin_tools_leaves_only_the_hub() {
     let meta = serde_json::Value::Object(record.new_sessions[0].meta.clone().expect("no _meta"));
     assert_eq!(
         meta,
+        // Only AskUserQuestion besides the hub, never allowed up front.
         json!({
             "disableBuiltInTools": true,
             "claudeCode": {"options": {
-                "tools": [],
+                "tools": ["AskUserQuestion"],
                 "allowedTools": ["mcp__fronde"],
                 "settingSources": [],
                 "strictMcpConfig": true,
@@ -590,4 +597,184 @@ async fn cancel_between_turns_does_not_reach_the_next_turn() {
         handle.record().permission_outcomes,
         vec![selected("allow-once")]
     );
+}
+
+#[tokio::test]
+async fn ask_user_question_is_never_allowed_up_front() {
+    let spec = AgentSpec {
+        builtin_tools: vec!["AskUserQuestion".into(), "WebSearch".into()],
+        ..spec()
+    };
+    let (_client, handle, _rx) = connect_with(&spec, FakeScript::default(), None).await;
+    let record = handle.record();
+    let meta = record.new_sessions[0].meta.clone().expect("no _meta");
+    let options = &meta["claudeCode"]["options"];
+    assert_eq!(options["tools"], json!(["WebSearch", "AskUserQuestion"]));
+    assert_eq!(options["allowedTools"], json!(["mcp__fronde", "WebSearch"]));
+}
+
+#[tokio::test]
+async fn initialize_advertises_forms_only() {
+    let (_client, handle, _rx) = connect(FakeScript::default(), None).await;
+    let record = handle.record();
+    let elicitation = record.initializes[0]
+        .client_capabilities
+        .elicitation
+        .clone()
+        .expect("no elicitation capability");
+    assert!(elicitation.supports_form());
+    assert!(!elicitation.supports_url());
+}
+
+/// The Claude adapter's form for one question with its free-text field.
+fn question_form() -> serde_json::Value {
+    json!({
+        "mode": "form",
+        "toolCallId": "toolu_1",
+        "message": "Quelle appli installer ?",
+        "requestedSchema": {"type": "object", "properties": {
+            "question_0": {"type": "string", "title": "Appli", "oneOf": [
+                {"const": "Mealie", "title": "Mealie"},
+                {"const": "Seerr", "title": "Seerr"},
+            ]},
+            "question_0_custom": {"type": "string", "title": "Other"},
+        }},
+    })
+}
+
+fn eliciting(form: serde_json::Value) -> FakeScript {
+    FakeScript {
+        elicitation: Some(form),
+        ..FakeScript::default()
+    }
+}
+
+async fn elicitation_asked(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> ElicitationAsk {
+    loop {
+        let event = timeout(WAIT, rx.recv())
+            .await
+            .expect("no elicitation")
+            .expect("event channel closed");
+        if let AgentEvent::Elicitation(ask) = event {
+            return *ask;
+        }
+    }
+}
+
+#[tokio::test]
+async fn elicitation_round_trip() {
+    let (client, handle, mut rx) = connect(eliciting(question_form()), None).await;
+    let client = Arc::new(client);
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Installe une appli").await }
+    });
+    let ask = elicitation_asked(&mut rx).await;
+    assert_eq!(ask.request.message, "Quelle appli installer ?");
+    let content: std::collections::BTreeMap<_, _> = [(
+        "question_0".to_owned(),
+        ElicitationContentValue::String("Seerr".into()),
+    )]
+    .into();
+    let accept = CreateElicitationResponse::new(ElicitationAction::Accept(
+        ElicitationAcceptAction::new().content(content),
+    ));
+    assert!(ask.reply.send(accept.clone()));
+    let end = timeout(WAIT, turn).await.expect("turn timed out");
+    assert_eq!(end.expect("turn panicked").expect("prompt"), TurnEnd::Done);
+    assert_eq!(handle.record().elicitation_responses, vec![Ok(accept)]);
+}
+
+#[tokio::test]
+async fn url_elicitation_is_cancelled() {
+    let url = json!({
+        "mode": "url", "message": "Connecte-toi", "url": "https://example.com/login",
+        "elicitationId": "e1",
+    });
+    let (client, handle, mut rx) = connect(eliciting(url), None).await;
+    assert_eq!(prompt(&client, "Installe").await, TurnEnd::Cancelled);
+    assert_eq!(
+        handle.record().elicitation_responses,
+        vec![Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
+    );
+    // Nobody was asked.
+    assert!(
+        !drain(&mut rx)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Elicitation(_)))
+    );
+}
+
+#[tokio::test]
+async fn cancel_and_drop_resolve_pending_elicitation() {
+    let (client, handle, mut rx) = connect(eliciting(question_form()), None).await;
+    let client = Arc::new(client);
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Installe").await }
+    });
+    let ask = elicitation_asked(&mut rx).await;
+    client.cancel().expect("cancel");
+    let end = timeout(WAIT, turn).await.expect("turn timed out");
+    assert_eq!(
+        end.expect("turn panicked").expect("prompt"),
+        TurnEnd::Cancelled
+    );
+    let cancelled = CreateElicitationResponse::new(ElicitationAction::Cancel);
+    assert_eq!(
+        handle.record().elicitation_responses,
+        vec![Ok(cancelled.clone())]
+    );
+    assert!(
+        !ask.reply.send(cancelled),
+        "a cancelled form cannot be answered"
+    );
+
+    // Dropped unanswered: cancelled too.
+    let (client, handle, mut rx) = connect(eliciting(question_form()), None).await;
+    let client = Arc::new(client);
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Installe").await }
+    });
+    drop(elicitation_asked(&mut rx).await);
+    timeout(WAIT, turn)
+        .await
+        .expect("turn timed out")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        handle.record().elicitation_responses,
+        vec![Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
+    );
+}
+
+#[tokio::test]
+async fn withdrawn_elicitation_closes_its_reply() {
+    let withdraw = Arc::new(tokio::sync::Notify::new());
+    let script = FakeScript {
+        withdraw_elicitation: Some(withdraw.clone()),
+        ..eliciting(question_form())
+    };
+    let (client, handle, mut rx) = connect(script, None).await;
+    let client = Arc::new(client);
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Installe").await }
+    });
+    let ask = elicitation_asked(&mut rx).await;
+    withdraw.notify_one();
+    timeout(WAIT, ask.reply.answered())
+        .await
+        .expect("the withdrawn request's reply stays open");
+    timeout(WAIT, turn)
+        .await
+        .expect("turn timed out")
+        .unwrap()
+        .unwrap();
+    assert_eq!(handle.record().elicitation_responses.len(), 1);
 }

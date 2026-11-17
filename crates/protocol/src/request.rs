@@ -886,7 +886,8 @@ fn check_choice(field: &Field, answer: Option<&ChoiceAnswer>) -> Result<(), Inva
     Ok(())
 }
 
-/// A text field's answer: blank counts as unanswered.
+/// A text field's answer, without the blank around it, which the asker never gets: blank
+/// counts as unanswered.
 fn check_text(
     key: &str,
     text: &str,
@@ -895,7 +896,8 @@ fn check_text(
     max_length: Option<u32>,
     required: bool,
 ) -> Result<(), Invalid> {
-    if text.trim().is_empty() {
+    let text = text.trim();
+    if text.is_empty() {
         if required {
             return Err(invalid(Some(key), "Remplis ce champ."));
         }

@@ -145,6 +145,48 @@ stops (Fronde restarts, or a turn the agent never ended stops it), and is never 
 since Fronde's sessions load no Claude Code settings. Fronde itself never remembers a grant: the
 next agent process asks again.
 
+## Forms from the agent
+
+Claude asks you questions with its own tool, `AskUserQuestion`, as well as with `user_ask`.
+Fronde tells the Claude adapter that it shows forms (ACP's `elicitation` capability, forms only),
+so the adapter sends each `AskUserQuestion` as an ACP `elicitation/create` form instead of turning
+the tool off. Fronde enables the tool in the agent's session but never allows it up front, so
+each use goes through the adapter's permission check, which is where it asks. The adapter sends
+other forms the same way: the choice to retry a refused request with another model, and the forms
+of MCP servers it connects to (with Fronde's settings, it connects to Fronde's hub only, which
+sends none).
+
+Each form becomes a card of the running turn, headed *Question de Fronde*. The form's schema is a
+flat object of fields, and maps onto the card's fields:
+
+| Schema | Card field |
+| --- | --- |
+| `string` with `oneOf` (titled options) or `enum` | A question with one answer |
+| `array` whose `items` have `anyOf` or `enum` | A question with several answers (`maxItems: 1`: one answer) |
+| `string` named `<k>_custom` beside a question `<k>`, not required | That question's *Autre…* and note |
+| Any other `string` | A text field; `format` `email`, `uri`, `date`, `date-time`; `minLength`, `maxLength` |
+| `number`, `integer` | A number field; `minimum`, `maximum` |
+| `boolean` | A toggle |
+
+`AskUserQuestion` therefore reads as one question per field, with *Autre…*, a note and previews,
+like `user_ask`. A question without its `<k>_custom` field offers neither *Autre…* nor a note,
+since nothing would carry them back. A `pattern` is not checked by Fronde: the asker checks its
+own. The form's texts are cleaned as a permission card's are (hidden characters replaced, head
+and tail kept), and the card says so. A form Fronde cannot show is declined at once, with the
+reason in the answer's `_meta` (`fronde/refused`): another type (an object, say), another
+`format`, more than 12 fields, a question with no option or more than 50, two options that read
+the same, a number of picks other than one or any. So is a form that looks like it asks for a
+secret (see [Security](security.md#forms-from-agents-and-servers)).
+
+The agent gets typed answers: each option's value (never its title), the text, the number (whole
+as an integer), the toggle, and a question's free text and note joined under `<k>_custom`. A
+field left blank is left out. *Refuser* gives the agent a `decline`, which Claude reads as a
+skipped question. The card expires after **10 minutes**, and the agent then gets a `cancel`, as it
+does when you press *Stop* or the turn ends. When the agent withdraws its form first (its tool
+call was aborted), the card closes and a late answer goes nowhere. A form that is not a form
+(ACP's URL mode, used for an MCP server's sign-in, which Fronde does not advertise) gets a
+`cancel` without a card.
+
 ## Secret cards
 
 `user_secret` asks for one secret on a card of its own, never in a question card. The card shows
@@ -237,8 +279,8 @@ These use the same requests and cards, and are **not built yet**:
 
 - **Tools that take a `secret_ref`**: integration setup from the chat, and commands that read a
   secret from a file in threads that have a shell.
-- **Elicitations**: forms that Claude's `AskUserQuestion` and upstream MCP servers send, shown as
-  cards; an upstream server's go to the admin.
+- **Upstream servers' forms**: forms that upstream MCP servers send, shown as cards for the
+  admin.
 - **Late answers**: an answer to a question whose asker is gone (after a restart, or a tool call
   cut short) reaches the assistant as a message. Today such an answer is saved but goes nowhere.
 - **A tray** above the message box listing the open cards, and their count in the tab's title.

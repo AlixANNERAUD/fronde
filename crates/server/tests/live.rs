@@ -12,7 +12,7 @@
 //! signs in with the token `claude setup-token` prints, in `CLAUDE_CODE_OAUTH_TOKEN`, which the
 //! configuration names as `[agent] oauth_token`.
 
-use fronde_protocol::{Card, ClientMsg, Entry, Event, ServerMsg};
+use fronde_protocol::{Card, ChoiceAnswer, ClientMsg, Entry, Event, Field, Response, ServerMsg};
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{CONTENT_TYPE, SET_COOKIE};
 use std::net::SocketAddr;
@@ -190,6 +190,87 @@ async fn live_chat_with_claude() {
             );
         }
     }
+}
+
+/// Claude's own `AskUserQuestion` reaches the chat as a form card (the adapter turns it into an
+/// ACP elicitation since Fronde advertises forms), never as a permission, and the answer reaches
+/// the model. Run as `live_chat_with_claude` is, with `--run-ignored only`.
+#[tokio::test]
+#[ignore = "talks to the real Claude; set FRONDE_LIVE_AGENT to the adapter's path"]
+async fn live_ask_user_question_becomes_a_card() {
+    let Ok(agent) = std::env::var("FRONDE_LIVE_AGENT") else {
+        eprintln!("FRONDE_LIVE_AGENT is not set: skipped");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let helper = Path::new(env!("CARGO_BIN_EXE_fronde"));
+    let (addr, _server) = fronde::start_with_helper(config(dir.path(), &agent), helper)
+        .await
+        .unwrap();
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Avec ton outil AskUserQuestion (pas user_ask), demande-moi ma couleur préférée                    parmi Rouge et Bleu, puis répète ma réponse en un mot."
+                .into(),
+        },
+    )
+    .await;
+    let mut answered = None;
+    let mut reply = String::new();
+    let wait = async {
+        while let Some(message) = socket.next().await {
+            let Message::Text(json) = message.unwrap() else {
+                continue;
+            };
+            let ServerMsg::Entry(Entry { event, .. }) = serde_json::from_str(&json).unwrap() else {
+                continue;
+            };
+            eprintln!("{}", serde_json::to_string(&event).unwrap());
+            match &event {
+                Event::Request {
+                    card: Card::Permission { title, .. },
+                    ..
+                } => panic!("the agent asked for a permission: {title}"),
+                Event::Request {
+                    id,
+                    card: Card::Form { fields, .. },
+                    from: None,
+                } => {
+                    let Some(Field::Choice { key, options, .. }) = fields.first() else {
+                        panic!("not a question: {fields:?}");
+                    };
+                    let label = options.last().unwrap().label.clone();
+                    let response = Response::Form {
+                        values: [(
+                            key.clone(),
+                            ChoiceAnswer {
+                                selected: vec![label.clone()],
+                                ..ChoiceAnswer::default()
+                            }
+                            .into(),
+                        )]
+                        .into(),
+                    };
+                    say(&mut socket, ClientMsg::Answer { id: *id, response }).await;
+                    answered = Some(label);
+                }
+                Event::Assistant { text } => reply.push_str(text),
+                Event::TurnEnded { .. } => return,
+                _ => {}
+            }
+        }
+        panic!("the chat closed during the turn");
+    };
+    timeout(TURN, wait)
+        .await
+        .unwrap_or_else(|_| panic!("no turn_ended within {TURN:?}"));
+    let label = answered.expect("AskUserQuestion never reached the chat as a card");
+    assert!(
+        reply.contains(&label),
+        "the answer {label:?} did not reach the model: {reply:?}"
+    );
 }
 
 /// The adapter's titles for WebSearch (`Search "…"`, `Web search`) and WebFetch (`Fetch …`).

@@ -1,11 +1,15 @@
 //! Fronde's conversation: one agent session, its turns recorded in the conversation log.
 
-use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, PermissionAsk, TurnEnd};
+use crate::acp::{
+    AgentClient, AgentEvent, AgentSpec, ElicitationAsk, Failure, PermissionAsk, Reply, TurnEnd,
+    Unanswered,
+};
 use crate::confine::Confine;
+use crate::elicitation;
 use crate::legacy;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
-use agent_client_protocol::v1::schema::RequestPermissionOutcome;
+use agent_client_protocol::v1::schema::CreateElicitationResponse;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use fronde_db::DatabaseConnection;
@@ -80,6 +84,8 @@ pub struct Assistant {
     requests: OnceLock<(Weak<Requests>, User)>,
     /// How long a permission card waits for an answer.
     permission_timeout: Mutex<Duration>,
+    /// How long an elicitation's card waits for an answer.
+    elicitation_timeout: Mutex<Duration>,
 }
 
 struct Turn {
@@ -127,6 +133,7 @@ impl Assistant {
             turn: tokio::sync::Mutex::new(None),
             requests: OnceLock::new(),
             permission_timeout: Mutex::new(permission::PERMISSION_TIMEOUT),
+            elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
         let last_turn =
@@ -176,6 +183,13 @@ impl Assistant {
     /// [`permission::PERMISSION_TIMEOUT`] unless changed here.
     pub fn set_permission_timeout(&self, timeout: Duration) {
         *lock(&self.permission_timeout) = timeout;
+    }
+
+    /// How long an elicitation's card waits for an answer before the agent gets a cancel:
+    /// [`fronde_requests::elicitation::DEFAULT_TIMEOUT`] unless changed here, at most
+    /// [`fronde_requests::elicitation::MAX_TIMEOUT`].
+    pub fn set_elicitation_timeout(&self, timeout: Duration) {
+        *lock(&self.elicitation_timeout) = timeout.min(fronde_requests::elicitation::MAX_TIMEOUT);
     }
 
     /// Logs the message and runs the turn in the background; refused while a turn runs.
@@ -284,24 +298,83 @@ impl Assistant {
         if reply.is_answered() {
             return;
         }
-        let deny = || {
-            reply.send(permission::denial(&options));
-        };
-        let (Some(requests), Some((_, owner))) = (self.requests(), self.requests.get()) else {
+        let Some((_, owner)) = self.requests.get() else {
             tracing::warn!("a permission request came with no requests to show it: refused");
-            return deny();
-        };
-        // Only a turn's request is cancelled with its turn; there is none to tie it to.
-        let Some(turn) = self.current_turn().await else {
-            tracing::warn!("a permission request came outside a turn: refused");
-            return deny();
+            reply.send(permission::denial(&options));
+            return;
         };
         let Some(card) = permission::card(&tool_call, &options, owner.admin) else {
             tracing::warn!("a permission request offered nothing the card can show: refused");
-            return deny();
+            reply.send(permission::denial(&options));
+            return;
         };
         let offered = permission::offered(&card);
         let timeout = *lock(&self.permission_timeout);
+        let denial = permission::denial(&options);
+        self.ask_in_turn(
+            "permission",
+            card,
+            timeout,
+            reply,
+            denial,
+            move |resolution| permission::outcome(resolution, &options, &offered),
+        )
+        .await;
+    }
+
+    /// Shows the agent's form as a card of the running turn, and answers the agent once the
+    /// card is answered, declined, expires or is cancelled with its turn. A form the card
+    /// cannot show is declined at once, the reason in the answer's `_meta`.
+    async fn ask_elicitation(&self, ask: ElicitationAsk) {
+        let ElicitationAsk { request, reply } = ask;
+        if reply.is_answered() {
+            return;
+        }
+        let elicited = match elicitation::card(&request) {
+            Ok(elicited) => elicited,
+            Err(refused) => {
+                tracing::warn!("refused a form from the agent: {refused}");
+                reply.send(elicitation::refusal(&refused));
+                return;
+            }
+        };
+        let card = elicited.card.clone();
+        let timeout = *lock(&self.elicitation_timeout);
+        let cancel = CreateElicitationResponse::unanswered();
+        self.ask_in_turn(
+            "elicitation",
+            card,
+            timeout,
+            reply,
+            cancel,
+            move |resolution| elicitation::response(resolution, &elicited),
+        )
+        .await;
+    }
+
+    /// Shows `card` as a request of the running turn and answers `reply` with what `answer`
+    /// makes of the request's end, or with `refusal` at once when it cannot be shown: nobody
+    /// could answer it. A request outside a turn, or whose turn ends while it is shown, is never
+    /// left open: only a turn's request is cancelled with its turn.
+    async fn ask_in_turn<T: Unanswered + Send + 'static>(
+        &self,
+        what: &'static str,
+        card: Card,
+        timeout: Duration,
+        reply: Arc<Reply<T>>,
+        refusal: T,
+        answer: impl FnOnce(&Resolution) -> T + Send + 'static,
+    ) {
+        let (Some(requests), Some((_, owner))) = (self.requests(), self.requests.get()) else {
+            tracing::warn!("a {what} request came with no requests to show it: refused");
+            reply.send(refusal);
+            return;
+        };
+        let Some(turn) = self.current_turn().await else {
+            tracing::warn!("a {what} request came outside a turn: refused");
+            reply.send(refusal);
+            return;
+        };
         let asked = requests
             .ask(Ask {
                 topic: TOPIC.into(),
@@ -317,8 +390,9 @@ impl Assistant {
         let waiter = match asked {
             Ok(waiter) => waiter,
             Err(error) => {
-                tracing::error!("cannot show the permission request, refusing it: {error:#}");
-                return deny();
+                tracing::error!("cannot show the {what} request, refusing it: {error:#}");
+                reply.send(refusal);
+                return;
             }
         };
         let id = waiter.id();
@@ -326,30 +400,30 @@ impl Assistant {
         // cancelled: this one must not outlive it.
         if self.current_turn().await != Some(turn) {
             if let Err(error) = requests.cancel(id).await {
-                tracing::error!("cannot cancel permission request {id}: {error:#}");
+                tracing::error!("cannot cancel {what} request {id}: {error:#}");
             }
-            reply.send(RequestPermissionOutcome::Cancelled);
+            reply.send(T::unanswered());
             return;
         }
         // Waiting here would hold up the agent's next events.
         tokio::spawn(async move {
             tokio::select! {
                 resolution = waiter.wait() => {
-                    let outcome = permission::outcome(&resolution, &options, &offered);
+                    let outcome = answer(&resolution);
                     if !reply.send(outcome) && matches!(resolution, Resolution::Answered(_)) {
                         tracing::warn!(
-                            "permission request {id} was answered after the agent got its answer: the agent did not get this one"
+                            "{what} request {id} was answered after the agent got its answer: the agent did not get this one"
                         );
                     }
                 }
-                // The agent got its answer elsewhere (a cancel on the wire): the card closes,
-                // so that no later answer is recorded as given.
+                // The agent got its answer elsewhere (a cancel on the wire, a withdrawn
+                // request): the card closes, so that no later answer is recorded as given.
                 () = reply.answered() => match requests.cancel(id).await {
                     Ok(true) => {}
                     Ok(false) => tracing::warn!(
-                        "permission request {id} was closed after the agent got its answer: the agent did not get this one"
+                        "{what} request {id} was closed after the agent got its answer: the agent did not get this one"
                     ),
-                    Err(error) => tracing::error!("cannot cancel permission request {id}: {error:#}"),
+                    Err(error) => tracing::error!("cannot cancel {what} request {id}: {error:#}"),
                 },
             }
         });
@@ -477,6 +551,10 @@ impl Assistant {
             },
             AgentEvent::Permission(ask) => {
                 self.ask_permission(*ask).await;
+                return;
+            }
+            AgentEvent::Elicitation(ask) => {
+                self.ask_elicitation(*ask).await;
                 return;
             }
         };

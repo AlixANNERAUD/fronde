@@ -3,6 +3,7 @@
 pub mod acp;
 pub mod assistant;
 pub mod confine;
+pub mod elicitation;
 #[cfg(feature = "testing")]
 pub mod fake;
 pub mod legacy;

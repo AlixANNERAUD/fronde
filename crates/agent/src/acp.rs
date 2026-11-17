@@ -5,7 +5,9 @@ use crate::scope::ScopeStop;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
-    CancelNotification, ContentBlock, ContentChunk, HttpHeader, Implementation, InitializeRequest,
+    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, CreateElicitationRequest,
+    CreateElicitationResponse, ElicitationAction, ElicitationCapabilities,
+    ElicitationFormCapabilities, ElicitationMode, HttpHeader, Implementation, InitializeRequest,
     McpServer, McpServerHttp, NewSessionRequest, PermissionOption, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResumeSessionRequest, SessionCapabilities, SessionId, SessionNotification, SessionUpdate,
@@ -95,6 +97,9 @@ pub enum AgentEvent {
     },
     /// The agent asks to use a tool and waits for [`PermissionAsk::reply`].
     Permission(Box<PermissionAsk>),
+    /// The agent asks the user to fill a form (Claude's `AskUserQuestion`, say) and waits for
+    /// [`ElicitationAsk::reply`].
+    Elicitation(Box<ElicitationAsk>),
 }
 
 /// A permission request from the agent.
@@ -107,17 +112,51 @@ pub struct PermissionAsk {
     pub reply: Arc<Reply>,
 }
 
-/// Where the answer to a permission request goes: the first answer is the one the agent gets.
-/// Dropped unanswered, the agent gets `Cancelled`; so does a request still open when its turn
-/// is stopped or ends.
-pub struct Reply {
-    sender: Mutex<Option<oneshot::Sender<RequestPermissionOutcome>>>,
+/// A form the agent asks the user to fill, in form mode: other modes never get this far.
+#[derive(Debug)]
+pub struct ElicitationAsk {
+    pub request: CreateElicitationRequest,
+    pub reply: Arc<Reply<CreateElicitationResponse>>,
+}
+
+/// Two asks are equal only if they are the same.
+impl PartialEq for ElicitationAsk {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reply, &other.reply)
+    }
+}
+
+impl Eq for ElicitationAsk {}
+
+/// What the agent gets for a request nobody answers: the turn was stopped or ended, the request
+/// was dropped.
+pub trait Unanswered {
+    fn unanswered() -> Self;
+}
+
+impl Unanswered for RequestPermissionOutcome {
+    fn unanswered() -> Self {
+        Self::Cancelled
+    }
+}
+
+impl Unanswered for CreateElicitationResponse {
+    fn unanswered() -> Self {
+        Self::new(ElicitationAction::Cancel)
+    }
+}
+
+/// Where the answer to a request of the agent's (a permission, an elicitation) goes: the first
+/// answer is the one the agent gets. Dropped unanswered, the agent gets a cancel
+/// ([`Unanswered`]); so does a request still open when its turn is stopped or ends.
+pub struct Reply<T = RequestPermissionOutcome> {
+    sender: Mutex<Option<oneshot::Sender<T>>>,
     answered: CancellationToken,
 }
 
-impl Reply {
+impl<T> Reply<T> {
     /// A reply, and where the agent's side receives its answer.
-    pub fn new() -> (Arc<Self>, oneshot::Receiver<RequestPermissionOutcome>) {
+    pub fn new() -> (Arc<Self>, oneshot::Receiver<T>) {
         let (sender, receiver) = oneshot::channel();
         let reply = Self {
             sender: Mutex::new(Some(sender)),
@@ -127,7 +166,7 @@ impl Reply {
     }
 
     /// Answers the agent; false if it was already answered.
-    pub fn send(&self, outcome: RequestPermissionOutcome) -> bool {
+    pub fn send(&self, outcome: T) -> bool {
         let sender = lock(&self.sender).take();
         // The agent may already have given up on the request: answered all the same.
         let sent = sender.is_some_and(|sender| {
@@ -149,7 +188,7 @@ impl Reply {
     }
 }
 
-impl fmt::Debug for Reply {
+impl<T> fmt::Debug for Reply<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Reply")
             .field("answered", &self.is_answered())
@@ -158,13 +197,29 @@ impl fmt::Debug for Reply {
 }
 
 /// Two replies are equal only if they are the same.
-impl PartialEq for Reply {
+impl<T> PartialEq for Reply<T> {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self, other)
     }
 }
 
-impl Eq for Reply {}
+impl<T> Eq for Reply<T> {}
+
+/// A reply the turn's end or a cancel closes, whatever it answers.
+trait Open: Send + Sync {
+    fn close(&self);
+    fn is_answered(&self) -> bool;
+}
+
+impl<T: Unanswered + Send> Open for Reply<T> {
+    fn close(&self) {
+        self.send(T::unanswered());
+    }
+
+    fn is_answered(&self) -> bool {
+        Reply::is_answered(self)
+    }
+}
 
 /// Why a turn ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,8 +420,8 @@ impl AgentClient {
         })
     }
 
-    /// Ask the agent to stop the current turn; pending and later permission requests of the
-    /// turn are cancelled.
+    /// Ask the agent to stop the current turn; pending and later requests of the turn
+    /// (permissions, elicitations) are cancelled.
     pub fn cancel(&self) -> anyhow::Result<()> {
         self.permissions.cancel();
         self.connection
@@ -376,9 +431,10 @@ impl AgentClient {
     }
 }
 
-/// The ACP side of permission requests: the tool calls they are about, and the turn's
-/// requests not answered yet, which a cancel or the end of the turn cancels. The answer itself
-/// comes from whoever handles [`AgentEvent::Permission`].
+/// The ACP side of the agent's requests: the tool calls permission requests are about, and the
+/// turn's requests (permissions, elicitations) not answered yet, which a cancel or the end of
+/// the turn cancels. The answer itself comes from whoever handles [`AgentEvent::Permission`] and
+/// [`AgentEvent::Elicitation`].
 struct Permissions {
     state: Mutex<PermissionState>,
 }
@@ -389,7 +445,7 @@ struct PermissionState {
     /// refused at once. Cleared again when the next turn starts.
     cancelling: bool,
     /// Weak, so that a request dropped unanswered is cancelled at once.
-    open: Vec<Weak<Reply>>,
+    open: Vec<Weak<dyn Open>>,
     /// The turn's tool calls not finished yet, as their updates described them, by id: a
     /// permission request carries only part of its tool call.
     tools: HashMap<String, ToolCallUpdateFields>,
@@ -436,16 +492,30 @@ impl Permissions {
         let mut tool_call = state.tools.get(&id).cloned().unwrap_or_default();
         merge(&mut tool_call, request.tool_call.fields);
         let (reply, answer) = Reply::new();
-        state
-            .open
-            .retain(|open| open.upgrade().is_some_and(|open| !open.is_answered()));
-        state.open.push(Arc::downgrade(&reply));
+        open(&mut state, &reply);
         let ask = PermissionAsk {
             tool_call,
             options: request.options,
             reply,
         };
         Some((ask, answer))
+    }
+
+    /// A reply for an elicitation of the turn, and where its answer arrives; `None` when the
+    /// turn is being cancelled.
+    fn elicit(
+        &self,
+    ) -> Option<(
+        Arc<Reply<CreateElicitationResponse>>,
+        oneshot::Receiver<CreateElicitationResponse>,
+    )> {
+        let mut state = self.state();
+        if state.cancelling {
+            return None;
+        }
+        let (reply, answer) = Reply::new();
+        open(&mut state, &reply);
+        Some((reply, answer))
     }
 
     fn cancel(&self) {
@@ -462,9 +532,18 @@ impl Permissions {
     }
 }
 
+/// Keeps `reply` among the turn's open ones, forgetting those answered or dropped.
+fn open<T: Unanswered + Send + 'static>(state: &mut PermissionState, reply: &Arc<Reply<T>>) {
+    state
+        .open
+        .retain(|open| open.upgrade().is_some_and(|open| !open.is_answered()));
+    let reply: Arc<dyn Open> = reply.clone();
+    state.open.push(Arc::downgrade(&reply));
+}
+
 fn close_open(state: &mut PermissionState) {
     for reply in state.open.drain(..).filter_map(|reply| reply.upgrade()) {
-        reply.send(RequestPermissionOutcome::Cancelled);
+        reply.close();
     }
 }
 
@@ -527,7 +606,7 @@ impl Connection {
             )
             .on_receive_request(
                 {
-                    let permissions = permissions.clone();
+                    let (permissions, events) = (permissions.clone(), events.clone());
                     async move |request: RequestPermissionRequest, responder, cx| {
                         let Some((ask, answer)) = permissions.ask(request) else {
                             return responder.respond(RequestPermissionResponse::new(
@@ -543,6 +622,49 @@ impl Connection {
                             let outcome =
                                 answer.await.unwrap_or(RequestPermissionOutcome::Cancelled);
                             responder.respond(RequestPermissionResponse::new(outcome))
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let permissions = permissions.clone();
+                    async move |request: CreateElicitationRequest, responder, cx| {
+                        let cancel = CreateElicitationResponse::unanswered;
+                        // Fronde shows forms only, and says so: a URL or another mode the agent
+                        // sends anyway is cancelled, the user never saw it.
+                        if !matches!(request.mode, ElicitationMode::Form(_)) {
+                            tracing::warn!(
+                                "the agent sent an elicitation that is not a form: cancelled"
+                            );
+                            return responder.respond(cancel());
+                        }
+                        let Some((reply, answer)) = permissions.elicit() else {
+                            return responder.respond(cancel());
+                        };
+                        // The agent withdraws a request with `$/cancel_request`, as the Claude
+                        // adapter does when its tool call is aborted.
+                        let withdrawn = responder.cancellation();
+                        let ask = ElicitationAsk {
+                            request,
+                            reply: reply.clone(),
+                        };
+                        // Weak, so that a request dropped unanswered is cancelled at once.
+                        let reply = Arc::downgrade(&reply);
+                        let _ = events.send(AgentEvent::Elicitation(Box::new(ask)));
+                        cx.spawn(async move {
+                            let response = tokio::select! {
+                                answer = answer => answer.unwrap_or_else(|_| cancel()),
+                                () = withdrawn.cancelled() => {
+                                    // The card closes; a later answer goes nowhere.
+                                    if let Some(reply) = reply.upgrade() {
+                                        reply.send(cancel());
+                                    }
+                                    cancel()
+                                }
+                            };
+                            responder.respond(response)
                         })
                     }
                 },
@@ -570,7 +692,8 @@ impl Connection {
             let response = connection
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1)
-                        .client_info(Implementation::new("fronde", env!("CARGO_PKG_VERSION"))),
+                        .client_info(Implementation::new("fronde", env!("CARGO_PKG_VERSION")))
+                        .client_capabilities(client_capabilities()),
                 )
                 .block_task()
                 .await?;
@@ -659,20 +782,41 @@ impl Connection {
     }
 }
 
-/// Fronde's agent gets the hub's tools and the listed built-in ones, all allowed up front. The
-/// Claude Code adapter loads the user's, project's and local settings unless told otherwise, and
-/// with them the owner's plugins, MCP servers, hooks and allow rules: none of them apply. The
-/// sign-in is not a setting and still works.
+/// What Fronde shows of the agent's requests besides permissions: forms. Advertising them makes
+/// the Claude adapter turn `AskUserQuestion` into a form instead of disallowing it. Not URLs:
+/// nothing needs one yet (an MCP server's sign-in), and the adapter forwards those only to a
+/// client that advertises them.
+fn client_capabilities() -> ClientCapabilities {
+    ClientCapabilities::new()
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+}
+
+/// Claude Code's own tool that asks the user questions: the adapter turns it into a form
+/// elicitation, which becomes a card. Enabled, never allowed up front, so that every use goes
+/// through the adapter's permission check, which is where it asks.
+pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
+
+/// Fronde's agent gets the hub's tools and the listed built-in ones, all allowed up front, and
+/// [`ASK_USER_QUESTION`]. The Claude Code adapter loads the user's, project's and local settings
+/// unless told otherwise, and with them the owner's plugins, MCP servers, hooks and allow rules:
+/// none of them apply. The sign-in is not a setting and still works.
 fn session_meta(builtin_tools: &[String]) -> serde_json::Map<String, serde_json::Value> {
     let allowed: Vec<&str> = std::iter::once("mcp__fronde")
         .chain(builtin_tools.iter().map(String::as_str))
+        .filter(|tool| *tool != ASK_USER_QUESTION)
+        .collect();
+    let tools: Vec<&str> = builtin_tools
+        .iter()
+        .map(String::as_str)
+        .filter(|tool| *tool != ASK_USER_QUESTION)
+        .chain([ASK_USER_QUESTION])
         .collect();
     // The adapter prefers `tools` over `disableBuiltInTools`; the flag stays so that an adapter
     // ignoring `tools` falls back to no built-in tool rather than all of them.
     let serde_json::Value::Object(meta) = json!({
         "disableBuiltInTools": true,
         "claudeCode": {"options": {
-            "tools": builtin_tools,
+            "tools": tools,
             "allowedTools": allowed,
             "settingSources": [],
             "strictMcpConfig": true,

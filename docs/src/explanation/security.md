@@ -271,8 +271,9 @@ forward `Host`.
 ## The agent
 
 Fronde's agent has no shell and no files. Its session turns off Claude Code's built-in tools
-except `WebSearch` and `WebFetch`, which only read the web, and allows only those and the hub's
-tools. It loads none of Claude Code's settings, so your plugins, MCP servers, hooks and permission
+except `WebSearch` and `WebFetch`, which only read the web, and `AskUserQuestion`, which only asks
+you, and allows up front only the two web tools and the hub's (`AskUserQuestion` asks through the
+adapter's permission check, which shows it as a form card). It loads none of Claude Code's settings, so your plugins, MCP servers, hooks and permission
 rules on the same machine do not reach it. Its permission mode asks before acting, and any request
 it makes is a permission card in the chat (see
 [Requests and cards](requests.md#permission-cards)): only the user it is for answers it, and only
@@ -461,6 +462,21 @@ its position only, never its content. A question card is not for secrets: `user_
 never to ask for a password or key, and its answers are kept in `fronde.db` as an audit trail.
 Secrets have their own card, `user_secret` (see above).
 Cards show agents' text as text, never as HTML. See [Requests and cards](requests.md).
+
+## Forms from agents and servers
+
+The agent's forms (`AskUserQuestion`) and, with the same rules, upstream MCP servers' are cards:
+their texts are the asker's, cleaned and capped as any card's, and checked by `Card::check` before
+they are written. An answer gives back only what the card asked: an offered option's value, a
+text, a number within its bounds, a toggle. The answer is kept in `fronde.db` as an audit trail,
+so a form never carries a secret: a text or number field whose name or title holds a word such as
+*password*, *passwd*, *passphrase*, *secret*, *token*, *key*, *apikey*, *credential* or *otp* (split
+on anything but letters and digits, and between a lower-case and an upper-case letter), or the
+words *mot de passe*, and any field with `format: password`, makes Fronde decline the whole form
+without showing it, and tell the asker to have the owner configure the secret instead. MCP forbids
+sensitive data in form mode. The rule is plain on purpose: it also declines a harmless *token
+count*, which costs the asker a rewording, never a leak. Options and toggles are not checked:
+they carry nothing the asker does not already know.
 
 ## Untrusted content
 

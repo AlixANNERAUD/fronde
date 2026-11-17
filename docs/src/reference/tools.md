@@ -257,4 +257,7 @@ text blocks joined, with images, audio and resources replaced by a placeholder.
 ## Agent built-in tools
 
 Fronde's own agent also gets Claude Code's `WebSearch` and `WebFetch`, unless
-`[agent] builtin_tools` says otherwise. Other clients of `/mcp` do not get them from Fronde.
+`[agent] builtin_tools` says otherwise, and always `AskUserQuestion`, which is never allowed up
+front: each use becomes a form card in the chat (see
+[Forms from the agent](../explanation/requests.md#forms-from-the-agent)). Other clients of `/mcp`
+do not get them from Fronde.

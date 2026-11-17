@@ -1,4 +1,5 @@
 use agent_client_protocol::v1::schema::{
+    CreateElicitationResponse, ElicitationAction, ElicitationContentValue,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate, ToolCall, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields,
 };
@@ -1530,4 +1531,320 @@ async fn no_card_outlives_its_turn() {
         .await
         .expect("a card outlived its turn");
     }
+}
+
+/// The form the Claude adapter 0.107.0 sends for two questions of `AskUserQuestion`
+/// (`askUserQuestionsToCreateRequest` in `dist/elicitation.js`), without its session id.
+fn ask_user_question_form() -> serde_json::Value {
+    serde_json::json!({
+        "mode": "form",
+        "toolCallId": "toolu_01",
+        "message": "Please answer the following questions.",
+        "requestedSchema": {
+            "type": "object",
+            "properties": {
+                "question_0": {
+                    "type": "string",
+                    "title": "Appli",
+                    "description": "Quelle appli installer ?",
+                    "oneOf": [
+                        {"const": "Mealie", "title": "Mealie", "description": "Recettes",
+                         "_meta": {"_claude/askUserQuestionOption": {"preview": "[ Mealie ]"}}},
+                        {"const": "Seerr", "title": "Seerr", "description": "Films"},
+                    ],
+                },
+                "question_0_custom": {
+                    "type": "string",
+                    "title": "Other",
+                    "description": "Type your own answer, or add a note to the option you chose above (optional).",
+                },
+                "question_1": {
+                    "type": "array",
+                    "title": "Pièces",
+                    "description": "Quelles pièces ?",
+                    "items": {"anyOf": [
+                        {"const": "Salon", "title": "Salon"},
+                        {"const": "Cuisine", "title": "Cuisine"},
+                    ]},
+                },
+                "question_1_custom": {
+                    "type": "string",
+                    "title": "Other",
+                    "description": "Type your own answer to add to your selection above (optional).",
+                },
+            },
+        },
+    })
+}
+
+fn eliciting(form: serde_json::Value) -> FakeScript {
+    FakeScript {
+        elicitation: Some(form),
+        ..FakeScript::default()
+    }
+}
+
+/// Waits for a form card and returns its request's id and card.
+async fn wait_for_form(assistant: &Assistant) -> (u64, Card) {
+    let events = wait_until(assistant, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Request {
+                    card: Card::Form { .. },
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            Event::Request {
+                id,
+                card: card @ Card::Form { .. },
+                from: None,
+            } => Some((id, card)),
+            _ => None,
+        })
+        .expect("a form from the assistant")
+}
+
+fn elicited(fakes: &Fakes) -> Vec<Result<CreateElicitationResponse, String>> {
+    fakes.handles()[0].record().elicitation_responses
+}
+
+fn pick(selected: &[&str], other: Option<&str>, note: Option<&str>) -> fronde_protocol::FieldValue {
+    fronde_protocol::ChoiceAnswer {
+        selected: selected.iter().map(|s| (*s).to_owned()).collect(),
+        other: other.map(str::to_owned),
+        note: note.map(str::to_owned),
+    }
+    .into()
+}
+
+#[tokio::test]
+async fn ask_user_question_becomes_one_card_per_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), eliciting(ask_user_question_form())).await;
+    assistant.send("Installe une appli".into()).await;
+    let (id, card) = wait_for_form(&assistant).await;
+    let Card::Form {
+        message, fields, ..
+    } = &card
+    else {
+        unreachable!()
+    };
+    assert_eq!(message, "Please answer the following questions.");
+    let questions: Vec<_> = fields
+        .iter()
+        .map(|field| match field {
+            fronde_protocol::Field::Choice {
+                key,
+                header,
+                question,
+                multi,
+                other,
+                ..
+            } => (
+                key.as_str(),
+                header.as_deref(),
+                question.as_str(),
+                *multi,
+                *other,
+            ),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        questions,
+        [
+            (
+                "question_0",
+                Some("Appli"),
+                "Quelle appli installer ?",
+                false,
+                true
+            ),
+            ("question_1", Some("Pièces"), "Quelles pièces ?", true, true),
+        ]
+    );
+
+    let values = [
+        (
+            "question_0".to_owned(),
+            pick(&["Seerr"], None, Some("le soir")),
+        ),
+        (
+            "question_1".to_owned(),
+            pick(&["Salon"], Some("Garage"), None),
+        ),
+    ]
+    .into();
+    fakes
+        .requests()
+        .answer(id, Response::Form { values }, &alix())
+        .await
+        .unwrap();
+    let events = wait_for_turns(&assistant, 1).await;
+    assert!(
+        events.contains(&closed(
+            id,
+            Outcome::Answered {
+                summary: "Seerr ; Salon, Garage".into()
+            }
+        )),
+        "{events:?}"
+    );
+    let [Ok(response)] = <[_; 1]>::try_from(elicited(&fakes)).unwrap() else {
+        panic!("{:?}", elicited(&fakes));
+    };
+    let ElicitationAction::Accept(accept) = response.action else {
+        panic!("{response:?}");
+    };
+    let content = accept.content.unwrap();
+    let text = |s: &str| ElicitationContentValue::String(s.into());
+    assert_eq!(
+        content,
+        [
+            ("question_0".to_owned(), text("Seerr")),
+            ("question_0_custom".to_owned(), text("le soir")),
+            (
+                "question_1".to_owned(),
+                ElicitationContentValue::StringArray(vec!["Salon".into()])
+            ),
+            ("question_1_custom".to_owned(), text("Garage")),
+        ]
+        .into()
+    );
+}
+
+#[tokio::test]
+async fn elicitation_decline_and_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), eliciting(ask_user_question_form())).await;
+    assistant.send("Installe".into()).await;
+    let (id, _) = wait_for_form(&assistant).await;
+    fakes
+        .requests()
+        .answer(id, Response::Decline, &alix())
+        .await
+        .unwrap();
+    let events = wait_for_turns(&assistant, 1).await;
+    let declined = Event::RequestClosed {
+        id,
+        outcome: Outcome::Declined,
+        by: Some("alix".into()),
+    };
+    assert!(events.contains(&declined), "{events:?}");
+    assert_eq!(
+        elicited(&fakes),
+        [Ok(CreateElicitationResponse::new(
+            ElicitationAction::Decline
+        ))]
+    );
+}
+
+#[tokio::test]
+async fn cancel_cancels_the_elicitation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), eliciting(ask_user_question_form())).await;
+    assistant.send("Installe".into()).await;
+    let (id, _) = wait_for_form(&assistant).await;
+    assistant.cancel().await;
+    let events = wait_for_turns(&assistant, 1).await;
+    assert!(
+        events.contains(&closed(id, Outcome::Cancelled)),
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&ended(TurnOutcome::Cancelled)));
+    assert_eq!(
+        elicited(&fakes),
+        [Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
+    );
+    let late = Response::Form {
+        values: [("question_0".to_owned(), pick(&["Seerr"], None, None))].into(),
+    };
+    assert_eq!(
+        fakes.requests().answer(id, late, &alix()).await,
+        Err(Refusal::Closed)
+    );
+}
+
+#[tokio::test]
+async fn elicitation_expires_as_a_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), eliciting(ask_user_question_form())).await;
+    assistant.set_elicitation_timeout(Duration::from_millis(200));
+    assistant.send("Installe".into()).await;
+    let (id, _) = wait_for_form(&assistant).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    assert!(events.contains(&closed(id, Outcome::Expired)), "{events:?}");
+    assert_eq!(
+        elicited(&fakes),
+        [Ok(CreateElicitationResponse::new(
+            ElicitationAction::Cancel
+        ))]
+    );
+}
+
+#[tokio::test]
+async fn withdrawn_elicitation_closes_its_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let withdraw = Arc::new(Notify::new());
+    let script = FakeScript {
+        withdraw_elicitation: Some(withdraw.clone()),
+        ..eliciting(ask_user_question_form())
+    };
+    let (assistant, fakes) = open(dir.path(), script).await;
+    assistant.send("Installe".into()).await;
+    let (id, _) = wait_for_form(&assistant).await;
+    withdraw.notify_one();
+    let events = wait_until(&assistant, |events| {
+        events.contains(&closed(id, Outcome::Cancelled))
+    })
+    .await;
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Event::RequestClosed {
+            outcome: Outcome::Answered { .. },
+            ..
+        }
+    )));
+    wait_for_turns(&assistant, 1).await;
+    assert_eq!(elicited(&fakes).len(), 1);
+}
+
+#[tokio::test]
+async fn secret_form_is_declined_without_a_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let form = serde_json::json!({
+        "mode": "form",
+        "message": "Ta clé GitHub",
+        "requestedSchema": {"type": "object", "properties": {"github_token": {"type": "string"}}},
+    });
+    let (assistant, fakes) = open(dir.path(), eliciting(form)).await;
+    assistant.send("Configure GitHub".into()).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Request { .. })),
+        "{events:?}"
+    );
+    let [Ok(response)] = <[_; 1]>::try_from(elicited(&fakes)).unwrap() else {
+        panic!("{:?}", elicited(&fakes));
+    };
+    assert_eq!(response.action, ElicitationAction::Decline);
+    let reason = response.meta.unwrap()["fronde/refused"].clone();
+    assert!(
+        reason
+            .as_str()
+            .unwrap()
+            .contains("takes no secret in a form"),
+        "{reason}"
+    );
 }

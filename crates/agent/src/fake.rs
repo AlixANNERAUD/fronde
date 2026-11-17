@@ -1,13 +1,13 @@
 //! In-process fake ACP agent for tests: it replays a script and records what the client sent.
 
 use agent_client_protocol::v1::schema::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
-    SessionNotification, SessionResumeCapabilities, SessionSystemPromptCapabilities, SessionUpdate,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallUpdate,
-    ToolCallUpdateFields,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, CreateElicitationRequest,
+    CreateElicitationResponse, ElicitationAction, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionNotification, SessionResumeCapabilities,
+    SessionSystemPromptCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
+    StopReason, TextContent, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Channel, Client, ConnectTo, Error};
 use std::sync::{Arc, Mutex};
@@ -42,6 +42,13 @@ pub struct FakeScript {
     pub ignore_cancel: bool,
     /// After this many updates of each prompt, wait for the notify before sending the rest.
     pub pause: Option<(usize, Arc<Notify>)>,
+    /// Ask this `elicitation/create` during each prompt, after the permission if any, its
+    /// `sessionId` filled in: the JSON the agent would send, such as the Claude adapter's form
+    /// for `AskUserQuestion`.
+    pub elicitation: Option<serde_json::Value>,
+    /// Withdraw the elicitation with `$/cancel_request` once notified, as the Claude adapter does
+    /// when the tool call that asked is aborted.
+    pub withdraw_elicitation: Option<Arc<Notify>>,
 }
 
 impl Default for FakeScript {
@@ -58,6 +65,8 @@ impl Default for FakeScript {
             signed_out: false,
             ignore_cancel: false,
             pause: None,
+            elicitation: None,
+            withdraw_elicitation: None,
         }
     }
 }
@@ -76,6 +85,10 @@ pub struct FakeRecord {
     pub resumes: Vec<ResumeSessionRequest>,
     pub modes: Vec<String>,
     pub permission_outcomes: Vec<RequestPermissionOutcome>,
+    /// What each elicitation got: the response, or the error.
+    pub elicitation_responses: Vec<Result<CreateElicitationResponse, String>>,
+    /// The client's `initialize` requests, with its capabilities.
+    pub initializes: Vec<InitializeRequest>,
     pub cancels: usize,
     /// The client closed the connection.
     pub closed: bool,
@@ -135,7 +148,9 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
         .on_receive_request(
             {
                 let script = script.clone();
+                let record = record.clone();
                 async move |request: InitializeRequest, responder, _cx| {
+                    lock(&record).initializes.push(request.clone());
                     let mut sessions = SessionCapabilities::new()
                         .system_prompt(SessionSystemPromptCapabilities::new());
                     if script.resume {
@@ -234,8 +249,9 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
                             if script.wait_for_cancel {
                                 cancelled.notified().await;
                             }
-                            let asked = cx.send_request(permission_request(session));
+                            let asked = cx.send_request(permission_request(session.clone()));
                             if script.leave_permission_pending {
+                                let record = record.clone();
                                 cx.spawn(async move {
                                     let outcome = asked.block_task().await?.outcome;
                                     lock(&record).permission_outcomes.push(outcome);
@@ -248,6 +264,27 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
                                 }
                                 lock(&record).permission_outcomes.push(outcome);
                             }
+                        }
+                        if let Some(form) = &script.elicitation {
+                            let mut form = form.clone();
+                            form["sessionId"] = serde_json::Value::String(session.0.to_string());
+                            let request: CreateElicitationRequest = serde_json::from_value(form)
+                                .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+                            let asked = cx.send_request(request);
+                            if let Some(gate) = &script.withdraw_elicitation {
+                                gate.notified().await;
+                                asked.cancel()?;
+                            }
+                            let response = asked.block_task().await;
+                            if response
+                                .as_ref()
+                                .is_ok_and(|response| response.action == ElicitationAction::Cancel)
+                            {
+                                stop = StopReason::Cancelled;
+                            }
+                            lock(&record)
+                                .elicitation_responses
+                                .push(response.map_err(|error| error.to_string()));
                         }
                         responder.respond(PromptResponse::new(stop))
                     })

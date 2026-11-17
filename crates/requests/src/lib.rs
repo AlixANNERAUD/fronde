@@ -11,6 +11,8 @@
 //! conversation, or the name it was stored under. The value never reaches the request's row, the
 //! journal, the asker or the log.
 
+pub mod elicitation;
+
 use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
