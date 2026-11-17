@@ -112,11 +112,16 @@ impl ComponentHost {
         &self.inner.linker
     }
 
-    /// Compile a component and refuse it if it asks for the filesystem or sockets.
-    pub(crate) async fn compile(&self, spec: &ComponentSpec) -> anyhow::Result<Component> {
+    /// Compile a component, refuse it if its file is no longer the `approved` build (`None` only
+    /// in tests) or if it asks for the filesystem or sockets.
+    pub(crate) async fn compile(
+        &self,
+        spec: &ComponentSpec,
+        approved: Option<&str>,
+    ) -> anyhow::Result<Component> {
         let engine = self.engine().clone();
         let (name, path) = (spec.name.clone(), spec.path.clone());
-        let approved = spec.sha256.clone();
+        let approved = approved.map(str::to_string);
         // Compiling takes CPU for a while: keep it off the runtime's worker threads.
         let compiled = tokio::task::spawn_blocking(move || {
             let bytes = std::fs::read(&path)

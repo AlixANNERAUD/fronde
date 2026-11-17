@@ -55,7 +55,7 @@ fn checks(timezone: &str) -> Checks {
 }
 
 fn spec(config: &ComponentConfig, timezone: &str) -> ComponentSpec {
-    prepare(config, &checks(timezone)).unwrap().spec
+    prepare(config, &checks(timezone)).unwrap().spec().clone()
 }
 
 fn refused_by(config: &ComponentConfig, checks: &Checks) -> String {
@@ -77,9 +77,10 @@ fn grants_what_the_manifest_asks() {
              basic = {{ username = \"alix\", password = {{ env = \"PATH\" }} }}\n"
         ),
     );
-    let spec: ComponentSpec = spec(&config, "Europe/Paris");
+    let prepared = prepare(&config, &checks("Europe/Paris")).unwrap();
+    assert_eq!(Some(prepared.sha256()), config.sha256.as_deref());
+    let spec: ComponentSpec = prepared.spec().clone();
     assert_eq!(spec.name, "c");
-    assert_eq!(spec.sha256, config.sha256);
     let allowed: Vec<(String, bool)> = spec
         .allow
         .iter()
@@ -163,22 +164,22 @@ fn sha256_mismatch_refused() {
 
 #[test]
 fn compiling_checks_the_approved_hash_again() {
-    let echo = PathBuf::from(concat!(
+    // The echo test component, approved by the hashes in its entry.
+    let dist = Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../components/dist/echo.wasm"
+        "/../../components/dist"
     ));
-    let spec = ComponentSpec {
-        name: "echo".into(),
-        path: echo,
-        allow: vec![],
-        credentials: vec![],
-        settings: BTreeMap::new(),
-        sha256: Some("0".repeat(64)),
-        tool_prefixes: vec!["echo_".into()],
-    };
+    let dir = component(&std::fs::read_to_string(dist.join("echo.toml")).unwrap());
+    std::fs::copy(dist.join("echo.wasm"), dir.path().join("c.wasm")).unwrap();
+    let prepared = prepare(&entry(dir.path(), ""), &checks("UTC")).unwrap();
+    // Replaced between the check and the compilation.
+    std::fs::copy(dist.join("calendar.wasm"), dir.path().join("c.wasm")).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let e = rt
-        .block_on(LoadedComponent::load(&ComponentHost::new().unwrap(), spec))
+        .block_on(LoadedComponent::load(
+            &ComponentHost::new().unwrap(),
+            prepared,
+        ))
         .err()
         .unwrap();
     assert!(
@@ -412,12 +413,14 @@ fn tools_outside_the_declared_prefixes_are_refused() {
         allow: vec![],
         credentials: vec![],
         settings: BTreeMap::new(),
-        sha256: None,
         tool_prefixes: vec!["other_".into()],
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
     let e = rt
-        .block_on(LoadedComponent::load(&ComponentHost::new().unwrap(), spec))
+        .block_on(LoadedComponent::load_unapproved(
+            &ComponentHost::new().unwrap(),
+            spec,
+        ))
         .err()
         .unwrap();
     assert!(
@@ -548,17 +551,17 @@ fn a_shipped_component_needs_no_hashes() {
     )
     .unwrap();
     assert_eq!(
-        prepared.approval,
+        *prepared.approval(),
         Approval::Shipped {
             name: "calendar".into()
         }
     );
     assert_eq!(
-        prepared.approval.to_string(),
+        prepared.approval().to_string(),
         "approved: shipped with this build (calendar)"
     );
     // The bytes compiled are still checked against the approved hash.
-    assert_eq!(prepared.spec.sha256, Some(hashes.sha256));
+    assert_eq!(prepared.sha256(), hashes.sha256);
 }
 
 #[test]
@@ -620,7 +623,7 @@ fn hashes_in_the_entry_win_over_the_shipped_ones() {
     // Pinned to these files: approved by the pin.
     let config = entry(dir.path(), SETTINGS);
     assert_eq!(
-        prepare(&config, &checks).unwrap().approval,
+        *prepare(&config, &checks).unwrap().approval(),
         Approval::Pinned
     );
     // Half a pin is no pin.

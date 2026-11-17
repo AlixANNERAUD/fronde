@@ -33,7 +33,7 @@ pub fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
                 )?;
                 let prepared =
                     fronde_wasm::prepare(c, &checks).with_context(|| format!("source {name}"))?;
-                writeln!(out, "source {name}: {}", prepared.approval)?;
+                writeln!(out, "source {name}: {}", prepared.approval())?;
             }
         }
     }

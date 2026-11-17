@@ -7,6 +7,11 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# `LoadedComponent::load_unapproved`, which skips the approval: for tests here and in dependent
+# crates, never for the binary.
+testing = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -37,6 +42,7 @@ webpki-roots.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+fronde-wasm = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 wiremock.workspace = true

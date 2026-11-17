@@ -33,14 +33,13 @@ fn spec() -> ComponentSpec {
         allow: vec![],
         credentials: vec![],
         settings: BTreeMap::new(),
-        sha256: None,
         tool_prefixes: vec!["echo_".into()],
     }
 }
 
 async fn load(spec: ComponentSpec) -> LoadedComponent {
     let host = ComponentHost::new().unwrap();
-    LoadedComponent::load(&host, spec).await.unwrap()
+    LoadedComponent::load_unapproved(&host, spec).await.unwrap()
 }
 
 fn origin(server: &MockServer) -> Origin {
@@ -183,7 +182,7 @@ async fn waiting_on_http_is_not_charged() {
     .unwrap();
     let mut spec = spec();
     spec.allow = vec![local(&server)];
-    let echo = LoadedComponent::load(&host, spec).await.unwrap();
+    let echo = LoadedComponent::load_unapproved(&host, spec).await.unwrap();
     let out = echo.call("echo_fetch", &json!({"url": server.uri()})).await;
     assert!(!out.is_error, "{}", out.to_text());
     assert_eq!(out.value["status"], 200);
@@ -242,7 +241,7 @@ async fn slow_responses_time_out() {
             local: true,
         },
     ];
-    let echo = LoadedComponent::load(&host, spec).await.unwrap();
+    let echo = LoadedComponent::load_unapproved(&host, spec).await.unwrap();
     for url in [late.uri(), dripping] {
         let started = Instant::now();
         let out = echo.call("echo_fetch", &json!({ "url": url })).await;
@@ -371,7 +370,9 @@ async fn infinite_loop_is_interrupted() {
         ..Limits::default()
     })
     .unwrap();
-    let echo = LoadedComponent::load(&host, spec()).await.unwrap();
+    let echo = LoadedComponent::load_unapproved(&host, spec())
+        .await
+        .unwrap();
     let started = Instant::now();
     let out = echo.call("echo_spin", &json!({})).await;
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -393,7 +394,9 @@ async fn slow_call_times_out() {
         ..Limits::default()
     })
     .unwrap();
-    let echo = LoadedComponent::load(&host, spec()).await.unwrap();
+    let echo = LoadedComponent::load_unapproved(&host, spec())
+        .await
+        .unwrap();
     let started = Instant::now();
     let out = echo.call("echo_sleep", &json!({"ms": 20_000})).await;
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -413,7 +416,10 @@ async fn rejects_filesystem_imports() {
         )
         .unwrap();
         let spec = ComponentSpec { path, ..spec() };
-        let e = LoadedComponent::load(&host, spec).await.err().unwrap();
+        let e = LoadedComponent::load_unapproved(&host, spec)
+            .await
+            .err()
+            .unwrap();
         assert!(e.to_string().contains(interface), "{e:#}");
     }
 }
@@ -424,7 +430,7 @@ async fn rejects_component_without_tools() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("empty.wat");
     std::fs::write(&path, "(component)").unwrap();
-    let e = LoadedComponent::load(&host, ComponentSpec { path, ..spec() })
+    let e = LoadedComponent::load_unapproved(&host, ComponentSpec { path, ..spec() })
         .await
         .err()
         .unwrap();
@@ -458,7 +464,7 @@ async fn rejects_unsupported_api_version() {
     ] {
         let path = dir.path().join("future.wat");
         std::fs::write(&path, wat).unwrap();
-        let e = LoadedComponent::load(&host, ComponentSpec { path, ..spec() })
+        let e = LoadedComponent::load_unapproved(&host, ComponentSpec { path, ..spec() })
             .await
             .err()
             .unwrap()

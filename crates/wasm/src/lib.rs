@@ -30,7 +30,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 pub use tool::LoadedComponent;
 
-/// A component to load, and what it may reach.
+/// A component to load, and what it may reach. It loads only as a [`Prepared`], which carries
+/// its approval.
 #[derive(Debug, Clone)]
 pub struct ComponentSpec {
     /// Source of its tools in the registry.
@@ -41,8 +42,6 @@ pub struct ComponentSpec {
     pub credentials: Vec<(Origin, Credential)>,
     /// What the guest reads through `settings.get`: never secrets.
     pub settings: BTreeMap<String, String>,
-    /// When set, the SHA-256 (hex) the file must have: the approved build.
-    pub sha256: Option<String>,
     /// Every tool the component exports must start with one of these.
     pub tool_prefixes: Vec<String>,
 }

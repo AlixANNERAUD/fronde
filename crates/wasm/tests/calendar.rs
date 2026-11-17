@@ -36,10 +36,9 @@ async fn calendar_component_lists_its_tools() {
         allow: vec![],
         credentials: vec![],
         settings: BTreeMap::new(),
-        sha256: None,
         tool_prefixes: vec!["calendar_".into(), "reminders_".into()],
     };
-    let calendar = LoadedComponent::load(&host, spec).await.unwrap();
+    let calendar = LoadedComponent::load_unapproved(&host, spec).await.unwrap();
     let names: Vec<&str> = calendar
         .list_tools()
         .iter()
@@ -103,10 +102,9 @@ async fn calendar_component_reads_events_from_caldav() {
             ("reminders_url".to_string(), url),
             ("timezone".to_string(), "America/New_York".to_string()),
         ]),
-        sha256: None,
         tool_prefixes: vec!["calendar_".into(), "reminders_".into()],
     };
-    let calendar = LoadedComponent::load(&host, spec).await.unwrap();
+    let calendar = LoadedComponent::load_unapproved(&host, spec).await.unwrap();
     let out = calendar
         .call(
             "calendar_list",

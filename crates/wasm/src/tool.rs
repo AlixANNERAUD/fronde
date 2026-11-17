@@ -1,9 +1,9 @@
 //! The `tool` world: components that bring tools to the hub's registry.
 
-use crate::ComponentSpec;
 use crate::api::Api;
 use crate::host::{ComponentHost, HostState, Sandbox};
 use crate::v0_1;
+use crate::{ComponentSpec, Prepared};
 use anyhow::{Context, bail, ensure};
 use async_trait::async_trait;
 use fronde_hub::source::Tool;
@@ -68,9 +68,29 @@ struct Loaded {
 }
 
 impl LoadedComponent {
-    /// Compile the component, check its imports and exports, and ask it for its tools.
-    pub async fn load(host: &ComponentHost, spec: ComponentSpec) -> anyhow::Result<Self> {
-        let component = host.compile(&spec).await?;
+    /// Compile the component [`prepare`](crate::prepare) approved, check its imports and
+    /// exports, and ask it for its tools.
+    pub async fn load(host: &ComponentHost, prepared: Prepared) -> anyhow::Result<Self> {
+        let (spec, sha256) = prepared.into_parts();
+        Self::load_spec(host, spec, Some(&sha256)).await
+    }
+
+    /// Load a component with no approval and no check of its grants against a manifest: for
+    /// tests only, which is why it exists only with the `testing` feature.
+    #[cfg(feature = "testing")]
+    pub async fn load_unapproved(
+        host: &ComponentHost,
+        spec: ComponentSpec,
+    ) -> anyhow::Result<Self> {
+        Self::load_spec(host, spec, None).await
+    }
+
+    async fn load_spec(
+        host: &ComponentHost,
+        spec: ComponentSpec,
+        approved: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let component = host.compile(&spec, approved).await?;
         let api = Api::of(&component, host.engine(), &spec.name)?;
         let exports_tools = component
             .component_type()

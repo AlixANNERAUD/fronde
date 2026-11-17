@@ -42,10 +42,9 @@ async fn component() -> Value {
         allow: vec![],
         credentials: vec![],
         settings: BTreeMap::new(),
-        sha256: None,
         tool_prefixes: vec!["calendar_".into(), "reminders_".into()],
     };
-    let calendar = LoadedComponent::load(&ComponentHost::new().unwrap(), spec)
+    let calendar = LoadedComponent::load_unapproved(&ComponentHost::new().unwrap(), spec)
         .await
         .unwrap();
     contract(calendar.list_tools())

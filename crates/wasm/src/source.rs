@@ -116,11 +116,32 @@ impl Checks {
     }
 }
 
-/// A component entry ready to load, and what approved it.
+/// A component entry ready to load, and what approved it. Only [`prepare`] makes one, so that
+/// nothing loads a component without its approval or with more than its entry grants.
 #[derive(Debug, Clone)]
 pub struct Prepared {
-    pub spec: ComponentSpec,
-    pub approval: Approval,
+    spec: ComponentSpec,
+    approval: Approval,
+    /// The approved build's SHA-256: the file is hashed again as it is compiled.
+    sha256: String,
+}
+
+impl Prepared {
+    pub fn spec(&self) -> &ComponentSpec {
+        &self.spec
+    }
+
+    pub fn approval(&self) -> &Approval {
+        &self.approval
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn into_parts(self) -> (ComponentSpec, String) {
+        (self.spec, self.sha256)
+    }
 }
 
 /// Check `config` against the component's approval and manifest and against `checks`, resolve
@@ -219,10 +240,10 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
             allow,
             credentials,
             settings,
-            sha256: Some(current.sha256),
             tool_prefixes: manifest.tool_prefixes,
         },
         approval,
+        sha256: current.sha256,
     })
 }
 
@@ -442,9 +463,9 @@ impl ToolSource for ComponentSource {
     }
 
     async fn start(&self) -> anyhow::Result<Session> {
-        let Prepared { spec, approval } = prepare(&self.config, &self.checks)?;
-        tracing::info!("{}: {approval}", self.config.name);
-        let component = LoadedComponent::load(&self.host, spec).await?;
+        let prepared = prepare(&self.config, &self.checks)?;
+        tracing::info!("{}: {}", self.config.name, prepared.approval());
+        let component = LoadedComponent::load(&self.host, prepared).await?;
         Ok(Session::lasting(component.tools()))
     }
 }
