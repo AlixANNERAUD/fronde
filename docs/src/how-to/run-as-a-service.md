@@ -68,10 +68,16 @@ This stops and disables `fronde.service`, removes the unit file, and reloads sys
 
 If you [store secrets](store-a-secret.md), the service needs their master key when it starts,
 often at boot, before any desktop session has unlocked a keychain. A systemd credential fits:
-the key is encrypted on disk with the machine's key (and its TPM when there is one), and systemd
-decrypts it for the service alone each time it starts. This needs systemd 256 or later, for
-credentials in user services. `fronde service install` leaves the unit as it is; you add the
-credential with a drop-in file.
+the key is encrypted on disk with the machine's key (and its TPM when there is one), so the
+`.cred` file is useless on another machine, and systemd decrypts it each time the service starts
+into memory that is never swapped out. This needs systemd 256 or later, for credentials in user
+services. `fronde service install` leaves the unit as it is; you add the credential with a
+drop-in file.
+
+It does not hide the key from other programs running as your user: while the service runs, they
+can read the decrypted key in `$XDG_RUNTIME_DIR/credentials/fronde.service/`, and they can
+decrypt the `.cred` file with `systemd-creds --user decrypt`. A key file or the keychain is no
+better there; see [Security model](../explanation/security.md#stored-secrets).
 
 Do this before storing the first secret. Make a key and encrypt it, without ever writing it in
 clear:
