@@ -2,18 +2,22 @@ use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::{Assistant, Connector, TOPIC};
 use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::{ConversationLog, Event, TurnOutcome};
-use fronde_agent::threads::{StartedBy, ThreadId, Threads};
+use fronde_agent::threads::{Budget, StartedBy, ThreadId, Threads};
 use fronde_protocol::{Card, ChoiceOption, Field, Outcome};
 use fronde_requests::{Ask, Caller, Requests, User};
 use sea_orm::EntityTrait;
+use secrecy::ExposeSecret;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(10);
 const ARCHIVED: &str = "Cette conversation est archivée : elle ne reçoit plus de message.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
+const WAITING: &str = "En attente : d'autres conversations utilisent l'agent.";
 
 fn spec() -> AgentSpec {
     AgentSpec {
@@ -443,4 +447,347 @@ async fn open_closes_a_turn_left_open_in_any_thread() {
         ]
     );
     assert_eq!(read("thread:3").await.len(), 2);
+}
+
+/// Fake agents started for any thread: each records its thread and hub token, and a thread given
+/// a gate holds each of its turns after a first chunk until the gate is opened.
+#[derive(Default)]
+struct Pooled {
+    gates: Mutex<HashMap<ThreadId, Arc<Notify>>>,
+    /// Each start: its thread, its hub token and the fake agent's handle.
+    started: Mutex<Vec<(ThreadId, String, FakeHandle)>>,
+}
+
+impl Pooled {
+    fn connector(self: &Arc<Self>) -> Connector {
+        let pooled = self.clone();
+        Arc::new(move |spec: &AgentSpec, resume, events| {
+            let (spec, pooled) = (spec.clone(), pooled.clone());
+            Box::pin(async move {
+                let gate = pooled.gates.lock().unwrap().get(&spec.thread).cloned();
+                let script = FakeScript {
+                    updates: vec![text_chunk("Je regarde"), text_chunk(" : voilà")],
+                    pause: gate.map(|gate| (1, gate)),
+                    resume: true,
+                    ..FakeScript::default()
+                };
+                let (transport, handle) = fake_agent(script);
+                pooled.started.lock().unwrap().push((
+                    spec.thread,
+                    spec.hub_token.expose_secret().to_owned(),
+                    handle,
+                ));
+                AgentClient::connect(transport, &spec, resume, events).await
+            })
+        })
+    }
+
+    /// Holds thread `id`'s turns until [`Pooled::open`].
+    fn gate(&self, id: ThreadId) {
+        self.gates
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(Notify::new()));
+    }
+
+    /// Lets thread `id`'s running (or next) turn go on.
+    fn open(&self, id: ThreadId) {
+        self.gates.lock().unwrap()[&id].notify_one();
+    }
+
+    /// The threads whose agents started, in order.
+    fn threads(&self) -> Vec<ThreadId> {
+        self.started
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(thread, ..)| *thread)
+            .collect()
+    }
+
+    /// The handles of thread `id`'s agents, oldest first.
+    fn handles(&self, id: ThreadId) -> Vec<FakeHandle> {
+        self.started
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(thread, ..)| *thread == id)
+            .map(|(.., handle)| handle.clone())
+            .collect()
+    }
+
+    fn token(&self, id: ThreadId) -> String {
+        self.started
+            .lock()
+            .unwrap()
+            .iter()
+            .rfind(|(thread, ..)| *thread == id)
+            .map(|(_, token, _)| token.clone())
+            .expect("no agent started for the thread")
+    }
+
+    async fn wait_for_starts(&self, count: usize) {
+        timeout(WAIT, async {
+            while self.started.lock().unwrap().len() < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} agents never started: {:?}", self.threads()));
+    }
+}
+
+async fn open_pooled(dir: &Path, max_running: usize) -> (Arc<Threads>, Arc<Pooled>) {
+    let pooled = Arc::new(Pooled::default());
+    let db = fronde_db::open(dir).await.unwrap();
+    let budget = Budget {
+        max_running,
+        ..Budget::default()
+    };
+    let threads = Threads::open_with(db, dir, spec(), pooled.connector(), alix(), budget)
+        .await
+        .unwrap();
+    (threads, pooled)
+}
+
+async fn new_thread(threads: &Threads, started_by: StartedBy) -> Arc<Assistant> {
+    let parent = match started_by {
+        StartedBy::Thread(parent) => Some(parent),
+        _ => None,
+    };
+    let row = threads
+        .create("alix", started_by, parent, "Fil")
+        .await
+        .unwrap();
+    threads.assistant(row.id).await.unwrap().unwrap()
+}
+
+async fn wait_until(assistant: &Assistant, what: &str, done: impl Fn(&[Event]) -> bool) {
+    timeout(WAIT, async {
+        while !done(&events(assistant)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: {:?}", events(assistant)));
+}
+
+fn waiting() -> Event {
+    Event::Notice {
+        text: WAITING.into(),
+    }
+}
+
+fn count(events: &[Event], event: &Event) -> usize {
+    events.iter().filter(|e| *e == event).count()
+}
+
+async fn wait_closed(handle: &FakeHandle) {
+    timeout(WAIT, async {
+        while !handle.record().closed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the agent's connection was never closed");
+}
+
+/// With two agents at most, a third thread's turn waits, says so once, and starts once one of
+/// the running turns ends: that agent, now idle, makes room.
+#[tokio::test]
+async fn pool_caps_running_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_pooled(dir.path(), 2).await;
+    let main = threads.main();
+    let second = new_thread(&threads, StartedBy::User).await;
+    let third = new_thread(&threads, StartedBy::User).await;
+    for thread in [&main, &second, &third] {
+        pooled.gate(thread.thread());
+    }
+
+    main.send("Un".into()).await;
+    second.send("Deux".into()).await;
+    pooled.wait_for_starts(2).await;
+    third.send("Trois".into()).await;
+    wait_until(&third, "the third turn never said it waits", |events| {
+        events.contains(&waiting())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pooled.threads(), [main.thread(), second.thread()]);
+    assert!(!third.agent_running());
+
+    // The main turn ends: its idle agent stops for the third thread's.
+    pooled.open(main.thread());
+    wait_for_turns(&main, 1).await;
+    pooled.wait_for_starts(3).await;
+    assert_eq!(pooled.threads()[2], third.thread());
+    wait_closed(&pooled.handles(main.thread())[0]).await;
+    assert!(!main.agent_running());
+    assert!(second.agent_running());
+
+    pooled.open(second.thread());
+    pooled.open(third.thread());
+    let shown = wait_for_turns(&third, 1).await;
+    assert_eq!(count(&shown, &waiting()), 1, "{shown:?}");
+    assert_eq!(
+        shown.last(),
+        Some(&Event::TurnEnded {
+            outcome: TurnOutcome::Done
+        })
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|event| matches!(event, Event::Assistant { text } if text.contains("voilà"))),
+        "{shown:?}"
+    );
+    wait_for_turns(&second, 1).await;
+    assert!(!events(&main).contains(&waiting()));
+    assert!(!events(&second).contains(&waiting()));
+}
+
+/// Two idle agents and a third thread's turn: the agent idle for longer stops, the other stays.
+#[tokio::test]
+async fn lru_idle_agent_makes_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_pooled(dir.path(), 2).await;
+    let main = threads.main();
+    let second = new_thread(&threads, StartedBy::User).await;
+    let third = new_thread(&threads, StartedBy::User).await;
+
+    main.send("Un".into()).await;
+    wait_for_turns(&main, 1).await;
+    second.send("Deux".into()).await;
+    wait_for_turns(&second, 1).await;
+    assert!(main.agent_running() && second.agent_running());
+
+    third.send("Trois".into()).await;
+    let shown = wait_for_turns(&third, 1).await;
+    // Room was made at once: no wait to tell.
+    assert!(!shown.contains(&waiting()), "{shown:?}");
+    wait_closed(&pooled.handles(main.thread())[0]).await;
+    assert!(!main.agent_running());
+    assert!(second.agent_running() && third.agent_running());
+    assert!(!pooled.handles(second.thread())[0].record().closed);
+    // The stopped agent's token is revoked; the others' still work.
+    let token = pooled.token(main.thread());
+    assert!(threads.holder(token.as_bytes()).await.is_none());
+    let token = pooled.token(second.thread());
+    assert!(threads.holder(token.as_bytes()).await.is_some());
+}
+
+/// With two agents at most, threads the owner did not start share one: two children queue
+/// behind a running one, and a message to the main thread starts at once.
+#[tokio::test]
+async fn children_never_take_the_last_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_pooled(dir.path(), 2).await;
+    let main = threads.main();
+    let parent = StartedBy::Thread(ThreadId::MAIN);
+    let first = new_thread(&threads, parent.clone()).await;
+    let second = new_thread(&threads, parent.clone()).await;
+    let third = new_thread(&threads, parent).await;
+    for child in [&first, &second, &third] {
+        pooled.gate(child.thread());
+    }
+
+    first.send("Un".into()).await;
+    pooled.wait_for_starts(1).await;
+    second.send("Deux".into()).await;
+    third.send("Trois".into()).await;
+    for child in [&second, &third] {
+        wait_until(child, "a child never said it waits", |events| {
+            events.contains(&waiting())
+        })
+        .await;
+    }
+
+    main.send("Bonjour".into()).await;
+    let shown = wait_for_turns(&main, 1).await;
+    assert!(!shown.contains(&waiting()), "{shown:?}");
+    assert_eq!(
+        shown.last(),
+        Some(&Event::TurnEnded {
+            outcome: TurnOutcome::Done
+        })
+    );
+    assert_eq!(pooled.threads(), [first.thread(), main.thread()]);
+
+    // Stop gives up a wait.
+    third.cancel().await;
+    assert_eq!(
+        wait_for_turns(&third, 1).await.last(),
+        Some(&Event::TurnEnded {
+            outcome: TurnOutcome::Cancelled
+        })
+    );
+
+    // Once the first child's turn ends, the second's starts in its place.
+    pooled.open(first.thread());
+    pooled.open(second.thread());
+    let shown = wait_for_turns(&second, 1).await;
+    assert_eq!(count(&shown, &waiting()), 1, "{shown:?}");
+    assert_eq!(
+        pooled.threads(),
+        [first.thread(), main.thread(), second.thread()]
+    );
+    wait_closed(&pooled.handles(first.thread())[0]).await;
+    // The main thread's idle agent was not the one stopped: a child's makes room for a child.
+    assert!(main.agent_running());
+}
+
+/// An agent idle for `idle_stop` stops, its token revoked; the next message starts it again and
+/// resumes the same session.
+#[tokio::test]
+async fn idle_agent_stops_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_pooled(dir.path(), 3).await;
+    let main = threads.main();
+    main.send("Un".into()).await;
+    wait_for_turns(&main, 1).await;
+    let token = pooled.token(main.thread());
+    assert!(threads.holder(token.as_bytes()).await.is_some());
+
+    // Paused only while nothing is written, as in the assistant's tests: the database is written
+    // by a thread of its own, which a paused clock does not wait for.
+    tokio::time::pause();
+    tokio::time::sleep(Budget::default().idle_stop - Duration::from_secs(1)).await;
+    assert!(main.agent_running());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!main.agent_running());
+    tokio::time::resume();
+    wait_closed(&pooled.handles(main.thread())[0]).await;
+    assert!(threads.holder(token.as_bytes()).await.is_none());
+
+    main.send("Deux".into()).await;
+    let shown = wait_for_turns(&main, 2).await;
+    let handles = pooled.handles(main.thread());
+    assert_eq!(handles.len(), 2);
+    let record = handles[1].record();
+    assert!(record.new_sessions.is_empty(), "{record:?}");
+    assert_eq!(record.resumes.len(), 1);
+    assert_eq!(record.resumes[0].session_id.0.as_ref(), FAKE_SESSION_ID);
+    assert_eq!(count(&shown, &user("Deux")), 1);
+    assert!(
+        !shown
+            .iter()
+            .any(|event| matches!(event, Event::Notice { .. })),
+        "{shown:?}"
+    );
+
+    // A new turn before the delay keeps the agent: the delay starts over at its end.
+    tokio::time::pause();
+    tokio::time::sleep(Budget::default().idle_stop - Duration::from_secs(1)).await;
+    assert!(main.agent_running());
+    tokio::time::resume();
+    main.send("Trois".into()).await;
+    wait_for_turns(&main, 3).await;
+    tokio::time::pause();
+    tokio::time::sleep(Budget::default().idle_stop - Duration::from_secs(1)).await;
+    assert!(main.agent_running());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!main.agent_running());
+    tokio::time::resume();
+    assert_eq!(pooled.handles(main.thread()).len(), 2);
 }

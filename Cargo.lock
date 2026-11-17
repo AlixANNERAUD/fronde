@@ -2576,6 +2576,7 @@ dependencies = [
  "fronde-protocol",
  "fronde-requests",
  "http",
+ "jiff",
  "rmcp",
  "rustix",
  "schemars 1.2.3",

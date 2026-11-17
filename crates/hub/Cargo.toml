@@ -22,6 +22,7 @@ backon.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 http.workspace = true
+jiff.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 sea-orm.workspace = true

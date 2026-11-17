@@ -66,6 +66,28 @@ hand. A scope's name is `fronde-agent-<id>-t<thread>-<random>.scope`, and a scop
 process the kernel OOM-killed goes as a whole (`OOMPolicy=stop`). At each start of the agent, Fronde logs `agent limits: …` with the scope's
 name, or why there is none.
 
+Each thread has its own agent, so several scopes may run at once: at most `[threads]
+max_running` (3 by default), and an agent idle for `[threads] idle_stop` (10 minutes) stops
+(see [`[threads]`](../reference/configuration.md#threads)). At its start, Fronde also caps the
+slice that holds them all, with `[agent.limits] total_memory` (4 GiB by default):
+
+```sh
+systemctl --user set-property --runtime fronde-agents.slice MemoryMax=4294967296 MemoryHigh=3221225472
+```
+
+`--runtime` keeps the cap until the user manager stops; Fronde sets it again at each start, and
+`total_memory = "none"` leaves the slice alone (`systemctl --user revert fronde-agents.slice`
+removes a cap set earlier). If the user manager refuses, Fronde logs a warning and each scope
+still caps its own agent. Watch the agents together with:
+
+```sh
+systemctl --user show fronde-agents.slice -p MemoryCurrent -p MemoryMax -p MemoryHigh
+systemctl --user list-units 'fronde-agent-*'
+```
+
+The start log and `fronde check` say `agents: at most 3 at once (one kept for your own
+threads), stopped after 10m idle, 4 GiB for all of them (2 GiB each)`.
+
 ## 5. Upgrade
 
 After replacing or rebuilding the `fronde` binary, re-run `install` with `--force` so the unit file is updated if the binary path changed:

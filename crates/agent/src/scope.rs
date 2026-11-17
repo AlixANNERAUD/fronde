@@ -60,8 +60,7 @@ impl Limits {
     /// For the log and `fronde check`: `2 GiB memory, 2 CPUs, 512 tasks`.
     pub fn describe(&self) -> String {
         let memory = match self.memory {
-            Some(bytes) if bytes % (1 << 30) == 0 => format!("{} GiB memory", bytes >> 30),
-            Some(bytes) if bytes % (1 << 20) == 0 => format!("{} MiB memory", bytes >> 20),
+            Some(bytes) if bytes % (1 << 20) == 0 => format!("{} memory", bytes_text(bytes)),
             Some(bytes) => format!("{bytes} bytes of memory"),
             None => "memory uncapped".to_owned(),
         };
@@ -187,6 +186,56 @@ impl Scope {
             ),
             Err(error) => tracing::debug!("systemctl stop {pattern}: {error}"),
         }
+    }
+}
+
+/// The memory of every agent together, as `fronde-agents.slice` caps it: `MemoryMax`, with
+/// `MemoryHigh` at three quarters, as a scope's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slice {
+    /// Bytes.
+    pub memory: u64,
+}
+
+impl Slice {
+    /// `systemctl`'s arguments that set the cap until the user manager stops (`--runtime`: a
+    /// drop-in under `/run`, gone at the next boot, written again at each start of Fronde).
+    pub fn args(&self) -> Vec<String> {
+        vec![
+            "--user".to_owned(),
+            "set-property".to_owned(),
+            "--runtime".to_owned(),
+            SLICE.to_owned(),
+            format!("MemoryMax={}", self.memory),
+            format!("MemoryHigh={}", self.memory / 4 * 3),
+        ]
+    }
+
+    /// Caps the slice through the user manager `scope` reaches. A failure is a warning: each
+    /// agent's own scope still caps it.
+    pub async fn cap(&self, scope: &Scope) {
+        let args = self.args();
+        let failed = match manager_command(&scope.ctl(), &args).await {
+            Ok(output) if output.status.success() => return,
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!(
+            "agent limits: cannot cap {SLICE} at {} for all agents ({failed}); each agent's \
+             scope still caps it",
+            bytes_text(self.memory)
+        );
+    }
+}
+
+/// `4 GiB`, `512 MiB` or a number of bytes.
+pub fn bytes_text(bytes: u64) -> String {
+    if bytes.is_multiple_of(1 << 30) {
+        format!("{} GiB", bytes >> 30)
+    } else if bytes.is_multiple_of(1 << 20) {
+        format!("{} MiB", bytes >> 20)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -333,6 +382,25 @@ mod tests {
             ]
         );
         assert_eq!(scope.ctl(), PathBuf::from("/usr/bin/systemctl"));
+    }
+
+    #[test]
+    fn slice_cap_arguments() {
+        let slice = Slice { memory: 4 << 30 };
+        assert_eq!(
+            slice.args(),
+            [
+                "--user",
+                "set-property",
+                "--runtime",
+                "fronde-agents.slice",
+                "MemoryMax=4294967296",
+                "MemoryHigh=3221225472",
+            ]
+        );
+        assert_eq!(bytes_text(4 << 30), "4 GiB");
+        assert_eq!(bytes_text(1536 << 20), "1536 MiB");
+        assert_eq!(bytes_text(1000), "1000 bytes");
     }
 
     #[test]

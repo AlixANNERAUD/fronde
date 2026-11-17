@@ -98,10 +98,19 @@ builtin_tools = ["WebSearch", "WebFetch"]
 sandbox = true
 read = []
 
-# The agent's systemd scope, when a systemd user manager answers: memory (MemoryMax), CPUs
-# (CPUQuota) and processes and threads (TasksMax). "none" leaves one out. Without systemd, as in
-# a container, give the container its own limits.
+# Each agent's systemd scope, when a systemd user manager answers: memory (MemoryMax), CPUs
+# (CPUQuota) and processes and threads (TasksMax); and the memory of all of them together, the
+# MemoryMax of fronde-agents.slice. "none" leaves one out. Without systemd, as in a container,
+# give the container its own limits.
 [agent.limits]
 memory = "2G"
+total_memory = "4G"
 cpus = 2
 tasks = 512
+
+# Each conversation (thread) has its own agent process. At most max_running run at once, one of
+# them kept for the threads you start; an agent idle for idle_stop stops, and resumes its session
+# on the next message.
+[threads]
+max_running = 3
+idle_stop = "10m"

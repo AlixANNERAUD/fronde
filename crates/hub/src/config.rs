@@ -24,6 +24,9 @@ pub struct Config {
     pub web: Option<WebConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
+    /// How many agents run at once, and how long an idle one is kept.
+    #[serde(default)]
+    pub threads: ThreadsConfig,
     /// The `code_run_python` tool; without it there is none.
     pub python: Option<PythonConfig>,
     /// Where the master key of the stored secrets is kept.
@@ -222,14 +225,19 @@ pub struct AgentConfig {
     pub limits: AgentLimits,
 }
 
-/// `[agent.limits]`: what the agent's systemd scope caps; `None` (`"none"`) for no cap of
-/// Fronde's. Without a systemd user manager there is no scope, and these do not apply.
+/// `[agent.limits]`: what each agent's systemd scope caps, and the slice of all of them; `None`
+/// (`"none"`) for no cap of Fronde's. Without a systemd user manager there is no scope, and these
+/// do not apply.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AgentLimits {
-    /// Bytes of memory (`MemoryMax`; `MemoryHigh` is three quarters of it).
+    /// Bytes of memory of each agent (`MemoryMax`; `MemoryHigh` is three quarters of it).
     #[serde(deserialize_with = "memory_limit")]
     pub memory: Option<u64>,
+    /// Bytes of memory of every agent together: `MemoryMax` of `fronde-agents.slice`, with
+    /// `MemoryHigh` at three quarters of it.
+    #[serde(deserialize_with = "total_memory_limit")]
+    pub total_memory: Option<u64>,
     /// CPUs' worth of time (`CPUQuota`, 100 % per CPU).
     #[serde(deserialize_with = "cpus_limit")]
     pub cpus: Option<f64>,
@@ -242,9 +250,69 @@ impl Default for AgentLimits {
     fn default() -> Self {
         Self {
             memory: Some(2 << 30),
+            total_memory: Some(4 << 30),
             cpus: Some(2.0),
             tasks: Some(512),
         }
+    }
+}
+
+/// `[threads]`: how many agent processes run at once, and how long an idle one is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ThreadsConfig {
+    /// Agent processes running at once, the main thread's included; at least 1. Threads the
+    /// owner did not start may use all of them but one, kept for the owner's.
+    #[serde(deserialize_with = "max_running")]
+    pub max_running: usize,
+    /// How long an agent waits for a message once its turn ended before it is stopped; its
+    /// session resumes on the next message.
+    #[serde(deserialize_with = "duration")]
+    pub idle_stop: std::time::Duration,
+}
+
+impl Default for ThreadsConfig {
+    fn default() -> Self {
+        Self {
+            max_running: 3,
+            idle_stop: std::time::Duration::from_secs(10 * 60),
+        }
+    }
+}
+
+fn max_running<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    let expected = "max_running: expected a number of agents of at least 1";
+    match RawLimit::deserialize(d)? {
+        RawLimit::Integer(count) if count >= 1 => {
+            usize::try_from(count).map_err(|_| serde::de::Error::custom(expected))
+        }
+        _ => Err(serde::de::Error::custom(expected)),
+    }
+}
+
+/// A duration as humans write it: `"10m"`, `"1h 30m"`, `"90s"`; above zero.
+fn duration<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::time::Duration, D::Error> {
+    let expected = "expected a duration above zero such as \"10m\", \"1h\" or \"90s\"";
+    let text = String::deserialize(d)
+        .map_err(|_| serde::de::Error::custom(format!("idle_stop: {expected}")))?;
+    let parsed = text
+        .parse::<jiff::SignedDuration>()
+        .ok()
+        .filter(|duration| duration.is_positive())
+        .and_then(|duration| std::time::Duration::try_from(duration).ok());
+    match parsed {
+        Some(duration) => Ok(duration),
+        None => Err(serde::de::Error::custom(format!(
+            "idle_stop: {expected}, not {text:?}"
+        ))),
+    }
+}
+
+/// A duration as `[threads] idle_stop` writes it: `10m`, `1h 30m`.
+pub fn duration_text(duration: std::time::Duration) -> String {
+    match jiff::SignedDuration::try_from(duration) {
+        Ok(duration) => format!("{duration:#}"),
+        Err(_) => format!("{duration:?}"),
     }
 }
 
@@ -258,7 +326,15 @@ enum RawLimit {
 }
 
 fn memory_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    let expected = "memory: expected a size such as \"2G\" or \"512M\", or \"none\"";
+    size_limit(d, "memory")
+}
+
+fn total_memory_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    size_limit(d, "total_memory")
+}
+
+fn size_limit<'de, D: serde::Deserializer<'de>>(d: D, key: &str) -> Result<Option<u64>, D::Error> {
+    let expected = format!("{key}: expected a size such as \"2G\" or \"512M\", or \"none\"");
     match RawLimit::deserialize(d)? {
         RawLimit::Text(text) if text == "none" => Ok(None),
         RawLimit::Text(text) => parse_size(&text)

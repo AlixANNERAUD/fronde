@@ -80,8 +80,23 @@ Each thread has its own agent process, started on the thread's first message, in
 directories (`agent/` and `home/` for the main thread, `threads/<id>/work/` and
 `threads/<id>/home/` for another), confined to them, in a systemd scope named after the thread,
 and with its own hub token (see [Threads](security.md#threads)). Starting or stopping one never
-stops another. Several threads in the chat, a cap on how many agents run at once, and threads
-that agents start for a task, are planned.
+stops another. Several threads in the chat, and threads that agents start for a task, are
+planned.
+
+At most `[threads] max_running` agent processes run at once (3 by default), the main thread's
+included: the **pool**. A turn whose thread has no agent running takes a slot before its agent
+starts. When none is free, the pool stops the agent idle for the longest time (never one in a
+turn); when every agent is in a turn, the message waits, and its thread says so once
+(« En attente : d'autres conversations utilisent l'agent. »). It starts as soon as another turn
+ends; Stop gives up the wait. Threads you did not start (a thread's children, an outside
+client's) share all the slots but one, so a thread you talk to always gets one. An agent idle
+for `[threads] idle_stop` (10 minutes by default) stops, which frees its slot and revokes its
+token; the next message starts it again and resumes its session. Under a systemd user manager,
+`fronde-agents.slice` caps the memory of every agent together (`[agent.limits] total_memory`,
+4 GiB by default), each scope still capping its own agent (2 GiB). Measured on Linux arm64 with
+the adapter 0.107.0, signed out and confined: about 110 MiB for the adapter alone, through
+`initialize`; about 290 to 450 MiB with the Claude Code process `session/new` starts, and about
+300 MiB idle with that session. See [Configuration](../reference/configuration.md#threads).
 
 ## Requests
 

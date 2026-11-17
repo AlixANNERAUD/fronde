@@ -94,7 +94,12 @@ Cap the container instead, which holds Fronde and its agent:
 docker run … --memory 3g --cpus 2 --pids-limit 1024 …
 ```
 
-(`mem_limit`, `cpus` and `pids_limit` in Compose). When the container runs out of memory, the
+(`mem_limit`, `cpus` and `pids_limit` in Compose). Each thread has its own agent, and at most
+[`[threads] max_running`](../reference/configuration.md#threads) of them run at once (3 by
+default; one idle for `idle_stop`, 10 minutes, stops): without systemd, that number and the
+container's `--memory` are the agents' whole budget, and `[agent.limits] total_memory` does not
+apply. Count about 0.5 GiB for each agent with its Claude Code, plus Fronde itself, when you
+pick `--memory`; lower `max_running` on a small machine. When the container runs out of memory, the
 kernel kills the agent first: Fronde starts it with the highest `oom_score_adj` (1000), and
 the chat starts a new one at the next message. Fronde sets no `ulimit` of its own besides core
 dumps (none for the agent): Linux counts processes per user, not per container, and the

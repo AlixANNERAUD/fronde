@@ -68,7 +68,9 @@ signals and abstract sockets); seccomp: no Unix sockets but connected pairs, onl
 sockets, no io_uring`, followed by `the agent cannot start` on a kernel without Landlock or
 seccomp, then what caps its resources: `agent limits: 2 GiB memory, 2 CPUs, 512 tasks, in a
 systemd scope under fronde-agents.slice` once the systemd user manager made a scope like the
-agent's (it starts one that runs `true`), or `agent limits: none (…)` with the reason, then, with
+agent's (it starts one that runs `true`), or `agent limits: none (…)` with the reason, then how
+many agents run at once and their memory together: `agents: at most 3 at once (one kept for your
+own threads), stopped after 10m idle, 4 GiB for all of them (2 GiB each)`, then, with
 `[agent] oauth_token`, `agent token: [agent] oauth_token, read` once it read a
 file or variable token (a stored one is named, and opened when the agent starts), and refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the

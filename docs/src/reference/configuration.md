@@ -318,6 +318,7 @@ before Fronde when memory runs out (`oom_score_adj` 1000), and the agent writes 
 | `memory` | size or `"none"` | `"2G"` | The most memory it may use (`MemoryMax`), as a number of bytes or with `K`, `M`, `G` or `T` (powers of 1024). Past three quarters of it (`MemoryHigh`), the kernel reclaims its memory first; at the limit, it is OOM-killed. |
 | `cpus` | number or `"none"` | `2` | How many CPUs' worth of time it may use (`CPUQuota`, 100 % per CPU): `0.5` is half of one. At least `0.01`. |
 | `tasks` | integer or `"none"` | `512` | How many processes and threads it may run at once (`TasksMax`). Node.js and Claude Code use a few dozen. |
+| `total_memory` | size or `"none"` | `"4G"` | The most memory all the agents together may use: Fronde sets it at start as the `MemoryMax` of `fronde-agents.slice`, with `MemoryHigh` at three quarters (`systemctl --user set-property --runtime`). `"none"` leaves the slice uncapped. Only with a scope; without one, `[threads] max_running` and the container's limits are the budget. |
 
 `"none"` leaves out that limit: the slice's and systemd's own defaults then apply (systemd caps
 a user's tasks at 15 % of the system's by default). With all three `"none"`, Fronde starts no
@@ -331,6 +332,25 @@ say which applies (`agent limits: …`).
 memory = "4G"
 cpus = 1.5
 tasks = "none"
+```
+
+## `[threads]`
+
+Optional. Each conversation (thread) has its own agent process, started on its first message.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `max_running` | integer | `3` | How many agent processes run at once, the main thread's included; at least 1. When none is free, Fronde stops the agent idle for the longest time; when every agent is in a turn, the message waits, its thread shows « En attente : d'autres conversations utilisent l'agent. », and it starts once another turn ends (Stop gives up the wait). Threads you did not start (an agent's children, an outside client's, planned) share all of them but one, kept for yours. |
+| `idle_stop` | duration | `"10m"` | How long an agent is kept after its turn ends without a new message (`"90s"`, `"1h 30m"`). It then stops, freeing its place and revoking its hub token; the next message starts it again and resumes its session. |
+
+The agent with its Claude Code uses about 0.3 to 0.45 GiB before its first turn (measured, see
+[Architecture](../explanation/architecture.md#threads)), more during a long conversation:
+`max_running` times about 0.6 GiB fits within the default `total_memory` of 4 GiB.
+
+```toml
+[threads]
+max_running = 3
+idle_stop = "10m"
 ```
 
 ## Environment variables

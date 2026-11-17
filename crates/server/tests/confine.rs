@@ -971,6 +971,13 @@ fn real_adapter_starts_confined() {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
+    // The memory of the adapter and everything it starts, printed with `--no-capture`: the
+    // figures behind the agents' budget (`[agent.limits]`).
+    let pid = child.id();
+    let memory =
+        |stage: &str| eprintln!("adapter memory, {stage}: {} MiB", tree_rss_kib(pid) >> 10);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    memory("idle before initialize");
     let (send, lines) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(stdout)
@@ -990,6 +997,7 @@ fn real_adapter_starts_confined() {
         serde_json::json!({"protocolVersion": 1, "clientCapabilities": {}}),
     );
     assert!(init["result"]["protocolVersion"].is_number(), "{init}");
+    memory("after initialize");
     let session = rpc(
         &mut stdin,
         &lines,
@@ -1009,10 +1017,21 @@ fn real_adapter_starts_confined() {
         }),
     );
     assert!(session["result"]["sessionId"].is_string(), "{session}");
+    memory("after session/new");
     let header = authorization
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("Claude Code never reached the hub");
     assert_eq!(header, format!("Bearer {token}"));
+    let mut peak = 0;
+    for _ in 0..20 {
+        peak = peak.max(tree_rss_kib(pid));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    eprintln!(
+        "adapter memory, peak over the 10 s after session/new: {} MiB",
+        peak >> 10
+    );
+    memory("idle with a session");
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
@@ -1020,6 +1039,47 @@ fn real_adapter_starts_confined() {
     assert!(
         setup.data.join("home/.claude").exists() || setup.data.join("home/.claude.json").exists()
     );
+}
+
+/// The resident memory of process `pid` and of all its descendants, in KiB.
+fn tree_rss_kib(pid: u32) -> u64 {
+    let mut parents = BTreeMap::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(child) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // After the command's name in parentheses: state, then the parent's pid.
+        let parent = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|parent| parent.parse::<u32>().ok());
+        if let Some(parent) = parent {
+            parents.insert(child, parent);
+        }
+    }
+    let in_tree = |mut process: u32| loop {
+        if process == pid {
+            return true;
+        }
+        match parents.get(&process) {
+            Some(&parent) if parent != 0 => process = parent,
+            _ => return false,
+        }
+    };
+    parents
+        .keys()
+        .filter(|&&process| in_tree(process))
+        .filter_map(|process| std::fs::read_to_string(format!("/proc/{process}/status")).ok())
+        .filter_map(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .and_then(|kib| kib.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        })
+        .sum()
 }
 
 #[test]
@@ -1240,7 +1300,11 @@ async fn starting_a_thread_keeps_the_others_running() {
         .await
         .expect("systemd-run found");
     let pattern = format!("{}-*.scope", scope.prefix);
-    assert_eq!(fake.calls("systemctl"), [["--user", "stop", &pattern]]);
+    // Then caps the slice of all agents (`slice_budget_is_set_at_start`).
+    let calls = fake.calls("systemctl");
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    assert_eq!(calls[0], ["--user", "stop", &pattern]);
+    assert_eq!(calls[1][..2], ["--user", "set-property"]);
     setup.confine.scope = Some(scope);
 
     // Two agents start one after the other: no `stop` between them or after.
@@ -1250,7 +1314,7 @@ async fn starting_a_thread_keeps_the_others_running() {
     let second = chat(&spec, &setup.confine).await.expect("a second agent");
     assert_eq!(
         fake.calls("systemctl").len(),
-        1,
+        2,
         "{:#?}",
         fake.calls("systemctl")
     );
@@ -1263,6 +1327,82 @@ async fn starting_a_thread_keeps_the_others_running() {
     assert_eq!(units.len(), 2, "{units:?}");
     assert_ne!(units[0], units[1]);
     drop((first, second));
+}
+
+/// The server's start caps `fronde-agents.slice`, the memory of every agent together, with
+/// `[agent.limits] total_memory`; `"none"` leaves it uncapped.
+#[tokio::test]
+async fn slice_budget_is_set_at_start() {
+    let (setup, _) = acp_setup("");
+    let fake = FakeSystemd::new(true);
+    let scope = fronde::start_scope(&setup.config, Some(&fake.path()))
+        .await
+        .expect("systemd-run found");
+    let set = [
+        "--user",
+        "set-property",
+        "--runtime",
+        "fronde-agents.slice",
+        "MemoryMax=4294967296",
+        "MemoryHigh=3221225472",
+    ];
+    assert_eq!(fake.calls("systemctl")[1], set);
+    assert_eq!(
+        fronde::pool_line(&setup.config, Some(&scope)),
+        "at most 3 at once (one kept for your own threads), stopped after 10m idle, 4 GiB for \
+         all of them (2 GiB each)"
+    );
+
+    let (setup, _) = acp_setup(
+        "[agent.limits]\ntotal_memory = \"6G\"\n[threads]\nmax_running = 1\nidle_stop = \"1h\"",
+    );
+    let fake = FakeSystemd::new(true);
+    let scope = fronde::start_scope(&setup.config, Some(&fake.path()))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls("systemctl")[1][4..],
+        ["MemoryMax=6442450944", "MemoryHigh=4831838208"]
+    );
+    assert_eq!(
+        fronde::pool_line(&setup.config, Some(&scope)),
+        "at most 1 at once, stopped after 1h idle, 6 GiB for all of them (2 GiB each)"
+    );
+
+    let (setup, _) = acp_setup("[agent.limits]\ntotal_memory = \"none\"");
+    let fake = FakeSystemd::new(true);
+    let scope = fronde::start_scope(&setup.config, Some(&fake.path()))
+        .await
+        .unwrap();
+    let calls = fake.calls("systemctl");
+    assert_eq!(calls.len(), 1, "{calls:#?}");
+    assert_eq!(calls[0][1], "stop");
+    assert!(
+        fronde::pool_line(&setup.config, Some(&scope))
+            .ends_with("memory of all of them uncapped (2 GiB each)")
+    );
+
+    // A user manager that refuses the cap: a warning, and the agents still start in scopes.
+    let (setup, _) = acp_setup("");
+    let fake = FakeSystemd::new(true);
+    std::fs::write(
+        fake.dir.path().join("systemctl"),
+        "#!/bin/sh\necho 'Access denied' >&2\nexit 1\n",
+    )
+    .unwrap();
+    assert!(
+        fronde::start_scope(&setup.config, Some(&fake.path()))
+            .await
+            .is_some()
+    );
+
+    // Without systemd-run, as in a container, nothing is asked and the container's limits are
+    // the budget.
+    assert_eq!(
+        fronde::pool_line(&setup.config, None),
+        "at most 3 at once (one kept for your own threads), stopped after 10m idle, their \
+         memory capped only by the container's or the service's limits"
+    );
 }
 
 #[tokio::test]

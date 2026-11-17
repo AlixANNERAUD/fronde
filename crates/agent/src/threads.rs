@@ -8,10 +8,15 @@
 //! Each thread's agent has its own directories ([`ThreadDirs`]), which its sandbox lets it write,
 //! and no other thread's; and each start of an agent process its own hub token ([`Tokens`]),
 //! by which the hub knows the thread, revoked when Fronde lets the process go.
+//!
+//! At most [`Budget::max_running`] agent processes run at once ([`Pool`]), one of them kept for
+//! the threads the owner started; an agent idle for [`Budget::idle_stop`] stops, and resumes its
+//! session on the next message.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -25,11 +30,12 @@ use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect,
 };
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 pub use fronde_protocol::ThreadId;
 
 use crate::acp::AgentSpec;
-use crate::assistant::{self, Assistant, Connector, TOPIC};
+use crate::assistant::{self, Assistant, Connector, Shared, TOPIC};
 use crate::legacy;
 use crate::log::{Event, new_log_id, new_stream};
 use crate::tokens::Tokens;
@@ -157,6 +163,161 @@ pub fn thread_dirs(data_dir: &Path, id: ThreadId) -> ThreadDirs {
     }
 }
 
+/// How many agent processes run at once, and how long an idle one is kept: `[threads]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Agent processes running at once, the main thread's included; at least 1. Threads the
+    /// owner did not start may hold all of them but one.
+    pub max_running: usize,
+    /// How long an agent is kept once its turn ended, without a new message.
+    pub idle_stop: Duration,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            max_running: 3,
+            idle_stop: Duration::from_secs(10 * 60),
+        }
+    }
+}
+
+/// The agent processes that may run at once. Each running agent holds a [`Slot`]; a turn whose
+/// thread has no agent running takes one before its agent starts. When none is free, the pool
+/// stops the agent idle for the longest time, never one in a turn; when every agent is in a
+/// turn, it waits for one to end.
+///
+/// Threads the owner did not start (a thread's children, an outside client's) also take a
+/// permit of a second semaphore, one smaller, first: they never hold the last slot, so that a
+/// thread the owner talks to always gets one, by stopping an idle agent or by waiting for
+/// another of the owner's.
+pub(crate) struct Pool {
+    all: Arc<Semaphore>,
+    /// For the threads the owner did not start; `None` when only one agent runs at once, which
+    /// they then wait for like any other turn.
+    others: Option<Arc<Semaphore>>,
+    idle_stop: Duration,
+    /// The open threads' assistants, among which an idle agent is stopped to make room.
+    members: Mutex<Vec<Weak<Assistant>>>,
+    /// Woken when a turn ends: its agent, now idle, may be stopped for a waiting turn.
+    turn_ended: Notify,
+}
+
+/// A running agent's place in the [`Pool`], given back when the agent stops.
+pub(crate) struct Slot {
+    _all: OwnedSemaphorePermit,
+    _other: Option<OwnedSemaphorePermit>,
+}
+
+impl Pool {
+    fn new(budget: Budget) -> Arc<Self> {
+        let max = budget.max_running.max(1);
+        Arc::new(Self {
+            all: Arc::new(Semaphore::new(max)),
+            others: (max > 1).then(|| Arc::new(Semaphore::new(max - 1))),
+            idle_stop: budget.idle_stop,
+            members: Mutex::new(Vec::new()),
+            turn_ended: Notify::new(),
+        })
+    }
+
+    pub(crate) fn idle_stop(&self) -> Duration {
+        self.idle_stop
+    }
+
+    fn register(&self, assistant: &Arc<Assistant>) {
+        let mut members = lock(&self.members);
+        members.retain(|member| member.strong_count() > 0);
+        members.push(Arc::downgrade(assistant));
+    }
+
+    /// A turn ended: a turn waiting for a slot may now stop that agent.
+    pub(crate) fn turn_ended(&self) {
+        self.turn_ended.notify_waiters();
+    }
+
+    /// A slot for `me`'s agent, once one is free. A turn that has to wait says so once in its
+    /// thread's stream. Dropping the future gives up the wait.
+    pub(crate) async fn acquire(&self, me: &Assistant) -> anyhow::Result<Slot> {
+        let mut waiting = false;
+        let other = match &self.others {
+            Some(others) if !me.owners() => Some(self.take(others, me, true, &mut waiting).await?),
+            _ => None,
+        };
+        let all = self.take(&self.all, me, false, &mut waiting).await?;
+        Ok(Slot {
+            _all: all,
+            _other: other,
+        })
+    }
+
+    /// A permit of `semaphore`, stopping an idle agent to make one free; among the threads the
+    /// owner did not start only, when `others_only`.
+    async fn take(
+        &self,
+        semaphore: &Arc<Semaphore>,
+        me: &Assistant,
+        others_only: bool,
+        waiting: &mut bool,
+    ) -> anyhow::Result<OwnedSemaphorePermit> {
+        loop {
+            if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+            // Listening before looking for an idle agent: a turn ending meanwhile is not missed.
+            let ended = self.turn_ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            if self.stop_idle(me, others_only).await
+                && let Ok(permit) = semaphore.clone().try_acquire_owned()
+            {
+                return Ok(permit);
+            }
+            if !*waiting {
+                *waiting = true;
+                me.waiting_for_a_slot().await;
+            }
+            tokio::select! {
+                permit = semaphore.clone().acquire_owned() => {
+                    return permit.context("the agent pool was closed");
+                }
+                () = &mut ended => {}
+            }
+        }
+    }
+
+    /// Stops the agent idle for the longest time, other than `me`'s and never one in a turn;
+    /// among the threads the owner did not start only, when `others_only`. Whether it stopped
+    /// one.
+    async fn stop_idle(&self, me: &Assistant, others_only: bool) -> bool {
+        let mut candidates: Vec<Arc<Assistant>> = lock(&self.members)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|member| {
+                !std::ptr::eq(Arc::as_ptr(member), me)
+                    && member.agent_running()
+                    && !(others_only && member.owners())
+            })
+            .collect();
+        candidates.sort_by_key(|member| member.last_active());
+        for candidate in candidates {
+            if candidate.stop_agent().await {
+                tracing::info!(
+                    "stopped the idle agent of thread {} to make room for thread {}'s",
+                    candidate.thread(),
+                    me.thread()
+                );
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Which thread's agent holds a hub token, as the hub's gate needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holder {
@@ -176,6 +337,8 @@ pub struct Threads {
     connector: Connector,
     /// The live hub tokens of every thread's agent processes.
     tokens: Tokens,
+    /// The agent processes that may run at once.
+    pool: Arc<Pool>,
     /// The user the threads are for: the owner, the one user so far.
     owner: User,
     main: Arc<Assistant>,
@@ -201,6 +364,19 @@ impl Threads {
         connector: Connector,
         owner: User,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with(db, data_dir, spec, connector, owner, Budget::default()).await
+    }
+
+    /// [`Threads::open`], with at most `budget.max_running` agents running at once and an idle
+    /// one stopped after `budget.idle_stop`.
+    pub async fn open_with(
+        db: DatabaseConnection,
+        data_dir: &Path,
+        spec: AgentSpec,
+        connector: Connector,
+        owner: User,
+        budget: Budget,
+    ) -> anyhow::Result<Arc<Self>> {
         legacy::import(&db, data_dir, TOPIC, LEGACY_SESSION).await?;
         ensure_main(&db, &owner.name)
             .await
@@ -210,22 +386,30 @@ impl Threads {
             ..spec
         };
         let tokens = Tokens::new();
+        let pool = Pool::new(budget);
+        let shared = Shared {
+            db: db.clone(),
+            connector: connector.clone(),
+            tokens: tokens.clone(),
+            pool: pool.clone(),
+        };
         let main = Assistant::open(
             ThreadId::MAIN,
             TOPIC.into(),
             spec.clone(),
-            db.clone(),
-            connector.clone(),
-            tokens.clone(),
+            shared,
             false,
+            true,
         )
         .await?;
+        pool.register(&main);
         let threads = Arc::new(Self {
             db,
             data_dir: data_dir.to_path_buf(),
             spec,
             connector,
             tokens,
+            pool,
             owner,
             open: tokio::sync::Mutex::new(HashMap::from([(ThreadId::MAIN, main.clone())])),
             main,
@@ -277,16 +461,22 @@ impl Threads {
         let Some(row) = self.get(id).await? else {
             return Ok(None);
         };
+        let shared = Shared {
+            db: self.db.clone(),
+            connector: self.connector.clone(),
+            tokens: self.tokens.clone(),
+            pool: self.pool.clone(),
+        };
         let assistant = Assistant::open(
             id,
             row.topic,
             self.spec_for(id),
-            self.db.clone(),
-            self.connector.clone(),
-            self.tokens.clone(),
+            shared,
             row.archived_at.is_some(),
+            row.started_by == StartedBy::User,
         )
         .await?;
+        self.pool.register(&assistant);
         if let Some(requests) = self.requests.get().and_then(Weak::upgrade) {
             assistant.set_requests(&requests, self.owner.clone());
         }

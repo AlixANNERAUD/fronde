@@ -22,8 +22,8 @@ use fronde_agent::confine::{
     CONNECT_PORTS, Confine, GrantRequest, KEEP_ENV, Policy, SYSTEM_READ, Sandbox, Support,
     canonical_paths, grants, url_port, write_grant,
 };
-use fronde_agent::scope::{Limits, SLICE, Scope};
-use fronde_agent::threads::{ThreadId, Threads, thread_dirs};
+use fronde_agent::scope::{Limits, SLICE, Scope, Slice, bytes_text};
+use fronde_agent::threads::{Budget, ThreadId, Threads, thread_dirs};
 use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
@@ -363,6 +363,7 @@ pub async fn start_with_helper(
                 "agent limits: {}",
                 limits_line(&config, confine.scope.as_ref())
             );
+            tracing::info!("agents: {}", pool_line(&config, confine.scope.as_ref()));
             confined_connector(confine)
         }
         // Without `[web]` there is no chat, so no agent to start.
@@ -435,11 +436,54 @@ pub fn agent_scope(config: &Config, path: Option<&std::ffi::OsStr>) -> Option<Sc
 }
 
 /// [`agent_scope`], and the scopes an earlier run left stopped: once, here, so that starting an
-/// agent later never stops another that runs.
+/// agent later never stops another that runs. With `[agent.limits] total_memory`, the slice of
+/// every agent's scope is capped too, until the user manager stops.
 pub async fn start_scope(config: &Config, path: Option<&std::ffi::OsStr>) -> Option<Scope> {
     let scope = agent_scope(config, path)?;
     scope.stop_leftovers().await;
+    if let Some(memory) = config.agent.limits.total_memory {
+        Slice { memory }.cap(&scope).await;
+    }
     Some(scope)
+}
+
+/// How many agents run at once and how long an idle one is kept: `[threads]`.
+pub fn budget(config: &Config) -> Budget {
+    Budget {
+        max_running: config.threads.max_running,
+        idle_stop: config.threads.idle_stop,
+    }
+}
+
+/// The pool of agents and their memory together, for the start log and `fronde check`:
+/// `at most 3 at once (one kept for your own threads), stopped after 10m idle, 4 GiB for all of
+/// them (2 GiB each)`.
+pub fn pool_line(config: &Config, scope: Option<&Scope>) -> String {
+    let threads = &config.threads;
+    let kept = if threads.max_running > 1 {
+        " (one kept for your own threads)"
+    } else {
+        ""
+    };
+    let idle = fronde_hub::config::duration_text(threads.idle_stop);
+    let memory = match scope {
+        Some(scope) => {
+            let all = match config.agent.limits.total_memory {
+                Some(bytes) => format!("{} for all of them", bytes_text(bytes)),
+                None => "memory of all of them uncapped".to_owned(),
+            };
+            let each = match scope.limits.memory {
+                Some(bytes) => format!("{} each", bytes_text(bytes)),
+                None => "each uncapped".to_owned(),
+            };
+            format!("{all} ({each})")
+        }
+        None => "their memory capped only by the container's or the service's limits".to_owned(),
+    };
+    format!(
+        "at most {} at once{kept}, stopped after {idle} idle, {memory}",
+        threads.max_running
+    )
 }
 
 fn agent_limits(config: &Config) -> Limits {
@@ -645,6 +689,7 @@ pub async fn start_with(
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
     let agent = config.agent.clone();
+    let budget = budget(&config);
     warn_if_keychain_off();
     let backends = config.master_key_backends()?;
     fronde_hub::private::prepare_data_dir(&data_dir)?;
@@ -715,7 +760,8 @@ pub async fn start_with(
                 name: user.clone(),
                 admin: true,
             };
-            let threads = Threads::open(db.clone(), &data_dir, spec, connector, owner).await?;
+            let threads =
+                Threads::open_with(db.clone(), &data_dir, spec, connector, owner, budget).await?;
             let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
             let requests = Requests::open_with(db.clone(), threads.clone(), Some(secrets)).await?;
             threads.set_requests(&requests).await;

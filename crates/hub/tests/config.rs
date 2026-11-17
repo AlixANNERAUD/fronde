@@ -918,6 +918,7 @@ fn agent_limits_default_and_parse() {
         c.agent.limits,
         AgentLimits {
             memory: Some(2 * 1024 * 1024 * 1024),
+            total_memory: Some(4 * 1024 * 1024 * 1024),
             cpus: Some(2.0),
             tasks: Some(512),
         }
@@ -942,6 +943,70 @@ fn agent_limits_default_and_parse() {
     assert_eq!((l.memory, l.cpus, l.tasks), (None, Some(2.0), Some(512)));
     let l = limits("memory = \"none\"\ncpus = \"none\"\ntasks = \"none\"");
     assert_eq!((l.memory, l.cpus, l.tasks), (None, None, None));
+    assert_eq!(l.total_memory, Some(4 << 30));
+    let l = limits("total_memory = \"6G\"");
+    assert_eq!((l.total_memory, l.memory), (Some(6 << 30), Some(2 << 30)));
+    assert_eq!(limits("total_memory = \"none\"").total_memory, None);
+}
+
+#[test]
+fn threads_default_and_parse() {
+    use fronde_hub::config::ThreadsConfig;
+    use std::time::Duration;
+    let c = load_str(MIN).unwrap();
+    assert_eq!(
+        c.threads,
+        ThreadsConfig {
+            max_running: 3,
+            idle_stop: Duration::from_secs(600),
+        }
+    );
+    let threads = |table: &str| {
+        load_str(&format!("{MIN}\n[threads]\n{table}\n"))
+            .unwrap()
+            .threads
+    };
+    let t = threads("max_running = 1\nidle_stop = \"1h 30m\"");
+    assert_eq!(
+        (t.max_running, t.idle_stop),
+        (1, Duration::from_secs(90 * 60))
+    );
+    assert_eq!(
+        threads("idle_stop = \"90s\"").idle_stop,
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        threads("max_running = 5").idle_stop,
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        fronde_hub::config::duration_text(Duration::from_secs(600)),
+        "10m"
+    );
+    // The example says the defaults.
+    let example = load(std::path::Path::new("../../fronde.example.toml")).unwrap();
+    assert_eq!(example.threads, ThreadsConfig::default());
+    assert_eq!(
+        example.agent.limits,
+        fronde_hub::config::AgentLimits::default()
+    );
+}
+
+#[test]
+fn threads_refuse_bad_values() {
+    for (table, expected) in [
+        ("max_running = 0", "max_running: expected"),
+        ("max_running = -1", "max_running: expected"),
+        ("max_running = 1.5", "max_running: expected"),
+        ("max_running = \"3\"", "max_running: expected"),
+        ("idle_stop = \"0s\"", "idle_stop: expected a duration"),
+        ("idle_stop = \"soon\"", "idle_stop: expected a duration"),
+        ("idle_stop = 600", "idle_stop: expected a duration"),
+        ("max_depth = 1", "unknown field"),
+    ] {
+        let e = refused(&format!("{MIN}\n[threads]\n{table}\n"));
+        assert!(e.contains(expected), "{table}: {e}");
+    }
 }
 
 #[test]
@@ -953,6 +1018,8 @@ fn agent_limits_refuse_bad_values() {
         ("memory = 0", "memory: expected a size"),
         ("memory = \"-1G\"", "memory: expected a size"),
         ("memory = \"unlimited\"", "memory: expected a size"),
+        ("total_memory = \"lots\"", "total_memory: expected a size"),
+        ("total_memory = 0", "total_memory: expected a size"),
         ("cpus = 0", "cpus: expected"),
         ("cpus = -1.5", "cpus: expected"),
         ("cpus = \"fast\"", "cpus: expected"),

@@ -8,7 +8,7 @@ use crate::confine::Confine;
 use crate::elicitation;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
-use crate::threads::{self, ThreadId};
+use crate::threads::{self, Pool, Slot, ThreadId};
 use crate::tokens::{TokenLease, Tokens};
 use agent_client_protocol::v1::schema::CreateElicitationResponse;
 use anyhow::{Context, anyhow};
@@ -34,6 +34,7 @@ const SIGNED_OUT: &str =
 const FAILED: &str = "L'agent a rencontré une erreur.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
 const ARCHIVED: &str = "Cette conversation est archivée : elle ne reçoit plus de message.";
+const WAITING: &str = "En attente : d'autres conversations utilisent l'agent.";
 /// The main thread's stream in the database.
 pub const TOPIC: &str = "conversation";
 /// How long the agent gets to start and open its session.
@@ -69,6 +70,16 @@ pub fn confined_connector(confine: Confine) -> Connector {
     })
 }
 
+/// What every thread's assistant gets from the registry.
+pub(crate) struct Shared {
+    pub(crate) db: DatabaseConnection,
+    pub(crate) connector: Connector,
+    /// Where each start of an agent gets its own hub token.
+    pub(crate) tokens: Tokens,
+    /// The agent processes that may run at once.
+    pub(crate) pool: Arc<Pool>,
+}
+
 pub struct Assistant {
     thread: ThreadId,
     /// The thread's stream.
@@ -78,11 +89,20 @@ pub struct Assistant {
     connector: Connector,
     /// Where each start of the agent gets its own hub token.
     tokens: Tokens,
+    /// Where its agent gets a place among those running at once.
+    pool: Arc<Pool>,
+    /// The owner started this thread: its agent may take the pool's last slot.
+    owners: bool,
     log: ConversationLog,
     db: DatabaseConnection,
     /// The thread is archived: it refuses messages.
     archived: AtomicBool,
     session: Mutex<Option<Session>>,
+    /// When a turn last started or ended: the pool stops the agent idle for the longest time
+    /// first.
+    last_active: Mutex<tokio::time::Instant>,
+    /// Stops the agent once it has been idle for the pool's `idle_stop`; cancelled by a turn.
+    idle_timer: Mutex<Option<CancellationToken>>,
     /// The running turn; `None` when idle.
     turn: tokio::sync::Mutex<Option<Turn>>,
     /// The requests a turn asks through, the agent's permissions among them, cancelled when it
@@ -111,6 +131,8 @@ struct Session {
     /// The agent process's hub token: revoked once the last clone of the session is dropped,
     /// with the client that stops the process.
     _lease: Arc<TokenLease>,
+    /// Its place among the agents running at once, freed with it.
+    _slot: Arc<Slot>,
 }
 
 impl Session {
@@ -126,15 +148,21 @@ impl Session {
 impl Assistant {
     /// Opens the conversation of `thread`, stored in `db` under `topic`; the agent is started on
     /// the first message. [`Threads`](crate::threads::Threads) opens each thread once.
+    /// `owners`: the owner started the thread.
     pub(crate) async fn open(
         thread: ThreadId,
         topic: String,
         spec: AgentSpec,
-        db: DatabaseConnection,
-        connector: Connector,
-        tokens: Tokens,
+        shared: Shared,
         archived: bool,
+        owners: bool,
     ) -> anyhow::Result<Arc<Self>> {
+        let Shared {
+            db,
+            connector,
+            tokens,
+            pool,
+        } = shared;
         let log = ConversationLog::open(&db, &topic).await?;
         let assistant = Arc::new(Self {
             thread,
@@ -142,10 +170,14 @@ impl Assistant {
             spec,
             connector,
             tokens,
+            pool,
+            owners,
             log,
             db,
             archived: AtomicBool::new(archived),
             session: Mutex::new(None),
+            last_active: Mutex::new(tokio::time::Instant::now()),
+            idle_timer: Mutex::new(None),
             turn: tokio::sync::Mutex::new(None),
             requests: OnceLock::new(),
             permission_timeout: Mutex::new(permission::PERMISSION_TIMEOUT),
@@ -248,6 +280,11 @@ impl Assistant {
                 seq,
                 ending: false,
             });
+            // A turn keeps its agent: the idle stop waits for its end.
+            if let Some(timer) = lock(&self.idle_timer).take() {
+                timer.cancel();
+            }
+            self.touch();
             (cancel, seq)
         };
         let assistant = self.clone();
@@ -274,7 +311,63 @@ impl Assistant {
             let mut turn = assistant.turn.lock().await;
             assistant.append(Event::TurnEnded { outcome }).await;
             *turn = None;
+            drop(turn);
+            assistant.touch();
+            assistant.arm_idle_stop();
+            assistant.pool.turn_ended();
         });
+    }
+
+    /// The agent was used now.
+    fn touch(&self) {
+        *lock(&self.last_active) = tokio::time::Instant::now();
+    }
+
+    /// When a turn last started or ended.
+    pub(crate) fn last_active(&self) -> tokio::time::Instant {
+        *lock(&self.last_active)
+    }
+
+    /// Whether the owner started this thread: its agent may take the pool's last slot.
+    pub(crate) fn owners(&self) -> bool {
+        self.owners
+    }
+
+    /// Stops the agent once it has been idle for the pool's `idle_stop`, unless a turn starts
+    /// first; a running agent only.
+    fn arm_idle_stop(self: &Arc<Self>) {
+        if !self.agent_running() {
+            return;
+        }
+        let timer = CancellationToken::new();
+        if let Some(earlier) = lock(&self.idle_timer).replace(timer.clone()) {
+            earlier.cancel();
+        }
+        let after = self.pool.idle_stop();
+        let assistant = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::select! {
+                () = timer.cancelled() => return,
+                () = tokio::time::sleep(after) => {}
+            }
+            if let Some(assistant) = assistant.upgrade()
+                && assistant.stop_agent().await
+            {
+                tracing::info!(
+                    "the agent of thread {} was idle for {after:?}: stopped, its session resumes \
+                     on the next message",
+                    assistant.thread
+                );
+            }
+        });
+    }
+
+    /// Says, once per turn, that the turn waits for another thread's agent to stop.
+    pub(crate) async fn waiting_for_a_slot(&self) {
+        self.append(Event::Notice {
+            text: WAITING.into(),
+        })
+        .await;
     }
 
     /// Stops the running turn, if any, and cancels the requests it asked: the agent may wait
@@ -468,12 +561,25 @@ impl Assistant {
         text: &str,
         cancel: &CancellationToken,
     ) -> anyhow::Result<TurnOutcome> {
-        // Dropping the connect future stops an agent that is still starting.
-        let session = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
-            connected = tokio::time::timeout(START_TIMEOUT, self.connect()) => {
-                connected.map_err(|_| anyhow!(StartTimeout))??
+        let running = self.session_slot().clone();
+        let session = match running {
+            Some(session) => session,
+            None => {
+                // A place among the agents running at once first, as long as it takes: the
+                // start's timeout begins once the agent may start. Stop gives up the wait.
+                let slot = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
+                    slot = self.pool.acquire(self) => slot?,
+                };
+                // Dropping the connect future stops an agent that is still starting.
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
+                    connected = tokio::time::timeout(START_TIMEOUT, self.connect(slot)) => {
+                        connected.map_err(|_| anyhow!(StartTimeout))??
+                    }
+                }
             }
         };
         let prompt = session.client.prompt(text);
@@ -513,12 +619,9 @@ impl Assistant {
         })
     }
 
-    /// The current session, connecting (and resuming the saved one) when there is none. Each
-    /// start of the agent gets a new hub token, which the session holds.
-    async fn connect(self: &Arc<Self>) -> anyhow::Result<Session> {
-        if let Some(session) = self.session_slot().clone() {
-            return Ok(session);
-        }
+    /// Starts the agent in `slot` and resumes the saved session, or opens a new one. Each start
+    /// of the agent gets a new hub token, which the session holds with the slot.
+    async fn connect(self: &Arc<Self>, slot: Slot) -> anyhow::Result<Session> {
         // The main thread's directories are the data directory's `agent` and `home`, which the
         // server makes; another thread's are made when its agent first starts.
         if self.thread != ThreadId::MAIN {
@@ -559,6 +662,7 @@ impl Assistant {
             client,
             flushes,
             _lease: Arc::new(lease),
+            _slot: Arc::new(slot),
         };
         // In its slot before its events are read: a connection that ended at once finds it.
         *self.session_slot() = Some(session.clone());
@@ -566,12 +670,16 @@ impl Assistant {
         Ok(session)
     }
 
-    /// Stops the thread's agent process when no turn runs, revoking its hub token; the next
-    /// message starts it again, resuming its session. Whether it stopped one.
+    /// Stops the thread's agent process when no turn runs, revoking its hub token and freeing
+    /// its place in the pool; the next message starts it again, resuming its session. Whether it
+    /// stopped one.
     pub async fn stop_agent(&self) -> bool {
         let turn = self.turn.lock().await;
         if turn.is_some() {
             return false;
+        }
+        if let Some(timer) = lock(&self.idle_timer).take() {
+            timer.cancel();
         }
         self.session_slot().take().is_some()
     }
