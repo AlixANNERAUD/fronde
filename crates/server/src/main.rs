@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 #[derive(Parser)]
 #[command(
@@ -260,9 +262,12 @@ fn main() -> ExitCode {
     if let Command::Confine { policy, command } = &cli.command {
         return confine(policy, command);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(fronde::log_filter())
-        .with_writer(std::io::stderr)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(fronde::log_filter()),
+        )
         .init();
     // Built by hand rather than with `#[tokio::main]`, whose runtime waits on drop for every
     // blocking thread, however long.

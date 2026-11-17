@@ -11,7 +11,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono-tz.workspace = true
 axum = { workspace = true, features = ["ws"] }
-bytes.workspace = true
 clap.workspace = true
 fronde-agent = { path = "../agent" }
 fronde-db = { path = "../db" }
@@ -58,6 +57,9 @@ fronde-migration = { path = "../migration" }
 sea-orm.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
+# The log canary's page: a WebSocket client that logs nothing, so that a secret it sends can reach
+# the captured log only from the server's side.
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "ring", "getrandom"] }
 tempfile.workspace = true
 wiremock.workspace = true
 

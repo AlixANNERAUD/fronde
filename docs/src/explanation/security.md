@@ -152,10 +152,15 @@ Some plain copies remain:
   decrypted secret and zbus's D-Bus message buffers. An entry that is not text comes back as
   bytes inside keyring-core's `BadEncoding` error: Fronde zeroes the bytes it gets, not the copies
   made before.
-- A secret typed in a card crosses the WebSocket library's read buffer, which is not zeroed.
-  Fronde wipes the message it is handed once read, and the value it parses becomes a
-  `SecretString` at once. In the browser, the page empties the box once the secret is sent, but
-  the browser's own copies (the input's history, the outgoing message) are its own.
+- A secret typed in a card arrives in a WebSocket message whose bytes share the WebSocket
+  library's read buffer, so Fronde cannot wipe them: they stay in memory until that buffer is
+  reused. A message the browser split into fragments is put together in another buffer, and
+  serde_json copies a string holding escapes into a scratch buffer while it parses; both are freed
+  without being zeroed. The value parsed becomes a `SecretString` at once: that is the copy Fronde
+  holds, and zeroes. A zeroizing allocator, which would zero every buffer as it is freed, is a
+  possible future hardening. In the browser, the page reads the box only to send it and empties
+  it once the secret went out, but the browser's own copies (the box's memory, the outgoing
+  message) are its own.
 
 ## Secrets given in a card
 
@@ -164,9 +169,11 @@ The value goes from the page to the store and nowhere else: not to the agent, wh
 reference or a name; not to the conversation stream or any message the pages get; not to the
 request's row, which keeps where it went; not to the log. Tests check each of these with known
 values: the stream, the rows, every file of the data directory (`fronde.db`, its `-wal` and
-`-shm`), the tool's result and the log captured at TRACE from every library. The WebSocket
-library writes every message it receives at TRACE, so Fronde's log filter turns its targets
-(`tungstenite`, `tokio_tungstenite`) off, whatever `RUST_LOG` says.
+`-shm`), the tool's result and the log captured at TRACE from every library, through Fronde's
+own log filter. The WebSocket library writes every message it receives at TRACE, so that filter
+drops every event whose target starts with `tungstenite` or `tokio_tungstenite`. It is a filter
+of its own beside `RUST_LOG`'s directives, so no directive can turn those targets back on: not a
+longer prefix (`tungstenite:=trace`), not a span (`[span]=trace`).
 
 A secret kept **for this conversation** lives in Fronde's memory only: never on disk, gone at the
 next restart. Its reference, `sr_` and 128 random bits, works for the asker that got it, in that

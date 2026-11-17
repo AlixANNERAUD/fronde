@@ -2,7 +2,7 @@
 
 use crate::web::{Web, is_signed_in, renew};
 use axum::extract::State;
-use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fronde_agent::assistant::Assistant;
@@ -11,7 +11,6 @@ use fronde_requests::User;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tower_sessions::Session;
-use zeroize::Zeroize as _;
 
 pub async fn upgrade(
     State(web): State<Arc<Web>>,
@@ -70,9 +69,14 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>) {
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
                     Some(Ok(_)) => continue,
                 };
+                // The frame may carry a secret typed in a card, and cannot be wiped: its bytes
+                // share the WebSocket library's read buffer, and serde_json copies a string with
+                // escapes into a scratch buffer of its own, both freed without being zeroed: they
+                // stay in memory until it is reused. The `SecretString` the request service makes
+                // of the value is the copy Fronde holds, and zeroes. Dropped at once, so that the
+                // read buffer may reuse that memory sooner.
                 let parsed = serde_json::from_str::<ClientMsg>(&text);
-                // The frame may carry a secret typed in a card: wiped once read, whatever it was.
-                wipe(text);
+                drop(text);
                 match parsed {
                     Ok(ClientMsg::Hello { last_seq, log_id }) => {
                         // Subscribed first, so nothing falls between the replay and the stream.
@@ -131,14 +135,6 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>) {
                 }
             }
         }
-    }
-}
-
-/// Overwrites a frame's text with zeros, when nothing else holds it. A secret answer then lives on
-/// only in the `SecretString` the request service makes of it.
-fn wipe(text: Utf8Bytes) {
-    if let Ok(mut bytes) = bytes::Bytes::from(text).try_into_mut() {
-        bytes.as_mut().zeroize();
     }
 }
 

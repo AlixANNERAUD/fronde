@@ -2434,7 +2434,6 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "bytes",
  "chrono-tz",
  "clap",
  "fronde-agent",
@@ -2463,6 +2462,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tokio-websockets",
  "toml",
  "tower-http 0.7.1",
  "tower-sessions",
@@ -6286,6 +6286,25 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-websockets"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d52efb639344a7c6adb8e62c6f3d2c19c001ff1b79a5041ba1c6ed42e19c6aa5"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "getrandom 0.4.3",
+ "http",
+ "httparse",
+ "ring",
+ "simdutf8",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

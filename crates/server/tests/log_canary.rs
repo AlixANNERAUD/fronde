@@ -12,7 +12,6 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::fmt::format::FmtSpan;
 use wiremock::matchers::{method, path as url_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -94,25 +93,26 @@ const COMPILER: [&str; 6] = [
     "wasmtime_internal_unwinder",
 ];
 
-/// The process's global subscriber, at TRACE with every span event, fed by `log` records too, so
-/// that every thread (tokio workers, `spawn_blocking`) and every crate writes to the scanner.
+/// The process's global subscriber, through Fronde's own log filter at TRACE (the compiler's
+/// targets off), with every span event, fed by `log` records too, so that every thread (tokio
+/// workers, `spawn_blocking`) and every crate writes to the scanner.
 fn capture() -> Scanner {
-    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
     static SCANNER: OnceLock<Scanner> = OnceLock::new();
     SCANNER
         .get_or_init(|| {
             let scanner = Scanner::default();
             let out = scanner.clone();
-            // The targets Fronde's own filter silences are off too, as in production.
-            let targets = COMPILER.iter().chain(&fronde::SILENCED_LOG_TARGETS).fold(
-                Targets::new().with_default(LevelFilter::TRACE),
-                |t, target| t.with_target(*target, LevelFilter::OFF),
-            );
-            let subscriber = tracing_subscriber::registry().with(targets).with(
+            let spec = std::iter::once("trace".to_owned())
+                .chain(COMPILER.iter().map(|target| format!("{target}=off")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let subscriber = tracing_subscriber::registry().with(
                 tracing_subscriber::fmt::layer()
                     .with_span_events(FmtSpan::FULL)
                     .with_writer(move || out.clone())
-                    .with_ansi(false),
+                    .with_ansi(false)
+                    .with_filter(fronde::log_filter_from(Some(&spec))),
             );
             tracing::subscriber::set_global_default(subscriber).unwrap();
             tracing_log::LogTracer::builder()
@@ -123,6 +123,47 @@ fn capture() -> Scanner {
             scanner
         })
         .clone()
+}
+
+/// The page's WebSocket to `/ws`, signed in with `cookie`. Its client, tokio-websockets, logs
+/// nothing: a canary in the log came from the server, never from the test's own client.
+type Page =
+    tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_page(addr: std::net::SocketAddr, cookie: &str) -> Page {
+    use axum::http::{HeaderValue, header};
+    let (socket, _) = tokio_websockets::ClientBuilder::new()
+        .uri(&format!("ws://{addr}/ws"))
+        .unwrap()
+        .add_header(header::COOKIE, HeaderValue::from_str(cookie).unwrap())
+        .unwrap()
+        .add_header(
+            header::ORIGIN,
+            HeaderValue::from_str(&format!("http://{addr}")).unwrap(),
+        )
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    socket
+}
+
+/// The page's next text message; `None` once the socket closed.
+async fn next_text(page: &mut Page) -> Option<String> {
+    use futures::StreamExt as _;
+    while let Some(Ok(message)) = page.next().await {
+        if let Some(text) = message.as_text() {
+            return Some(text.to_owned());
+        }
+    }
+    None
+}
+
+async fn send_text(page: &mut Page, text: String) {
+    use futures::SinkExt as _;
+    page.send(tokio_websockets::Message::text(text))
+        .await
+        .unwrap();
 }
 
 /// The tests share the process's one subscriber: they run one at a time.
@@ -270,11 +311,8 @@ async fn assistant_token_never_appears() {
     use fronde_agent::assistant::Connector;
     use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
     use fronde_protocol::ClientMsg;
-    use futures::{SinkExt, StreamExt};
     use std::time::Duration;
     use tokio::time::timeout;
-    use tokio_tungstenite::tungstenite::Message;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     const WAIT: Duration = Duration::from_secs(10);
     let _serial = SERIAL.lock().await;
@@ -344,14 +382,7 @@ async fn assistant_token_never_appears() {
         .next()
         .unwrap()
         .to_owned();
-    let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("cookie", cookie.parse().unwrap());
-    request
-        .headers_mut()
-        .insert("origin", format!("http://{addr}").parse().unwrap());
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let mut socket = open_page(addr, &cookie).await;
     for message in [
         ClientMsg::Hello {
             last_seq: 0,
@@ -361,8 +392,7 @@ async fn assistant_token_never_appears() {
             text: "Salut".into(),
         },
     ] {
-        let json = serde_json::to_string(&message).unwrap();
-        socket.send(Message::text(json)).await.unwrap();
+        send_text(&mut socket, serde_json::to_string(&message).unwrap()).await;
     }
     let token = timeout(WAIT, async {
         loop {
@@ -408,10 +438,8 @@ async fn assistant_token_never_appears() {
     gate.notify_one();
     // The turn ends: its last entry reaches the page.
     timeout(WAIT, async {
-        while let Some(Ok(message)) = socket.next().await {
-            if let Message::Text(text) = message
-                && text.contains("turn_ended")
-            {
+        while let Some(text) = next_text(&mut socket).await {
+            if text.contains("turn_ended") {
                 return;
             }
         }
@@ -449,12 +477,9 @@ async fn secret_answer_never_appears() {
     use fronde_agent::assistant::Connector;
     use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
     use fronde_protocol::{Card, ClientMsg, Event, Keep, Response, SecretValue, ServerMsg};
-    use futures::{SinkExt, StreamExt};
     use secrecy::ExposeSecret as _;
     use std::time::Duration;
     use tokio::time::timeout;
-    use tokio_tungstenite::tungstenite::Message;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     const WAIT: Duration = Duration::from_secs(10);
     // The file backend, named: the default would try the machine's real keychain.
@@ -531,14 +556,7 @@ async fn secret_answer_never_appears() {
         .next()
         .unwrap()
         .to_owned();
-    let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("cookie", cookie.parse().unwrap());
-    request
-        .headers_mut()
-        .insert("origin", format!("http://{addr}").parse().unwrap());
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let mut socket = open_page(addr, &cookie).await;
     for message in [
         ClientMsg::Hello {
             last_seq: 0,
@@ -548,8 +566,7 @@ async fn secret_answer_never_appears() {
             text: "Salut".into(),
         },
     ] {
-        let json = serde_json::to_string(&message).unwrap();
-        socket.send(Message::text(json)).await.unwrap();
+        send_text(&mut socket, serde_json::to_string(&message).unwrap()).await;
     }
     let token = timeout(WAIT, async {
         loop {
@@ -591,11 +608,8 @@ async fn secret_answer_never_appears() {
             .await
         });
         let id = timeout(WAIT, async {
-            while let Some(Ok(message)) = socket.next().await {
-                let Message::Text(text) = message else {
-                    continue;
-                };
-                received.push(text.to_string());
+            while let Some(text) = next_text(&mut socket).await {
+                received.push(text.clone());
                 match serde_json::from_str::<ServerMsg>(&text).unwrap() {
                     ServerMsg::Hello { admin, .. } => hello_admin = Some(admin),
                     ServerMsg::Entry(entry) => {
@@ -619,7 +633,7 @@ async fn secret_answer_never_appears() {
         let malformed = format!(
             r#"{{"type":"answer","id":{id},"response":{{"type":"secret","value":"{MALFORMED}","keep":"forever"}}}}"#
         );
-        socket.send(Message::text(malformed)).await.unwrap();
+        send_text(&mut socket, malformed).await;
         let answer = ClientMsg::Answer {
             id,
             response: Response::Secret {
@@ -627,8 +641,7 @@ async fn secret_answer_never_appears() {
                 keep,
             },
         };
-        let json = serde_json::to_string(&answer).unwrap();
-        socket.send(Message::text(json)).await.unwrap();
+        send_text(&mut socket, serde_json::to_string(&answer).unwrap()).await;
         let result = timeout(WAIT, call).await.unwrap().unwrap().unwrap();
         assert!(!result.is_error.unwrap_or(false), "{result:?}");
         let text = serde_json::to_string(&result).unwrap();
@@ -648,13 +661,11 @@ async fn secret_answer_never_appears() {
     assert_eq!(hello_admin, Some(true), "the owner may keep secrets");
     gate.notify_one();
     timeout(WAIT, async {
-        while let Some(Ok(message)) = socket.next().await {
-            if let Message::Text(text) = message {
-                let ended = text.contains("turn_ended");
-                received.push(text.to_string());
-                if ended {
-                    return;
-                }
+        while let Some(text) = next_text(&mut socket).await {
+            let ended = text.contains("turn_ended");
+            received.push(text);
+            if ended {
+                return;
             }
         }
     })

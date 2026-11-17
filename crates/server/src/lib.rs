@@ -41,13 +41,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tower_sessions::ExpiredDeletion;
+use tracing_subscriber::filter::{FilterExt as _, filter_fn};
+use tracing_subscriber::layer::Filter;
+use tracing_subscriber::registry::LookupSpan;
 
 /// Log targets never written, whatever `RUST_LOG` says: tungstenite writes every WebSocket
 /// message at TRACE, and a page's message may carry a secret typed in a card.
 pub const SILENCED_LOG_TARGETS: [&str; 2] = ["tungstenite", "tokio_tungstenite"];
 
-/// The log filter: `RUST_LOG`, else `info`, with [`SILENCED_LOG_TARGETS`] off.
-pub fn log_filter() -> tracing_subscriber::EnvFilter {
+/// The log filter: `RUST_LOG`, else `info`, and [`SILENCED_LOG_TARGETS`] always dropped.
+pub fn log_filter<S>() -> impl Filter<S> + Send + Sync + use<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
     log_filter_from(
         std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
             .ok()
@@ -56,37 +62,28 @@ pub fn log_filter() -> tracing_subscriber::EnvFilter {
 }
 
 /// [`log_filter`] from the directives `spec` (`RUST_LOG`'s syntax), `info` when none or invalid.
-/// A directive naming a silenced target, or one inside it, is dropped: a more precise one would
-/// win over the silencing.
-fn log_filter_from(spec: Option<&str>) -> tracing_subscriber::EnvFilter {
-    let silenced = |directive: &str| {
-        let target = directive
-            .split(['[', '='])
-            .next()
-            .unwrap_or_default()
-            .trim();
-        SILENCED_LOG_TARGETS.iter().any(|silenced| {
-            target
-                .strip_prefix(silenced)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
-        })
-    };
-    let kept = spec.map(|spec| {
-        spec.split(',')
-            .filter(|directive| !silenced(directive))
-            .collect::<Vec<_>>()
-            .join(",")
-    });
-    let filter = kept
+/// The silenced targets are dropped by a filter of their own, which every event must also pass:
+/// within the directives, a longer prefix (`tungstenite:=trace`) or a span (`[span]=trace`) would
+/// win over a `tungstenite=off`.
+pub fn log_filter_from<S>(spec: Option<&str>) -> impl Filter<S> + Send + Sync + use<S>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    let directives = spec
         .and_then(|spec| tracing_subscriber::EnvFilter::try_new(spec).ok())
         .unwrap_or_else(|| "info".into());
-    SILENCED_LOG_TARGETS.iter().fold(filter, |filter, target| {
-        filter.add_directive(
-            format!("{target}=off")
-                .parse()
-                .expect("a target name is a valid directive"),
-        )
-    })
+    // The hint leaves the most verbose level to the directives, which the `log` bridge reads.
+    let silence = filter_fn(|metadata| !is_silenced(metadata.target()))
+        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE);
+    directives.and(silence)
+}
+
+/// Whether `target` starts with one of [`SILENCED_LOG_TARGETS`]: a module inside one, or any
+/// other spelling a library might give its target, is dropped too.
+fn is_silenced(target: &str) -> bool {
+    SILENCED_LOG_TARGETS
+        .iter()
+        .any(|silenced| target.starts_with(silenced))
 }
 
 /// How often expired web sessions and key-value entries are deleted.
@@ -880,31 +877,48 @@ mod tests {
 
     #[test]
     fn websocket_messages_are_never_logged() {
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
         for spec in [
             None,
             Some("trace"),
             Some("tungstenite=trace,tokio_tungstenite=trace,fronde=error"),
             Some("trace,tungstenite::protocol=trace"),
             Some("trace,tokio_tungstenite[x]=trace"),
+            // A longer prefix than `tungstenite`, which beat a `tungstenite=off` directive.
+            Some("tungstenite:=trace,fronde=error"),
+            Some("tungstenite::=trace,tokio_tungstenite:=trace,fronde=error"),
+            // Span directives are matched before target ones.
+            Some("[span]=trace"),
+            Some("off,[span]=trace"),
+            Some("trace,[span]=trace"),
+            Some("tungstenite=trace,[span{x}]=trace"),
         ] {
             let logs = Logs::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(log_filter_from(spec))
-                .with_writer({
-                    let logs = logs.clone();
-                    move || logs.clone()
-                })
-                .with_ansi(false)
-                .finish();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer({
+                        let logs = logs.clone();
+                        move || logs.clone()
+                    })
+                    .with_ansi(false)
+                    .with_filter(log_filter_from(spec)),
+            );
             tracing::subscriber::with_default(subscriber, || {
                 tracing::trace!(target: "tungstenite::protocol", "Received message secret");
                 tracing::error!(target: "tokio_tungstenite", "frame secret");
                 tracing::error!(target: "fronde", "kept");
+                let span = tracing::error_span!("span", x = 1);
+                let _entered = span.enter();
+                tracing::trace!(target: "tungstenite::protocol", "Received message secret");
+                tracing::error!(target: "tungstenite", "frame secret");
+                tracing::error!(target: "fronde", "kept in a span");
             });
             let text = logs.text();
             assert!(!text.contains("secret"), "{spec:?}: {text}");
             assert!(text.contains("kept"), "{spec:?}: {text}");
         }
+        assert!(is_silenced("tungstenite") && is_silenced("tokio_tungstenite::compat"));
+        assert!(!is_silenced("fronde::ws") && !is_silenced("axum::extract::ws"));
     }
 
     #[test]

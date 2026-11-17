@@ -116,8 +116,9 @@ kept secret from anyone but an admin.
 
 The answer travels from the page to the server on the chat's WebSocket and goes straight to the
 secret store. The page empties the box once it is sent, and never shows the secret again. On the
-server, the message is wiped once read, and the value becomes a `SecretString`, wiped once it is
-stored. Then the request closes: its row keeps where the secret went (`{"kept": "conversation",
+server, the value becomes a `SecretString` as soon as the message is parsed, wiped once it is
+stored. The message itself cannot be wiped: it may stay in the WebSocket library's buffer until
+that memory is reused (see [Secrets in memory](security.md#secrets-in-memory)). Then the request closes: its row keeps where the secret went (`{"kept": "conversation",
 "secret_ref": …}` or `{"kept": "stored", "name": …, "origin": …}`), the conversation says
 *Enregistré, jamais montré à l'agent* or *Gardé pour <origin>* (with *clé maîtresse créée :
 trousseau*, *fichier* or *identifiant systemd* when that secret made the master key, to back up),
