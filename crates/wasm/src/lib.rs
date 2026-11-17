@@ -31,7 +31,7 @@ pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, Network
 pub use python::{PYTHON_VERSION, PYTHON_WASM_SHA256, Python, PythonSource};
 pub use source::{
     Approval, Approvals, Checks, ComponentSource, Hashes, NotApproved, NotApprovedReason, Prepared,
-    Shipped, Stored, prepare, shipped,
+    Shipped, Stored, StoredSecrets, prepare, shipped, stored_approvals,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;

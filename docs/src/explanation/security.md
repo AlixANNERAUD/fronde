@@ -28,6 +28,18 @@ them. The value is read from standard input, never from the command line, where 
 could see it in the process list, and never from a terminal, which would echo it. Decrypted
 values are held in buffers zeroed when dropped, and no command, log or tool output shows one.
 
+A stored secret is used only as a component's credential, `{ stored = "name" }` in
+`[[sources.credentials]]`; the configuration refuses it anywhere else. Rows are read still sealed,
+and a value is opened only when a component that names it is prepared, just before it loads, and
+only when the origin the secret was stored for is the credential's origin, both normalised. A
+secret stored for one origin is never sent to another, even when the configuration names it for
+one: the component is refused with the command that stores it for the right origin. The opened
+value goes to the component's gate, which adds it to requests for that origin; the component
+never sees it. The rows are read again each time a component starts, so a secret stored while
+Fronde runs reaches a component waiting for it, which Fronde tries again until it is there.
+Fronde checks the master key when it starts: a key that did not seal the stored secrets, or no
+key file while some are stored, stops it.
+
 The master key is one line, `fronde-key-v1:` followed by the key in base64url, in `master.key`
 in the data directory, mode 0600, created with the first secret. Fronde never takes it from an
 environment variable: the agent inherits Fronde's environment. Keeping it in the system's
@@ -44,7 +56,8 @@ themselves.
 ## Secrets in memory
 
 Fronde holds the secrets it resolves (the `/mcp` bearer token, the web chat password, upstream MCP
-tokens and component credentials) as `secrecy::SecretString` values. They print as redacted with
+tokens and component credentials, stored ones included once opened) as `secrecy::SecretString`
+values. They print as redacted with
 `Debug` and their memory is zeroed when they are dropped. The plain value is read only at a few
 places in the code, each listed in a test (`crates/server/tests/secrets.rs`): the checks of the
 token's length and of the password, the constant-time compare of `/mcp` tokens and sign-in

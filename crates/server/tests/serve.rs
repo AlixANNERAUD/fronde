@@ -501,6 +501,165 @@ async fn check_leaves_an_older_database_unchanged() {
     );
 }
 
+/// A configuration with one calendar entry, pinned to its files, whose CalDAV password is the
+/// stored secret `caldav`. Returns the configuration's path and the data directory.
+fn calendar_with_stored_password(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
+    let wasm = dir.join("calendar.wasm");
+    std::fs::write(&wasm, b"not compiled by check").unwrap();
+    std::fs::copy(dist("calendar.toml"), dir.join("calendar.toml")).unwrap();
+    let entry = component_entry("calendar", &wasm, &dir.join("calendar.toml"));
+    let data = dir.join("data");
+    let path = dir.join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+             {entry}allow = [\"https://cloud.example\"]\n[sources.settings]\n\
+             events_url = \"https://cloud.example/e/\"\nreminders_url = \"https://cloud.example/r/\"\n\
+             [[sources.credentials]]\norigin = \"https://cloud.example\"\n\
+             basic = {{ username = \"alix\", password = {{ stored = \"caldav\" }} }}\n",
+            data.display().to_string()
+        ),
+    )
+    .unwrap();
+    (path, data)
+}
+
+/// Store `value` as `name` for `origin` in `data`'s database, as `fronde secret set` does.
+async fn store_secret(data: &std::path::Path, name: &str, origin: &str, value: &str) {
+    fronde_hub::private::prepare_data_dir(data).unwrap();
+    let db = fronde_db::open(data).await.unwrap();
+    let (key, _) = fronde_db::master_key::load_or_create(&db, data)
+        .await
+        .unwrap();
+    fronde_db::secrets::set(
+        &db,
+        &key,
+        fronde_db::secrets::SOURCES,
+        name,
+        origin,
+        &secrecy::SecretString::from(value.to_string()),
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+}
+
+/// Every file of `dir` with its content, by name.
+fn snapshot(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (e.file_name(), std::fs::read(e.path()).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn check_reports_stored_credentials() {
+    const VALUE: &str = "canary-stored-caldav-5e6f7a8b";
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = calendar_with_stored_password(dir.path());
+    let output = |out: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // Not stored: said so, with the command that stores it.
+    let out = run_check(&path);
+    let shown = output(&out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("source calendar")
+            && shown.contains("no secret named caldav is stored")
+            && shown.contains("`fronde secret set caldav --origin https://cloud.example --config"),
+        "{shown}"
+    );
+    assert!(!fronde_db::path(&data).exists(), "check made no database");
+
+    // Stored for another origin.
+    store_secret(&data, "caldav", "https://other.example", VALUE).await;
+    let out = run_check(&path);
+    let shown = output(&out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains(
+            "the stored secret caldav is for https://other.example, not https://cloud.example"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains(VALUE), "{shown}");
+
+    // Stored for its origin: it opens, and its value is never shown nor anything written.
+    store_secret(&data, "caldav", "https://cloud.example", VALUE).await;
+    let before = snapshot(&data);
+    let out = run_check(&path);
+    let shown = output(&out);
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(
+        shown.contains(
+            "source calendar: credential for https://cloud.example: stored secret caldav opens, \
+             stored for this origin"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains(VALUE), "{shown}");
+    // SQLite's read-only open of a WAL database leaves an empty `-wal` and its index `-shm`.
+    let after: Vec<_> = snapshot(&data)
+        .into_iter()
+        .filter(|(name, bytes)| {
+            !(name == "fronde.db-shm" || name == "fronde.db-wal" && bytes.is_empty())
+        })
+        .collect();
+    assert!(after == before, "check changed the data directory");
+
+    // A key that did not seal it.
+    let key_file = fronde_db::master_key::path(&data);
+    std::fs::remove_file(&key_file).unwrap();
+    fronde_hub::private::write(&key_file, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
+    let out = run_check(&path);
+    let shown = output(&out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("is not the one that sealed the stored secrets"),
+        "{shown}"
+    );
+}
+
+/// `serve` checks the master key before anything else, whether or not a component needs it.
+#[tokio::test]
+async fn start_refuses_a_wrong_or_missing_master_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path(), TOKEN);
+    store_secret(&config.data.dir, "caldav", "https://cloud.example", "v").await;
+    let key_file = fronde_db::master_key::path(&config.data.dir);
+
+    std::fs::remove_file(&key_file).unwrap();
+    fronde_hub::private::write(&key_file, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
+    let e = fronde::start(config.clone()).await.unwrap_err();
+    assert!(
+        format!("{e:#}").contains("is not the one that sealed the stored secrets"),
+        "{e:#}"
+    );
+
+    std::fs::remove_file(&key_file).unwrap();
+    let e = fronde::start(config).await.unwrap_err();
+    assert!(
+        format!("{e:#}").contains(&format!("the master key {} is missing", key_file.display())),
+        "{e:#}"
+    );
+    assert!(!key_file.exists(), "no new key is made");
+}
+
 #[test]
 fn check_approves_the_shipped_calendar_without_hashes() {
     // This binary was built after `mise run components`, from the same components/dist.

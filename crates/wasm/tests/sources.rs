@@ -451,6 +451,7 @@ fn tool_prefixes_stay_clear_of_other_sources() {
             timezone: "UTC".into(),
             approvals: Approvals::default(),
             sources,
+            ..Checks::default()
         }
     };
     // Itself, and sources whose tools it cannot reach.
@@ -529,6 +530,7 @@ fn shipping(shipped: Vec<Shipped>) -> Checks {
             stored: vec![],
         },
         sources: vec![],
+        ..Checks::default()
     }
 }
 
@@ -657,6 +659,7 @@ fn storing(stored: Vec<Stored>) -> Checks {
             stored,
         },
         sources: vec![],
+        ..Checks::default()
     }
 }
 
@@ -799,6 +802,7 @@ fn shipped_files_are_approved_as_shipped_even_when_stored() {
             stored: vec![stored_for("c", &hashes)],
         },
         sources: vec![],
+        ..Checks::default()
     };
     assert_eq!(
         *prepare(&config, &checks).unwrap().approval(),

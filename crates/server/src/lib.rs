@@ -143,7 +143,8 @@ fn site_root() -> PathBuf {
 }
 
 /// The configured components and `[python]`, sharing one engine; each is checked and loaded by
-/// the hub, components against the approvals stored in `db` when Fronde started.
+/// the hub, components against the approvals stored in `db` when Fronde started and the secrets
+/// stored there when the component starts.
 async fn wasm_sources(
     config: &Config,
     db: &fronde_db::DatabaseConnection,
@@ -164,7 +165,10 @@ async fn wasm_sources(
     let mut sources: Vec<Arc<dyn ToolSource>> = entries
         .into_iter()
         .map(|c| {
-            Arc::new(ComponentSource::new(c, checks.clone(), host.clone())) as Arc<dyn ToolSource>
+            Arc::new(
+                ComponentSource::new(c, checks.clone(), host.clone())
+                    .reading_secrets_from(db.clone(), config.data.dir.clone()),
+            ) as Arc<dyn ToolSource>
         })
         .collect();
     if let Some(python) = &config.python {
@@ -251,6 +255,9 @@ pub async fn start_with(
     let agent = config.agent.clone();
     fronde_hub::private::prepare_data_dir(&data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
+    // A wrong master key, or none while secrets are stored, stops Fronde here, whether or not a
+    // component needs a stored secret.
+    fronde_db::master_key::load(&db, &data_dir).await?;
     let components = wasm_sources(&config, &db).await?;
     // The store creates its own table, `tower_sessions`, which the entities leave out.
     let sessions = Sessions::new(db.get_sqlite_connection_pool().clone());

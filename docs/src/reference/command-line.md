@@ -46,10 +46,14 @@ components' credentials. For each component it prints the SHA-256 of its `.wasm`
 manifest, then checks it as `serve` would before loading it (approval, grants within its
 manifest, settings, tool prefixes, credentials over https) and prints which approval applied:
 `approved: shipped with this build (calendar)`, `approved: pinned by the hashes in its entry` or
-`approved: by the owner, stored in the database`. It reads the approvals stored in `fronde.db`
-when the data directory has one, as `serve` does at start, and never creates, updates or writes
-the database: it opens it read-only, and a database an older Fronde left without the approvals
-table has no stored approval, which is what `serve` would find after updating it. With
+`approved: by the owner, stored in the database`. For each credential that names a stored secret
+(`{ stored = "…" }`) it then prints `source <name>: credential for <origin>: stored secret <secret>
+opens, stored for this origin`, never the value; a secret that is not stored, one stored for
+another origin, or one that does not open is an error saying how to fix it. It reads the
+approvals and secrets stored in `fronde.db` when the data directory has one, and checks the master
+key against them, as `serve` does at start, and never creates, updates or writes the database: it
+opens it read-only, and a database an older Fronde left without the approvals or secrets table
+has no stored approval or secret, which is what `serve` would find after updating it. With
 `[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
 `python: approved (CPython 3.15.2)`. It also checks that `[data] dir` can be created and written:
 it creates the directory (mode 0700), writes a probe file and removes it, and otherwise names the
@@ -84,7 +88,8 @@ fronde secret remove <name> --config <file>
 - `remove` removes one secret, and exits with 1 if there is none by that name. Removing the last
   one also removes the key check, so a lost `master.key` then no longer blocks a new one.
 
-Using a stored secret as a component's credential is **planned**.
+A component's credential names a stored secret with `{ stored = "<name>" }` (see
+[Configuration](configuration.md#kind--component)).
 
 ## `fronde healthcheck`
 

@@ -53,6 +53,7 @@ async fn shipped_calendar_is_approved_loads_and_lists_its_tools() {
             stored: vec![],
         },
         sources: vec![],
+        ..Checks::default()
     };
     let prepared = prepare(&config, &checks).unwrap();
     assert_eq!(

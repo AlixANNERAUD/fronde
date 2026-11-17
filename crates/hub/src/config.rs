@@ -239,12 +239,23 @@ pub struct BasicCredential {
     pub password: Secret,
 }
 
-/// A secret is never written in the TOML: it points to a file or an environment variable.
+/// A secret is never written in the TOML: it points to a file, an environment variable, or, in a
+/// component's credentials only, a secret stored encrypted in `fronde.db`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Secret {
-    File { file: PathBuf },
-    Env { env: String },
+    File {
+        file: PathBuf,
+    },
+    Env {
+        env: String,
+    },
+    /// The secret `fronde secret set` stored under this name. Only the preparation of the
+    /// component whose credential names it opens it (`fronde_wasm::prepare`), so
+    /// [`Secret::resolve`] refuses it.
+    Stored {
+        stored: String,
+    },
 }
 
 /// Per-user data directory used when `[data] dir` is not set: `$XDG_DATA_HOME/fronde`, else
@@ -294,8 +305,27 @@ impl Secret {
         }
     }
 
+    /// Refuse a stored secret where only a file or an environment variable may be, saying so
+    /// for `place`.
+    fn not_stored(&self, place: &str) -> anyhow::Result<()> {
+        if let Secret::Stored { stored } = self {
+            bail!(
+                "{place} = {{ stored = {stored:?} }}: a stored secret can only be a component's \
+                 credential, in [[sources.credentials]]; use {{ file = \"…\" }} or \
+                 {{ env = \"…\" }} here"
+            );
+        }
+        Ok(())
+    }
+
+    /// The value of a file or environment secret. A stored secret is refused: only the
+    /// preparation of the component whose credential names it opens it.
     pub fn resolve(&self) -> anyhow::Result<SecretString> {
         match self {
+            Secret::Stored { stored } => bail!(
+                "the stored secret {stored} is opened only when the component whose credential \
+                 names it is prepared"
+            ),
             Secret::File { file } => {
                 crate::private::check_secret_file(file)?;
                 let mut s = std::fs::read_to_string(file)
@@ -369,14 +399,17 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         config.data.dir = base.join(&config.data.dir).components().collect();
     }
     config.server.token.anchor(base);
+    config.server.token.not_stored("server.token")?;
     if let Some(web) = &mut config.web {
         web.password.anchor(base);
+        web.password.not_stored("web.password")?;
     }
     for source in &mut config.sources {
         match source {
             SourceConfig::Mcp(m) => {
                 if let Some(t) = &mut m.token {
                     t.anchor(base);
+                    t.not_stored(&format!("source {:?}: token", m.name))?;
                 }
             }
             SourceConfig::Component(c) => {
@@ -605,6 +638,15 @@ fn check_component(c: &ComponentConfig) -> anyhow::Result<()> {
             bail!(
                 "source {name:?}: the credential for {origin} needs exactly one of basic or bearer"
             );
+        }
+        let secret = match (&credential.basic, &credential.bearer) {
+            (Some(b), _) => &b.password,
+            (_, Some(t)) => t,
+            (None, None) => unreachable!("checked above"),
+        };
+        if let Secret::Stored { stored } = secret {
+            fronde_db::secrets::check_name(stored)
+                .with_context(|| format!("source {name:?}: the credential for {origin}"))?;
         }
         credited.push(origin);
     }

@@ -240,6 +240,14 @@ pub async fn check_key<C: ConnectionTrait>(db: &C, key: &MasterKey) -> anyhow::R
     }
 }
 
+/// Whether the database has the secrets table. A database last opened by an older Fronde does
+/// not, which only [`crate::open_read_only`] sees: [`crate::open`] adds it.
+pub async fn table_exists(db: &DatabaseConnection) -> Result<bool, sea_orm::DbErr> {
+    fronde_migration::SchemaManager::new(db)
+        .has_table("secrets")
+        .await
+}
+
 /// A secret's name: 1 to 64 ASCII letters, digits, `-`, `_` or `.`.
 pub fn check_name(name: &str) -> anyhow::Result<()> {
     let ok = !name.is_empty()

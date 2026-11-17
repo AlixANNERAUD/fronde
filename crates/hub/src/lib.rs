@@ -32,7 +32,8 @@ pub struct Hub {
 
 impl Hub {
     /// Open memory, register the hub's own tools, start `components` (one that fails is skipped
-    /// with a warning) and connect upstream servers in the background.
+    /// with a warning, unless it is waiting for a stored secret: that one is tried again) and
+    /// connect upstream servers in the background.
     pub async fn start(
         config: Config,
         db: DatabaseConnection,
@@ -56,8 +57,12 @@ impl Hub {
         sources.start(Arc::new(Native::new("hub", own))).await?;
         for component in components {
             let name = component.name().to_string();
-            if let Err(e) = sources.start(component).await {
-                tracing::warn!("{name}: skipped: {e:#}");
+            match sources.start(component).await {
+                Err(e) if e.downcast_ref::<source::Waiting>().is_some() => {
+                    tracing::warn!("{name}: not started yet, trying again: {e:#}");
+                }
+                Err(e) => tracing::warn!("{name}: skipped: {e:#}"),
+                Ok(()) => {}
             }
         }
         for source in &config.sources {

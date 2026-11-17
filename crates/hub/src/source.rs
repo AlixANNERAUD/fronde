@@ -77,6 +77,20 @@ impl ToolSource for Native {
     }
 }
 
+/// A start error that something other than the configuration fixes while Fronde runs, such as
+/// a stored secret not set yet: [`Supervisor::start`] then keeps trying the source with backoff
+/// instead of giving it up. It reads as its message, which says what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiting(pub String);
+
+impl std::fmt::Display for Waiting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Waiting {}
+
 /// What the supervisor knows about a source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
@@ -155,8 +169,9 @@ impl Supervisor {
     }
 
     /// Start `source` now and return its error if it fails, without retrying: for sources that
-    /// cannot fix themselves (the hub's own tools, a component). If it starts and later stops,
-    /// it is restarted with backoff.
+    /// cannot fix themselves (the hub's own tools, a component). A source [`Waiting`] for
+    /// something outside the configuration is the exception: it is tried again with backoff
+    /// until it starts. If it starts and later stops, it is restarted with backoff.
     pub async fn start(&self, source: Arc<dyn ToolSource>) -> anyhow::Result<()> {
         let name = source.name().to_string();
         self.set(&name, Health::Starting);
@@ -166,6 +181,20 @@ impl Supervisor {
                     tokio::spawn(self.clone().run(source, Some(closed)));
                 }
                 Ok(())
+            }
+            Err(e) if e.downcast_ref::<Waiting>().is_some() => {
+                self.set(
+                    &name,
+                    Health::Down {
+                        error: format!("{e:#}"),
+                    },
+                );
+                let supervisor = self.clone();
+                tokio::spawn(async move {
+                    wait(&mut backoff()).await;
+                    supervisor.run(source, None).await;
+                });
+                Err(e)
             }
             Err(e) => {
                 self.set(
@@ -338,6 +367,53 @@ mod tests {
         ));
         tokio::time::sleep(Duration::from_secs(120)).await;
         assert_eq!(source.starts.load(Ordering::SeqCst), 1, "no retry");
+    }
+
+    /// Fails its first start as [`Waiting`], then starts with one tool.
+    #[derive(Default)]
+    struct Patient {
+        starts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolSource for Patient {
+        fn name(&self) -> &str {
+            "patient"
+        }
+
+        async fn start(&self) -> anyhow::Result<Session> {
+            if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(
+                    anyhow::Error::new(Waiting("set the secret".into())).context("credential")
+                );
+            }
+            let tool = typed_tool("patient_ok", "Ok.", true, |_: Value| async {
+                ToolOutput::ok(true)
+            });
+            Ok(Session::lasting(vec![tool]))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_retries_a_waiting_source() {
+        let registry = Arc::new(Registry::new());
+        let supervisor = Supervisor::new(registry.clone());
+        let source = Arc::new(Patient::default());
+        let e = supervisor.start(source.clone()).await.unwrap_err();
+        assert_eq!(format!("{e:#}"), "credential: set the secret");
+        assert!(matches!(
+            supervisor.health()["patient"],
+            Health::Down { ref error } if error == "credential: set the secret"
+        ));
+        assert!(registry.get("patient_ok").is_none());
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(supervisor.health()["patient"], Health::Up { tools: 1 });
+        assert_eq!(source.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            registry.call("patient_ok", json!({})).await.value,
+            json!(true)
+        );
     }
 
     #[tokio::test]

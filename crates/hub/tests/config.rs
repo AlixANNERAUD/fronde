@@ -451,6 +451,70 @@ fn credential_needs_exactly_one_kind_and_no_plain_secret() {
 }
 
 #[test]
+fn a_credential_can_name_a_stored_secret() {
+    let c = load_str(&component(
+        "allow = [\"https://a.example\", \"https://b.example\"]\n\
+         [[sources.credentials]]\norigin = \"https://a.example\"\n\
+         basic = { username = \"alix\", password = { stored = \"caldav\" } }\n\
+         [[sources.credentials]]\norigin = \"https://b.example\"\nbearer = { stored = \"api.token-2\" }\n",
+    ))
+    .unwrap();
+    let [SourceConfig::Component(c)] = &c.sources[..] else {
+        panic!("{:?}", c.sources)
+    };
+    let password = &c.credentials[0].basic.as_ref().unwrap().password;
+    assert!(matches!(password, Secret::Stored { stored } if stored == "caldav"));
+    let bearer = c.credentials[1].bearer.as_ref().unwrap();
+    assert!(matches!(bearer, Secret::Stored { stored } if stored == "api.token-2"));
+    // Only the component's preparation opens it.
+    let e = format!("{:#}", bearer.resolve().unwrap_err());
+    assert!(e.contains("opened only when the component"), "{e}");
+}
+
+#[test]
+fn stored_secret_refused_outside_credentials() {
+    let stored = "{ stored = \"tok\" }";
+    let cases = [
+        (
+            format!("[server]\ntoken = {stored}\n[data]\ndir = \"/tmp/x\"\ntimezone = \"UTC\"\n"),
+            "server.token",
+        ),
+        (
+            format!("{MIN}\n[web]\npassword = {stored}\n"),
+            "web.password",
+        ),
+        (
+            format!(
+                "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"up\"\nurl = \"https://up.example/mcp\"\ntoken = {stored}\n"
+            ),
+            "source \"up\": token",
+        ),
+    ];
+    for (text, place) in cases {
+        let e = refused(&text);
+        assert!(
+            e.contains(&format!("{place} = {{ stored = \"tok\" }}"))
+                && e.contains("[[sources.credentials]]")
+                && e.contains("{ file = \"…\" }"),
+            "{place}: {e}"
+        );
+    }
+}
+
+#[test]
+fn stored_secret_names_are_checked() {
+    for bad in ["", "a b", "caldav/x", &"x".repeat(65)] {
+        let e = refused(&component(&format!(
+            "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = {{ stored = {bad:?} }}\n"
+        )));
+        assert!(
+            e.contains("the credential for https://a.example") && e.contains("is not allowed"),
+            "{bad:?}: {e}"
+        );
+    }
+}
+
+#[test]
 fn component_hash_must_be_hex() {
     let e = refused(&component("sha256 = \"abc\"\n"));
     assert!(e.contains("64 lower-case hex digits"), "{e}");

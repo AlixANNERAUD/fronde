@@ -20,8 +20,15 @@ A secret is never written in the file. It is one of:
 | --- | --- |
 | `{ file = "/run/secrets/name" }` | The file's content, without its trailing line breaks. A relative path is read from the directory of the configuration file, not from Fronde's working directory. |
 | `{ env = "NAME" }` | The value of the environment variable `NAME`. |
+| `{ stored = "name" }` | The secret stored under `name` by `fronde secret set`, encrypted in `fronde.db` (see [Store a secret](../how-to/store-a-secret.md)). Only in a component's `[[sources.credentials]]`, and only for the origin it was stored for. |
 
-The settings below marked *secret* take one of these forms.
+The settings below marked *secret* take one of these forms, except `{ stored = "…" }`, which only
+a component's credential takes: `server.token`, `web.password` and an upstream server's `token`
+refuse it, saying to use `{ file = "…" }` or `{ env = "…" }`.
+
+When secrets are stored, Fronde checks the master key as it starts: a key file that is not the one
+that sealed them, or no key file at all, stops it with an error that says to restore the key from
+a backup. `fronde check` does the same.
 
 A secret file must be private. On Unix, Fronde refuses a file that group or others can read or
 write, or that another user owns, and says so: `secret file <path> is readable by other users; run
@@ -144,6 +151,12 @@ one of:
 | `basic` | `{ username = "…", password = secret }` | Sent as `Authorization: Basic …`. |
 | `bearer` | secret | Sent as `Authorization: Bearer …`. |
 
+The secret may be `{ stored = "name" }`, a secret stored with `fronde secret set`. It is opened
+when the component starts, and only for a credential whose `origin` is the one the secret was
+stored for, both normalised: a secret stored for `https://other.example` is refused for
+`https://cloud.example`, with the `fronde secret set` command that stores it for the right one.
+A missing one is refused with the same command.
+
 The manifest must ask for a credential of that kind for that origin. A credential travels only
 over https, or plain http to this machine (`localhost`, `127.0.0.1`, `::1`, `::ffff:127.0.0.1`;
 not `localhost.` nor `0.0.0.0`), and only when the name resolves to loopback addresses alone: a
@@ -171,6 +184,12 @@ for, a credential over plain http to another machine, a tool prefix another sour
 missing secret) is skipped with a warning, and the rest of Fronde starts. `fronde check` reports
 the same problems as errors, except those only compiling the component finds (a file that is not
 a component, imports it may not have, tools outside its prefixes).
+
+A component whose stored secret is missing, or stored for another origin, is not skipped: Fronde
+tries it again, after 2 seconds, then waiting twice as long each time up to a minute, and reads
+the stored secrets again at each try. Store the secret with `fronde secret set` while Fronde runs
+and the component starts within a minute, with no restart. A component that started keeps the
+value it read: after changing a stored secret, restart Fronde.
 
 ## `[python]`
 

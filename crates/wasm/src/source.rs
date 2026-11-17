@@ -7,20 +7,28 @@
 //! entry without them, those of a component shipped with this build of Fronde or those the owner
 //! approved for this source (rows of `fronde.db`). Hashes in the entry always win. A changed
 //! manifest or build is not loaded until it is approved again. A path never approves anything.
+//!
+//! A credential `{ stored = "name" }` names a secret sealed in `fronde.db`. [`Checks`] carries
+//! those rows still sealed, with the master key; [`prepare`] opens only the ones its entry's
+//! credentials name, each only for the origin it was stored for.
 
 use crate::egress::{Allowed, Credential, Grants};
 use crate::manifest::{Injection, Manifest, NetworkRule, World};
 use crate::{ComponentHost, ComponentSpec, LoadedComponent};
 use anyhow::{Context, bail, ensure};
 use async_trait::async_trait;
-use fronde_hub::config::{ComponentConfig, Config, RESERVED_TOOL_PREFIXES, SourceConfig};
+use fronde_db::master_key::MasterKey;
+use fronde_db::secrets::Sealed;
+use fronde_hub::config::{ComponentConfig, Config, RESERVED_TOOL_PREFIXES, Secret, SourceConfig};
 use fronde_hub::origin::{Origin, is_local};
-use fronde_hub::source::{Session, ToolSource};
+use fronde_hub::source::{Session, ToolSource, Waiting};
+use secrecy::SecretString;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// `(name, sha256, manifest_sha256)` of each component in `components/dist` when this build was
 /// compiled (`build.rs`); empty if there was none.
@@ -143,6 +151,57 @@ impl Approvals {
     }
 }
 
+/// The secrets stored for components' credentials, still sealed, and the master key that opens
+/// them. Nothing is opened until [`prepare`] needs one.
+#[derive(Debug, Clone, Default)]
+pub struct StoredSecrets {
+    /// `None` when nothing is stored and there is no key file.
+    pub key: Option<Arc<MasterKey>>,
+    pub sealed: Vec<Sealed>,
+}
+
+impl StoredSecrets {
+    /// The rows of `db` in the `sources` scope, and the key of `data_dir`, checked against `db`:
+    /// a key that did not seal them, or no key file while secrets are stored, is an error. Only
+    /// reads.
+    pub async fn load(db: &fronde_db::DatabaseConnection, data_dir: &Path) -> anyhow::Result<Self> {
+        let key = fronde_db::master_key::load(db, data_dir).await?;
+        let sealed = fronde_db::secrets::load_sealed(db, fronde_db::secrets::SOURCES).await?;
+        Ok(Self { key, sealed })
+    }
+
+    /// The value of the secret `name`, which must have been stored for `origin`. A secret not
+    /// stored yet, or stored for another origin, is [`Waiting`]: `fronde secret set` fixes it
+    /// while Fronde runs.
+    fn open(&self, name: &str, origin: &Origin) -> anyhow::Result<SecretString> {
+        let set = format!(
+            "`fronde secret set {name} --origin {origin} --config <your fronde.toml>`, the value \
+             on standard input"
+        );
+        let Some(sealed) = self.sealed.iter().find(|s| s.name == name) else {
+            return Err(Waiting(format!(
+                "no secret named {name} is stored; store it with {set}"
+            ))
+            .into());
+        };
+        let stored = Origin::parse(&sealed.origin).with_context(|| {
+            format!("the stored secret {name} has an unreadable origin; store it again with {set}")
+        })?;
+        if stored != *origin {
+            return Err(Waiting(format!(
+                "the stored secret {name} is for {stored}, not {origin}, and a stored secret goes \
+                 only to its own origin; store it again for {origin} with {set}, or name the \
+                 secret stored for {origin}"
+            ))
+            .into());
+        }
+        let key = self.key.as_deref().with_context(|| {
+            format!("the stored secret {name} cannot be opened: there is no master key")
+        })?;
+        sealed.open(key)
+    }
+}
+
 /// What a component entry is checked against besides its own files.
 #[derive(Debug, Clone, Default)]
 pub struct Checks {
@@ -152,6 +211,8 @@ pub struct Checks {
     pub approvals: Approvals,
     /// Every `[[sources]]` entry: a component's tool prefixes must stay clear of the others.
     pub sources: Vec<SourceConfig>,
+    /// What `{ stored = "…" }` credentials name.
+    pub secrets: StoredSecrets,
 }
 
 impl Checks {
@@ -162,27 +223,36 @@ impl Checks {
             timezone: config.data.timezone.name().to_string(),
             approvals: Approvals::shipped(),
             sources: config.sources.clone(),
+            secrets: StoredSecrets::default(),
         }
     }
 
-    /// [`Checks::of`], with the approvals stored in `db`, read now: [`prepare`] reads no
-    /// database, so an approval stored later applies at the next start.
+    /// [`Checks::of`], with the approvals and the sealed secrets stored in `db` and the master
+    /// key of the data directory, read now: [`prepare`] reads no database, so an approval stored
+    /// later applies at the next start. A [`ComponentSource`] reads the secrets again each time
+    /// it starts.
     pub async fn load(config: &Config, db: &fronde_db::DatabaseConnection) -> anyhow::Result<Self> {
         let mut checks = Self::of(config);
-        checks.approvals.stored = fronde_db::approvals::all(db)
-            .await
-            .context("cannot read the component approvals in the database")?
-            .into_iter()
-            .map(|row| Stored {
-                source: row.source,
-                hashes: Hashes {
-                    sha256: row.sha256,
-                    manifest_sha256: row.manifest_sha256,
-                },
-            })
-            .collect();
+        checks.approvals.stored = stored_approvals(db).await?;
+        checks.secrets = StoredSecrets::load(db, &config.data.dir).await?;
         Ok(checks)
     }
+}
+
+/// The approvals the owner stored in `db`.
+pub async fn stored_approvals(db: &fronde_db::DatabaseConnection) -> anyhow::Result<Vec<Stored>> {
+    Ok(fronde_db::approvals::all(db)
+        .await
+        .context("cannot read the component approvals in the database")?
+        .into_iter()
+        .map(|row| Stored {
+            source: row.source,
+            hashes: Hashes {
+                sha256: row.sha256,
+                manifest_sha256: row.manifest_sha256,
+            },
+        })
+        .collect())
 }
 
 /// Why a component's files are not approved: [`prepare`]'s error, under any context its callers
@@ -271,7 +341,7 @@ impl Prepared {
 }
 
 /// Check `config` against the component's approval and manifest and against `checks`, resolve
-/// its credentials, and return what to load.
+/// its credentials, opening the stored secrets they name, and return what to load.
 pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prepared> {
     let name = &config.name;
     let manifest_path = config.manifest_path();
@@ -344,18 +414,19 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
                 && r.origins.iter().any(|o| covers(o, &origin, &settings))),
             "the manifest asks for no {kind} credential for {origin}"
         );
+        let resolve = |secret: &Secret| {
+            match secret {
+                Secret::Stored { stored } => checks.secrets.open(stored, &origin),
+                other => other.resolve(),
+            }
+            .with_context(|| format!("credential for {origin}"))
+        };
         let credential = match (&c.basic, &c.bearer) {
             (Some(b), _) => Credential::Basic {
                 username: b.username.clone(),
-                password: b
-                    .password
-                    .resolve()
-                    .with_context(|| format!("credential for {origin}"))?,
+                password: resolve(&b.password)?,
             },
-            (_, Some(t)) => Credential::Bearer(
-                t.resolve()
-                    .with_context(|| format!("credential for {origin}"))?,
-            ),
+            (_, Some(t)) => Credential::Bearer(resolve(t)?),
             _ => unreachable!("checked above"),
         };
         credentials.push((origin, credential));
@@ -564,11 +635,23 @@ fn check_settings(
     Ok(())
 }
 
-/// A component as a source of tools: it is checked and loaded when the hub starts.
+/// Whether a credential of `config` names a stored secret.
+fn uses_stored_secrets(config: &ComponentConfig) -> bool {
+    config.credentials.iter().any(|c| {
+        let secret = c.basic.as_ref().map(|b| &b.password).or(c.bearer.as_ref());
+        matches!(secret, Some(Secret::Stored { .. }))
+    })
+}
+
+/// A component as a source of tools: it is checked and loaded each time it starts.
 pub struct ComponentSource {
     config: ComponentConfig,
     checks: Checks,
     host: ComponentHost,
+    /// The database and data directory where the stored secrets and the master key are read
+    /// again at each start, so that a secret stored or changed since the last one applies.
+    /// Without them, those of `checks`.
+    store: Option<(fronde_db::DatabaseConnection, PathBuf)>,
 }
 
 impl ComponentSource {
@@ -577,7 +660,19 @@ impl ComponentSource {
             config,
             checks,
             host,
+            store: None,
         }
+    }
+
+    /// Read the stored secrets from `db`, and the master key from `data_dir`, each time the
+    /// component starts.
+    pub fn reading_secrets_from(
+        mut self,
+        db: fronde_db::DatabaseConnection,
+        data_dir: PathBuf,
+    ) -> Self {
+        self.store = Some((db, data_dir));
+        self
     }
 }
 
@@ -588,7 +683,14 @@ impl ToolSource for ComponentSource {
     }
 
     async fn start(&self) -> anyhow::Result<Session> {
-        let prepared = prepare(&self.config, &self.checks)?;
+        let prepared = match &self.store {
+            Some((db, data_dir)) if uses_stored_secrets(&self.config) => {
+                let mut checks = self.checks.clone();
+                checks.secrets = StoredSecrets::load(db, data_dir).await?;
+                prepare(&self.config, &checks)?
+            }
+            _ => prepare(&self.config, &self.checks)?,
+        };
         tracing::info!("{}: {}", self.config.name, prepared.approval());
         let component = LoadedComponent::load(&self.host, prepared).await?;
         Ok(Session::lasting(component.tools()))

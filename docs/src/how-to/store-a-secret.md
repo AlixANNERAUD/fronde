@@ -2,9 +2,7 @@
 
 Fronde can keep a secret, such as a CalDAV password, encrypted in its database, bound to the one
 origin it is for. You type it once into `fronde secret set`; it never goes in the configuration
-file. Using a stored secret in a component's `[[sources.credentials]]` (`{ stored = "…" }`) is
-**planned**: today you can store, list and remove secrets, and a credential still names a file or
-an environment variable.
+file, and a component's credential names it with `{ stored = "…" }`.
 
 ## Store it
 
@@ -34,6 +32,36 @@ up now, apart from the database: see [Data directory](../reference/data-director
 it, the stored secrets cannot be read, and Fronde does not make a new key while secrets are
 stored.
 
+## Use it in a credential
+
+Name it in the component's `[[sources.credentials]]`, for the origin you stored it for:
+
+```toml
+[[sources.credentials]]
+origin = "https://cloud.example"
+basic = { username = "alex", password = { stored = "caldav" } }
+```
+
+or `bearer = { stored = "api-token" }`. Then check it:
+
+```sh
+fronde check --config fronde.toml
+```
+
+which prints `source calendar: credential for https://cloud.example: stored secret caldav opens,
+stored for this origin`, never the value. It reports a secret that is not stored, one stored for
+another origin, and a master key that does not open the stored secrets, each with what to do.
+
+Only a component's credential takes `{ stored = "…" }`: the `/mcp` token, the chat password and
+an upstream server's token still name a file or an environment variable.
+
+To move a password from a file into the store, store it from the file, replace
+`{ file = "…" }` by `{ stored = "caldav" }`, run `fronde check`, then delete the file:
+
+```sh
+fronde secret set caldav --origin https://cloud.example --config fronde.toml < caldav-password
+```
+
 ## See what is stored
 
 ```sh
@@ -48,4 +76,7 @@ prints each secret's name, origin and last change. It never prints a value: no c
 fronde secret remove caldav --config fronde.toml
 ```
 
-These commands work while Fronde runs. A running Fronde does not use stored secrets yet.
+These commands work while Fronde runs. A component waiting for a secret that is not stored yet,
+or that is stored for another origin, is tried again, and starts within a minute of
+`fronde secret set`. A component already running keeps the value it read when it started: after
+replacing or removing a secret, restart Fronde.

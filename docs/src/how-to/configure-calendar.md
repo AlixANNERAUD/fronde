@@ -43,6 +43,17 @@ two collections are on different servers. The component reaches nothing else. Fr
 with HTTP Basic authentication for that origin; the component never sees the password. Prefer an
 app password to your account password. The time zone comes from `[data] timezone`.
 
+To keep the password in Fronde's database rather than in a variable or a file, store it for the
+server's origin and name it in the credential (see [Store a secret](store-a-secret.md)):
+
+```sh
+fronde secret set caldav --origin https://cloud.example --config fronde.toml < caldav-password
+```
+
+```toml
+basic = { username = "alex", password = { stored = "caldav" } }
+```
+
 A server on this machine or on your local network is refused unless its origin is allowed as
 local, `{ origin = "http://192.168.1.10:5232", local = true }`. Fronde sends the password over
 plain http only to this machine (`localhost`, `127.0.0.1`): a server elsewhere on the network
@@ -62,9 +73,9 @@ source calendar: approved: shipped with this build (calendar)
 ```
 
 Fronde knows the hashes of the components built with it, so an entry without hashes is approved
-when the files are exactly those. It fails if the password's file or variable is missing, or if
-the entry grants what the component cannot use (such as a password over plain http to another
-machine).
+when the files are exactly those. It fails if the password's file or variable is missing, if a
+stored password is missing or stored for another origin, or if the entry grants what the
+component cannot use (such as a password over plain http to another machine).
 
 A `calendar.wasm` from anywhere else is not approved: `fronde check` fails and prints its two
 hashes. Read its `calendar.toml`, which says which origins and credentials it asks for, then copy
