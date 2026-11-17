@@ -2489,8 +2489,10 @@ dependencies = [
  "fronde-requests",
  "futures",
  "landlock",
+ "libc",
  "rustix",
  "sea-orm",
+ "seccompiler",
  "secrecy",
  "serde",
  "serde_json",
@@ -5325,6 +5327,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

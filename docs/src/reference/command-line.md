@@ -64,8 +64,9 @@ has no stored approval or secret, which is what `serve` would find after updatin
 `[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
 `python: approved (CPython 3.15.2)`. With `[web]`, it prints what the agent's sandbox covers on
 this kernel, such as `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, signals and
-abstract sockets); not confined: Unix socket paths (Linux 7.1)`, followed by `the agent cannot
-start` on a kernel without Landlock, and refuses a grant over Fronde's data or configuration
+abstract sockets); seccomp: no Unix sockets but connected pairs, only IPv4, IPv6 and netlink route
+sockets, no io_uring`, followed by `the agent cannot start` on a kernel without Landlock or
+seccomp, and refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the
 agent's `agent/` and `home/` in the data directory for that. It also checks that `[data] dir` can
 be created and written:

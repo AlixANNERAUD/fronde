@@ -1,6 +1,14 @@
 //! The agent's confinement, through the real `fronde __confine` helper. The confined agent is a
 //! shell, or this test binary run again as `probe_child`, which tries what an agent must not do
 //! and reports each outcome.
+//!
+//! `real_adapter_starts_confined` runs the Claude ACP adapter itself under the sandbox. It is
+//! ignored by default; run it after `mise run agent`:
+//!
+//! ```sh
+//! FRONDE_LIVE_AGENT=$(which claude-agent-acp) \
+//!   mise exec -- cargo nextest run -p fronde --test confine --run-ignored only --no-capture
+//! ```
 
 #![cfg(target_os = "linux")]
 
@@ -9,6 +17,7 @@ use fronde_agent::confine::{Confine, Support};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -104,10 +113,10 @@ impl Setup {
 /// fail with the sandbox's error, which [`refused_without_landlock`] checks.
 fn landlock() -> bool {
     let support = Support::probe();
-    if !support.files() {
+    if !support.ready() {
         eprintln!("this kernel cannot confine the agent ({support:?}): checking the refusal");
     }
-    support.files()
+    support.ready()
 }
 
 fn refused_without_landlock(output: &Output) {
@@ -228,6 +237,10 @@ struct Plan {
     allowed_dirs: Vec<PathBuf>,
     open_port: u16,
     closed_port: u16,
+    /// Unix sockets listening outside the sandbox, by path.
+    unix_paths: Vec<PathBuf>,
+    /// The name of an abstract Unix socket listening outside the sandbox.
+    unix_abstract: String,
 }
 
 /// What the probe tried, by name: `ok`, `denied`, or another error.
@@ -239,6 +252,128 @@ fn outcome<T>(result: std::io::Result<T>) -> String {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => "denied".to_owned(),
         Err(error) => format!("error: {error}"),
     }
+}
+
+/// `ok`, or the error number: to tell the seccomp filter's `EACCES` from any other refusal.
+fn errno<T>(result: std::io::Result<T>) -> String {
+    match result {
+        Ok(_) => "ok".to_owned(),
+        Err(error) => format!("errno {}", error.raw_os_error().unwrap_or(-1)),
+    }
+}
+
+fn eacces() -> String {
+    format!("errno {}", rustix::io::Errno::ACCESS.raw_os_error())
+}
+
+/// The descriptors this process inherited that are sockets: none, since the agent's standard
+/// streams are pipes and Rust opens everything else close-on-exec.
+fn inherited_sockets() -> String {
+    let mut sockets = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        if let Ok(target) = std::fs::read_link(entry.path())
+            && target.to_string_lossy().starts_with("socket:")
+        {
+            sockets.push(format!("{:?} {}", entry.file_name(), target.display()));
+        }
+    }
+    sockets.join(", ")
+}
+
+/// Every kind of socket the agent might try, by name.
+fn probe_sockets(report: &mut Report, plan: &Plan) {
+    use rustix::net::{AddressFamily, SocketType, netlink, socket};
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let raw = |family, kind, protocol| errno(socket(family, kind, protocol).map_err(Into::into));
+    for path in &plan.unix_paths {
+        report.insert(
+            format!("unix connect {}", path.display()),
+            errno(UnixStream::connect(path)),
+        );
+    }
+    report.insert(
+        "unix abstract".to_owned(),
+        errno(
+            SocketAddr::from_abstract_name(&plan.unix_abstract)
+                .and_then(|address| UnixStream::connect_addr(&address)),
+        ),
+    );
+    report.insert(
+        "unix listen".to_owned(),
+        errno(UnixListener::bind("probe.sock")),
+    );
+    report.insert("unix datagram".to_owned(), errno(UnixDatagram::unbound()));
+    report.insert("unix datagram pair".to_owned(), errno(UnixDatagram::pair()));
+    report.insert(
+        "unix raw pair".to_owned(),
+        errno(
+            rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::RAW,
+                rustix::net::SocketFlags::CLOEXEC,
+                None,
+            )
+            .map_err(Into::into),
+        ),
+    );
+    // What Node gives its children as standard streams: it must still work, both ways.
+    let pair = UnixStream::pair().and_then(|(mut a, mut b)| {
+        use std::io::{Read, Write};
+        a.write_all(b"ping")?;
+        let mut buffer = [0; 4];
+        b.read_exact(&mut buffer)?;
+        b.write_all(&buffer)?;
+        a.read_exact(&mut buffer)?;
+        Ok(buffer)
+    });
+    report.insert(
+        "unix stream pair".to_owned(),
+        match pair {
+            Ok(buffer) if &buffer == b"ping" => "ok".to_owned(),
+            other => format!("{other:?}"),
+        },
+    );
+    report.insert(
+        "seqpacket pair".to_owned(),
+        errno(
+            rustix::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                rustix::net::SocketFlags::CLOEXEC,
+                None,
+            )
+            .map_err(Into::into),
+        ),
+    );
+    report.insert(
+        "ipv4".to_owned(),
+        raw(AddressFamily::INET, SocketType::STREAM, None),
+    );
+    report.insert(
+        "udp".to_owned(),
+        errno(std::net::UdpSocket::bind("127.0.0.1:0")),
+    );
+    report.insert(
+        "netlink route".to_owned(),
+        raw(AddressFamily::NETLINK, SocketType::RAW, None),
+    );
+    report.insert(
+        "netlink sock_diag".to_owned(),
+        raw(
+            AddressFamily::NETLINK,
+            SocketType::RAW,
+            Some(netlink::SOCK_DIAG),
+        ),
+    );
+    report.insert(
+        "packet".to_owned(),
+        raw(AddressFamily::PACKET, SocketType::DGRAM, None),
+    );
+    report.insert(
+        "vsock".to_owned(),
+        raw(AddressFamily::VSOCK, SocketType::STREAM, None),
+    );
 }
 
 fn probe_file(report: &mut Report, file: &Path) {
@@ -278,6 +413,8 @@ fn probe_child() {
     };
     let plan: Plan = serde_json::from_str(&plan).unwrap();
     let mut report = Report::new();
+    report.insert("inherited sockets".to_owned(), inherited_sockets());
+    probe_sockets(&mut report, &plan);
     for file in &plan.protected_files {
         probe_file(&mut report, file);
     }
@@ -320,6 +457,7 @@ struct Probe {
     setup: Setup,
     plan: Plan,
     _listeners: [std::net::TcpListener; 2],
+    _unix: [UnixListener; 2],
     _credentials: tempfile::TempDir,
     originals: Vec<(PathBuf, Vec<u8>)>,
 }
@@ -359,6 +497,17 @@ fn probe_setup() -> Probe {
     }
     let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Stand-ins for the user manager, D-Bus, ssh-agent or Docker: a path outside the grants, and
+    // an abstract name.
+    let unix_path = setup.root.path().join("outside.sock");
+    let unix = UnixListener::bind(&unix_path).unwrap();
+    let unix_abstract = format!("fronde-test-{}", setup.root.path().display());
+    let abstract_listener = {
+        use std::os::linux::net::SocketAddrExt;
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(&unix_abstract).unwrap();
+        UnixListener::bind_addr(&address).unwrap()
+    };
+    UnixStream::connect(&unix_path).expect("the test reaches its own socket");
     let plan = Plan {
         protected_files,
         protected_dirs: vec![
@@ -371,11 +520,14 @@ fn probe_setup() -> Probe {
         allowed_dirs: vec![data.join("agent"), data.join("home"), data.join("home/tmp")],
         open_port: open.local_addr().unwrap().port(),
         closed_port: closed.local_addr().unwrap().port(),
+        unix_paths: vec![unix_path],
+        unix_abstract,
     };
     Probe {
         setup,
         plan,
         _listeners: [open, closed],
+        _unix: [unix, abstract_listener],
         _credentials: credentials_dir,
         originals,
     }
@@ -519,4 +671,198 @@ fn grants_never_cover_the_credentials_or_the_configuration() {
         .expect("a grant over the configuration's directory was accepted")
         .to_string();
     assert!(error.contains("[agent] read"), "{error}");
+}
+
+#[test]
+fn agent_cannot_reach_unix_sockets() {
+    let probe = probe_setup();
+    let Some(report) = probe.run() else { return };
+    let denied = eacces();
+    for path in &probe.plan.unix_paths {
+        let attempt = format!("unix connect {}", path.display());
+        assert_eq!(report[&attempt], denied, "{attempt}: {report:#?}");
+    }
+    for attempt in [
+        "unix abstract",
+        "unix listen",
+        "unix datagram",
+        // A datagram pair could still send to any datagram socket by path.
+        "unix datagram pair",
+        "unix raw pair",
+        // Other families than IPv4, IPv6 and netlink route sockets.
+        "netlink sock_diag",
+        "packet",
+        "vsock",
+    ] {
+        assert_eq!(report[attempt], denied, "{attempt}: {report:#?}");
+    }
+    assert!(
+        !probe.setup.data.join("agent/probe.sock").exists(),
+        "{report:#?}"
+    );
+    // What the agent still needs: pairs for its children's streams, TCP to its ports, UDP for
+    // DNS, and the netlink route socket glibc reads the interfaces through.
+    for attempt in [
+        "unix stream pair",
+        "seqpacket pair",
+        "ipv4",
+        "udp",
+        "netlink route",
+        "open port",
+    ] {
+        assert_eq!(report[attempt], "ok", "{attempt}: {report:#?}");
+    }
+    assert_eq!(report["inherited sockets"], "", "{report:#?}");
+}
+
+/// The sockets of this machine's D-Bus buses the test itself can reach.
+fn buses() -> Vec<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+        || PathBuf::from(format!("/run/user/{}", rustix::process::getuid().as_raw())),
+        PathBuf::from,
+    );
+    [
+        runtime.join("bus"),
+        PathBuf::from("/run/dbus/system_bus_socket"),
+    ]
+    .into_iter()
+    .filter(|path| UnixStream::connect(path).is_ok())
+    .collect()
+}
+
+#[test]
+fn dbus_is_unreachable() {
+    let mut probe = probe_setup();
+    let buses = buses();
+    if buses.is_empty() {
+        eprintln!("no D-Bus bus on this machine: only the test's own socket is checked");
+    }
+    probe.plan.unix_paths.extend(buses.iter().cloned());
+    let Some(report) = probe.run() else { return };
+    // The Secret Service keychain is spoken over the session bus.
+    for bus in &buses {
+        let attempt = format!("unix connect {}", bus.display());
+        assert_eq!(report[&attempt], eacces(), "{attempt}: {report:#?}");
+    }
+}
+
+#[test]
+fn escape_through_the_user_manager_fails() {
+    let Some(systemd_run) = ["/usr/bin/systemd-run", "/bin/systemd-run"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("no systemd-run on this machine: nothing to escape through");
+        return;
+    };
+    let setup = setup("");
+    let db = setup.data.join("fronde.db");
+    std::fs::write(&db, "secret").unwrap();
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", rustix::process::getuid().as_raw()));
+    let bus = format!("unix:path={runtime}/bus");
+    // The agent is told where the user manager is, so that only the sandbox stops it.
+    let spec = setup.spec(
+        &shell(&format!(
+            "{systemd_run} --user --wait --pipe --quiet --collect cat {:?}",
+            db.display().to_string()
+        )),
+        &[
+            ("XDG_RUNTIME_DIR", &runtime),
+            ("DBUS_SESSION_BUS_ADDRESS", &bus),
+        ],
+    );
+    let output = setup.run(&spec, &[("LC_ALL", "C")]);
+    if !landlock() {
+        return refused_without_landlock(&output);
+    }
+    assert!(!output.status.success(), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
+    // sd-bus reports the filter's refusal of its Unix socket as a missing privilege.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to connect to user scope bus via local transport")
+            && (stderr.contains("Permission denied") || stderr.contains("Operation not permitted")),
+        "{stderr}"
+    );
+}
+
+/// Sends one JSON-RPC request to the agent and waits for its answer, skipping notifications.
+fn rpc(
+    stdin: &mut impl std::io::Write,
+    lines: &std::sync::mpsc::Receiver<String>,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let request =
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    writeln!(stdin, "{request}").unwrap();
+    stdin.flush().unwrap();
+    loop {
+        let line = lines
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("no answer to {method}"));
+        let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if message["id"] == id {
+            return message;
+        }
+    }
+}
+
+/// The real adapter, with its Claude Code, under the whole sandbox: it starts, and answers
+/// `initialize` and `session/new`. Signed out, as its home is new: a turn is `live.rs`'s.
+#[test]
+#[ignore = "needs the adapter from `mise run agent` in FRONDE_LIVE_AGENT"]
+fn real_adapter_starts_confined() {
+    use std::io::BufRead;
+    let adapter = std::env::var("FRONDE_LIVE_AGENT").expect("FRONDE_LIVE_AGENT");
+    let setup = setup(&format!("command = [{adapter:?}]"));
+    assert!(landlock(), "this kernel cannot confine the agent");
+    let spec = setup.spec(&[&adapter], &[]);
+    let helper = setup.confine.command(&spec).unwrap();
+    let mut child = Command::new(&helper.program)
+        .args(&helper.args)
+        .envs(helper.env.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let init = rpc(
+        &mut stdin,
+        &lines,
+        0,
+        "initialize",
+        serde_json::json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    assert!(init["result"]["protocolVersion"].is_number(), "{init}");
+    let session = rpc(
+        &mut stdin,
+        &lines,
+        1,
+        "session/new",
+        serde_json::json!({"cwd": setup.data.join("agent"), "mcpServers": []}),
+    );
+    assert!(session["result"]["sessionId"].is_string(), "{session}");
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    // It kept to its own home.
+    assert!(
+        setup.data.join("home/.claude").exists() || setup.data.join("home/.claude.json").exists()
+    );
 }

@@ -40,6 +40,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 iana-time-zone = "0.1"
 # The agent's sandbox (crates/agent/src/confine.rs), Linux only.
 landlock = "0.4.7"
+# The agent's seccomp filter (crates/agent/src/confine.rs), Linux only: no Unix sockets.
+seccompiler = "0.5.0"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

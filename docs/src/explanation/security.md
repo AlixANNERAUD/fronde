@@ -100,10 +100,10 @@ give the same protection, which is none:
 
 The agent and the tools it runs are such code. Its sandbox (see
 [Where the agent runs](#where-the-agent-runs)) keeps it from reading the key file, the data
-directory and systemd's credentials directly. It does not yet keep it from the keychain over
-D-Bus, from `systemd-creds --user decrypt`, or from having the user manager run something for it
-(`systemd-run --user`), all reached through Unix sockets: closing those is **planned (C3)**. Root
-can read all three as well.
+directory and systemd's credentials directly, and it cannot open a Unix socket, so it cannot ask
+the keychain over D-Bus, run `systemd-creds --user decrypt`, or have the user manager run
+something for it (`systemd-run --user`) either. Any other process of your user can, and root can
+read all three as well.
 
 What each backend adds beyond the file:
 
@@ -271,9 +271,10 @@ agent first when memory runs out, and Fronde comes first for the CPU.
 ### Where the agent runs
 
 Before it starts the agent, the helper confines itself with Landlock, a Linux security module
-that any user can apply to their own processes. The agent and every process it starts inherit
-the confinement and cannot lift it. No external program, no root and no user namespace are
-needed, so it works the same natively and in Docker.
+that any user can apply to their own processes, and then with a seccomp filter, which refuses
+some system calls. The agent and every process it starts inherit both and cannot lift them. No
+external program, no root and no user namespace are needed, so it works the same natively and
+in Docker.
 
 The agent may:
 
@@ -284,7 +285,11 @@ The agent may:
   `<data>/home`, its home, and write `/dev/null`;
 - connect over TCP to ports 443 (https, Claude's API and `WebFetch`), 53 (DNS over TCP), the
   hub's own port, for `/mcp`, and the port of an `HTTPS_PROXY` or `HTTP_PROXY` it is given. It may
-  not listen on any TCP port.
+  not listen on any TCP port;
+- open IPv4, IPv6 and netlink route sockets (read-only for your user: glibc reads the network
+  interfaces through them when it resolves a name), and connected pairs of Unix stream sockets,
+  which reach nothing but each other and carry the standard streams of the processes Node
+  starts.
 
 Everything else on disk is out of its reach. It cannot read or write `fronde.db` (with its `-wal`
 and `-shm`), the memory files, anything else in the data directory, the configuration's directory
@@ -298,36 +303,49 @@ is left out with a warning. The agent cannot ptrace Fronde or read its `/proc/<p
 `mem`, and it cannot send Fronde a signal. Landlock only adds limits: the agent still runs as your
 user, under the usual file permissions.
 
-What the kernel can enforce depends on its Landlock version (its ABI). Fronde needs ABI 2
-(Linux 5.19) for files. TCP ports need ABI 4 (Linux 6.7), and signals and abstract Unix sockets
-ABI 6 (Linux 6.12); on an older kernel the agent runs without those parts. `fronde check` and the
-log at start say which apply, for example `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53
-8484, signals and abstract sockets); not confined: Unix socket paths (Linux 7.1)`.
+### No Unix sockets
 
-With `[agent] sandbox = true`, the default, the agent does not start on a kernel without Landlock
-or with ABI 1: the chat answers *L'agent a rencontré une erreur*, and the log says why and how to
-fix it.
+Landlock checks a Unix socket reached by path only from ABI 9 (Linux 7.1). Before that, a
+confined agent could still talk to whatever listens on a socket it can name, and some of those
+would act for it outside the sandbox. So the seccomp filter makes `socket()` fail with
+`EACCES` (permission denied) for every family but IPv4, IPv6 and netlink route sockets: no Unix
+socket, by path or abstract, no raw packet, vsock (which reaches the host from a virtual
+machine) or other netlink socket. It refuses a pair of Unix datagram sockets too, which could
+still send to any datagram socket by path, and io_uring, which can create sockets without the
+`socket()` system call. A socket can only come from these calls, and the agent inherits none: its
+standard streams are pipes, and Fronde opens everything else close-on-exec. This closes:
+
+- the systemd user manager: `systemd-run --user` would run any command unconfined, able to read
+  `fronde.db` or the configuration;
+- `systemd-creds --user decrypt`, which would decrypt a credential encrypted for your user, the
+  master key among them;
+- your session's D-Bus and, through it, the Secret Service keychain, which hands any unlocked
+  item, the master key among them, to any process of your session;
+- ssh-agent, gnupg's agent, and the Docker socket if your user may use it (which is root).
+
+It costs Claude Code's cross-session messaging, which talks over a Unix socket in its temporary
+directory and which Fronde does not use: Claude Code carries on without it. The filter covers
+x86_64 and aarch64; a 32-bit x86 program, whose socket calls go through `socketcall`, is killed
+at its first system call instead.
+
+### What the kernel enforces
+
+What the kernel can enforce depends on its Landlock version (its ABI). Fronde needs ABI 2
+(Linux 5.19) for files, and seccomp filters, which every kernel since Linux 3.17 has. TCP ports need ABI 4
+(Linux 6.7), and signals and abstract Unix sockets ABI 6 (Linux 6.12); on an older kernel the
+agent runs without those parts (seccomp still refuses abstract sockets). `fronde check` and the
+log at start say which apply, for example `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53
+8484, signals and abstract sockets); seccomp: no Unix sockets but connected pairs, only IPv4,
+IPv6 and netlink route sockets, no io_uring`.
+
+With `[agent] sandbox = true`, the default, the agent does not start on a kernel without Landlock,
+with ABI 1, or where the seccomp filter cannot be installed: the chat answers *L'agent a
+rencontré une erreur*, and the log says why and how to fix it.
 `[agent] sandbox = false` runs the agent unconfined, with the explicit environment only, and
 Fronde logs a warning at every start. There is no silent fallback.
 
-What Landlock does not cover, and is not closed yet:
+What the sandbox does not cover:
 
-- **Unix sockets reached by path.** Landlock checks them only from ABI 9 (Linux 7.1), and this
-  sandbox does not block them yet: blocking every new Unix socket with seccomp is **planned
-  (C3)**. Until then a confined agent can still talk to whatever listens on a Unix socket it can
-  name, and some of those act for it outside the sandbox:
-  - the systemd user manager: `systemd-run --user` runs any command unconfined, which can read
-    `fronde.db` or the configuration;
-  - `systemd-creds --user decrypt` decrypts a credential encrypted for your user, the master key
-    among them;
-  - your session's D-Bus and, through it, the Secret Service keychain, which hands any unlocked
-    item, the master key among them, to any process of your session;
-  - ssh-agent, gnupg's agent, and the Docker socket if your user may use it (which is root).
-
-  So C2 alone keeps the agent from reading or writing Fronde's files directly, not from a
-  determined escape through these services. Natively, under a desktop session or a user
-  manager, treat it as defence in depth, not full confinement. In Docker, none of these sockets
-  is in the container unless you mount one.
 - **UDP.** Landlock does not restrict it before ABI 10: the agent may send DNS queries, or any
   other UDP, to any host.
 - **Hosts.** TCP is limited by port, not by host: `WebFetch` needs the open web on 443, so the
@@ -402,9 +420,9 @@ agent and the tools it runs included. Such a process can store an approval for f
 choice under an entry without hashes. Hashes pinned in the entry close that door, since they
 always win over stored approvals: pin every component in a `fronde.toml` that Fronde's user
 cannot write (owned by another user, or mounted read-only), and approval stays out of the agent's
-reach. The agent's sandbox keeps it from opening `fronde.db` itself; until Unix sockets are
-blocked too (**planned, C3**), it could still have the systemd user manager write the database
-for it, so pin the hashes anyway.
+reach. The agent's sandbox keeps it from opening `fronde.db` itself, and from having the systemd
+user manager write it; any other process of your user can still write it, so pin the hashes
+anyway.
 
 A component's tools start with the prefixes its manifest declares, which no other source may
 use: a component cannot shadow the hub's tools or another source's. See

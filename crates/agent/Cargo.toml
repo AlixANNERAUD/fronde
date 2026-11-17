@@ -32,6 +32,8 @@ uuid.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 # The `__confine` helper: the agent's sandbox and its priority.
 landlock.workspace = true
+libc = "0.2"
+seccompiler.workspace = true
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]

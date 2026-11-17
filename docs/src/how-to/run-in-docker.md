@@ -66,10 +66,10 @@ keeps its settings. Back it up as a whole. It never holds the master key of
 
 ## The agent's sandbox
 
-Fronde confines its agent with Landlock (see
+Fronde confines its agent with Landlock and a seccomp filter of its own (see
 [Where the agent runs](../explanation/security.md#where-the-agent-runs)), which the host's kernel
-provides: a container cannot bring its own. Docker's default seccomp profile allows it. Check that
-the host enables it:
+provides: a container cannot bring its own. Docker's default seccomp profile allows both. Check
+that the host enables Landlock:
 
 ```sh
 cat /sys/kernel/security/lsm   # the list must include landlock

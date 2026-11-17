@@ -1,6 +1,7 @@
 //! `fronde __confine`: the helper Fronde starts instead of its agent. It keeps only the
 //! environment variables its policy names, lowers its own priority, raises its OOM score, confines
-//! itself with Landlock and then `exec`s the agent, which inherits all of it and cannot undo any.
+//! itself with Landlock and a seccomp filter, and then `exec`s the agent, which inherits all of it
+//! and cannot undo any.
 //! It runs in a fresh, single-threaded process, so nothing runs between `fork` and `exec` in
 //! Fronde's own.
 
@@ -62,7 +63,8 @@ pub struct Policy {
 }
 
 /// What the confined agent may reach. Everything else on the filesystem is out of its reach, and
-/// so are other TCP ports, signals to processes outside it and abstract Unix sockets.
+/// so are other TCP ports, signals to processes outside it and every Unix socket but a connected
+/// pair it makes itself (see [`SOCKETS`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sandbox {
@@ -194,13 +196,20 @@ pub fn url_port(url: &str) -> Option<u16> {
     }
 }
 
-/// What the kernel's Landlock can do for the agent.
+/// What the kernel can do for the agent's sandbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Support {
     /// The kernel's Landlock ABI, as far as Fronde tells them apart (7 and 8 read as 6): 0 when
     /// Landlock is missing or turned off.
     pub abi: u8,
+    /// Whether the helper can install its seccomp filter: the kernel has seccomp filters that
+    /// return an error, on an architecture the filter is written for (x86_64 or aarch64).
+    pub seccomp: bool,
 }
+
+/// What the seccomp filter leaves the agent, for `fronde check` and the log.
+pub const SOCKETS: &str = "seccomp: no Unix sockets but connected pairs, only IPv4, IPv6 and \
+                           netlink route sockets, no io_uring";
 
 /// The lowest Landlock ABI the agent runs under: ABI 1 forbids every rename across directories,
 /// which Claude Code's atomic writes need.
@@ -209,7 +218,15 @@ pub const MIN_ABI: u8 = 2;
 impl Support {
     /// Asks the running kernel, without restricting anything.
     pub fn probe() -> Self {
-        Self { abi: probe_abi() }
+        Self {
+            abi: probe_abi(),
+            seccomp: seccomp_rules::available(),
+        }
+    }
+
+    /// Whether the agent can start confined.
+    pub fn ready(self) -> bool {
+        self.files() && self.seccomp
     }
 
     pub fn files(self) -> bool {
@@ -232,6 +249,14 @@ impl Support {
 
     /// An error saying why the agent cannot be confined here, if it cannot.
     pub fn require(self) -> anyhow::Result<()> {
+        if self.files() && !self.seccomp {
+            bail!(
+                "the agent's sandbox needs seccomp filters (Linux 3.17) on x86_64 or aarch64, and \
+                 this kernel or machine ({}) has none; set [agent] sandbox = false to run the \
+                 agent unconfined, with access to everything your user can read and write",
+                std::env::consts::ARCH
+            );
+        }
         if self.files() {
             return Ok(());
         }
@@ -250,7 +275,7 @@ impl Support {
 
     /// What the sandbox covers on this kernel, and what it misses, for `fronde check` and the log.
     pub fn describe(self, ports: &[u16]) -> String {
-        if !self.files() {
+        if !self.ready() {
             return format!(
                 "unavailable ({})",
                 self.require()
@@ -272,12 +297,15 @@ impl Support {
         } else {
             missing.push("signals and abstract sockets (Linux 6.12)");
         }
+        // Below ABI 9, the seccomp filter alone keeps the agent from Unix sockets.
         if self.unix_paths() {
             covered.push("Unix socket paths".to_owned());
-        } else {
-            missing.push("Unix socket paths (Linux 7.1)");
         }
-        let mut text = format!("Landlock ABI {} ({})", self.abi, covered.join(", "));
+        let mut text = format!(
+            "Landlock ABI {} ({}); {SOCKETS}",
+            self.abi,
+            covered.join(", ")
+        );
         if !missing.is_empty() {
             text.push_str(&format!("; not confined: {}", missing.join(", ")));
         }
@@ -478,6 +506,7 @@ fn run_helper_with(
     if let Some(sandbox) = &policy.sandbox {
         // From here on, this process and every one it starts are confined.
         landlock_rules::apply(sandbox)?;
+        seccomp_rules::apply()?;
     }
     let error = command.exec();
     Err(anyhow::Error::new(error).context(format!(
@@ -607,6 +636,119 @@ mod landlock_rules {
 #[cfg(not(target_os = "linux"))]
 mod landlock_rules {
     pub(super) fn apply(_: &super::Sandbox) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "the agent's sandbox needs Linux; set [agent] sandbox = false to run it unconfined"
+        )
+    }
+}
+
+/// The seccomp filter, which closes what Landlock leaves open below ABI 9: a Unix socket reached
+/// by path is how the systemd user manager, D-Bus and the keychain, ssh-agent, gnupg and Docker
+/// would act for the agent outside its sandbox. The agent gets only the sockets it needs: IPv4 and
+/// IPv6 (which Landlock limits by port), netlink route sockets (read-only for an unprivileged
+/// process; glibc's `getaddrinfo` and `getifaddrs` read the interfaces through them), and a
+/// connected pair of stream or sequenced Unix sockets, which reaches nothing but itself and is how
+/// Node gives its child processes their standard streams. A datagram pair is refused: it could
+/// still send to any datagram socket by path. io_uring is refused too, since it creates sockets
+/// without the `socket` system call. Any other process architecture (32-bit x86, whose
+/// `socketcall` this filter does not inspect) is killed at its first system call.
+#[cfg(target_os = "linux")]
+mod seccomp_rules {
+    use anyhow::Context;
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch,
+    };
+    use std::collections::BTreeMap;
+
+    /// The architectures whose system calls the filter covers, and was tested on.
+    const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+
+    /// The bits of a socket type that name it, without `SOCK_NONBLOCK` and `SOCK_CLOEXEC`.
+    const SOCK_TYPE_MASK: u64 = 0xf;
+
+    pub(super) fn available() -> bool {
+        ARCHES.contains(&std::env::consts::ARCH)
+            && std::fs::read_to_string("/proc/sys/kernel/seccomp/actions_avail")
+                .is_ok_and(|actions| actions.split_whitespace().any(|a| a == "errno"))
+            && program().is_ok()
+    }
+
+    /// An `int` argument: the kernel reads only its low 32 bits, and so does the filter.
+    fn arg(index: u8, op: SeccompCmpOp, value: i32) -> anyhow::Result<SeccompCondition> {
+        Ok(SeccompCondition::new(
+            index,
+            SeccompCmpArgLen::Dword,
+            op,
+            u64::from(value as u32),
+        )?)
+    }
+
+    pub(super) fn program() -> anyhow::Result<BpfProgram> {
+        use SeccompCmpOp::{Eq, MaskedEq, Ne};
+        let arch = std::env::consts::ARCH;
+        anyhow::ensure!(
+            ARCHES.contains(&arch),
+            "the agent's seccomp filter does not cover {arch}"
+        );
+        let socket = vec![
+            SeccompRule::new(vec![
+                arg(0, Ne, libc::AF_INET)?,
+                arg(0, Ne, libc::AF_INET6)?,
+                arg(0, Ne, libc::AF_NETLINK)?,
+            ])?,
+            SeccompRule::new(vec![
+                arg(0, Eq, libc::AF_NETLINK)?,
+                arg(2, Ne, libc::NETLINK_ROUTE)?,
+            ])?,
+        ];
+        // `AF_UNIX` with `SOCK_RAW` is a datagram socket too.
+        let socketpair = vec![
+            SeccompRule::new(vec![arg(1, MaskedEq(SOCK_TYPE_MASK), libc::SOCK_DGRAM)?])?,
+            SeccompRule::new(vec![arg(1, MaskedEq(SOCK_TYPE_MASK), libc::SOCK_RAW)?])?,
+        ];
+        let rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::from([
+            (libc::SYS_socket, socket),
+            (libc::SYS_socketpair, socketpair),
+            (libc::SYS_io_uring_setup, Vec::new()),
+            (libc::SYS_io_uring_enter, Vec::new()),
+            (libc::SYS_io_uring_register, Vec::new()),
+        ]);
+        // The x32 ABI shares the x86_64 audit architecture, with its own system call numbers.
+        #[cfg(target_arch = "x86_64")]
+        let rules = {
+            const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+            let x32: Vec<(i64, Vec<SeccompRule>)> = rules
+                .iter()
+                .map(|(number, chain)| (number | X32_SYSCALL_BIT, chain.clone()))
+                .collect();
+            rules.into_iter().chain(x32).collect()
+        };
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EACCES as u32),
+            TargetArch::try_from(arch)?,
+        )?;
+        Ok(filter.try_into()?)
+    }
+
+    pub(super) fn apply() -> anyhow::Result<()> {
+        let program = program()?;
+        seccompiler::apply_filter(&program).context(
+            "cannot install the agent's seccomp filter; set [agent] sandbox = false to run the \
+             agent unconfined",
+        )
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod seccomp_rules {
+    pub(super) fn available() -> bool {
+        false
+    }
+
+    pub(super) fn apply() -> anyhow::Result<()> {
         anyhow::bail!(
             "the agent's sandbox needs Linux; set [agent] sandbox = false to run it unconfined"
         )
@@ -758,7 +900,8 @@ mod tests {
     fn sandbox_unavailable_stops_the_agent() {
         let missing = OsStr::new("/nonexistent/fronde-test-agent");
         for abi in [0, 1] {
-            let error = command_for(&confine(true).policy, Support { abi }, missing, &[])
+            let support = Support { abi, seccomp: true };
+            let error = command_for(&confine(true).policy, support, missing, &[])
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("[agent] sandbox = false"), "{error}");
@@ -770,10 +913,25 @@ mod tests {
             };
             assert!(error.contains(found), "{error}");
         }
+        // Landlock without seccomp is refused too.
+        let support = Support {
+            abi: 6,
+            seccomp: false,
+        };
+        let error = command_for(&confine(true).policy, support, missing, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("seccomp"), "{error}");
+        assert!(error.contains("[agent] sandbox = false"), "{error}");
+        assert!(support.describe(&[]).starts_with("unavailable"));
         // Without the sandbox, the same kernel runs the agent with the explicit environment.
         let mut policy = confine(false).policy;
         policy.cwd = PathBuf::from("/");
-        let command = command_for(&policy, Support { abi: 0 }, missing, &[]).unwrap();
+        let support = Support {
+            abi: 0,
+            seccomp: false,
+        };
+        let command = command_for(&policy, support, missing, &[]).unwrap();
         assert!(
             command
                 .get_envs()
@@ -783,16 +941,24 @@ mod tests {
 
     #[test]
     fn support_says_what_is_missing() {
+        let support = |abi| Support { abi, seccomp: true };
         assert_eq!(
-            Support { abi: 9 }.describe(&[443, 53]),
-            "Landlock ABI 9 (files, TCP ports 443 53, signals and abstract sockets, Unix socket paths)"
+            support(9).describe(&[443, 53]),
+            format!(
+                "Landlock ABI 9 (files, TCP ports 443 53, signals and abstract sockets, Unix \
+                 socket paths); {SOCKETS}"
+            )
         );
-        let text = Support { abi: 3 }.describe(&[443]);
+        let text = support(3).describe(&[443]);
         assert!(
             text.contains("not confined: TCP ports (Linux 6.7)"),
             "{text}"
         );
-        assert!(Support { abi: 1 }.describe(&[]).starts_with("unavailable"));
+        // Below ABI 9, seccomp keeps the agent from Unix sockets on its own.
+        let text = support(6).describe(&[443]);
+        assert!(text.ends_with(SOCKETS), "{text}");
+        assert!(!text.contains("not confined"), "{text}");
+        assert!(support(1).describe(&[]).starts_with("unavailable"));
     }
 
     fn tree() -> (tempfile::TempDir, PathBuf, PathBuf) {

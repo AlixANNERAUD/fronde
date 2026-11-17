@@ -353,7 +353,8 @@ pub async fn start_with_helper(
 /// How the agent is started through `helper`, the `fronde` binary: in `<data>/agent`, with its
 /// own home `<data>/home` (and `TMPDIR` in it), created here, and only the variables it needs
 /// from Fronde's environment, never a `{ env }` secret's. With `[agent] sandbox`, Landlock keeps
-/// it to the system's directories, its program's and its own two, and to the TCP ports it needs.
+/// it to the system's directories, its program's and its own two, and to the TCP ports it needs,
+/// and a seccomp filter keeps it from Unix sockets.
 pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> {
     let data = &config.data.dir;
     fronde_hub::private::prepare_data_dir(data)?;
@@ -458,7 +459,7 @@ pub fn sandbox_line(confine: &Confine, hub_port: u16) -> (String, bool) {
     let support = Support::probe();
     let mut ports = sandbox.connect_ports.clone();
     ports.push(hub_port);
-    (support.describe(&ports), support.files())
+    (support.describe(&ports), support.ready())
 }
 
 /// [`start`], with Fronde reaching its agent through `connector` and the web interface's files in
