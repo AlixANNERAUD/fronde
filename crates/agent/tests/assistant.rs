@@ -212,7 +212,10 @@ fn permission_id(event: &Event) -> Option<u64> {
 }
 
 fn user(text: &str) -> Event {
-    Event::User { text: text.into() }
+    Event::User {
+        text: text.into(),
+        by: None,
+    }
 }
 
 fn notice(text: &str) -> Event {

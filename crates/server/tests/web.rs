@@ -2,7 +2,10 @@ use fronde::sessions::Sessions;
 use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::Connector;
 use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
-use fronde_protocol::{ClientMsg, Entry, Event, Response, ServerMsg, TurnOutcome};
+use fronde_protocol::{
+    ClientMsg, Entry, Event, Response, ServerMsg, ThreadId, ThreadStatus, ThreadSummary,
+    TurnOutcome,
+};
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE,
@@ -209,7 +212,15 @@ async fn next_entry(socket: &mut Socket) -> Entry {
 /// Says hello and returns the server's answer, which comes before any entry.
 async fn hello(socket: &mut Socket, last_seq: u64, log_id: Option<&str>) -> (String, u64) {
     let log_id = log_id.map(str::to_owned);
-    say(socket, ClientMsg::Hello { last_seq, log_id }).await;
+    say(
+        socket,
+        ClientMsg::Hello {
+            last_seq,
+            log_id,
+            thread: None,
+        },
+    )
+    .await;
     match next_message(socket).await {
         ServerMsg::Hello {
             log_id, last_seq, ..
@@ -377,6 +388,7 @@ async fn ws_send_runs_a_turn() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
     )
     .await;
@@ -384,6 +396,7 @@ async fn ws_send_runs_a_turn() {
         &mut socket,
         ClientMsg::Send {
             text: "Salut".into(),
+            thread: None,
         },
     )
     .await;
@@ -396,7 +409,8 @@ async fn ws_send_runs_a_turn() {
         events,
         [
             Event::User {
-                text: "Salut".into()
+                text: "Salut".into(),
+                by: None,
             },
             Event::Assistant {
                 text: "Bonjour ".into()
@@ -473,10 +487,18 @@ async fn ws_hello_replays_then_streams() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
     )
     .await;
-    say(&mut first, ClientMsg::Send { text: "Un".into() }).await;
+    say(
+        &mut first,
+        ClientMsg::Send {
+            text: "Un".into(),
+            thread: None,
+        },
+    )
+    .await;
     let turn = until_turn_ended(&mut first).await;
     let seqs: Vec<u64> = turn.iter().map(|entry| entry.seq).collect();
     assert_eq!(seqs, [1, 2, 3, 4]);
@@ -488,6 +510,7 @@ async fn ws_hello_replays_then_streams() {
         ClientMsg::Hello {
             last_seq: 2,
             log_id: None,
+            thread: None,
         },
     )
     .await;
@@ -497,6 +520,7 @@ async fn ws_hello_replays_then_streams() {
         &mut second,
         ClientMsg::Send {
             text: "Deux".into(),
+            thread: None,
         },
     )
     .await;
@@ -506,7 +530,8 @@ async fn ws_hello_replays_then_streams() {
     assert_eq!(
         live[0].event,
         Event::User {
-            text: "Deux".into()
+            text: "Deux".into(),
+            by: None,
         }
     );
 
@@ -529,10 +554,18 @@ async fn hub_url_follows_the_listen_address() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
     )
     .await;
-    say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Un".into(),
+            thread: None,
+        },
+    )
+    .await;
     until_turn_ended(&mut socket).await;
 
     let spec = seen.lock().unwrap().clone().unwrap();
@@ -766,7 +799,14 @@ async fn hello_names_the_log_before_the_replay() {
     let (log_id, last_seq) = hello(&mut socket, 0, None).await;
     assert!(!log_id.is_empty());
     assert_eq!(last_seq, 0);
-    say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Un".into(),
+            thread: None,
+        },
+    )
+    .await;
     let turn = until_turn_ended(&mut socket).await;
 
     // The same log, the next time: only the newer entries.
@@ -807,13 +847,15 @@ async fn reconnect_in_the_middle_of_an_answer_gets_the_rest_once() {
         &mut first,
         ClientMsg::Send {
             text: "Compte".into(),
+            thread: None,
         },
     )
     .await;
     assert_eq!(
         next_entry(&mut first).await.event,
         Event::User {
-            text: "Compte".into()
+            text: "Compte".into(),
+            by: None,
         }
     );
     let seen = next_entry(&mut first).await;
@@ -833,6 +875,7 @@ async fn reconnect_in_the_middle_of_an_answer_gets_the_rest_once() {
         ClientMsg::Hello {
             last_seq: seen.seq,
             log_id: Some(log_id),
+            thread: None,
         },
     )
     .await;
@@ -884,10 +927,18 @@ async fn hello_after_a_log_reset_replays_everything() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
     )
     .await;
-    say(&mut socket, ClientMsg::Send { text: "Un".into() }).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Un".into(),
+            thread: None,
+        },
+    )
+    .await;
     let turn = until_turn_ended(&mut socket).await;
     let mut stale = open_chat(addr, &cookie).await;
     say(
@@ -895,6 +946,7 @@ async fn hello_after_a_log_reset_replays_everything() {
         ClientMsg::Hello {
             last_seq: 100,
             log_id: None,
+            thread: None,
         },
     )
     .await;
@@ -924,6 +976,7 @@ async fn relative_data_dir_gives_an_absolute_agent_cwd() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
     )
     .await;
@@ -931,6 +984,7 @@ async fn relative_data_dir_gives_an_absolute_agent_cwd() {
         &mut socket,
         ClientMsg::Send {
             text: "Salut".into(),
+            thread: None,
         },
     )
     .await;
@@ -1190,6 +1244,7 @@ async fn oversized_message_closes_the_socket() {
         &mut socket,
         ClientMsg::Send {
             text: "x".repeat(60 * 1024),
+            thread: None,
         },
     )
     .await;
@@ -1200,6 +1255,7 @@ async fn oversized_message_closes_the_socket() {
     // Over it: the server drops the connection without reading it as a message.
     let huge = serde_json::to_string(&ClientMsg::Send {
         text: "x".repeat(100 * 1024),
+        thread: None,
     })
     .unwrap();
     let _ = timeout(WAIT, socket.send(Message::text(huge)))
@@ -1222,6 +1278,7 @@ async fn oversized_message_closes_the_socket() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
     )
     .await;
@@ -1417,6 +1474,7 @@ async fn answer_over_websocket_reaches_the_waiter() {
         &mut socket,
         ClientMsg::Send {
             text: "Salut".into(),
+            thread: None,
         },
     )
     .await;
@@ -1424,7 +1482,8 @@ async fn answer_over_websocket_reaches_the_waiter() {
     assert_eq!(
         next_entry(&mut socket).await.event,
         Event::User {
-            text: "Salut".into()
+            text: "Salut".into(),
+            by: None,
         }
     );
     let assistant_token = loop {
@@ -1553,6 +1612,7 @@ async fn permission_card_over_websocket() {
         &mut socket,
         ClientMsg::Send {
             text: "Mon agenda ?".into(),
+            thread: None,
         },
     )
     .await;
@@ -1679,6 +1739,7 @@ async fn turn_end_closes_a_permission_card() {
         &mut socket,
         ClientMsg::Send {
             text: "Mon agenda ?".into(),
+            thread: None,
         },
     )
     .await;
@@ -1728,4 +1789,676 @@ async fn turn_end_closes_a_permission_card() {
             reason: "Cette demande est déjà close.".into()
         }
     );
+}
+
+/// Says hello to `thread` and returns the server's hello (log id, newest seq) and the thread
+/// list that follows it.
+async fn hello_thread(
+    socket: &mut Socket,
+    thread: ThreadId,
+    last_seq: u64,
+    log_id: Option<&str>,
+) -> (String, u64, Vec<ThreadSummary>) {
+    say(
+        socket,
+        ClientMsg::Hello {
+            last_seq,
+            log_id: log_id.map(str::to_owned),
+            thread: Some(thread),
+        },
+    )
+    .await;
+    // Entries of the thread streamed until now may still come first.
+    let (log_id, newest) = loop {
+        match next_message(socket).await {
+            ServerMsg::Hello {
+                log_id,
+                last_seq,
+                thread: named,
+                ..
+            } => {
+                assert_eq!(named, Some(thread));
+                break (log_id, last_seq);
+            }
+            ServerMsg::Entry(_) | ServerMsg::Threads { .. } => {}
+            other => panic!("expected the server's hello, got {other:?}"),
+        }
+    };
+    match next_message(socket).await {
+        ServerMsg::Threads { threads } => (log_id, newest, threads),
+        other => panic!("expected the thread list, got {other:?}"),
+    }
+}
+
+/// Thread lists until one satisfies `done`; entries are skipped.
+async fn list_until(
+    socket: &mut Socket,
+    done: impl Fn(&[ThreadSummary]) -> bool,
+) -> Vec<ThreadSummary> {
+    loop {
+        match next_message(socket).await {
+            ServerMsg::Threads { threads } if done(&threads) => return threads,
+            ServerMsg::Threads { .. } | ServerMsg::Entry(_) => {}
+            other => panic!("expected a thread list, got {other:?}"),
+        }
+    }
+}
+
+fn listed(threads: &[ThreadSummary], id: ThreadId) -> Option<&ThreadSummary> {
+    threads.iter().find(|thread| thread.id == id)
+}
+
+/// Starts a thread with its first message; returns the thread the server made.
+async fn create(socket: &mut Socket, client_id: &str, text: &str) -> ThreadId {
+    say(
+        socket,
+        ClientMsg::Create {
+            client_id: client_id.into(),
+            text: text.into(),
+        },
+    )
+    .await;
+    loop {
+        match next_message(socket).await {
+            ServerMsg::Created {
+                client_id: named,
+                thread,
+            } => {
+                assert_eq!(named, client_id);
+                return thread;
+            }
+            ServerMsg::Threads { .. } | ServerMsg::Entry(_) => {}
+            other => panic!("expected the new thread, got {other:?}"),
+        }
+    }
+}
+
+/// The next thread refusal: its thread, its client id and its reason; lists and entries are
+/// skipped.
+async fn next_thread_refusal(socket: &mut Socket) -> (Option<ThreadId>, Option<String>, String) {
+    loop {
+        match next_message(socket).await {
+            ServerMsg::ThreadRefused {
+                thread,
+                client_id,
+                reason,
+            } => return (thread, client_id, reason),
+            ServerMsg::Threads { .. } | ServerMsg::Entry(_) => {}
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+fn events_of(entries: Vec<Entry>) -> Vec<Event> {
+    entries.into_iter().map(|entry| entry.event).collect()
+}
+
+const NOT_FOUND: &str = "Conversation introuvable.";
+const ARCHIVED_REFUSAL: &str = "Cette conversation est archivée : elle ne reçoit plus de message.";
+
+#[tokio::test]
+async fn create_streams_the_new_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, seen) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    let (_, _, threads) = hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].id, ThreadId::MAIN);
+    assert_eq!(threads[0].title, "Fronde");
+    assert_eq!(threads[0].status, ThreadStatus::Idle);
+
+    let thread = create(&mut socket, "c1", "Range\nle garage").await;
+    assert_eq!(thread, ThreadId(2));
+    let (_, _, threads) = hello_thread(&mut socket, thread, 0, None).await;
+    let summary = listed(&threads, thread).unwrap();
+    assert_eq!(summary.title, "Range le garage");
+    assert_eq!(summary.parent, None);
+    assert!(!summary.archived);
+    assert_eq!(
+        events_of(until_turn_ended(&mut socket).await),
+        [
+            Event::User {
+                text: "Range\nle garage".into(),
+                by: None,
+            },
+            Event::Assistant {
+                text: "Bonjour ".into()
+            },
+            Event::Assistant {
+                text: "Alix !".into()
+            },
+            Event::TurnEnded {
+                outcome: TurnOutcome::Done
+            },
+        ]
+    );
+    // Thread 2's agent works in thread 2's directory.
+    let spec = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(spec.thread, thread);
+    assert!(spec.cwd.ends_with("threads/2/work"), "{:?}", spec.cwd);
+
+    // A retry after a lost reply gets the same thread, and sends nothing again.
+    let (log_id, newest, _) = hello_thread(&mut socket, thread, 4, None).await;
+    assert_eq!(newest, 4);
+    assert_eq!(create(&mut socket, "c1", "Range\nle garage").await, thread);
+    let (_, again, threads) = hello_thread(&mut socket, thread, 4, Some(&log_id)).await;
+    assert_eq!(again, 4);
+    assert_eq!(threads.len(), 2);
+
+    // A client id the server would not keep, or an empty first message, is refused.
+    for (client_id, text) in [("", "Salut"), ("a b", "Salut"), ("c2", "  ")] {
+        say(
+            &mut socket,
+            ClientMsg::Create {
+                client_id: client_id.into(),
+                text: text.into(),
+            },
+        )
+        .await;
+        let (thread, refused, _) = next_thread_refusal(&mut socket).await;
+        assert_eq!((thread, refused.as_deref()), (None, Some(client_id)));
+    }
+    say(
+        &mut socket,
+        ClientMsg::Create {
+            client_id: "x".repeat(65),
+            text: "Salut".into(),
+        },
+    )
+    .await;
+    next_thread_refusal(&mut socket).await;
+}
+
+/// A page streams one thread at a time; a hello switches it, and replays the other thread's
+/// log from what the page has.
+#[tokio::test]
+async fn switching_threads_replays_the_other_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    let (main_log, _, _) = hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Un".into(),
+            thread: Some(ThreadId::MAIN),
+        },
+    )
+    .await;
+    let main_turn = until_turn_ended(&mut socket).await;
+    assert_eq!(main_turn.last().unwrap().seq, 4);
+
+    let second = create(&mut socket, "c1", "Deux").await;
+    let (second_log, _, _) = hello_thread(&mut socket, second, 0, None).await;
+    assert_ne!(second_log, main_log);
+    let second_turn = until_turn_ended(&mut socket).await;
+    assert_eq!(
+        second_turn[0].event,
+        Event::User {
+            text: "Deux".into(),
+            by: None,
+        }
+    );
+
+    // A message to the main thread while the page streams thread 2: none of its entries come.
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Trois".into(),
+            thread: Some(ThreadId::MAIN),
+        },
+    )
+    .await;
+    list_until(&mut socket, |threads| {
+        listed(threads, ThreadId::MAIN).unwrap().status == ThreadStatus::Done
+            && listed(threads, ThreadId::MAIN).unwrap().updated_at > main_turn.last().unwrap().at
+    })
+    .await;
+
+    // Back to the main thread: only what came after seq 4.
+    let (log_id, newest, _) = hello_thread(&mut socket, ThreadId::MAIN, 4, Some(&main_log)).await;
+    assert_eq!((log_id, newest), (main_log, 8));
+    let replayed = until_turn_ended(&mut socket).await;
+    assert_eq!(replayed.first().unwrap().seq, 5);
+    assert_eq!(
+        replayed.first().unwrap().event,
+        Event::User {
+            text: "Trois".into(),
+            by: None,
+        }
+    );
+    assert_eq!(replayed.len(), 4);
+}
+
+/// Send and Stop name their thread: a turn of thread 2 runs, waits on its card, and stops,
+/// while the main thread stays idle.
+#[tokio::test]
+async fn send_and_stop_on_thread_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        ask_permission: true,
+        ..FakeScript::default()
+    });
+    let addr = start_with(config(dir.path(), true), connector, &site(dir.path())).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    let second = create(&mut socket, "c1", "Mon agenda ?").await;
+    hello_thread(&mut socket, second, 0, None).await;
+    loop {
+        if matches!(next_entry(&mut socket).await.event, Event::Request { .. }) {
+            break;
+        }
+    }
+    say(
+        &mut socket,
+        ClientMsg::Cancel {
+            thread: Some(second),
+        },
+    )
+    .await;
+    // The card closes and the turn ends, in either order; the lists that come meanwhile are
+    // kept, the last one may be the one awaited.
+    let mut stopped = Vec::new();
+    let mut last_list = None;
+    while stopped.len() < 2 {
+        match next_message(&mut socket).await {
+            ServerMsg::Entry(entry) => stopped.push(entry.event),
+            ServerMsg::Threads { threads } => last_list = Some(threads),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        stopped.contains(&Event::TurnEnded {
+            outcome: TurnOutcome::Cancelled
+        }),
+        "{stopped:?}"
+    );
+    assert!(
+        stopped.iter().any(|event| matches!(
+            event,
+            Event::RequestClosed {
+                outcome: fronde_protocol::Outcome::Cancelled,
+                ..
+            }
+        )),
+        "{stopped:?}"
+    );
+    // Its badge goes with its card.
+    let stopped = |threads: &[ThreadSummary]| {
+        listed(threads, second).is_some_and(|thread| {
+            thread.status == ThreadStatus::Cancelled && thread.open_requests == 0
+        })
+    };
+    let threads = match last_list {
+        Some(threads) if stopped(&threads) => threads,
+        _ => list_until(&mut socket, stopped).await,
+    };
+    assert_eq!(
+        listed(&threads, ThreadId::MAIN).unwrap().status,
+        ThreadStatus::Idle
+    );
+
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Encore".into(),
+            thread: Some(second),
+        },
+    )
+    .await;
+    assert_eq!(
+        next_entry(&mut socket).await.event,
+        Event::User {
+            text: "Encore".into(),
+            by: None,
+        }
+    );
+    list_until(&mut socket, |threads| {
+        listed(threads, second).unwrap().status == ThreadStatus::Running
+    })
+    .await;
+    // The main thread's log stays empty.
+    let (_, newest, _) = hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    assert_eq!(newest, 0);
+}
+
+/// A card of thread 2 is answered from a page streaming the main thread: request ids are
+/// global, and the list shows the thread waits for an answer meanwhile.
+#[tokio::test]
+async fn answer_a_card_of_another_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        ask_permission: true,
+        ..FakeScript::default()
+    });
+    let addr = start_with(config(dir.path(), true), connector, &site(dir.path())).await;
+    let cookie = sign_in(addr).await;
+    let mut main = open_chat(addr, &cookie).await;
+    hello_thread(&mut main, ThreadId::MAIN, 0, None).await;
+    let second = create(&mut main, "c1", "Mon agenda ?").await;
+    let mut other = open_chat(addr, &cookie).await;
+    hello_thread(&mut other, second, 0, None).await;
+    let id = loop {
+        if let Event::Request { id, .. } = next_entry(&mut other).await.event {
+            break id;
+        }
+    };
+    let threads = list_until(&mut main, |threads| {
+        listed(threads, second).is_some_and(|thread| thread.open_requests == 1)
+    })
+    .await;
+    assert_eq!(
+        listed(&threads, second).unwrap().status,
+        ThreadStatus::Running
+    );
+    assert_eq!(listed(&threads, ThreadId::MAIN).unwrap().open_requests, 0);
+
+    say(
+        &mut main,
+        ClientMsg::Answer {
+            id,
+            response: Response::Permission {
+                choice: "allow-once".into(),
+            },
+        },
+    )
+    .await;
+    let turn = events_of(until_turn_ended(&mut other).await);
+    assert!(
+        matches!(
+            &turn[..],
+            [
+                Event::RequestClosed { id: closed, by: Some(by), .. },
+                Event::TurnEnded { outcome: TurnOutcome::Done }
+            ] if *closed == id && by == "Alix"
+        ),
+        "{turn:?}"
+    );
+    list_until(&mut main, |threads| {
+        listed(threads, second)
+            .is_some_and(|thread| thread.open_requests == 0 && thread.status == ThreadStatus::Done)
+    })
+    .await;
+}
+
+/// Renaming and archiving push the new list to every page that streams a thread; bad titles
+/// and archiving the main thread are refused.
+#[tokio::test]
+async fn rename_and_archive_push_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    let mut phone = open_chat(addr, &cookie).await;
+    hello_thread(&mut phone, ThreadId::MAIN, 0, None).await;
+    let second = create(&mut socket, "c1", "Deux").await;
+    list_until(&mut phone, |threads| {
+        listed(threads, second).is_some_and(|thread| thread.status == ThreadStatus::Done)
+    })
+    .await;
+
+    say(
+        &mut socket,
+        ClientMsg::Rename {
+            thread: second,
+            title: "  Garage ".into(),
+        },
+    )
+    .await;
+    list_until(&mut phone, |threads| {
+        listed(threads, second).unwrap().title == "Garage"
+    })
+    .await;
+    list_until(&mut socket, |threads| {
+        listed(threads, second).unwrap().title == "Garage"
+    })
+    .await;
+    for title in [
+        "Gar\u{202E}age".to_owned(),
+        "Gar\u{200B}age".to_owned(),
+        "Gar\nage".to_owned(),
+        "   ".to_owned(),
+        "x".repeat(81),
+    ] {
+        say(
+            &mut socket,
+            ClientMsg::Rename {
+                thread: second,
+                title: title.clone(),
+            },
+        )
+        .await;
+        let (thread, _, reason) = next_thread_refusal(&mut socket).await;
+        assert_eq!(thread, Some(second), "{title:?}");
+        assert!(reason.starts_with("Le titre"), "{reason}");
+    }
+    // The main thread can be renamed, never archived.
+    say(
+        &mut socket,
+        ClientMsg::Archive {
+            thread: ThreadId::MAIN,
+            archived: true,
+        },
+    )
+    .await;
+    let (thread, _, reason) = next_thread_refusal(&mut socket).await;
+    assert_eq!(thread, Some(ThreadId::MAIN));
+    assert_eq!(reason, "La conversation principale ne s'archive pas.");
+
+    say(
+        &mut socket,
+        ClientMsg::Archive {
+            thread: second,
+            archived: true,
+        },
+    )
+    .await;
+    list_until(&mut phone, |threads| {
+        listed(threads, second).unwrap().archived
+    })
+    .await;
+    say(
+        &mut phone,
+        ClientMsg::Archive {
+            thread: second,
+            archived: false,
+        },
+    )
+    .await;
+    list_until(&mut socket, |threads| {
+        listed(threads, second).is_some_and(|thread| !thread.archived && thread.title == "Garage")
+    })
+    .await;
+}
+
+/// An archived thread is read-only: still streamed, but messages and renames are refused, and
+/// its log does not change.
+#[tokio::test]
+async fn archived_thread_refuses_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    let second = create(&mut socket, "c1", "Deux").await;
+    let (log_id, _, _) = hello_thread(&mut socket, second, 0, None).await;
+    until_turn_ended(&mut socket).await;
+    say(
+        &mut socket,
+        ClientMsg::Archive {
+            thread: second,
+            archived: true,
+        },
+    )
+    .await;
+    list_until(&mut socket, |threads| {
+        listed(threads, second).unwrap().archived
+    })
+    .await;
+
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Encore".into(),
+            thread: Some(second),
+        },
+    )
+    .await;
+    assert_eq!(
+        next_thread_refusal(&mut socket).await,
+        (Some(second), None, ARCHIVED_REFUSAL.into())
+    );
+    say(
+        &mut socket,
+        ClientMsg::Rename {
+            thread: second,
+            title: "Garage".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        next_thread_refusal(&mut socket).await,
+        (Some(second), None, ARCHIVED_REFUSAL.into())
+    );
+    // Still readable, unchanged.
+    let (_, newest, _) = hello_thread(&mut socket, second, 0, Some(&log_id)).await;
+    assert_eq!(newest, 4);
+    let replayed = until_turn_ended(&mut socket).await;
+    assert_eq!(replayed.len(), 4);
+}
+
+/// A thread that does not exist is refused like one the user may not see, whatever the
+/// message; the page's stream does not change.
+#[tokio::test]
+async fn unknown_thread_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    let unknown = ThreadId(99);
+    for message in [
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: Some(unknown),
+        },
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: Some(unknown),
+        },
+        ClientMsg::Cancel {
+            thread: Some(unknown),
+        },
+        ClientMsg::Rename {
+            thread: unknown,
+            title: "Garage".into(),
+        },
+        ClientMsg::Archive {
+            thread: unknown,
+            archived: true,
+        },
+    ] {
+        say(&mut socket, message).await;
+        assert_eq!(
+            next_thread_refusal(&mut socket).await,
+            (Some(unknown), None, NOT_FOUND.into())
+        );
+    }
+    // Still streaming the main thread.
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        next_entry(&mut socket).await.event,
+        Event::User {
+            text: "Salut".into(),
+            by: None,
+        }
+    );
+}
+
+/// A page that knows nothing of threads talks to the main thread as before, and never gets a
+/// thread message, even when threads change.
+#[tokio::test]
+async fn old_page_still_talks_to_the_main_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut old = open_chat(addr, &cookie).await;
+    let send_raw = |json: &'static str| Message::text(json);
+    timeout(WAIT, old.send(send_raw(r#"{"type":"hello","last_seq":0}"#)))
+        .await
+        .unwrap()
+        .unwrap();
+    let ServerMsg::Hello { thread, .. } = next_message(&mut old).await else {
+        panic!("expected the server's hello");
+    };
+    assert_eq!(thread, None);
+    // Another page makes a thread meanwhile.
+    let mut new = open_chat(addr, &cookie).await;
+    hello_thread(&mut new, ThreadId::MAIN, 0, None).await;
+    create(&mut new, "c1", "Deux").await;
+
+    timeout(
+        WAIT,
+        old.send(send_raw(r#"{"type":"send","text":"salut"}"#)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut events = Vec::new();
+    loop {
+        match next_message(&mut old).await {
+            ServerMsg::Entry(entry) => {
+                let ended = matches!(entry.event, Event::TurnEnded { .. });
+                events.push(entry.event);
+                if ended {
+                    break;
+                }
+            }
+            other => panic!("an old page got {other:?}"),
+        }
+    }
+    assert_eq!(
+        events,
+        [
+            Event::User {
+                text: "salut".into(),
+                by: None,
+            },
+            Event::Assistant {
+                text: "Bonjour ".into()
+            },
+            Event::Assistant {
+                text: "Alix !".into()
+            },
+            Event::TurnEnded {
+                outcome: TurnOutcome::Done
+            },
+        ]
+    );
+    let json = serde_json::to_string(&ServerMsg::Entry(Entry {
+        seq: 1,
+        at: "2026-11-17T10:00:00Z".parse().unwrap(),
+        event: events[0].clone(),
+    }))
+    .unwrap();
+    assert!(
+        json.contains(r#""event":{"type":"user","text":"salut"}"#),
+        "{json}"
+    );
+    timeout(WAIT, old.send(send_raw(r#"{"type":"cancel"}"#)))
+        .await
+        .unwrap()
+        .unwrap();
 }

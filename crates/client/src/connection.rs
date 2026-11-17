@@ -56,6 +56,7 @@ impl Connection {
         ClientMsg::Hello {
             last_seq: chat.last_seq(),
             log_id: chat.log_id().map(str::to_owned),
+            thread: chat.thread(),
         }
     }
 
@@ -115,7 +116,8 @@ mod tests {
             connection.on_open(&chat),
             ClientMsg::Hello {
                 last_seq: 0,
-                log_id: None
+                log_id: None,
+                thread: None,
             }
         );
         chat.apply(&ServerMsg::Hello {
@@ -123,13 +125,15 @@ mod tests {
             last_seq: 0,
             user: None,
             admin: false,
+            thread: None,
         });
         assert_eq!(connection.state(), State::Open);
         assert_eq!(
             connection.on_open(&chat),
             ClientMsg::Hello {
                 last_seq: 0,
-                log_id: Some("a".into())
+                log_id: Some("a".into()),
+                thread: None,
             }
         );
     }

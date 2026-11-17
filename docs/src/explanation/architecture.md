@@ -103,8 +103,17 @@ Each thread has its own agent process, started on the thread's first message, in
 directories (`agent/` and `home/` for the main thread, `threads/<id>/work/` and
 `threads/<id>/home/` for another), confined to them, in a systemd scope named after the thread,
 and with its own hub token (see [Threads](security.md#threads)). Starting or stopping one never
-stops another. Several threads in the chat, and threads that agents start for a task, are
-planned.
+stops another. Threads that agents start for a task are planned.
+
+The chat's WebSocket carries every thread (see
+[the chat WebSocket](../reference/endpoints.md#the-chat-websocket)). A socket streams one thread
+at a time and switches with a new `hello`; the page that names a thread also gets the thread
+list, pushed again whenever a thread is made, renamed or archived, a turn starts, waits or ends,
+or a card opens or closes in it. Each thread's status is computed live: waiting for an agent,
+running, or how its last turn ended, read from the thread's stream for a thread not open yet.
+Every thread id a page sends is checked against the signed-in user, never trusted as an
+identity: a thread that does not exist and one the user may not see are refused alike, and an
+archived thread is read-only. The web interface's thread list is planned.
 
 At most `[threads] max_running` agent processes run at once (3 by default), the main thread's
 included: the **pool**. A turn whose thread has no agent running takes a slot before its agent

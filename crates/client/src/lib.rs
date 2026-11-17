@@ -2,6 +2,8 @@
 
 pub mod chat;
 pub mod connection;
+pub mod threads;
 
 pub use chat::{Chat, Item, PermissionStatus, RequestStatus, Row, ToolStatus};
 pub use connection::{Action, Connection, State};
+pub use threads::{ListRow, ThreadRefusal, Threads};

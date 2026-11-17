@@ -298,7 +298,10 @@ mod tests {
     const SESSION: (&str, &str) = ("agent", "session");
 
     fn user(text: &str) -> Event {
-        Event::User { text: text.into() }
+        Event::User {
+            text: text.into(),
+            by: None,
+        }
     }
 
     fn line(seq: u64, text: &str) -> String {
@@ -323,7 +326,7 @@ mod tests {
         log.since(0)
             .into_iter()
             .map(|entry| match entry.event {
-                Event::User { text } => (entry.seq, text),
+                Event::User { text, .. } => (entry.seq, text),
                 other => panic!("{other:?}"),
             })
             .collect()

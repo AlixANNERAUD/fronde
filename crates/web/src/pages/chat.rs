@@ -73,7 +73,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
 #[component]
 fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>) -> Element {
     match item {
-        Item::User { text } => rsx! {
+        Item::User { text, .. } => rsx! {
             Message { align: MessageAlign::End,
                 MessageContent {
                     Bubble { align: BubbleAlign::End,
@@ -194,7 +194,7 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> E
         let text = draft.peek().trim().to_owned();
         if !text.is_empty() {
             on_send.call(Outgoing {
-                message: ClientMsg::Send { text },
+                message: ClientMsg::Send { text, thread: None },
                 sent: Some(delivered),
                 dropped: None,
             });
@@ -230,7 +230,7 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> E
                             aria_label: "Stop",
                             onclick: move |_| {
                                 on_send.call(Outgoing {
-                                    message: ClientMsg::Cancel,
+                                    message: ClientMsg::Cancel { thread: None },
                                     sent: None,
                                     dropped: None,
                                 })
@@ -546,7 +546,8 @@ mod tests {
         assert_eq!(
             sent(),
             [ClientMsg::Send {
-                text: "Bonjour".into()
+                text: "Bonjour".into(),
+                thread: None,
             }]
         );
         assert!(page.html().contains(r#"value="""#), "{}", page.html());

@@ -1,7 +1,9 @@
 //! What the chat shows, built from the conversation log's entries. Pure logic, without browser
 //! APIs, so it is tested natively.
 
-use fronde_protocol::{Card, Entry, Event, Outcome, RequestId, ServerMsg, ToolState, TurnOutcome};
+use fronde_protocol::{
+    Card, Entry, Event, Outcome, RequestId, ServerMsg, ThreadId, ToolState, TurnOutcome,
+};
 
 /// How a tool call ended, as the chat shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub enum RequestStatus {
 pub enum Item {
     User {
         text: String,
+        /// Who wrote it, when it was not the page's user: a parent thread for a child's task.
+        by: Option<String>,
     },
     /// Consecutive text chunks of a turn, merged.
     Assistant {
@@ -105,9 +109,25 @@ pub struct Chat {
     viewer: Option<String>,
     /// That user is an admin, who may keep a secret for good.
     admin: bool,
+    /// The thread whose log this is, to name in the hello; `None` for the main thread of a page
+    /// that knows nothing of threads.
+    thread: Option<ThreadId>,
 }
 
 impl Chat {
+    /// The chat of thread `thread`, empty until its hello.
+    pub fn for_thread(thread: ThreadId) -> Self {
+        Self {
+            thread: Some(thread),
+            ..Self::default()
+        }
+    }
+
+    /// The thread whose log this is, as the hello names it.
+    pub fn thread(&self) -> Option<ThreadId> {
+        self.thread
+    }
+
     pub fn rows(&self) -> &[Row] {
         &self.rows
     }
@@ -138,6 +158,7 @@ impl Chat {
                 last_seq,
                 user,
                 admin,
+                thread: _,
             } => {
                 // Another log, or one shorter than what the page shows (deleted and started
                 // again): what the page shows is gone, the server replays the whole new log.
@@ -146,6 +167,7 @@ impl Chat {
                 {
                     *self = Self {
                         generation: self.generation + 1,
+                        thread: self.thread,
                         ..Self::default()
                     };
                 }
@@ -163,6 +185,10 @@ impl Chat {
                     row.version += 1;
                 }
             }
+            // The thread list's messages: see [`crate::Threads`].
+            ServerMsg::Threads { .. }
+            | ServerMsg::Created { .. }
+            | ServerMsg::ThreadRefused { .. } => {}
         }
     }
 
@@ -193,9 +219,9 @@ impl Chat {
         self.last_seq = entry.seq;
         let seq = entry.seq;
         match entry.event {
-            Event::User { text } => {
+            Event::User { text, by } => {
                 self.running = true;
-                self.push(seq, Item::User { text });
+                self.push(seq, Item::User { text, by });
             }
             Event::Assistant { text } => {
                 let running = self.running;
@@ -350,7 +376,13 @@ mod tests {
     }
 
     fn user(seq: u64, text: &str) -> Entry {
-        entry(seq, Event::User { text: text.into() })
+        entry(
+            seq,
+            Event::User {
+                text: text.into(),
+                by: None,
+            },
+        )
     }
 
     fn assistant(seq: u64, text: &str) -> Entry {
@@ -377,6 +409,7 @@ mod tests {
             last_seq,
             user: None,
             admin: false,
+            thread: None,
         }
     }
 
@@ -397,7 +430,8 @@ mod tests {
             items(&chat),
             [
                 Item::User {
-                    text: "Salut".into()
+                    text: "Salut".into(),
+                    by: None,
                 },
                 Item::Assistant {
                     text: "Bonjour Alix !".into()
@@ -465,7 +499,8 @@ mod tests {
             items(&chat),
             [
                 Item::User {
-                    text: "Salut".into()
+                    text: "Salut".into(),
+                    by: None,
                 },
                 Item::Assistant {
                     text: "Bonjour".into()
@@ -645,6 +680,7 @@ mod tests {
             last_seq: 0,
             user: Some("alix".into()),
             admin: true,
+            thread: None,
         });
         assert!(chat.admin());
         let card = Card::Secret {
@@ -773,6 +809,7 @@ mod tests {
             last_seq: 0,
             user: Some("alix".into()),
             admin: true,
+            thread: None,
         });
         assert!(chat.admin());
         apply_all(
@@ -842,7 +879,8 @@ mod tests {
             items(&chat),
             [
                 Item::User {
-                    text: "Deux".into()
+                    text: "Deux".into(),
+                    by: None,
                 },
                 Item::Assistant { text: "B".into() },
             ]

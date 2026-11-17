@@ -387,9 +387,11 @@ async fn assistant_token_never_appears() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
         ClientMsg::Send {
             text: "Salut".into(),
+            thread: None,
         },
     ] {
         send_text(&mut socket, serde_json::to_string(&message).unwrap()).await;
@@ -723,9 +725,11 @@ async fn secret_answer_never_appears() {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
         ClientMsg::Send {
             text: "Salut".into(),
+            thread: None,
         },
     ] {
         send_text(&mut socket, serde_json::to_string(&message).unwrap()).await;
@@ -784,7 +788,10 @@ async fn secret_answer_never_appears() {
                             return id;
                         }
                     }
-                    ServerMsg::Refused { .. } => {}
+                    ServerMsg::Refused { .. }
+                    | ServerMsg::Threads { .. }
+                    | ServerMsg::Created { .. }
+                    | ServerMsg::ThreadRefused { .. } => {}
                 }
             }
             panic!("the socket closed");

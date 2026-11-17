@@ -8,12 +8,13 @@ use crate::confine::Confine;
 use crate::elicitation;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
-use crate::threads::{self, Pool, Slot, ThreadId};
+use crate::threads::{self, Changes, Pool, Slot, ThreadId};
 use crate::tokens::{TokenLease, Tokens};
 use agent_client_protocol::v1::schema::CreateElicitationResponse;
 use anyhow::{Context, anyhow};
+use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
-use fronde_protocol::{Card, Outcome, RequestId};
+use fronde_protocol::{Card, Outcome, RequestId, ThreadStatus};
 use fronde_requests::{Ask, Caller, Requests, Resolution, User};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -78,6 +79,8 @@ pub(crate) struct Shared {
     pub(crate) tokens: Tokens,
     /// The agent processes that may run at once.
     pub(crate) pool: Arc<Pool>,
+    /// Told when a thread's status changes, for the thread list.
+    pub(crate) changes: Changes,
 }
 
 pub struct Assistant {
@@ -113,6 +116,21 @@ pub struct Assistant {
     permission_timeout: Mutex<Duration>,
     /// How long an elicitation's card waits for an answer.
     elicitation_timeout: Mutex<Duration>,
+    /// Where its turns stand, for the thread list.
+    activity: Mutex<Activity>,
+    /// Told when [`Assistant::status`] changes.
+    changes: Changes,
+}
+
+/// Where a thread's turns stand, as the thread list shows it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Activity {
+    /// A turn runs: from its message to its end.
+    running: bool,
+    /// The running turn waits for a place among the agents running at once.
+    queued: bool,
+    /// How the last turn ended, if one did.
+    last_outcome: Option<TurnOutcome>,
 }
 
 struct Turn {
@@ -162,6 +180,7 @@ impl Assistant {
             connector,
             tokens,
             pool,
+            changes,
         } = shared;
         let log = ConversationLog::open(&db, &topic).await?;
         let assistant = Arc::new(Self {
@@ -182,6 +201,8 @@ impl Assistant {
             requests: OnceLock::new(),
             permission_timeout: Mutex::new(permission::PERMISSION_TIMEOUT),
             elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
+            activity: Mutex::new(Activity::default()),
+            changes,
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
         let last_turn = assistant
@@ -202,6 +223,7 @@ impl Assistant {
                 })
                 .await;
         }
+        lock(&assistant.activity).last_outcome = last_outcome(&assistant.log.since(0));
         Ok(assistant)
     }
 
@@ -216,6 +238,33 @@ impl Assistant {
     /// The thread's stream.
     pub fn topic(&self) -> &str {
         &self.topic
+    }
+
+    /// Where the thread's turns stand: queued or running, else how its last turn ended.
+    pub fn status(&self) -> ThreadStatus {
+        let activity = *lock(&self.activity);
+        if activity.queued {
+            return ThreadStatus::Queued;
+        }
+        if activity.running {
+            return ThreadStatus::Running;
+        }
+        status_after(activity.last_outcome)
+    }
+
+    /// When the thread's newest entry was written, if it has one.
+    pub fn last_activity(&self) -> Option<DateTime<Utc>> {
+        self.log.last_at()
+    }
+
+    /// Records a change of the thread's activity, and tells the thread list when its status
+    /// changed.
+    fn set_activity(&self, change: impl FnOnce(&mut Activity)) {
+        let before = self.status();
+        change(&mut lock(&self.activity));
+        if self.status() != before {
+            self.changes.notify();
+        }
     }
 
     pub(crate) fn set_archived(&self, archived: bool) {
@@ -267,7 +316,11 @@ impl Assistant {
                 self.append(Event::Notice { text: BUSY.into() }).await;
                 return;
             }
-            let seq = match self.log.append(Event::User { text: text.clone() }).await {
+            let message = Event::User {
+                text: text.clone(),
+                by: None,
+            };
+            let seq = match self.log.append(message).await {
                 Ok(entry) => Some(entry.seq),
                 Err(error) => {
                     tracing::error!("cannot write the conversation log: {error:#}");
@@ -285,6 +338,7 @@ impl Assistant {
                 timer.cancel();
             }
             self.touch();
+            self.set_activity(|activity| activity.running = true);
             (cancel, seq)
         };
         let assistant = self.clone();
@@ -311,6 +365,13 @@ impl Assistant {
             let mut turn = assistant.turn.lock().await;
             assistant.append(Event::TurnEnded { outcome }).await;
             *turn = None;
+            assistant.set_activity(|activity| {
+                *activity = Activity {
+                    running: false,
+                    queued: false,
+                    last_outcome: Some(outcome),
+                }
+            });
             drop(turn);
             assistant.touch();
             assistant.arm_idle_stop();
@@ -364,6 +425,7 @@ impl Assistant {
 
     /// Says, once per turn, that the turn waits for another thread's agent to stop.
     pub(crate) async fn waiting_for_a_slot(&self) {
+        self.set_activity(|activity| activity.queued = true);
         self.append(Event::Notice {
             text: WAITING.into(),
         })
@@ -573,6 +635,7 @@ impl Assistant {
                     () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
                     slot = self.pool.acquire(self) => slot?,
                 };
+                self.set_activity(|activity| activity.queued = false);
                 // Dropping the connect future stops an agent that is still starting.
                 tokio::select! {
                     biased;
@@ -863,6 +926,27 @@ fn notice_for(error: &anyhow::Error) -> &'static str {
         Failure::NotInstalled => NOT_INSTALLED,
         Failure::SignedOut => SIGNED_OUT,
         Failure::Other => FAILED,
+    }
+}
+
+/// How the last turn of `entries` ended, if one did and none started since.
+fn last_outcome(entries: &[crate::log::Entry]) -> Option<TurnOutcome> {
+    entries.iter().rev().find_map(|entry| match entry.event {
+        Event::TurnEnded { outcome } => Some(Some(outcome)),
+        Event::User { .. } => Some(None),
+        _ => None,
+    })?
+}
+
+/// A thread's status when no turn runs, from how its last turn ended.
+pub(crate) fn status_after(outcome: Option<TurnOutcome>) -> ThreadStatus {
+    match outcome {
+        None => ThreadStatus::Idle,
+        Some(TurnOutcome::Done) => ThreadStatus::Done,
+        Some(TurnOutcome::Cancelled) => ThreadStatus::Cancelled,
+        Some(TurnOutcome::Refused | TurnOutcome::Limit | TurnOutcome::Error) => {
+            ThreadStatus::Failed
+        }
     }
 }
 

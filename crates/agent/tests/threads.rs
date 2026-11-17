@@ -4,8 +4,8 @@ use fronde_agent::fake::{
     FAKE_MODEL_OPTION, FAKE_MODELS, FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk,
 };
 use fronde_agent::log::{ConversationLog, Event, TurnOutcome};
-use fronde_agent::threads::{Budget, StartedBy, ThreadId, Threads};
-use fronde_protocol::{Card, ChoiceOption, Field, Outcome};
+use fronde_agent::threads::{Budget, Refusal, StartedBy, ThreadId, Threads};
+use fronde_protocol::{Card, ChoiceOption, Field, Outcome, ThreadStatus, ThreadSummary};
 use fronde_requests::{Ask, Caller, Requests, User};
 use sea_orm::EntityTrait;
 use secrecy::ExposeSecret;
@@ -96,7 +96,10 @@ async fn wait_for_turns(assistant: &Assistant, count: usize) -> Vec<Event> {
 }
 
 fn user(text: &str) -> Event {
-    Event::User { text: text.into() }
+    Event::User {
+        text: text.into(),
+        by: None,
+    }
 }
 
 fn question() -> Card {
@@ -967,4 +970,194 @@ async fn a_thread_of_another_provider_does_not_open() {
         error.contains("\"codex\", which is not configured"),
         "{error}"
     );
+}
+
+fn lea() -> User {
+    User {
+        name: "léa".into(),
+        admin: false,
+    }
+}
+
+fn summary_of(list: &[ThreadSummary], id: ThreadId) -> &ThreadSummary {
+    list.iter()
+        .find(|thread| thread.id == id)
+        .unwrap_or_else(|| panic!("thread {id} is not listed: {list:?}"))
+}
+
+/// A user who is not an admin sees only the threads that are for them, and cannot tell another
+/// user's thread from one that does not exist; an admin sees every thread.
+#[tokio::test]
+async fn a_family_user_sees_only_their_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector(FakeScript::default());
+    let threads = open(dir.path(), connector).await;
+    let mine = threads
+        .create("alix", StartedBy::User, None, "Alix")
+        .await
+        .unwrap();
+    let hers = threads
+        .create("léa", StartedBy::User, None, "Léa")
+        .await
+        .unwrap();
+
+    let listed: Vec<ThreadId> = threads
+        .summaries(&lea())
+        .await
+        .unwrap()
+        .iter()
+        .map(|thread| thread.id)
+        .collect();
+    assert_eq!(listed, [hers.id]);
+    assert_eq!(threads.visible(hers.id, &lea()).await.unwrap().id, hers.id);
+    let refusal = |error: anyhow::Error| error.downcast::<Refusal>().unwrap();
+    assert_eq!(
+        refusal(threads.visible(ThreadId::MAIN, &lea()).await.unwrap_err()),
+        Refusal::NotFound
+    );
+    assert_eq!(
+        refusal(threads.visible(mine.id, &lea()).await.unwrap_err()),
+        Refusal::NotFound
+    );
+    assert_eq!(
+        refusal(threads.visible(ThreadId(99), &lea()).await.unwrap_err()),
+        Refusal::NotFound
+    );
+
+    let listed: Vec<ThreadId> = threads
+        .summaries(&alix())
+        .await
+        .unwrap()
+        .iter()
+        .map(|thread| thread.id)
+        .collect();
+    assert_eq!(listed, [ThreadId::MAIN, mine.id, hers.id]);
+    assert_eq!(threads.visible(hers.id, &alix()).await.unwrap().id, hers.id);
+}
+
+/// A thread made from the chat is titled after its first message; the same `client_id` again
+/// (a retry) gets the same thread, and another user's `client_id` is not theirs to reuse.
+#[tokio::test]
+async fn create_for_titles_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector(FakeScript::default());
+    let threads = open(dir.path(), connector).await;
+    let mut changes = threads.changes();
+    let (row, fresh) = threads
+        .create_for(&alix(), "c1", "Range\nle garage\u{202E} demain")
+        .await
+        .unwrap();
+    assert!(fresh);
+    assert_eq!(row.title, "Range le garage demain");
+    assert_eq!(row.owner, "alix");
+    assert_eq!(row.started_by, StartedBy::User);
+    assert!(changes.has_changed().unwrap());
+    changes.mark_unchanged();
+
+    let (again, fresh) = threads
+        .create_for(&alix(), "c1", "Range le garage")
+        .await
+        .unwrap();
+    assert!(!fresh);
+    assert_eq!(again.id, row.id);
+    assert!(!changes.has_changed().unwrap());
+    let error = threads
+        .create_for(&lea(), "c1", "Autre chose")
+        .await
+        .unwrap_err();
+    assert_eq!(error.downcast::<Refusal>().unwrap(), Refusal::Taken);
+
+    // Once archived, the id may start a new thread.
+    threads.set_archived(row.id, true).await.unwrap();
+    let (other, fresh) = threads.create_for(&alix(), "c1", "Encore").await.unwrap();
+    assert!(fresh);
+    assert_ne!(other.id, row.id);
+    assert_eq!(threads.list(true).await.unwrap().len(), 3);
+}
+
+/// The thread list shows each thread's status live (queued, running, how its last turn ended),
+/// its open cards, and its last activity; each change is told.
+#[tokio::test]
+async fn summaries_show_status_cards_and_activity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled) = open_pooled(dir.path(), 1).await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    let main = threads.main();
+    let second = new_thread(&threads, StartedBy::User).await;
+    let created = threads.get(second.thread()).await.unwrap().unwrap();
+    let list = threads.summaries(&alix()).await.unwrap();
+    assert_eq!(summary_of(&list, ThreadId::MAIN).status, ThreadStatus::Idle);
+    assert_eq!(
+        summary_of(&list, second.thread()).updated_at,
+        created.updated_at
+    );
+
+    let mut changes = threads.changes();
+    pooled.gate(main.thread());
+    pooled.gate(second.thread());
+    main.send("Un".into()).await;
+    assert!(changes.has_changed().unwrap());
+    pooled.wait_for_starts(1).await;
+    second.send("Deux".into()).await;
+    wait_until(&second, "the second turn never said it waits", |events| {
+        events.contains(&waiting())
+    })
+    .await;
+    let list = threads.summaries(&alix()).await.unwrap();
+    assert_eq!(
+        summary_of(&list, ThreadId::MAIN).status,
+        ThreadStatus::Running
+    );
+    assert_eq!(
+        summary_of(&list, second.thread()).status,
+        ThreadStatus::Queued
+    );
+    let last = second.log().since(0).last().unwrap().at;
+    assert_eq!(summary_of(&list, second.thread()).updated_at, last);
+
+    // A card in the second thread: its badge.
+    changes.mark_unchanged();
+    let waiter = requests.ask(ask(second.topic())).await.unwrap();
+    assert!(changes.has_changed().unwrap());
+    let list = threads.summaries(&alix()).await.unwrap();
+    assert_eq!(summary_of(&list, second.thread()).open_requests, 1);
+    assert_eq!(summary_of(&list, ThreadId::MAIN).open_requests, 0);
+    requests.cancel(waiter.id()).await.unwrap();
+    let list = threads.summaries(&alix()).await.unwrap();
+    assert_eq!(summary_of(&list, second.thread()).open_requests, 0);
+
+    // Stopped while it waits for an agent: cancelled at once.
+    second.cancel().await;
+    wait_for_turns(&second, 1).await;
+    pooled.open(main.thread());
+    wait_for_turns(&main, 1).await;
+    let list = threads.summaries(&alix()).await.unwrap();
+    assert_eq!(summary_of(&list, ThreadId::MAIN).status, ThreadStatus::Done);
+    assert_eq!(
+        summary_of(&list, second.thread()).status,
+        ThreadStatus::Cancelled
+    );
+}
+
+/// A thread not open shows how its last turn ended, read from its stream.
+#[tokio::test]
+async fn summaries_read_threads_not_open_from_their_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (connector, _) = fake_connector(FakeScript::default());
+        let threads = open(dir.path(), connector).await;
+        let second = new_thread(&threads, StartedBy::User).await;
+        second.send("Un".into()).await;
+        wait_for_turns(&second, 1).await;
+        let third = new_thread(&threads, StartedBy::Thread(second.thread())).await;
+        assert_eq!(third.thread(), ThreadId(3));
+    }
+    let (connector, _) = fake_connector(FakeScript::default());
+    let threads = open(dir.path(), connector).await;
+    let list = threads.summaries(&alix()).await.unwrap();
+    assert_eq!(summary_of(&list, ThreadId(2)).status, ThreadStatus::Done);
+    assert_eq!(summary_of(&list, ThreadId(3)).status, ThreadStatus::Idle);
+    assert_eq!(summary_of(&list, ThreadId(3)).parent, Some(ThreadId(2)));
 }

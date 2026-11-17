@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_entity::{stream_entries, streams};
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
@@ -120,6 +120,11 @@ impl ConversationLog {
         self.mirror.entries().last().map_or(0, |entry| entry.seq)
     }
 
+    /// When the newest entry was written, if there is one.
+    pub fn last_at(&self) -> Option<DateTime<Utc>> {
+        self.mirror.entries().last().map(|entry| entry.at)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Entry> {
         self.mirror.live.subscribe()
     }
@@ -233,7 +238,10 @@ mod tests {
     const TOPIC: &str = "conversation";
 
     fn user(text: &str) -> Event {
-        Event::User { text: text.into() }
+        Event::User {
+            text: text.into(),
+            by: None,
+        }
     }
 
     async fn db(dir: &Path) -> DatabaseConnection {

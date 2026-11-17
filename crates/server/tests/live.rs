@@ -73,6 +73,7 @@ async fn open_chat(addr: SocketAddr, cookie: &str) -> Socket {
         ClientMsg::Hello {
             last_seq: 0,
             log_id: None,
+            thread: None,
         },
     )
     .await;
@@ -87,7 +88,14 @@ async fn say(socket: &mut Socket, message: ClientMsg) {
 /// Sends `text` and returns the entries of its turn, printed as they come. A permission request
 /// fails the test: Fronde's tools are allowed up front.
 async fn turn(socket: &mut Socket, text: &str) -> Vec<Event> {
-    say(socket, ClientMsg::Send { text: text.into() }).await;
+    say(
+        socket,
+        ClientMsg::Send {
+            text: text.into(),
+            thread: None,
+        },
+    )
+    .await;
     let mut events = Vec::new();
     let wait = async {
         while let Some(message) = socket.next().await {
@@ -214,6 +222,7 @@ async fn live_ask_user_question_becomes_a_card() {
         ClientMsg::Send {
             text: "Avec ton outil AskUserQuestion (pas user_ask), demande-moi ma couleur préférée                    parmi Rouge et Bleu, puis répète ma réponse en un mot."
                 .into(),
+            thread: None,
         },
     )
     .await;

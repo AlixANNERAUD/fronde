@@ -36,8 +36,12 @@ pub enum TurnOutcome {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// A message to the thread's agent. `by`: who wrote it, when it was not the page's user (a
+    /// parent thread's title for a child's task).
     User {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
     },
     /// One entry per text chunk.
     Assistant {
@@ -115,26 +119,132 @@ impl std::fmt::Display for ThreadId {
 pub const CLOSE_SIGNED_OUT: u16 = 4401;
 
 /// What the chat page sends over the WebSocket.
+///
+/// `thread` fields are optional: none means the main thread, so that a page that knows nothing of
+/// threads talks to the main thread as before. Every thread id is checked against the page's user:
+/// an unknown thread and one the user may not see are refused alike ([`ServerMsg::ThreadRefused`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// Start streaming: the entries after `last_seq`, then the live ones. A page that names
-    /// another log than the server's (`log_id` of its last [`ServerMsg::Hello`]) gets the whole
-    /// log.
+    /// Start streaming `thread`: the entries after `last_seq`, then the live ones. A page that
+    /// names another log than the server's (`log_id` of its last [`ServerMsg::Hello`]) gets the
+    /// whole log. A new hello on the same socket switches the thread it streams. A page that
+    /// names a thread also gets the thread list ([`ServerMsg::Threads`]), now and on each change.
     Hello {
         last_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         log_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<ThreadId>,
     },
+    /// A message to `thread`'s agent.
     Send {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<ThreadId>,
     },
-    Cancel,
-    /// Answers the request `id`; the first answer wins.
-    Answer {
-        id: RequestId,
-        response: Response,
+    /// Stops `thread`'s running turn.
+    Cancel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<ThreadId>,
     },
+    /// Answers the request `id`; the first answer wins. Request ids are global: a card of any
+    /// thread is answered from any page.
+    Answer { id: RequestId, response: Response },
+    /// Starts a thread with its first message, so that no thread is ever empty. `client_id`
+    /// names the attempt, made by the page: a second `Create` with the same id (a retry after
+    /// a lost reply) gets the thread the first one made, without sending `text` again.
+    Create { client_id: String, text: String },
+    /// Renames `thread`: at most [`MAX_TITLE`] characters, none of them hidden.
+    Rename { thread: ThreadId, title: String },
+    /// Archives `thread`, or brings it back. An archived thread is read-only; the main thread is
+    /// never archived.
+    Archive { thread: ThreadId, archived: bool },
+}
+
+/// The longest title a page may give a thread, in characters.
+pub const MAX_TITLE: usize = 80;
+/// The longest title a thread gets from its first message, in characters.
+pub const FIRST_TITLE: usize = 60;
+/// The longest `client_id` of a [`ClientMsg::Create`], in characters.
+pub const MAX_CLIENT_ID: usize = 64;
+
+/// The title of a thread whose first message gives none.
+pub const DEFAULT_TITLE: &str = "Nouvelle conversation";
+
+/// A new thread's title, from its first message: on one line, without hidden characters, at
+/// most [`FIRST_TITLE`] characters.
+pub fn first_title(message: &str) -> String {
+    let visible: String = message
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|&c| !text::hidden(c))
+        .collect();
+    let title = visible
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(FIRST_TITLE)
+        .collect::<String>();
+    let title = title.trim_end();
+    if title.is_empty() {
+        DEFAULT_TITLE.into()
+    } else {
+        title.into()
+    }
+}
+
+/// `title` trimmed, if a page may give it to a thread: not empty, at most [`MAX_TITLE`]
+/// characters, on one line, without hidden characters (controls, bidi controls, zero-width
+/// characters…). Else why not, in French.
+pub fn check_title(title: &str) -> Result<String, &'static str> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("Le titre est vide.");
+    }
+    if title.chars().count() > MAX_TITLE {
+        return Err("Le titre est trop long (80 caractères au plus).");
+    }
+    if text::first_hidden(title, false).is_some() {
+        return Err("Le titre contient un caractère invisible ou de contrôle.");
+    }
+    Ok(title.into())
+}
+
+/// Where a thread stands, computed live.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStatus {
+    /// No turn ran yet.
+    Idle,
+    /// A turn waits for a place among the agents running at once.
+    Queued,
+    Running,
+    /// Its last turn ended well.
+    Done,
+    /// Its last turn ended in an error, a refusal or a limit.
+    Failed,
+    /// Its last turn was stopped.
+    Cancelled,
+}
+
+/// A thread as the thread list shows it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ThreadSummary {
+    pub id: ThreadId,
+    pub title: String,
+    /// The thread that started it, for a sub-agent's thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ThreadId>,
+    pub status: ThreadStatus,
+    /// Requests waiting for an answer in its stream: « attend ta réponse ».
+    #[serde(default)]
+    pub open_requests: u32,
+    /// Its last activity: its newest entry, or its last change.
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// What the server sends over the WebSocket.
@@ -145,7 +255,8 @@ pub enum ServerMsg {
     /// started over, so a page can tell that what it shows is gone even when seqs overlap;
     /// `last_seq` is the newest entry at that moment. `user`: whom the page is signed in as, so
     /// a closed card can say who answered when it was someone else. `admin`: that user may keep
-    /// a secret for good, so its card offers it.
+    /// a secret for good, so its card offers it. `thread`: the thread streamed, when the page
+    /// named one; the entries that follow are its.
     Hello {
         log_id: String,
         last_seq: u64,
@@ -153,12 +264,35 @@ pub enum ServerMsg {
         user: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         admin: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<ThreadId>,
     },
     Entry(Entry),
     /// The answer to the request `id` was refused, for this page only: the request did not
     /// change. `reason` is French, for the page.
     Refused {
         id: RequestId,
+        reason: String,
+    },
+    /// The threads the page's user may see, archived ones included, oldest first: after a hello
+    /// that named a thread, and on every change (a thread made, renamed or archived, a turn
+    /// started, queued or ended, a card opened or closed).
+    Threads {
+        threads: Vec<ThreadSummary>,
+    },
+    /// The thread [`ClientMsg::Create`] `client_id` made; the page says hello to it to stream it.
+    Created {
+        client_id: String,
+        thread: ThreadId,
+    },
+    /// A thread message was refused, for this page only: the thread named does not exist or is
+    /// not the user's (alike), is archived, or the title is not one. `thread` or `client_id`
+    /// says which message. `reason` is French, for the page.
+    ThreadRefused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<ThreadId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
         reason: String,
     },
 }
@@ -191,15 +325,17 @@ mod tests {
                 ClientMsg::Hello {
                     last_seq: 3,
                     log_id: None,
+                    thread: None,
                 },
             ),
             (
                 r#"{"type":"send","text":"salut"}"#,
                 ClientMsg::Send {
                     text: "salut".into(),
+                    thread: None,
                 },
             ),
-            (r#"{"type":"cancel"}"#, ClientMsg::Cancel),
+            (r#"{"type":"cancel"}"#, ClientMsg::Cancel { thread: None }),
             (
                 r#"{"type":"answer","id":7,"response":{"type":"decline"}}"#,
                 ClientMsg::Answer {
@@ -237,7 +373,10 @@ mod tests {
         let entry = Entry {
             seq: 2,
             at: "2026-11-16T10:00:00Z".parse().unwrap(),
-            event: Event::User { text: "hi".into() },
+            event: Event::User {
+                text: "hi".into(),
+                by: None,
+            },
         };
         let json = serde_json::to_string(&ServerMsg::Entry(entry.clone())).unwrap();
         assert_eq!(
@@ -345,6 +484,7 @@ mod tests {
             last_seq: 12,
             user: None,
             admin: false,
+            thread: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(json, r#"{"type":"hello","log_id":"0f3c","last_seq":12}"#);
@@ -354,6 +494,7 @@ mod tests {
             last_seq: 12,
             user: Some("alix".into()),
             admin: true,
+            thread: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
@@ -365,6 +506,7 @@ mod tests {
         let hello = ClientMsg::Hello {
             last_seq: 12,
             log_id: Some("0f3c".into()),
+            thread: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(json, r#"{"type":"hello","last_seq":12,"log_id":"0f3c"}"#);
@@ -392,5 +534,183 @@ mod tests {
             serde_json::to_string(&ToolState::Running).unwrap(),
             r#""running""#
         );
+    }
+
+    #[test]
+    fn thread_client_messages_json_shape() {
+        let cases = [
+            (
+                r#"{"type":"hello","last_seq":3,"log_id":"0f3c","thread":2}"#,
+                ClientMsg::Hello {
+                    last_seq: 3,
+                    log_id: Some("0f3c".into()),
+                    thread: Some(ThreadId(2)),
+                },
+            ),
+            (
+                r#"{"type":"send","text":"salut","thread":2}"#,
+                ClientMsg::Send {
+                    text: "salut".into(),
+                    thread: Some(ThreadId(2)),
+                },
+            ),
+            (
+                r#"{"type":"cancel","thread":2}"#,
+                ClientMsg::Cancel {
+                    thread: Some(ThreadId(2)),
+                },
+            ),
+            (
+                r#"{"type":"create","client_id":"c1","text":"Range le garage"}"#,
+                ClientMsg::Create {
+                    client_id: "c1".into(),
+                    text: "Range le garage".into(),
+                },
+            ),
+            (
+                r#"{"type":"rename","thread":2,"title":"Garage"}"#,
+                ClientMsg::Rename {
+                    thread: ThreadId(2),
+                    title: "Garage".into(),
+                },
+            ),
+            (
+                r#"{"type":"archive","thread":2,"archived":true}"#,
+                ClientMsg::Archive {
+                    thread: ThreadId(2),
+                    archived: true,
+                },
+            ),
+        ];
+        for (json, message) in cases {
+            assert_eq!(serde_json::from_str::<ClientMsg>(json).unwrap(), message);
+            assert_eq!(serde_json::to_string(&message).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn thread_server_messages_json_shape() {
+        let hello = ServerMsg::Hello {
+            log_id: "0f3c".into(),
+            last_seq: 12,
+            user: Some("alix".into()),
+            admin: true,
+            thread: Some(ThreadId(2)),
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"hello","log_id":"0f3c","last_seq":12,"user":"alix","admin":true,"thread":2}"#
+        );
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), hello);
+
+        let at = "2026-11-17T10:00:00Z".parse().unwrap();
+        let list = ServerMsg::Threads {
+            threads: vec![
+                ThreadSummary {
+                    id: ThreadId::MAIN,
+                    title: "Fronde".into(),
+                    parent: None,
+                    status: ThreadStatus::Idle,
+                    open_requests: 0,
+                    updated_at: at,
+                    archived: false,
+                },
+                ThreadSummary {
+                    id: ThreadId(3),
+                    title: "Recherche".into(),
+                    parent: Some(ThreadId(2)),
+                    status: ThreadStatus::Queued,
+                    open_requests: 1,
+                    updated_at: at,
+                    archived: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"threads","threads":[{"id":1,"title":"Fronde","status":"idle","open_requests":0,"updated_at":"2026-11-17T10:00:00Z"},{"id":3,"title":"Recherche","parent":2,"status":"queued","open_requests":1,"updated_at":"2026-11-17T10:00:00Z","archived":true}]}"#
+        );
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), list);
+
+        let created = ServerMsg::Created {
+            client_id: "c1".into(),
+            thread: ThreadId(4),
+        };
+        let json = serde_json::to_string(&created).unwrap();
+        assert_eq!(json, r#"{"type":"created","client_id":"c1","thread":4}"#);
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), created);
+
+        let refused = ServerMsg::ThreadRefused {
+            thread: Some(ThreadId(9)),
+            client_id: None,
+            reason: "Conversation introuvable.".into(),
+        };
+        let json = serde_json::to_string(&refused).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"thread_refused","thread":9,"reason":"Conversation introuvable."}"#
+        );
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), refused);
+
+        for (status, json) in [
+            (ThreadStatus::Idle, r#""idle""#),
+            (ThreadStatus::Queued, r#""queued""#),
+            (ThreadStatus::Running, r#""running""#),
+            (ThreadStatus::Done, r#""done""#),
+            (ThreadStatus::Failed, r#""failed""#),
+            (ThreadStatus::Cancelled, r#""cancelled""#),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn user_entry_names_another_writer_only() {
+        let mine = Event::User {
+            text: "salut".into(),
+            by: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&mine).unwrap(),
+            r#"{"type":"user","text":"salut"}"#
+        );
+        let task = Event::User {
+            text: "Cherche".into(),
+            by: Some("Vacances".into()),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert_eq!(json, r#"{"type":"user","text":"Cherche","by":"Vacances"}"#);
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), task);
+    }
+
+    #[test]
+    fn first_message_makes_a_short_visible_title() {
+        assert_eq!(first_title("  Range\nle   garage  "), "Range le garage");
+        assert_eq!(first_title("a\u{202E}b\u{200B}c"), "abc");
+        assert_eq!(first_title(&"é".repeat(100)).chars().count(), FIRST_TITLE);
+        assert_eq!(first_title(" \u{200B} "), DEFAULT_TITLE);
+    }
+
+    #[test]
+    fn titles_are_checked() {
+        assert_eq!(check_title("  Garage "), Ok("Garage".into()));
+        assert!(check_title("").is_err());
+        assert!(check_title("   ").is_err());
+        assert!(check_title(&"x".repeat(MAX_TITLE + 1)).is_err());
+        assert_eq!(
+            check_title(&"x".repeat(MAX_TITLE)),
+            Ok("x".repeat(MAX_TITLE))
+        );
+        for hidden in [
+            "a\u{202E}b",
+            "a\nb",
+            "a\u{200B}b",
+            "a\u{0007}b",
+            "a\u{2066}b",
+        ] {
+            assert!(check_title(hidden).is_err(), "{hidden:?}");
+        }
     }
 }

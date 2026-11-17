@@ -23,21 +23,21 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_entity::{stream_entries, streams, threads};
-use fronde_protocol::{Card, Outcome, RequestId};
+use fronde_protocol::{Card, Outcome, RequestId, ThreadSummary};
 use fronde_requests::{Caller, Journal, Requests, User};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect,
 };
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 pub use fronde_protocol::ThreadId;
 
 use crate::acp::{AgentSpec, Model};
 use crate::assistant::{self, Assistant, Connector, Shared, TOPIC};
 use crate::legacy;
-use crate::log::{Event, new_log_id, new_stream};
+use crate::log::{Event, TurnOutcome, new_log_id, new_stream};
 use crate::tokens::Tokens;
 
 /// Where the agent's session id was kept before threads: the key-value table's scope and key.
@@ -104,6 +104,12 @@ pub struct ThreadRow {
 }
 
 impl ThreadRow {
+    /// Whether `user` may see the thread, and so stream it, write to it, rename or archive it:
+    /// an admin sees every thread, another user only the threads that are for them.
+    pub fn visible_to(&self, user: &User) -> bool {
+        user.admin || self.owner == user.name
+    }
+
     fn from_model(row: threads::Model) -> anyhow::Result<Self> {
         Ok(Self {
             id: ThreadId(row.id),
@@ -316,6 +322,55 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Tells the thread lists that a thread changed: a counter that each change moves on.
+#[derive(Clone)]
+pub(crate) struct Changes(Arc<watch::Sender<u64>>);
+
+impl Changes {
+    fn new() -> Self {
+        Self(Arc::new(watch::channel(0).0))
+    }
+
+    pub(crate) fn notify(&self) {
+        self.0.send_modify(|count| *count = count.wrapping_add(1));
+    }
+}
+
+/// What the thread list shows of a thread whose assistant is not open: read once from its
+/// stream, and good until it opens, since only an open thread changes.
+#[derive(Clone, Copy, Debug)]
+struct Tail {
+    outcome: Option<TurnOutcome>,
+    at: Option<DateTime<Utc>>,
+}
+
+/// Why a page's thread was refused. An unknown thread and one the user may not see are the
+/// same refusal, so that a page learns nothing of other users' threads.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// No such thread, or not the user's.
+    NotFound,
+    /// The thread is archived: read-only.
+    Archived,
+    /// The main thread is never archived.
+    Main,
+    /// The page's `client_id` names another user's thread.
+    Taken,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "Conversation introuvable.",
+            Self::Archived => "Cette conversation est archivée : elle ne reçoit plus de message.",
+            Self::Main => "La conversation principale ne s'archive pas.",
+            Self::Taken => "Cet identifiant de conversation est déjà pris.",
+        })
+    }
+}
+
+impl std::error::Error for Refusal {}
+
 /// Which thread's agent holds a hub token, as the hub's gate needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holder {
@@ -346,6 +401,11 @@ pub struct Threads {
     /// The requests the threads ask through; weak, since they hold the registry as their
     /// journal.
     requests: OnceLock<Weak<Requests>>,
+    /// Told when a thread is made, renamed or archived, its status changes, or a card opens or
+    /// closes in it.
+    changes: Changes,
+    /// What the thread list shows of the threads not open, read once from their streams.
+    tails: Mutex<HashMap<ThreadId, Tail>>,
 }
 
 impl Threads {
@@ -385,11 +445,13 @@ impl Threads {
         };
         let tokens = Tokens::new();
         let pool = Pool::new(budget);
+        let changes = Changes::new();
         let shared = Shared {
             db: db.clone(),
             connector: connector.clone(),
             tokens: tokens.clone(),
             pool: pool.clone(),
+            changes: changes.clone(),
         };
         let main = Assistant::open(
             ThreadId::MAIN,
@@ -412,6 +474,8 @@ impl Threads {
             open: tokio::sync::Mutex::new(HashMap::from([(ThreadId::MAIN, main.clone())])),
             main,
             requests: OnceLock::new(),
+            changes,
+            tails: Mutex::new(HashMap::new()),
         });
         for row in threads.list(false).await? {
             if row.id == ThreadId::MAIN {
@@ -473,6 +537,7 @@ impl Threads {
             connector: self.connector.clone(),
             tokens: self.tokens.clone(),
             pool: self.pool.clone(),
+            changes: self.changes.clone(),
         };
         let assistant = Assistant::open(
             id,
@@ -549,10 +614,68 @@ impl Threads {
         title: &str,
     ) -> anyhow::Result<ThreadRow> {
         let transaction = fronde_db::begin_write(&self.db).await?;
+        let row = self
+            .insert(&transaction, owner, started_by, parent, title, None)
+            .await?;
+        transaction.commit().await?;
+        self.changes.notify();
+        Ok(row)
+    }
+
+    /// Makes a thread for `user` from the chat, titled after its first message `text`: the
+    /// thread [`ClientMsg::Create`](fronde_protocol::ClientMsg::Create) `client_id` asks for.
+    /// When that `client_id` already made one of the user's threads not archived (a retry
+    /// after a lost reply), that thread, and `false`: its first message was sent already.
+    pub async fn create_for(
+        &self,
+        user: &User,
+        client_id: &str,
+        text: &str,
+    ) -> anyhow::Result<(ThreadRow, bool)> {
+        let transaction = fronde_db::begin_write(&self.db).await?;
+        let earlier = threads::Entity::find()
+            .filter(threads::Column::StartedBy.eq(StartedBy::User.stored()))
+            .filter(threads::Column::ClientRequestId.eq(client_id))
+            .filter(threads::Column::ArchivedAt.is_null())
+            .one(&transaction)
+            .await?;
+        if let Some(earlier) = earlier {
+            let earlier = ThreadRow::from_model(earlier)?;
+            if earlier.owner != user.name {
+                bail!(Refusal::Taken);
+            }
+            return Ok((earlier, false));
+        }
+        let title = fronde_protocol::first_title(text);
+        let row = self
+            .insert(
+                &transaction,
+                &user.name,
+                StartedBy::User,
+                None,
+                &title,
+                Some(client_id),
+            )
+            .await?;
+        transaction.commit().await?;
+        self.changes.notify();
+        Ok((row, true))
+    }
+
+    /// Inserts a thread's stream and row within `transaction`, which holds the write lock.
+    async fn insert(
+        &self,
+        transaction: &sea_orm::DatabaseTransaction,
+        owner: &str,
+        started_by: StartedBy,
+        parent: Option<ThreadId>,
+        title: &str,
+        client_request_id: Option<&str>,
+    ) -> anyhow::Result<ThreadRow> {
         let depth = match parent {
             Some(parent) => {
                 let parent = threads::Entity::find_by_id(parent.0)
-                    .one(&transaction)
+                    .one(transaction)
                     .await?
                     .with_context(|| format!("no thread {parent}"))?;
                 parent.depth + 1
@@ -565,14 +688,14 @@ impl Threads {
             .select_only()
             .column_as(threads::Column::Id.max(), "max")
             .into_tuple()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .flatten();
         let id = ThreadId(last.unwrap_or(0) + 1);
         move_aside_leftover(&self.data_dir, id)?;
         let topic = topic_of(id);
         streams::Entity::insert(new_stream(&topic, &new_log_id()))
-            .exec(&transaction)
+            .exec(transaction)
             .await?;
         let now = Utc::now();
         let row = threads::ActiveModel {
@@ -586,15 +709,14 @@ impl Threads {
             provider: Set(self.spec.provider.id.into()),
             model: Set(None),
             session_id: Set(None),
-            client_request_id: Set(None),
+            client_request_id: Set(client_request_id.map(str::to_owned)),
             created_at: Set(now),
             updated_at: Set(now),
             archived_at: Set(None),
         };
         let row = threads::Entity::insert(row)
-            .exec_with_returning(&transaction)
+            .exec_with_returning(transaction)
             .await?;
-        transaction.commit().await?;
         ThreadRow::from_model(row)
     }
 
@@ -641,7 +763,70 @@ impl Threads {
 
     pub async fn rename(&self, id: ThreadId, title: &str) -> anyhow::Result<()> {
         self.update(id, threads::Column::Title, Expr::value(title.to_owned()))
-            .await
+            .await?;
+        self.changes.notify();
+        Ok(())
+    }
+
+    /// Thread `id` if `user` may see it; [`Refusal::NotFound`] alike when there is no such
+    /// thread and when it is not theirs.
+    pub async fn visible(&self, id: ThreadId, user: &User) -> anyhow::Result<ThreadRow> {
+        match self.get(id).await? {
+            Some(row) if row.visible_to(user) => Ok(row),
+            _ => Err(Refusal::NotFound.into()),
+        }
+    }
+
+    /// Changes the thread list may show: the counter moves on at each.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.0.subscribe()
+    }
+
+    /// The threads `user` may see, archived ones included, oldest first, as the thread list
+    /// shows them.
+    pub async fn summaries(&self, user: &User) -> anyhow::Result<Vec<ThreadSummary>> {
+        let rows: Vec<ThreadRow> = self
+            .list(true)
+            .await?
+            .into_iter()
+            .filter(|row| row.visible_to(user))
+            .collect();
+        let pending = match self.requests.get().and_then(Weak::upgrade) {
+            Some(requests) => requests.pending_by_topic().await?,
+            None => HashMap::new(),
+        };
+        let open = self.open.lock().await.clone();
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (status, at) = match open.get(&row.id) {
+                Some(assistant) => (assistant.status(), assistant.last_activity()),
+                None => {
+                    let tail = self.tail(&row).await?;
+                    (assistant::status_after(tail.outcome), tail.at)
+                }
+            };
+            summaries.push(ThreadSummary {
+                id: row.id,
+                parent: row.parent,
+                status,
+                open_requests: pending.get(&row.topic).copied().unwrap_or(0),
+                updated_at: at.map_or(row.updated_at, |at| at.max(row.updated_at)),
+                archived: row.archived_at.is_some(),
+                title: row.title,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// What the thread list shows of `row`, a thread not open: read from its stream the first
+    /// time.
+    async fn tail(&self, row: &ThreadRow) -> anyhow::Result<Tail> {
+        if let Some(tail) = lock(&self.tails).get(&row.id) {
+            return Ok(*tail);
+        }
+        let tail = read_tail(&self.db, &row.topic).await?;
+        lock(&self.tails).insert(row.id, tail);
+        Ok(tail)
     }
 
     /// Archives thread `id`, or brings it back; an archived thread refuses messages, and its
@@ -661,6 +846,7 @@ impl Threads {
                 assistant.retire().await;
             }
         }
+        self.changes.notify();
         Ok(())
     }
 
@@ -833,6 +1019,34 @@ pub(crate) async fn set_session_id<C: ConnectionTrait>(
     Ok(())
 }
 
+/// When the stream `topic`'s newest entry was written, and how its last turn ended, reading from
+/// its newest entry back to the last turn's start or end.
+async fn read_tail(db: &DatabaseConnection, topic: &str) -> anyhow::Result<Tail> {
+    let mut pages = stream_entries::Entity::find()
+        .filter(stream_entries::Column::Topic.eq(topic))
+        .order_by_desc(stream_entries::Column::Seq)
+        .paginate(db, SCAN_PAGE);
+    let mut at = None;
+    while let Some(rows) = pages.fetch_and_next().await? {
+        for row in rows {
+            at.get_or_insert(row.at);
+            let event: Event = serde_json::from_value(row.event)
+                .with_context(|| format!("entry {} of {topic} is not readable", row.seq))?;
+            match event {
+                Event::TurnEnded { outcome } => {
+                    return Ok(Tail {
+                        outcome: Some(outcome),
+                        at,
+                    });
+                }
+                Event::User { .. } => return Ok(Tail { outcome: None, at }),
+                _ => {}
+            }
+        }
+    }
+    Ok(Tail { outcome: None, at })
+}
+
 /// Whether the stream `topic` ends in a turn a stop left open, reading from its newest entry
 /// back to the last turn's start or end.
 async fn turn_left_open(db: &DatabaseConnection, topic: &str) -> anyhow::Result<bool> {
@@ -865,7 +1079,9 @@ impl Journal for Threads {
         let Some(assistant) = self.by_topic(topic).await? else {
             bail!("no stream {topic:?} to show request {id} in");
         };
-        assistant.announce(id, card, caller).await
+        let seq = assistant.announce(id, card, caller).await;
+        self.changes.notify();
+        seq
     }
 
     async fn close(
@@ -878,6 +1094,8 @@ impl Journal for Threads {
         let Some(assistant) = self.by_topic(topic).await? else {
             bail!("no stream {topic:?} to close request {id} in");
         };
-        assistant.close(id, outcome, by).await
+        let closed = assistant.close(id, outcome, by).await;
+        self.changes.notify();
+        closed
     }
 }

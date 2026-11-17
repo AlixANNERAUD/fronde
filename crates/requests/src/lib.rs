@@ -27,6 +27,7 @@ use fronde_protocol::request::{
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -732,6 +733,25 @@ impl Requests {
             cancelled += usize::from(self.cancel(row_id(&row)?).await?);
         }
         Ok(cancelled)
+    }
+
+    /// How many requests wait for an answer in each stream that has some: what the thread list
+    /// shows as « attend ta réponse ».
+    pub async fn pending_by_topic(&self) -> anyhow::Result<HashMap<String, u32>> {
+        let counts: Vec<(String, i64)> = requests::Entity::find()
+            .select_only()
+            .column(requests::Column::Topic)
+            .column_as(requests::Column::Id.count(), "count")
+            .filter(requests::Column::Status.eq(PENDING))
+            .group_by(requests::Column::Topic)
+            .into_tuple()
+            .all(&self.db)
+            .await
+            .context("cannot count the open requests")?;
+        Ok(counts
+            .into_iter()
+            .map(|(topic, count)| (topic, u32::try_from(count).unwrap_or(u32::MAX)))
+            .collect())
     }
 
     /// Expires the pending requests whose time is up; returns how many.
