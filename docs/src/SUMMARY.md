@@ -9,6 +9,7 @@
 # How-to guides
 
 - [Run in Docker](how-to/run-in-docker.md)
+- [Run as a systemd service](how-to/run-as-a-service.md)
 - [Sign Fronde in to Claude](how-to/sign-in-to-claude.md)
 - [Connect an agent over MCP](how-to/connect-an-agent-over-mcp.md)
 - [Add upstream MCP servers](how-to/add-upstream-mcp-servers.md)

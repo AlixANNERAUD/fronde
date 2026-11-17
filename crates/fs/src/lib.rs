@@ -85,19 +85,36 @@ pub fn write_if_missing(path: &Path) -> std::io::Result<()> {
     restrict_file(path)
 }
 
-/// Replace `path` with `content`, 0600 whatever the old mode was. The content goes to a temporary
-/// file that is synced, renamed over `path`, and the directory is synced too: after a power cut
-/// `path` holds the old content or the new one, never an empty or missing file.
-pub fn write_atomic(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+/// Replace `path` with `content`, with Unix permissions `mode` whatever the old mode was. The
+/// content goes to a temporary file that is synced, renamed over `path`, and the directory is
+/// synced too: after a power cut `path` holds the old content or the new one, never an empty or
+/// missing file.
+pub fn write_atomic_mode(
+    path: impl AsRef<Path>,
+    content: impl AsRef<[u8]>,
+    mode: u32,
+) -> std::io::Result<()> {
     let mut options = AtomicWriteFile::options();
     #[cfg(unix)]
     {
         use atomic_write_file::unix::OpenOptionsExt as _;
-        options.mode(0o600).preserve_mode(false);
+        options.mode(mode).preserve_mode(false);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut file = options.open(path.as_ref())?;
     file.write_all(content.as_ref())?;
+    #[cfg(unix)]
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
     file.commit()
+}
+
+/// Replace `path` with `content`, 0600 whatever the old mode was. The content goes to a temporary
+/// file that is synced, renamed over `path`, and the directory is synced too: after a power cut
+/// `path` holds the old content or the new one, never an empty or missing file.
+pub fn write_atomic(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    write_atomic_mode(path, content, 0o600)
 }
 
 #[cfg(all(test, unix))]
@@ -159,5 +176,14 @@ mod tests {
         write_atomic(&f, "id").unwrap();
         assert_eq!(mode(&f), 0o600);
         assert_eq!(fs::read_to_string(&f).unwrap(), "id");
+    }
+
+    #[test]
+    fn atomic_write_mode_sets_requested_permissions() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("fronde.service");
+        write_atomic_mode(&f, "[Unit]\n", 0o644).unwrap();
+        assert_eq!(mode(&f), 0o644);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "[Unit]\n");
     }
 }

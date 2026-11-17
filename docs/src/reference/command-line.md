@@ -4,9 +4,10 @@
 fronde <command> --config <file>
 ```
 
-Every command but `init` takes the path of the [configuration file](configuration.md). Logs go to standard
-error, filtered by `RUST_LOG` (default `info`). A command exits with 0 on success and 1 on
-failure, printing `error: …` with the cause.
+Commands that read a configuration take it with `--config <file>` (optional with `fronde.toml` as
+the default for `init` and `service install`). Logs go to standard error, filtered by `RUST_LOG`
+(default `info`). A command exits with 0 on success and 1 on failure, printing `error: …` with
+the cause, except `service status`, which passes `systemctl`'s exit code through.
 
 ## `fronde init`
 
@@ -51,6 +52,32 @@ prints `config OK` when all is well. It does not connect to anything.
 Exits with 0 when the server configured in the file answers `GET /health` with a success within
 5 seconds. A server listening on every interface (`0.0.0.0` or `::`) is reached over the loopback.
 The container image uses it as its health check.
+
+## `fronde service`
+
+Manages Fronde as a systemd user service (`fronde.service`). See
+[Run as a systemd service](../how-to/run-as-a-service.md).
+
+```text
+fronde service install [--config <file>] [--no-start] [--force]
+fronde service uninstall
+fronde service status
+```
+
+- `install` resolves the configuration file (default `fronde.toml`) and the running `fronde`
+  binary to absolute paths, writes `$XDG_CONFIG_HOME/systemd/user/fronde.service` (falling back
+  to `~/.config/systemd/user/fronde.service`) with mode 0644, runs `systemctl --user daemon-reload`,
+  and runs `systemctl --user enable --now fronde.service`. With `--no-start`, it stops after
+  `daemon-reload`. If the unit already exists with different content, it refuses unless `--force`
+  is given; if the content is identical, it ensures the service is enabled.
+- `uninstall` runs `systemctl --user disable --now fronde.service` (ignoring "not loaded" errors),
+  removes the unit file, and runs `systemctl --user daemon-reload`. Configuration and data files
+  are kept.
+- `status` runs `systemctl --user status fronde.service --no-pager` and passes its exit code
+  through.
+
+If `systemctl` or a systemd user instance is not available, all three commands exit with 1 and
+suggest running `fronde serve` under another supervisor.
 
 ## Other options
 

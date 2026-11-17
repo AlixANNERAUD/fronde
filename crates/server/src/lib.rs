@@ -2,6 +2,7 @@
 
 pub mod check;
 pub mod init;
+pub mod service;
 mod web;
 mod ws;
 

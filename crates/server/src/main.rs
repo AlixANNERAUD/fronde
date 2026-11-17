@@ -38,6 +38,31 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Manage the systemd user service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install and start Fronde as a systemd user service.
+    Install {
+        /// Path to the configuration file.
+        #[arg(long, default_value = "fronde.toml")]
+        config: PathBuf,
+        /// Write the unit file and reload systemd, without enabling or starting it.
+        #[arg(long)]
+        no_start: bool,
+        /// Replace an existing unit file if its content differs.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop, disable and remove the systemd user service.
+    Uninstall,
+    /// Show the status of the systemd user service.
+    Status,
 }
 
 /// A warning, not an error: the agent only starts at the first chat message.
@@ -131,14 +156,33 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let result = match &cli.command {
-        Command::Init { config, force } => init(config, *force),
-        Command::Check { config } => check(config).map(|()| println!("config OK")),
-        Command::Serve { config } => serve(config).await,
-        Command::Healthcheck { config } => healthcheck(config).await,
+    let result: anyhow::Result<ExitCode> = match &cli.command {
+        Command::Init { config, force } => init(config, *force).map(|()| ExitCode::SUCCESS),
+        Command::Check { config } => check(config).map(|()| {
+            println!("config OK");
+            ExitCode::SUCCESS
+        }),
+        Command::Serve { config } => serve(config).await.map(|()| ExitCode::SUCCESS),
+        Command::Healthcheck { config } => healthcheck(config).await.map(|()| ExitCode::SUCCESS),
+        Command::Service { action } => match action {
+            ServiceCommand::Install {
+                config,
+                no_start,
+                force,
+            } => fronde::service::install(
+                config,
+                fronde::service::InstallOptions {
+                    no_start: *no_start,
+                    force: *force,
+                },
+            )
+            .map(|()| ExitCode::SUCCESS),
+            ServiceCommand::Uninstall => fronde::service::uninstall().map(|()| ExitCode::SUCCESS),
+            ServiceCommand::Status => fronde::service::status(),
+        },
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE

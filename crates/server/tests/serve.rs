@@ -397,3 +397,67 @@ fn check_approves_the_shipped_calendar_without_hashes() {
         "{stdout}"
     );
 }
+
+fn cache_tempdir() -> tempfile::TempDir {
+    let base = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"))
+        .join(".cache/ft");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix("fronde-cli-test-")
+        .tempdir_in(&base)
+        .unwrap()
+}
+
+#[test]
+fn service_install_refuses_missing_config() {
+    let dir = cache_tempdir();
+    let xdg = dir.path().join("xdg");
+    let missing = dir.path().join("missing.toml");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+        .args(["service", "install", "--config"])
+        .arg(&missing)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not exist") && stderr.contains("fronde init"),
+        "{stderr}"
+    );
+    assert!(!xdg.exists());
+}
+
+#[test]
+fn service_commands_report_clear_error_without_systemd_user_instance() {
+    let dir = cache_tempdir();
+    let xdg = dir.path().join("xdg");
+    let cfg = dir.path().join("fronde.toml");
+    std::fs::write(&cfg, "").unwrap();
+
+    for args in [
+        vec![
+            "service".to_string(),
+            "install".to_string(),
+            "--config".to_string(),
+            cfg.display().to_string(),
+        ],
+        vec!["service".to_string(), "uninstall".to_string()],
+        vec!["service".to_string(), "status".to_string()],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+            .args(&args)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("XDG_RUNTIME_DIR")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("systemd user services are not available here"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(!xdg.exists());
+}
