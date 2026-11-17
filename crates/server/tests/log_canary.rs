@@ -42,6 +42,10 @@ struct Scan {
     leaked: Vec<(String, String)>,
     seen: Vec<String>,
     lines: usize,
+    /// Keeps every line, for a secret only known once the server runs; only for a run without
+    /// components, whose log stays small.
+    keep: bool,
+    kept: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -52,6 +56,9 @@ impl std::io::Write for Scanner {
         let line = String::from_utf8_lossy(b);
         let mut scan = self.0.lock().unwrap();
         scan.lines += 1;
+        if scan.keep {
+            scan.kept.push(line.to_string());
+        }
         let Scan {
             secrets,
             wanted,
@@ -116,6 +123,9 @@ fn capture() -> Scanner {
         })
         .clone()
 }
+
+/// The tests share the process's one subscriber: they run one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Starts the server with the calendar component, whose origin answers `status`, calls
 /// `calendar_list` and checks the log saw the call and no secret.
@@ -244,8 +254,186 @@ fn expected_auth() -> String {
 /// then one whose origin answers 401, for the error paths.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn log_canary_never_appears() {
+    let _serial = SERIAL.lock().await;
     let result = call_calendar(207).await;
     assert!(!result.is_error.unwrap_or(false), "{result:?}");
     let result = call_calendar(401).await;
     assert!(result.is_error.unwrap_or(false), "{result:?}");
+}
+
+/// The assistant's own `/mcp` token, made at each start and kept in memory, is never logged:
+/// not at start, not when the agent gets it, not when the assistant calls the hub with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assistant_token_never_appears() {
+    use fronde_agent::acp::{AgentClient, AgentSpec};
+    use fronde_agent::assistant::Connector;
+    use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
+    use fronde_protocol::ClientMsg;
+    use futures::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    const WAIT: Duration = Duration::from_secs(10);
+    let _serial = SERIAL.lock().await;
+    let scanner = capture();
+    *scanner.0.lock().unwrap() = Scan {
+        secrets: [MCP_CANARY, WEB_CANARY].map(String::from).to_vec(),
+        wanted: vec!["memory_search".to_string(), "user_ask".to_string()],
+        keep: true,
+        ..Scan::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = dir.path().join("mcp_token");
+    let web_file = dir.path().join("web_pass");
+    fronde_hub::private::write(&token_file, MCP_CANARY).unwrap();
+    fronde_hub::private::write(&web_file, WEB_CANARY).unwrap();
+    let config: Config = toml::from_str(&format!(
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n\
+         [data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+         [memory]\ngit = false\n\
+         [secrets]\nmaster_key = {{ file = {:?} }}\n\
+         [web]\npassword = {{ file = {:?} }}\n",
+        token_file.display().to_string(),
+        dir.path().join("data").display().to_string(),
+        dir.path().join("master.key").display().to_string(),
+        web_file.display().to_string(),
+    ))
+    .unwrap();
+    // The fake agent holds its turn open, so the assistant's calls belong to it.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let script = FakeScript {
+        updates: vec![text_chunk("Je regarde."), text_chunk(" Voilà.")],
+        pause: Some((1, gate.clone())),
+        ..FakeScript::default()
+    };
+    let seen: Arc<Mutex<Option<AgentSpec>>> = Arc::default();
+    let connector: Connector = Arc::new({
+        let seen = seen.clone();
+        move |spec: &AgentSpec, resume, events| {
+            *seen.lock().unwrap() = Some(spec.clone());
+            let (spec, script) = (spec.clone(), script.clone());
+            Box::pin(async move {
+                let (transport, _handle) = fake_agent(script);
+                AgentClient::connect(transport, &spec, resume, events).await
+            })
+        }
+    });
+    let (addr, server) = fronde::start_with(config, connector, &dir.path().join("site"))
+        .await
+        .unwrap();
+
+    // A message from the chat starts the agent, which gets its token.
+    let signed_in = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(format!("http://{addr}/auth/sign-in"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("password={WEB_CANARY}"))
+        .send()
+        .await
+        .unwrap();
+    let cookie = signed_in.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("cookie", cookie.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("origin", format!("http://{addr}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    for message in [
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+        ClientMsg::Send {
+            text: "Salut".into(),
+        },
+    ] {
+        let json = serde_json::to_string(&message).unwrap();
+        socket.send(Message::text(json)).await.unwrap();
+    }
+    let token = timeout(WAIT, async {
+        loop {
+            if let Some(spec) = seen.lock().unwrap().clone() {
+                return secrecy::ExposeSecret::expose_secret(&spec.hub_token).to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // The assistant calls the hub with it: a plain tool, and a question that expires.
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(token.clone()),
+    );
+    let client = ().serve(transport).await.unwrap();
+    let search = json!({"query": "chat"}).as_object().unwrap().clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("memory_search").with_arguments(search))
+        .await
+        .unwrap();
+    assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    let ask = json!({"timeout_ms": 1000, "questions": [{
+        "question": "Laquelle ?",
+        "header": "Appli",
+        "options": [
+            {"label": "Mealie", "description": "Recettes"},
+            {"label": "Seerr", "description": "Films"},
+        ],
+    }]});
+    let result = timeout(
+        WAIT,
+        client.call_tool(
+            CallToolRequestParams::new("user_ask").with_arguments(ask.as_object().unwrap().clone()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!result.is_error.unwrap_or(false), "{result:?}");
+    gate.notify_one();
+    // The turn ends: its last entry reaches the page.
+    timeout(WAIT, async {
+        while let Some(Ok(message)) = socket.next().await {
+            if let Message::Text(text) = message
+                && text.contains("turn_ended")
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.abort();
+
+    let scan = std::mem::take(&mut *scanner.0.lock().unwrap());
+    assert!(scan.lines > 0, "nothing was captured");
+    assert!(scan.leaked.is_empty(), "{:#?}", scan.leaked);
+    for want in &scan.wanted {
+        assert!(scan.seen.contains(want), "{want} is not in the log");
+    }
+    let leaks: Vec<&String> = scan
+        .kept
+        .iter()
+        .filter(|line| line.contains(&token))
+        .take(4)
+        .collect();
+    assert!(
+        leaks.is_empty(),
+        "the assistant's token is in the log: {leaks:#?}"
+    );
 }
