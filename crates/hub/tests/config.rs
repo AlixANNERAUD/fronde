@@ -35,6 +35,8 @@ fn loads_example() {
         std::path::Path::new("/keys/master.key")
     );
     assert!(c.web.is_some());
+    assert!(c.users().get("alix").unwrap().admin);
+    assert_eq!(c.password_of("alix").unwrap().0, "[users.alix] password");
     let accounts = c.accounts();
     assert_eq!(accounts.len(), 1);
     assert_eq!(
@@ -86,7 +88,7 @@ fn loads_web_and_agent() {
     );
     let c = load_str(&s).unwrap();
     let web = c.web.unwrap();
-    assert!(matches!(web.password, Secret::Env { env } if env == "P"));
+    assert!(matches!(web.password, Some(Secret::Env { env }) if env == "P"));
     assert!(web.secure_cookie);
     assert_eq!(c.agent.command, ["npx", "claude-agent-acp"]);
     assert_eq!(
@@ -1490,6 +1492,213 @@ fn declared_account_needs_a_token() {
     ));
     assert!(
         e.contains("[accounts.me] has no oauth_token") && e.contains("claude setup-token"),
+        "{e}"
+    );
+}
+
+/// Two people: the owner, an admin, and a member, each with a password.
+const USERS: &str = "[users.alix]\nadmin = true\npassword = { file = \"alix.password\" }\n\
+                     [users.marie]\npassword = { env = \"MARIE_PASSWORD\" }\n";
+
+/// `MIN` with `[data] user = "alix"` and `rest` after it.
+fn owned_by_alix(rest: &str) -> String {
+    format!("{MIN}user = \"alix\"\n{rest}")
+}
+
+/// `[users.<name>]`: an admin flag and a password, each password anchored and listed with the
+/// other secrets.
+#[test]
+fn users_parse() {
+    let c = load_str(&owned_by_alix(&format!(
+        "[web]\nsecure_cookie = true\n{USERS}"
+    )))
+    .unwrap();
+    let users = c.users();
+    assert_eq!(users.len(), 2);
+    let alix = users.get("alix").unwrap();
+    assert!(alix.admin);
+    assert!(!users.get("marie").unwrap().admin);
+    // Names are compared exactly.
+    assert!(users.get("Marie").is_none());
+    let base = c.path().unwrap().parent().unwrap().to_path_buf();
+    let (key, password) = c.password_of("alix").unwrap();
+    assert_eq!(key, "[users.alix] password");
+    assert!(matches!(password, Secret::File { file } if file == &base.join("alix.password")));
+    assert!(c.secret_files().contains(&base.join("alix.password")));
+    assert!(c.secret_env_names().contains(&"MARIE_PASSWORD".to_owned()));
+    assert!(c.password_of("paul").is_none());
+    assert!(c.web.unwrap().secure_cookie);
+    // A name with spaces and accents is a name.
+    let c = load_str(&format!(
+        "{MIN}user = \"Anne-Sophie Dupré\"\n\
+         [users.\"Anne-Sophie Dupré\"]\nadmin = true\npassword = {{ file = \"p\" }}\n"
+    ))
+    .unwrap();
+    assert_eq!(
+        c.password_of("Anne-Sophie Dupré").unwrap().0,
+        "[users.\"Anne-Sophie Dupré\"] password"
+    );
+    // No key but these, never a stored password, never one written in the file.
+    for bad in [
+        "[users.alix]\nadmin = true\npassword = { file = \"p\" }\nrole = \"x\"\n",
+        "[users.alix]\nadmin = true\npassword = { stored = \"p\" }\n",
+        "[users.alix]\nadmin = true\npassword = \"hunter2\"\n",
+    ] {
+        assert!(load_str(&owned_by_alix(bad)).is_err(), "{bad}");
+    }
+    let e = refused(&owned_by_alix(
+        "[users.alix]\nadmin = true\npassword = { stored = \"p\" }\n",
+    ));
+    assert!(
+        e.contains("[users.alix] password = { stored = \"p\" }"),
+        "{e}"
+    );
+}
+
+/// Without `[users]`, `[data] user` is the one user, an admin signing in with `[web] password`.
+#[test]
+fn legacy_password_is_the_owner() {
+    let c = load_str(&owned_by_alix("[web]\npassword = { env = \"P\" }\n")).unwrap();
+    let users = c.users();
+    assert_eq!(users.len(), 1);
+    assert_eq!(
+        users.get("alix"),
+        Some(&fronde_requests::User {
+            name: "alix".into(),
+            admin: true,
+        })
+    );
+    let (key, password) = c.password_of("alix").unwrap();
+    assert_eq!(key, "web.password");
+    assert!(matches!(password, Secret::Env { env } if env == "P"));
+    assert!(c.password_of("me").is_none());
+    // Without [web], the one user has no password: nobody signs in to a page.
+    let c = load_str(&owned_by_alix("")).unwrap();
+    assert_eq!(c.user_names(), ["alix"]);
+    assert!(c.password_of("alix").is_none());
+    // [web] needs a password when no [users] gives one.
+    let e = refused(&owned_by_alix("[web]\nsecure_cookie = true\n"));
+    assert!(
+        e.contains("[web] has no password") && e.contains("[users.<name>]"),
+        "{e}"
+    );
+}
+
+#[test]
+fn web_password_and_users_are_refused_together() {
+    let e = refused(&owned_by_alix(&format!(
+        "[web]\npassword = {{ file = \"p\" }}\n{USERS}"
+    )));
+    assert!(
+        e.contains("[web] password and [users] are both set")
+            && e.contains("move the password to [users.alix] password"),
+        "{e}"
+    );
+}
+
+/// `[data] user` is the owner: listed in `[users]`, an admin.
+#[test]
+fn owner_must_be_an_admin_user() {
+    let e = refused(&format!("{MIN}user = \"paul\"\n{USERS}"));
+    assert!(
+        e.contains("[data] user = \"paul\" is not in [users]")
+            && e.contains("add [users.paul] with admin = true")
+            && e.contains("alix, marie"),
+        "{e}"
+    );
+    let e = refused(&format!("{MIN}user = \"marie\"\n{USERS}"));
+    assert!(
+        e.contains("[data] user = \"marie\" is the owner, an admin")
+            && e.contains("set admin = true in [users.marie]"),
+        "{e}"
+    );
+    // The default [data] user, too.
+    let e = refused(&format!("{MIN}{USERS}"));
+    assert!(e.contains("[data] user = \"me\" is not in [users]"), "{e}");
+}
+
+#[test]
+fn user_needs_a_sign_in_method() {
+    let e = refused(&owned_by_alix("[users.alix]\nadmin = true\n"));
+    assert!(
+        e.contains("[users.alix] has no way to sign in")
+            && e.contains("password = { file = \"…\" }"),
+        "{e}"
+    );
+}
+
+/// A name is 1 to 64 visible characters, without spaces around it: two names that look alike
+/// are never two people.
+#[test]
+fn user_name_refuses_hidden_characters() {
+    let user = |name: &str| {
+        refused(&format!(
+            "{MIN}user = \"alix\"\n[users.alix]\nadmin = true\npassword = {{ file = \"p\" }}\n\
+             [users.{}]\npassword = {{ file = \"q\" }}\n",
+            toml::Value::String(name.to_owned())
+        ))
+    };
+    for hidden in ["mar\u{200b}ie", "marie\u{202e}", "ma\trie", "ma\u{ad}rie"] {
+        let e = user(hidden);
+        assert!(
+            e.contains("may not hold a hidden character"),
+            "{hidden:?}: {e}"
+        );
+    }
+    for spaced in [" marie", "marie "] {
+        let e = user(spaced);
+        assert!(
+            e.contains("may not start or end with a space"),
+            "{spaced:?}: {e}"
+        );
+    }
+    let e = user("");
+    assert!(e.contains("1 to 64 characters"), "{e}");
+    let e = user(&"é".repeat(65));
+    assert!(e.contains("1 to 64 characters"), "{e}");
+    load_str(&format!(
+        "{MIN}user = \"{}\"\n[users.\"{}\"]\nadmin = true\npassword = {{ file = \"p\" }}\n",
+        "é".repeat(64),
+        "é".repeat(64)
+    ))
+    .unwrap();
+}
+
+/// With `[users]`, an account's owner is one of them, and each person has their own token.
+#[test]
+fn accounts_belong_to_users() {
+    let accounts = "[accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n\
+                    oauth_token = { stored = \"claude_alix\" }\n\
+                    [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+                    oauth_token = { stored = \"claude_marie\" }\n";
+    let c = load_str(&owned_by_alix(&format!("{USERS}{accounts}"))).unwrap();
+    let owners: Vec<(String, String)> = c
+        .accounts()
+        .into_iter()
+        .map(|account| (account.name, account.owner))
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            ("alix".to_owned(), "alix".to_owned()),
+            ("marie".to_owned(), "marie".to_owned())
+        ]
+    );
+    let e = refused(&owned_by_alix(&format!(
+        "{USERS}{}",
+        accounts.replace("owner = \"marie\"", "owner = \"paul\"")
+    )));
+    assert!(
+        e.contains("[accounts.marie] owner = \"paul\" is not a user") && e.contains("alix, marie"),
+        "{e}"
+    );
+    // Two people, one token: refused, the token being named once per account.
+    let e = refused(&owned_by_alix(&format!(
+        "{USERS}{}",
+        accounts.replace("claude_marie", "claude_alix")
+    )));
+    assert!(
+        e.contains("[accounts.alix] and [accounts.marie] both read their token from the stored secret claude_alix"),
         "{e}"
     );
 }

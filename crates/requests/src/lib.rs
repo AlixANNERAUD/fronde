@@ -131,6 +131,42 @@ pub struct User {
     pub admin: bool,
 }
 
+/// The people who sign in, by name: a plain map the server builds from the configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Users(std::collections::BTreeMap<String, User>);
+
+impl Users {
+    /// The user named exactly `name`.
+    pub fn get(&self, name: &str) -> Option<&User> {
+        self.0.get(name)
+    }
+
+    /// Every user, by name.
+    pub fn iter(&self) -> impl Iterator<Item = &User> {
+        self.0.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl FromIterator<User> for Users {
+    /// A later user of the same name replaces an earlier one.
+    fn from_iter<I: IntoIterator<Item = User>>(users: I) -> Self {
+        Self(
+            users
+                .into_iter()
+                .map(|user| (user.name.clone(), user))
+                .collect(),
+        )
+    }
+}
+
 /// A new request.
 #[derive(Clone, Debug)]
 pub struct Ask {

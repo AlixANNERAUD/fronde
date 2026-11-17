@@ -208,6 +208,7 @@ mod tests {
                 .web
                 .unwrap()
                 .password
+                .unwrap()
                 .resolve()
                 .unwrap()
                 .expose_secret(),

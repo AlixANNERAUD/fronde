@@ -74,16 +74,23 @@ token = { env = "MCPHUB_TOKEN" }
 # Optional: the chat with Fronde at /, behind a password. Without it the server is only the hub.
 # Behind a reverse proxy, forward the Host header: the chat's WebSocket checks Origin against it.
 [web]
-password = { file = "/run/secrets/fronde_password" }
 # Set to true when the page is served over https.
 secure_cookie = false
 
+# Who signs in, one section per person: an admin flag and a password, { file } or { env }. The
+# owner ([data] user) is an admin. Without [users], [web] password is the owner's password.
+# Signing in by name, each person to their own conversations, is planned: until then only the
+# owner signs in.
+[users.alix]
+admin = true
+password = { file = "/run/secrets/fronde_password" }
+
 # The Claude subscription the agents sign in with, one section per account, owned by one person
-# ([data] user, the one user so far). Its token is the one `claude setup-token` prints, run in
-# the owner's own home: a secret like the others, { file = "…" }, { env = "…" } or
-# { stored = "…" } (stored for https://api.anthropic.com). Never run `claude` with HOME set to
-# the agent's home. Without [accounts], [agent] oauth_token (or CLAUDE_CODE_OAUTH_TOKEN in
-# Fronde's environment) is read as the owner's account, named "claude".
+# of [users]. Its token is the one `claude setup-token` prints, run in the owner's own home: a
+# secret like the others, { file = "…" }, { env = "…" } or { stored = "…" } (stored for
+# https://api.anthropic.com). Never run `claude` with HOME set to the agent's home. Without
+# [accounts], [agent] oauth_token (or CLAUDE_CODE_OAUTH_TOKEN in Fronde's environment) is read
+# as the owner's account, named "claude".
 [accounts.alix]
 provider = "claude"
 owner = "alix"

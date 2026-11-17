@@ -14,8 +14,13 @@ use std::io::Write;
 /// runtime as `serve` would.
 pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
     crate::check_token(&config.server.token.resolve().context("server.token")?)?;
-    if let Some(web) = &config.web {
-        crate::check_password(&web.password.resolve().context("web.password")?)?;
+    if config.web.is_some() {
+        for user in config.users().iter() {
+            let (key, password) = config
+                .password_of(&user.name)
+                .with_context(|| format!("{} has no password to sign in with", user.name))?;
+            crate::check_password(&password.resolve().context(key.clone())?, &key)?;
+        }
     }
     let checks = approval_checks(config).await?;
     if let Some(backend) = checks.secrets.key_backend() {
@@ -94,6 +99,7 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         writeln!(out, "agents: {}", crate::pool_line(config, scope.as_ref()))?;
         writeln!(out, "sub-agents: {}", crate::children_line(config))?;
         writeln!(out, "usage: {}", usage_check_line(config).await)?;
+        writeln!(out, "users: {}", users_line(config))?;
         for account in config.accounts() {
             writeln!(out, "{}", account_line(config, &account, &checks.secrets)?)?;
         }
@@ -110,6 +116,33 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         )?;
     }
     Ok(())
+}
+
+/// Who signs in, whether an admin, and the accounts each owns: `alix (admin, account alix),
+/// paul (no account: no agent)`.
+fn users_line(config: &Config) -> String {
+    let accounts = config.accounts();
+    config
+        .users()
+        .iter()
+        .map(|user| {
+            let mut parts: Vec<String> = Vec::new();
+            if user.admin {
+                parts.push("admin".to_owned());
+            }
+            let owned: Vec<String> = accounts
+                .iter()
+                .filter(|account| account.owner == user.name)
+                .map(|account| format!("account {}", account.name))
+                .collect();
+            if owned.is_empty() {
+                parts.push("no account: no agent".to_owned());
+            }
+            parts.extend(owned);
+            format!("{} ({})", user.name, parts.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One account's line: its provider and owner, where its token comes from and whether it reads,

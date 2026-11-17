@@ -302,9 +302,10 @@ pub async fn healthcheck(address: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn check_password(password: &SecretString) -> anyhow::Result<()> {
+/// A sign-in password is not empty; `key` names it in the configuration.
+pub fn check_password(password: &SecretString, key: &str) -> anyhow::Result<()> {
     if password.expose_secret().is_empty() {
-        bail!("web.password must not be empty");
+        bail!("{key} must not be empty");
     }
     Ok(())
 }
@@ -953,10 +954,17 @@ pub async fn start_signed_in_as(
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let token = config.server.token.resolve().context("server.token")?;
     check_token(&token)?;
+    // Only the owner signs in so far, with the owner's password.
     let password = match &config.web {
         Some(web) => {
-            let password = web.password.resolve().context("web.password")?;
-            check_password(&password)?;
+            let (key, password) = config.password_of(&config.data.user).with_context(|| {
+                format!(
+                    "the owner, {}, has no password to sign in with",
+                    config.data.user
+                )
+            })?;
+            let password = password.resolve().context(key.clone())?;
+            check_password(&password, &key)?;
             Some((password, web.secure_cookie))
         }
         None => None,

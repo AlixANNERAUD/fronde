@@ -25,7 +25,7 @@ A secret is never written in the file. It is one of:
 
 The settings below marked *secret* take one of these forms, except `{ stored = "…" }`, which only
 a component's credential, the `token` of an upstream server reached by `url` and an account's
-`oauth_token` take: `server.token` and `web.password` refuse it, saying to use `{ file = "…" }` or
+`oauth_token` take: `server.token`, `web.password` and the users' `password` refuse it, saying to use `{ file = "…" }` or
 `{ env = "…" }`, and so does the `token` of a server run as a `command`, which has no origin to
 bind it to.
 
@@ -61,7 +61,7 @@ Required.
 | --- | --- | --- | --- |
 | `dir` | path | `$XDG_DATA_HOME/fronde`, else `~/.local/share/fronde` (macOS and Windows: the platform's per-user data directory) | Where Fronde keeps its memory, index and conversation. Created (mode 0700) if missing; it must be writable by the user running Fronde. A relative path is read from the configuration file's directory. See [Data directory](data-directory.md). |
 | `timezone` | IANA name | required | Time zone of the journal, the calendar and reminders, such as `"Europe/Paris"`. |
-| `user` | string | `"me"` | What the assistant calls you, in its instructions and its system prompt. |
+| `user` | string | `"me"` | The owner: what the assistant calls you, in its instructions and its system prompt, and whose the main conversation is. With [`[users]`](#usersname), the name of one of them, an admin. |
 
 ## `[secrets]`
 
@@ -279,20 +279,57 @@ only the hub: `/health` and `/mcp`.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `password` | secret | required | The chat's password. Must not be empty. |
+| `password` | secret | required without `[users]` | The legacy form of the owner's password (see [`[users.<name>]`](#usersname)): `[data] user` signs in with it. Must not be empty. Refused with `[users]`, saying to move it to `[users.<name>] password`. |
 | `secure_cookie` | boolean | `false` | Mark the session cookie `Secure`. Set it to `true` when the page is served over https. |
+
+With `[users]`, `[web]` may be left empty (`[web]` alone) to serve the chat.
+
+## `[users.<name>]`
+
+Optional. The people who sign in to Fronde, one section per person, the section's name being
+theirs. Signing in by name, each person to their own conversations, is **planned**: until then,
+only the owner, `[data] user`, signs in, with their own password, and the others' sections are
+only checked.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `admin` | boolean | `false` | Whether they see and manage everything. The owner must be one. |
+| `password` | secret | required | Their password, `{ file = "…" }` or `{ env = "…" }`, never stored. Must not be empty. Signing in with OIDC instead is **planned**. |
+
+A name is 1 to 64 characters, compared exactly, with no hidden character (a zero-width space, a
+direction mark, a control character) and no space at either end, so that two names that look
+alike are never two people; quote it when it is more than letters, digits, `_` and `-`
+(`[users."Anne-Sophie Dupré"]`). Fronde refuses, naming the keys, a user without a password,
+`[data] user` not in `[users]` or not an admin, and `[web] password` with `[users]`.
+
+```toml
+[data]
+user = "alix"
+
+[web]
+
+[users.alix]
+admin = true
+password = { file = "alix.password" }
+
+[users.marie]
+password = { file = "marie.password" }
+```
+
+Without `[users]`, the legacy form keeps working, and is never rewritten: Fronde reads it as one
+user, `[data] user`, an admin, signing in with `[web] password`.
 
 ## `[accounts.<name>]`
 
 Optional. The provider subscriptions the agents sign in with, one section per account. An
 account belongs to one person, its `owner`, and is where that is written, once: the threads of
-its owner run on it (an account per person, and each thread signing in with its owner's, is
-**planned**; until then every thread is the owner's, and runs on the owner's account).
+its owner run on it (each person's threads signing in with their own account is **planned**;
+until then every thread is the owner's, and runs on the owner's account).
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `provider` | string | required | The provider the subscription is for: `"claude"`, the only one configured. Codex and Gemini/Antigravity are refused as planned. |
-| `owner` | string | required | The person it belongs to: `[data] user`, the one user so far. |
+| `owner` | string | required | The person it belongs to: one of [`[users]`](#usersname), or `[data] user` without them. |
 | `oauth_token` | secret | required | The token `claude setup-token` prints, run in the owner's own home and signed in with the owner's own Claude account: `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`), `{ file = "…" }` or `{ env = "…" }`. Fronde reads it at each start of the owner's agents and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through their environment only. |
 
 The name matches `^[a-z][a-z0-9_]{0,63}$`. Fronde refuses, naming the keys:

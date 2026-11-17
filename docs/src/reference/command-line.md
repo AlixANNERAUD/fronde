@@ -45,7 +45,7 @@ hand.
 ## `fronde check`
 
 Validates the configuration and exits. It parses the file, then reads every secret: the server
-token (at least 32 characters), the chat password (not empty), the upstream tokens and the
+token (at least 32 characters), with `[web]` each user's password (not empty), the upstream tokens and the
 components' credentials. For each component it prints the SHA-256 of its `.wasm` file and of its
 manifest, then checks it as `serve` would before loading it (approval, grants within its
 manifest, settings, tool prefixes, credentials over https) and prints which approval applied:
@@ -82,7 +82,9 @@ passed; `background work paused
 until 16:40 (5-hour window past the reserve's line, 70%)` past `[threads] reserve`), or `usage:
 claude: no reading yet; background work bounded by the daily counts` before Fronde's first turn,
 or `usage: cannot read (…)` when the stored reading does not read, and the check goes on (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)); the start log prints
-the same line; then one line per [account](configuration.md#accountsname), never with its
+the same line; then who signs in, `users: alix (admin, account alix), marie (account marie), paul
+(no account: no agent)` (see [`[users.<name>]`](configuration.md#usersname); for the legacy form,
+`users: alix (admin, account claude)`); then one line per [account](configuration.md#accountsname), never with its
 token: `account alix (claude, owner alix): stored secret claude_alix opens, for
 https://api.anthropic.com` (opened as the agent's start opens it, from the database read-only),
 `account alix (claude, owner alix): token from the file /run/secrets/claude, read` or `… from the

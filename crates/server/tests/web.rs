@@ -306,6 +306,64 @@ async fn sign_in_sets_session_and_wrong_password_refused() {
     assert_eq!(get(addr, "/", Some(cookie)).await.status(), 303);
 }
 
+/// With `[users]` and `[accounts]`, only the owner signs in so far, with the owner's own
+/// password, and the agents sign in with the owner's account: nobody else's password opens the
+/// page, and no other account's token reaches an agent.
+#[tokio::test]
+async fn only_the_owner_signs_in_until_names_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let mut config = config(path, false);
+    for (file, value) in [
+        ("marie.password", "password-of-marie"),
+        ("alix.token", "token-of-alix"),
+        ("marie.token", "token-of-marie"),
+    ] {
+        fronde_hub::private::write(path.join(file), value).unwrap();
+    }
+    let people: fronde_hub::config::Config = toml::from_str(&format!(
+        "[server]\ntoken = {{ file = \"t\" }}\n[data]\ntimezone = \"UTC\"\n\
+         [web]\n\
+         [users.Alix]\nadmin = true\npassword = {{ file = {:?} }}\n\
+         [users.marie]\npassword = {{ file = {:?} }}\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"Alix\"\noauth_token = {{ file = {:?} }}\n\
+         [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\noauth_token = {{ file = {:?} }}\n",
+        path.join("password").display().to_string(),
+        path.join("marie.password").display().to_string(),
+        path.join("alix.token").display().to_string(),
+        path.join("marie.token").display().to_string(),
+    ))
+    .unwrap();
+    config.web = people.web;
+    config.users = people.users;
+    config.accounts = people.accounts;
+    let (connector, seen) = fake_connector();
+    let addr = start_with(config, connector, &site(path)).await;
+
+    let member = post_password(addr, "password-of-marie").await;
+    assert_eq!(member.headers()[LOCATION], "/sign-in?error=1");
+    assert!(member.headers().get(SET_COOKIE).is_none());
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    until_turn_ended(&mut socket).await;
+    let spec = seen.lock().unwrap().clone().unwrap();
+    let read = spec.oauth_token.expect("the owner's account token");
+    let token = read().await.unwrap();
+    assert_eq!(
+        secrecy::ExposeSecret::expose_secret(&token),
+        "token-of-alix"
+    );
+}
+
 #[tokio::test]
 async fn session_is_renewed_by_use() {
     // Sessions expire after 30 days without a request, not 30 days after sign-in: each

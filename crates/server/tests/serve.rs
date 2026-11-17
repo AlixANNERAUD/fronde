@@ -1437,3 +1437,78 @@ async fn check_reports_each_account() {
     );
     assert!(!shown.contains(ALIX), "{shown}");
 }
+
+/// `fronde check` lists who signs in, whether an admin, and each one's account; a member's
+/// stored token not stored yet is a warning, not a failure. No password or token is printed.
+#[tokio::test]
+async fn check_lists_users_and_their_accounts() {
+    const ALIX: &str = "token-of-alix";
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    let legacy = std::fs::read_to_string(&path).unwrap();
+
+    // The legacy form: the one user, an admin, owns the one account.
+    let (code, shown) = check_with(&path, &legacy, None);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains("\nusers: me (admin, account claude)\n"),
+        "{shown}"
+    );
+
+    for (name, value) in [("alix", "password-of-alix"), ("marie", "password-of-marie")] {
+        fronde_hub::private::write(dir.path().join(format!("{name}.password")), value).unwrap();
+    }
+    let people = format!(
+        "{}[users.alix]\nadmin = true\npassword = {{ file = \"alix.password\" }}\n\
+         [users.marie]\npassword = {{ file = \"marie.password\" }}\n\
+         [users.paul]\npassword = {{ file = \"marie.password\" }}\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n\
+         oauth_token = {{ stored = \"claude_alix\" }}\n\
+         [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+         oauth_token = {{ stored = \"claude_marie\" }}\n",
+        legacy
+            .replace("[data]\n", "[data]\nuser = \"alix\"\n")
+            .replace("password = { file = \"password\" }\n", "")
+    );
+    store_secret(
+        &data,
+        &dir.path().join("master.key"),
+        "claude_alix",
+        "https://api.anthropic.com",
+        ALIX,
+    )
+    .await;
+    let (code, shown) = check_with(&path, &people, Some(ALIX));
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(
+            "\nusers: alix (admin, account alix), marie (account marie), paul (no account: no \
+             agent)\n"
+        ),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "account alix (claude, owner alix): stored secret claude_alix opens, for \
+             https://api.anthropic.com"
+        ),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "account marie (claude, owner marie): warning: stored secret claude_marie not stored \
+             yet: store it with `fronde secret set claude_marie --origin \
+             https://api.anthropic.com --config <your fronde.toml>`"
+        ),
+        "{shown}"
+    );
+    for secret in [ALIX, "password-of-alix", "password-of-marie"] {
+        assert!(!shown.contains(secret), "{secret}: {shown}");
+    }
+
+    // A member's password that does not read fails the check, naming its key.
+    std::fs::remove_file(dir.path().join("marie.password")).unwrap();
+    let (code, shown) = check_with(&path, &people, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(shown.contains("[users.marie] password"), "{shown}");
+}

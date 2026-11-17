@@ -32,6 +32,10 @@ pub struct Config {
     /// Where the master key of the stored secrets is kept.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// The people who sign in, by name. Left out, the legacy form stands for one: see
+    /// [`Config::users`].
+    #[serde(default)]
+    pub users: BTreeMap<String, UserConfig>,
     /// The provider accounts agents sign in with, by name. Left out, the legacy form stands for
     /// one account: see [`Config::accounts`].
     #[serde(default)]
@@ -99,17 +103,56 @@ impl Config {
             .accounts
             .values()
             .filter_map(|account| account.oauth_token.as_ref());
+        let users = self
+            .users
+            .values()
+            .filter_map(|user| user.password.as_ref());
         std::iter::once(&self.server.token)
-            .chain(self.web.as_ref().map(|web| &web.password))
+            .chain(self.web.as_ref().and_then(|web| web.password.as_ref()))
+            .chain(users)
             .chain(self.secrets.master_key.as_ref())
             .chain(self.agent.oauth_token.as_ref())
             .chain(accounts)
             .chain(sources)
     }
 
-    /// The names of the people who sign in: `[data] user`, the one user so far.
+    /// The people who sign in: the `[users]` declared, or else the one the legacy form stands
+    /// for, `[data] user`, an admin signing in with `[web] password`. The file is never
+    /// rewritten.
+    pub fn users(&self) -> fronde_requests::Users {
+        if self.users.is_empty() {
+            return [fronde_requests::User {
+                name: self.data.user.clone(),
+                admin: true,
+            }]
+            .into_iter()
+            .collect();
+        }
+        self.users
+            .iter()
+            .map(|(name, user)| fronde_requests::User {
+                name: name.clone(),
+                admin: user.admin,
+            })
+            .collect()
+    }
+
+    /// The password the user `name` signs in with, and the key that names it (`web.password` in
+    /// the legacy form, `[users.<name>] password` otherwise).
+    pub fn password_of(&self, name: &str) -> Option<(String, &Secret)> {
+        if self.users.is_empty() {
+            return (name == self.data.user)
+                .then(|| self.web.as_ref()?.password.as_ref())
+                .flatten()
+                .map(|password| ("web.password".to_owned(), password));
+        }
+        let password = self.users.get(name)?.password.as_ref()?;
+        Some((format!("[users.{}] password", table_key(name)), password))
+    }
+
+    /// The names of the people who sign in.
     pub fn user_names(&self) -> Vec<String> {
-        vec![self.data.user.clone()]
+        self.users().iter().map(|user| user.name.clone()).collect()
     }
 
     /// The provider accounts agents sign in with: the `[accounts]` declared, or else the one
@@ -193,6 +236,34 @@ impl Config {
     /// Read the legacy form as if Fronde's environment held `CLAUDE_CODE_OAUTH_TOKEN`, or not.
     pub fn set_inherited_sign_in(&mut self, inherited: bool) {
         self.inherited_sign_in = inherited;
+    }
+}
+
+/// `[users.<name>]`: someone who signs in to Fronde.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+    /// Sees and manages everything; `[data] user`, the owner, is one.
+    #[serde(default)]
+    pub admin: bool,
+    /// Signs in with this password: `{ file }` or `{ env }`. One sign-in method is required,
+    /// and this is the only one so far; OIDC is planned as another, beside it.
+    pub password: Option<Secret>,
+}
+
+/// The longest user name, in characters.
+pub const MAX_USER_NAME: usize = 64;
+
+/// `name` as a key of a TOML table: bare when it can be, quoted otherwise.
+fn table_key(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        name.to_owned()
+    } else {
+        format!("{name:?}")
     }
 }
 
@@ -324,7 +395,9 @@ pub const PYTHON_SOURCE: &str = "python";
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebConfig {
-    pub password: Secret,
+    /// The legacy form's password, the owner's (`[data] user`): required without `[users]`,
+    /// refused with it.
+    pub password: Option<Secret>,
     /// Mark the session cookie `Secure`; turn on when the page is served over https.
     #[serde(default)]
     pub secure_cookie: bool,
@@ -1062,10 +1135,11 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
     }
     config.server.token.anchor(base);
     config.server.token.not_stored("server.token")?;
-    if let Some(web) = &mut config.web {
-        web.password.anchor(base);
-        web.password.not_stored("web.password")?;
+    if let Some(password) = config.web.as_mut().and_then(|web| web.password.as_mut()) {
+        password.anchor(base);
+        password.not_stored("web.password")?;
     }
+    check_users(&mut config, base)?;
     for source in &mut config.sources {
         match source {
             SourceConfig::Mcp(m) => {
@@ -1164,6 +1238,73 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
         }
     }
     Ok(config)
+}
+
+/// The rules of `[users]` and the legacy `[web] password`, each refusal naming its key; anchors
+/// the password files.
+fn check_users(config: &mut Config, base: &Path) -> anyhow::Result<()> {
+    let owner = config.data.user.clone();
+    if config.users.is_empty() {
+        if config
+            .web
+            .as_ref()
+            .is_some_and(|web| web.password.is_none())
+        {
+            bail!(
+                "[web] has no password: set [web] password = {{ file = \"…\" }}, or list who \
+                 signs in as [users.<name>] sections, each with its password"
+            );
+        }
+        return Ok(());
+    }
+    if config
+        .web
+        .as_ref()
+        .is_some_and(|web| web.password.is_some())
+    {
+        bail!(
+            "[web] password and [users] are both set: move the password to [users.{}] password \
+             and remove it from [web]",
+            table_key(&owner)
+        );
+    }
+    for (name, user) in &mut config.users {
+        let key = table_key(name);
+        let length = name.chars().count();
+        if !(1..=MAX_USER_NAME).contains(&length) {
+            bail!("[users.{key}]: a user's name is 1 to {MAX_USER_NAME} characters");
+        }
+        if let Some(hidden) = fronde_protocol::text::first_hidden(name, false) {
+            bail!(
+                "[users.{key}]: a user's name may not hold a hidden character ({:?}); write it \
+                 with visible characters only",
+                hidden
+            );
+        }
+        if name.trim() != name {
+            bail!("[users.{key}]: a user's name may not start or end with a space");
+        }
+        let Some(password) = &mut user.password else {
+            bail!(
+                "[users.{key}] has no way to sign in: set password = {{ file = \"…\" }} or \
+                 {{ env = \"…\" }}"
+            );
+        };
+        password.anchor(base);
+        password.not_stored(&format!("[users.{key}] password"))?;
+    }
+    let key = table_key(&owner);
+    match config.users.get(&owner) {
+        Some(user) if user.admin => Ok(()),
+        Some(_) => bail!(
+            "[data] user = {owner:?} is the owner, an admin: set admin = true in [users.{key}]"
+        ),
+        None => bail!(
+            "[data] user = {owner:?} is not in [users]: add [users.{key}] with admin = true, or \
+             set [data] user to one of: {}",
+            config.users.keys().cloned().collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// The rules of `[accounts]`, each refusal naming its key; anchors the tokens' files.
