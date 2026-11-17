@@ -413,7 +413,12 @@ fn sync_dir(file: &Path) -> std::io::Result<()> {
 /// when the file is missing and nothing is stored. A missing file while secrets are stored, or a
 /// key that does not open them, is an error that says so.
 pub async fn load(db: &DatabaseConnection, file: &Path) -> anyhow::Result<Option<Arc<MasterKey>>> {
-    match read(file)? {
+    let mut key = read(file)?;
+    // A first secret stored since the file was read made the key before its row: read it again.
+    if key.is_none() && crate::secrets::any_stored(db).await? {
+        key = read(file)?;
+    }
+    match key {
         Some(key) => {
             crate::secrets::check_key(db, &key)
                 .await
@@ -423,7 +428,9 @@ pub async fn load(db: &DatabaseConnection, file: &Path) -> anyhow::Result<Option
         None if crate::secrets::any_stored(db).await? => bail!(
             "the master key {} is missing, but the database holds secrets sealed with it; \
              restore the file from a backup. Fronde does not make a new key while secrets are \
-             stored: it could not open them",
+             stored: it could not open them. Without the key, remove each stored secret \
+             (`fronde secret list`, then `fronde secret remove <name>`) and store them again: \
+             once the last one is removed, the first one stored makes a new key",
             file.display()
         ),
         None => Ok(None),

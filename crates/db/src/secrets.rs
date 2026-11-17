@@ -237,7 +237,9 @@ fn opens(key: &MasterKey, check: &[u8]) -> anyhow::Result<bool> {
     let wrong = || {
         format!(
             "this master key (from {}) is not the one that sealed the stored secrets; restore \
-             the right key from a backup",
+             the right key from a backup. Without it, remove each stored secret (`fronde secret \
+             list`, then `fronde secret remove <name>`) and store them again: once the last one \
+             is removed, they are stored under this key",
             key.backend()
         )
     };

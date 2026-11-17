@@ -141,6 +141,15 @@ async fn wait(delays: &mut ExponentialBackoff) {
     tokio::time::sleep(delay).await;
 }
 
+/// Which failed starts a supervised source is tried again after.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Every one: a connection may come back by itself.
+    Every,
+    /// Only a [`Waiting`] one; any other error gives the source up as [`Health::Failed`].
+    Waiting,
+}
+
 /// Starts sources, registers their tools and restarts the ones that stop.
 #[derive(Clone)]
 pub struct Supervisor {
@@ -171,14 +180,15 @@ impl Supervisor {
     /// Start `source` now and return its error if it fails, without retrying: for sources that
     /// cannot fix themselves (the hub's own tools, a component). A source [`Waiting`] for
     /// something outside the configuration is the exception: it is tried again with backoff
-    /// until it starts. If it starts and later stops, it is restarted with backoff.
+    /// for as long as it is waiting, and given up at the first other error. If it starts and
+    /// later stops, it is restarted with backoff, on the same terms.
     pub async fn start(&self, source: Arc<dyn ToolSource>) -> anyhow::Result<()> {
         let name = source.name().to_string();
         self.set(&name, Health::Starting);
         match source.start().await {
             Ok(session) => {
                 if let Some(closed) = self.up(&name, session) {
-                    tokio::spawn(self.clone().run(source, Some(closed)));
+                    tokio::spawn(self.clone().run(source, Some(closed), Retry::Waiting));
                 }
                 Ok(())
             }
@@ -189,11 +199,7 @@ impl Supervisor {
                         error: format!("{e:#}"),
                     },
                 );
-                let supervisor = self.clone();
-                tokio::spawn(async move {
-                    wait(&mut backoff()).await;
-                    supervisor.run(source, None).await;
-                });
+                tokio::spawn(self.clone().retry(source, Retry::Waiting));
                 Err(e)
             }
             Err(e) => {
@@ -212,12 +218,30 @@ impl Supervisor {
     /// whenever it stops: for connections.
     pub fn spawn(&self, source: Arc<dyn ToolSource>) {
         self.set(source.name(), Health::Starting);
-        tokio::spawn(self.clone().run(source, None));
+        tokio::spawn(self.clone().run(source, None, Retry::Every));
     }
 
-    async fn run(self, source: Arc<dyn ToolSource>, mut running: Option<Closed>) {
-        let name = source.name().to_string();
+    /// Start `source` again after it failed to start, until it starts.
+    async fn retry(self, source: Arc<dyn ToolSource>, retry: Retry) {
         let mut delays = backoff();
+        wait(&mut delays).await;
+        self.keep_running(source, None, retry, delays).await;
+    }
+
+    async fn run(self, source: Arc<dyn ToolSource>, running: Option<Closed>, retry: Retry) {
+        self.keep_running(source, running, retry, backoff()).await;
+    }
+
+    /// Start `source` (unless `running` is its session), and restart it whenever it stops.
+    /// `delays` goes on from the waits already made, so that they keep growing.
+    async fn keep_running(
+        self,
+        source: Arc<dyn ToolSource>,
+        mut running: Option<Closed>,
+        retry: Retry,
+        mut delays: ExponentialBackoff,
+    ) {
+        let name = source.name().to_string();
         loop {
             if let Some(closed) = running.take() {
                 closed.await;
@@ -232,6 +256,16 @@ impl Supervisor {
                     if running.is_none() {
                         return;
                     }
+                }
+                Err(e) if retry == Retry::Waiting && e.downcast_ref::<Waiting>().is_none() => {
+                    tracing::error!("{name}: cannot start, given up: {e:#}");
+                    self.set(
+                        &name,
+                        Health::Failed {
+                            error: format!("{e:#}"),
+                        },
+                    );
+                    return;
                 }
                 Err(e) => {
                     tracing::warn!("{name}: cannot start: {e:#}");
@@ -414,6 +448,86 @@ mod tests {
             registry.call("patient_ok", json!({})).await.value,
             json!(true)
         );
+    }
+
+    /// Waits at its first start, then fails with a plain error, then would start.
+    #[derive(Default)]
+    struct WaitsThenBreaks {
+        starts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolSource for WaitsThenBreaks {
+        fn name(&self) -> &str {
+            "breaks"
+        }
+
+        async fn start(&self) -> anyhow::Result<Session> {
+            match self.starts.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(Waiting("set the secret".into()).into()),
+                1 => anyhow::bail!("the master key does not open the stored secrets"),
+                _ => Ok(Session::lasting(vec![])),
+            }
+        }
+    }
+
+    /// A source that waited and then fails for another reason is given up, as one that failed
+    /// at once would be: it is not tried again.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_source_that_then_fails_is_given_up() {
+        let registry = Arc::new(Registry::new());
+        let supervisor = Supervisor::new(registry.clone());
+        let source = Arc::new(WaitsThenBreaks::default());
+        supervisor.start(source.clone()).await.unwrap_err();
+        assert!(matches!(supervisor.health()["breaks"], Health::Down { .. }));
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(matches!(
+            supervisor.health()["breaks"],
+            Health::Failed { ref error } if error.contains("does not open")
+        ));
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 2, "tried again");
+    }
+
+    /// Waits for as long as the test lets it.
+    #[derive(Default)]
+    struct AlwaysWaiting {
+        starts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolSource for AlwaysWaiting {
+        fn name(&self) -> &str {
+            "waiting"
+        }
+
+        async fn start(&self) -> anyhow::Result<Session> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Err(Waiting("set the secret".into()).into())
+        }
+    }
+
+    /// A waiting source is tried again after 2 s, then 4, then 8: the waits keep growing from
+    /// the first one.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_source_waits_longer_each_time() {
+        let supervisor = Supervisor::new(Arc::new(Registry::new()));
+        let source = Arc::new(AlwaysWaiting::default());
+        supervisor.start(source.clone()).await.unwrap_err();
+        let starts = || source.starts.load(Ordering::SeqCst);
+        assert_eq!(starts(), 1);
+        // Tries are due at 2, 2 + 4 and 2 + 4 + 8 seconds: look just before and after each.
+        let begin = tokio::time::Instant::now();
+        for (at, expected) in [(1, 1), (3, 2), (5, 2), (7, 3), (13, 3), (15, 4)] {
+            tokio::time::sleep_until(begin + Duration::from_secs(at)).await;
+            settle().await;
+            assert_eq!(starts(), expected, "at {at} s");
+        }
+        assert!(matches!(
+            supervisor.health()["waiting"],
+            Health::Down { .. }
+        ));
     }
 
     #[tokio::test]

@@ -74,6 +74,10 @@ A component's `Authorization` header is built by the gate for each request, mark
 `Debug` prints `Sensitive`) and dropped with the request; between requests only the
 `SecretString` is kept.
 
+The master key is read when a component that names a stored secret starts, used to open that
+secret and dropped (zeroed) once the component is prepared; nothing kept for the whole run holds
+it. `fronde serve` also reads it once at start, to check it, and drops it.
+
 Some plain copies remain:
 
 - An upstream MCP token is handed to the MCP client library as a `String`, which keeps it for the

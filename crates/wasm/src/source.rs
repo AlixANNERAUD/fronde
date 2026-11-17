@@ -152,12 +152,13 @@ impl Approvals {
 }
 
 /// The secrets stored for components' credentials, still sealed, and the master key that opens
-/// them. Nothing is opened until [`prepare`] needs one.
+/// them. Nothing is opened until [`prepare`] needs one: the fields are private, so that only
+/// [`StoredSecrets::load`] fills them and only `prepare` opens a secret from them.
 #[derive(Debug, Clone, Default)]
 pub struct StoredSecrets {
     /// `None` when nothing is stored and there is no key file.
-    pub key: Option<Arc<MasterKey>>,
-    pub sealed: Vec<Sealed>,
+    key: Option<Arc<MasterKey>>,
+    sealed: Vec<Sealed>,
 }
 
 impl StoredSecrets {
@@ -195,9 +196,15 @@ impl StoredSecrets {
             ))
             .into());
         }
-        let key = self.key.as_deref().with_context(|| {
-            format!("the stored secret {name} cannot be opened: there is no master key")
-        })?;
+        // The key is read before the rows: a first secret stored in between leaves a row without
+        // its key, which the next try reads.
+        let Some(key) = self.key.as_deref() else {
+            return Err(Waiting(format!(
+                "the stored secret {name} was stored while Fronde read the stored secrets; \
+                 trying again"
+            ))
+            .into());
+        };
         sealed.open(key)
     }
 }
@@ -227,14 +234,14 @@ impl Checks {
         }
     }
 
-    /// [`Checks::of`], with the approvals and the sealed secrets stored in `db` and the master
-    /// key of the configuration, read now: [`prepare`] reads no database, so an approval stored
-    /// later applies at the next start. A [`ComponentSource`] reads the secrets again each time
-    /// it starts.
+    /// [`Checks::of`], with the approvals stored in `db`, read now: [`prepare`] reads no
+    /// database, so an approval stored later applies at the next start. No stored secret, nor
+    /// the master key: these checks are kept for the whole run, and a [`ComponentSource`]
+    /// reads both each time it starts ([`ComponentSource::reading_secrets_from`]), so the key is
+    /// in memory only while a component that needs it is prepared.
     pub async fn load(config: &Config, db: &fronde_db::DatabaseConnection) -> anyhow::Result<Self> {
         let mut checks = Self::of(config);
         checks.approvals.stored = stored_approvals(db).await?;
-        checks.secrets = StoredSecrets::load(db, config.master_key_file()?).await?;
         Ok(checks)
     }
 }
@@ -694,5 +701,46 @@ impl ToolSource for ComponentSource {
         tracing::info!("{}: {}", self.config.name, prepared.approval());
         let component = LoadedComponent::load(&self.host, prepared).await?;
         Ok(Session::lasting(component.tools()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row read without its key, as when a first secret is stored between the read of the key
+    /// and the read of the rows, is waited for: the next try reads both.
+    #[tokio::test]
+    async fn a_row_without_its_key_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fronde_db::open(dir.path()).await.unwrap();
+        let file = dir.path().join("master.key");
+        let (key, _) = fronde_db::master_key::load_or_create(&db, &file)
+            .await
+            .unwrap();
+        let origin = "https://cloud.example";
+        let value = secrecy::SecretString::from("value".to_owned());
+        fronde_db::secrets::set(
+            &db,
+            &key,
+            fronde_db::secrets::SOURCES,
+            "api",
+            origin,
+            &value,
+        )
+        .await
+        .unwrap();
+        let secrets = StoredSecrets {
+            key: None,
+            sealed: fronde_db::secrets::load_sealed(&db, fronde_db::secrets::SOURCES)
+                .await
+                .unwrap(),
+        };
+        let e = secrets
+            .open("api", &Origin::parse(origin).unwrap())
+            .unwrap_err();
+        assert!(e.downcast_ref::<Waiting>().is_some(), "{e:#}");
+        let loaded = StoredSecrets::load(&db, &file).await.unwrap();
+        assert!(loaded.open("api", &Origin::parse(origin).unwrap()).is_ok());
     }
 }

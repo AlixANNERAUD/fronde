@@ -121,8 +121,11 @@ async fn stored_credential_reaches_the_gate() {
     let server = MockServer::start().await;
     expect_bearer(&server, "stored-token", 1).await;
     let db = fronde_db::open(data.path()).await.unwrap();
-    // The origin as Fronde stores it; the credential spells it as the mock server's URI does.
-    store(&db, data.path(), "api", &server.uri(), "stored-token").await;
+    // Stored under another spelling of the same origin, an upper-case scheme, which the
+    // database keeps as given: the origins are compared once both are parsed.
+    let spelled = server.uri().replacen("http://", "HTTP://", 1);
+    assert_ne!(spelled, server.uri());
+    store(&db, data.path(), "api", &spelled, "stored-token").await;
     let config = entry(dir.path(), &server, "{ stored = \"api\" }");
 
     let checks = checks(&db, data.path()).await;
@@ -211,6 +214,25 @@ async fn stored_secret_for_another_origin_is_refused() {
     );
     assert!(!shown.contains("for-other"), "{shown}");
     // `fronde secret set` fixes it while Fronde runs.
+    assert!(e.downcast_ref::<Waiting>().is_some());
+
+    // The same host on another port is another origin.
+    let port = server.address().port();
+    let other_port = format!(
+        "http://{}:{}",
+        server.address().ip(),
+        port.wrapping_add(1).max(1)
+    );
+    store(&db, data.path(), "api", &other_port, "for-other").await;
+    let e = refused(&config, &checks(&db, data.path()).await);
+    let shown = format!("{e:#}");
+    assert!(
+        shown.contains(&format!(
+            "the stored secret api is for {other_port}, not {origin}"
+        )),
+        "{shown}"
+    );
+    assert!(!shown.contains("for-other"), "{shown}");
     assert!(e.downcast_ref::<Waiting>().is_some());
 }
 

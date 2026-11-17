@@ -207,8 +207,10 @@ a component, imports it may not have, tools outside its prefixes).
 A component whose stored secret is missing, or stored for another origin, is not skipped: Fronde
 tries it again, after 2 seconds, then waiting twice as long each time up to a minute, and reads
 the stored secrets again at each try. Store the secret with `fronde secret set` while Fronde runs
-and the component starts within a minute, with no restart. A component that started keeps the
-value it read: after changing a stored secret, restart Fronde.
+and the component starts within a minute, with no restart. If a try then fails for another
+reason, such as a master key that does not open the stored secrets, the component is skipped as
+above and not tried again. A component that started keeps the value it read: after changing a
+stored secret, restart Fronde.
 
 ## `[python]`
 
