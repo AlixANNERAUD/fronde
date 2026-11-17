@@ -277,8 +277,37 @@ async fn wall_clock_is_capped() {
         call_timeout: Duration::from_millis(500),
         ..Limits::default()
     });
+    let started = Instant::now();
     let e = error(&run(&python, "import time\ntime.sleep(60)").await);
     assert!(e.contains("timed out"), "{e}");
+    assert!(started.elapsed() < Duration::from_secs(2), "{e}");
+}
+
+/// A relative sleep that wasi-libc hands to `poll_oneoff` alone (as `select` and `poll` do) must
+/// not block the runtime's thread: on a single worker, the call timeout still fires and other
+/// runs go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn relative_sleeps_never_block_the_runtime() {
+    let python = python().await;
+    let sleepy = python.clone().with_limits(Limits {
+        call_timeout: Duration::from_millis(500),
+        ..Limits::default()
+    });
+    for code in [
+        "import select\nselect.select([], [], [], 60)",
+        "import select\nselect.poll().poll(60_000)",
+    ] {
+        let started = Instant::now();
+        let (slept, other) = tokio::join!(run(&sleepy, code), run(&python, "1+1"));
+        let e = error(&slept);
+        assert!(e.contains("timed out"), "{code}: {e}");
+        assert_eq!(value(&other), &json!({"value": 2}), "{code}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{code}: {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 #[tokio::test]
@@ -382,4 +411,133 @@ async fn runs_concurrently() {
     assert_eq!(value(&b), &json!({"value": 1024}));
     assert_eq!(value(&c), &json!({"value": "xxx"}));
     assert_eq!(value(&d), &json!({"value": 120}));
+}
+
+#[tokio::test]
+async fn open_files_are_capped() {
+    let python = python().await;
+    let code = "files = []\n\
+                for _ in range(1000):\n    files.append(open('/lib/python3.15/os.py'))\n\
+                len(files)";
+    let e = error(&run(&python, code).await);
+    assert!(e.contains("more than 128 files open at once"), "{e}");
+    let out = run(&python, "len(open('/lib/python3.15/os.py').read(2))").await;
+    assert_eq!(value(&out), &json!({"value": 2}));
+}
+
+/// Two runs at a time: a third waits for a turn, within its wall-clock budget.
+#[tokio::test]
+async fn runs_take_turns() {
+    let python = python().await.with_limits(Limits {
+        call_timeout: Duration::from_secs(10),
+        ..small_budget()
+    });
+    let started = Instant::now();
+    let timed = |code: &'static str| {
+        let python = python.clone();
+        async move {
+            let out = run(&python, code).await;
+            (out, started.elapsed())
+        }
+    };
+    let ((a, _), (b, _), (c, waited)) = tokio::join!(
+        timed("import time\ntime.sleep(1)\n1"),
+        timed("import time\ntime.sleep(1)\n2"),
+        timed("3"),
+    );
+    assert_eq!(value(&a), &json!({"value": 1}));
+    assert_eq!(value(&b), &json!({"value": 2}));
+    assert_eq!(value(&c), &json!({"value": 3}));
+    assert!(waited >= Duration::from_secs(1), "{waited:?}");
+}
+
+#[tokio::test]
+async fn a_run_that_waits_too_long_for_a_turn_times_out() {
+    let python = python().await.with_limits(Limits {
+        call_timeout: Duration::from_secs(3),
+        ..small_budget()
+    });
+    // The same runtime, so the same turns, with less patience.
+    let hurried = python.clone().with_limits(Limits {
+        call_timeout: Duration::from_millis(500),
+        ..small_budget()
+    });
+    let started = Instant::now();
+    let (a, b, c) = tokio::join!(
+        run(&python, "import time\ntime.sleep(5)"),
+        run(&python, "import time\ntime.sleep(5)"),
+        async {
+            let out = run(&hurried, "1").await;
+            (out, started.elapsed())
+        },
+    );
+    for sleeper in [&a, &b] {
+        let e = error(sleeper);
+        assert!(e.contains("timed out"), "{e}");
+    }
+    let (c, waited) = c;
+    let e = error(&c);
+    assert!(e.contains("busy with other runs"), "{e}");
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+}
+
+#[tokio::test]
+async fn large_integers_stay_exact() {
+    let python = python().await;
+    let out = run(
+        &python,
+        "import math\n[math.factorial(25), 2**64, -2**64, 2**53, -2**53, 2**53 + 1]",
+    )
+    .await;
+    assert_eq!(
+        value(&out),
+        &json!({"value": [
+            "15511210043330985984000000",
+            "18446744073709551616",
+            "-18446744073709551616",
+            9007199254740992_i64,
+            -9007199254740992_i64,
+            "9007199254740993",
+        ]})
+    );
+}
+
+#[tokio::test]
+async fn unterminated_output_does_not_spoil_the_reply() {
+    let python = python().await;
+    let out = run(&python, "import os\nos.write(1, b'{\"value\": 1')\n2").await;
+    assert_eq!(value(&out), &json!({"value": 2}));
+}
+
+#[tokio::test]
+async fn a_reply_counts_only_with_a_clean_exit() {
+    let python = python().await;
+    let e = error(
+        &run(
+            &python,
+            "import os\nos.write(1, b'\\n{\"value\": 1}\\n')\nos._exit(3)",
+        )
+        .await,
+    );
+    assert!(e.contains("exit code 3"), "{e}");
+}
+
+#[tokio::test]
+async fn an_exception_that_cannot_be_printed_is_still_named() {
+    let python = python().await;
+    let code = "class Odd(Exception):\n    def __str__(self):\n        raise ValueError('no')\n\
+                raise Odd()";
+    let e = error(&run(&python, code).await);
+    assert!(e.starts_with("Odd (line 4)"), "{e}");
+}
+
+#[tokio::test]
+async fn code_and_data_are_capped() {
+    let python = python().await;
+    let data = json!("x".repeat(17 << 20));
+    let e = error(&python.run("len(data)", Some(&data), "UTC").await);
+    assert!(e.contains("over the limit of 16 MiB"), "{e}");
+    let data = json!("x".repeat(1 << 20));
+    let out = python.run("len(data)", Some(&data), "UTC").await;
+    assert_eq!(value(&out), &json!({"value": 1 << 20}));
 }

@@ -8,8 +8,15 @@
 //! other file, no `/tmp` (prints are captured in memory), no network.
 //!
 //! The module is compiled once, in memory, from the bytes whose hash matched the pinned build.
-//! Each run gets a fresh store and instance, with its own memory, CPU and time limits, so nothing
-//! carries from one run to the next and a failure only ends that run.
+//! Each run gets a fresh store and instance, with its own memory, CPU, time and handle limits, so
+//! nothing carries from one run to the next and a failure only ends that run. At most
+//! [`MAX_RUNS`] run at once; the others wait their turn within their wall-clock budget.
+//!
+//! Files of the standard library are read on the calling thread, which keeps imports fast, but
+//! nothing else blocks it: every sleep, `select` and `poll` included, waits on the async runtime's
+//! timers, which the call timeout cancels (see [`Python::run`]). The socket functions are replaced
+//! by ones that fail silently, instead of logging a warning at each call, which a loop could turn
+//! into a flood.
 
 use crate::guest_log::GuestLog;
 use crate::host::{ComponentHost, Limits, TICK, bounded, meter};
@@ -23,10 +30,11 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wasmtime::{InstancePre, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
+use tokio::sync::Semaphore;
+use wasmtime::{Caller, InstancePre, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
-use wasmtime_wasi::{FsPerms, I32Exit, WasiCtxBuilder};
+use wasmtime_wasi::{FsPerms, I32Exit, ResourceTableError, WasiCtxBuilder, WasiView};
 
 /// SHA-256 of the only `python.wasm` Fronde runs: CPython 3.15.2 for WASI SDK 33, from
 /// brettcannon/cpython-wasi-build. The `python` task of `mise.toml` pins the same hash.
@@ -52,6 +60,16 @@ const MEMORY_BYTES: usize = 256 << 20;
 /// (nothing is loaded dynamically).
 const MAX_TABLES: usize = 1;
 const MAX_TABLE_ELEMENTS: usize = 10_000;
+/// Open files, streams and the like at once: imports open one file at a time.
+const MAX_HANDLES: usize = 128;
+/// Code and data together, as the JSON sent to the runner.
+const MAX_ENVELOPE: usize = 16 << 20;
+/// Runs at once. Each may touch 256 MiB and a core; more wait for a turn.
+const MAX_RUNS: usize = 2;
+
+const P1: &str = "wasi_snapshot_preview1";
+/// WASI preview 1's `notsock` error number.
+const ERRNO_NOTSOCK: i32 = 57;
 
 fn script_limits() -> Limits {
     Limits {
@@ -79,6 +97,7 @@ struct Inner {
     host: ComponentHost,
     pre: InstancePre<ScriptState>,
     lib: PathBuf,
+    runs: Semaphore,
 }
 
 /// What the runner writes as the last line of its stdout.
@@ -154,6 +173,7 @@ impl Python {
                 host: host.clone(),
                 pre,
                 lib,
+                runs: Semaphore::new(MAX_RUNS),
             }),
             limits: script_limits(),
         })
@@ -161,19 +181,43 @@ impl Python {
 
     /// Run `code` with `data` as its global `data` and `timezone` as its `TZ`.
     pub async fn run(&self, code: &str, data: Option<&Value>, timezone: &str) -> ToolOutput {
-        let envelope = json!({ "code": code, "data": data, "timezone": timezone });
+        let started = Instant::now();
+        let envelope = json!({ "code": code, "data": data, "timezone": timezone }).to_string();
+        if envelope.len() > MAX_ENVELOPE {
+            return ToolOutput::error(format!(
+                "code and data come to {} MiB, over the limit of {} MiB: send fewer rows, only \
+                 the fields the code needs, or an aggregate",
+                envelope.len() >> 20,
+                MAX_ENVELOPE >> 20
+            ));
+        }
+        // Waiting for a turn counts against the run's wall-clock budget.
+        let budget = self.limits.call_timeout;
+        let Ok(Ok(_turn)) = tokio::time::timeout(budget, self.inner.runs.acquire()).await else {
+            return ToolOutput::error(format!(
+                "Python is busy with other runs ({MAX_RUNS} at a time), and this one waited its \
+                 whole {} s; try again in a moment",
+                budget.as_secs_f32()
+            ));
+        };
+        let limits = Limits {
+            call_timeout: budget.saturating_sub(started.elapsed()),
+            ..self.limits.clone()
+        };
         let stdout = MemoryOutputPipe::new(OUTPUT_BYTES);
         let mut wasi = WasiCtxBuilder::new();
         wasi.args(&["python", "-I", "-B", "-c", RUNNER])
-            .stdin(MemoryInputPipe::new(envelope.to_string()))
+            .stdin(MemoryInputPipe::new(envelope))
             .stdout(stdout.clone())
             .stderr(GuestLog::new("python"))
             .allow_tcp(false)
             .allow_udp(false)
             .allow_ip_name_lookup(false)
-            // Imports read hundreds of small files from the standard library, which sits in the
-            // page cache: sending each read to the blocking pool would triple a run's time.
-            // Must precede the preopen, which takes it.
+            // Imports look up hundreds of small files of the standard library, which sits in the
+            // page cache: sending each lookup to the blocking pool would make a run three times
+            // slower. The preopened directory keeps the setting it was opened with, so it is on
+            // for the preopen only. Off for the rest: with it on, `poll_oneoff` sleeps a lone
+            // relative timeout (`select`, `poll`) on this thread, out of the call timeout's reach.
             .allow_blocking_current_thread(true);
         if let Err(e) = wasi.preopened_dir(&self.inner.lib, "/lib", FsPerms::ReadOnly) {
             return ToolOutput::error(format!(
@@ -181,12 +225,15 @@ impl Python {
                  fixing, try again later"
             ));
         }
+        wasi.allow_blocking_current_thread(false);
+        let mut wasi = wasi.build_p1();
+        wasi.ctx().table.set_max_capacity(MAX_HANDLES);
         let mut store = Store::new(
             self.inner.host.engine(),
             ScriptState {
-                wasi: wasi.build_p1(),
+                wasi,
                 limits: StoreLimitsBuilder::new()
-                    .memory_size(self.limits.memory_bytes)
+                    .memory_size(limits.memory_bytes)
                     .memories(1)
                     .tables(MAX_TABLES)
                     .table_elements(MAX_TABLE_ELEMENTS)
@@ -195,7 +242,7 @@ impl Python {
             },
         );
         store.limiter(|s| &mut s.limits);
-        let out_of_cpu = meter(&mut store, &self.limits);
+        let out_of_cpu = meter(&mut store, &limits);
         let pre = &self.inner.pre;
         let call = async {
             let instance = pre.instantiate_async(&mut store).await?;
@@ -204,16 +251,23 @@ impl Python {
                 Ok(()) => Ok(0),
                 Err(e) => match e.downcast_ref::<I32Exit>() {
                     Some(I32Exit(code)) => Ok(*code),
+                    // WASI stops the run rather than failing the open.
+                    None if e.downcast_ref::<ResourceTableError>().is_some() => {
+                        Err(wasmtime::Error::msg(format!(
+                            "it had more than {MAX_HANDLES} files open at once; close each \
+                             file once read (use `with open(…)`)"
+                        )))
+                    }
                     None => Err(e),
                 },
             }
         };
-        let exit = match bounded("Python", &self.limits, &out_of_cpu, call).await {
+        let exit = match bounded("Python", &limits, &out_of_cpu, call).await {
             Ok(code) => code,
             Err(message) => return ToolOutput::error(message),
         };
         drop(store);
-        reply(&stdout.contents(), exit, &self.limits)
+        reply(&stdout.contents(), exit, &limits)
     }
 }
 
@@ -321,22 +375,48 @@ impl ToolSource for PythonSource {
     }
 }
 
-/// Link a module against WASI preview 1 alone: the script world's linker holds nothing else.
+/// Link a module against WASI preview 1 alone: the script world's linker holds nothing else, with
+/// silent socket functions (see the module's documentation).
 fn link(host: &ComponentHost, module: &Module) -> anyhow::Result<InstancePre<ScriptState>> {
     let mut linker = Linker::<ScriptState>::new(host.engine());
     wasmtime_wasi::p1::add_to_linker_async(&mut linker, |s| &mut s.wasi)?;
+    linker.allow_shadowing(true);
+    // No socket ever exists here: every call is on something that is not one.
+    linker.func_wrap(
+        P1,
+        "sock_accept",
+        |_: Caller<'_, ScriptState>, _: i32, _: i32, _: i32| ERRNO_NOTSOCK,
+    )?;
+    linker.func_wrap(
+        P1,
+        "sock_recv",
+        |_: Caller<'_, ScriptState>, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32| ERRNO_NOTSOCK,
+    )?;
+    linker.func_wrap(
+        P1,
+        "sock_send",
+        |_: Caller<'_, ScriptState>, _: i32, _: i32, _: i32, _: i32, _: i32| ERRNO_NOTSOCK,
+    )?;
+    linker.func_wrap(
+        P1,
+        "sock_shutdown",
+        |_: Caller<'_, ScriptState>, _: i32, _: i32| ERRNO_NOTSOCK,
+    )?;
     linker
         .instantiate_pre(module)
         .map_err(|e| anyhow::anyhow!("python.wasm needs more than WASI preview 1: {e:#}"))
 }
 
-/// The tool's output from what the guest wrote: the runner's reply is its last line.
+/// The tool's output from what the guest wrote: the runner's reply is its last line, on a line of
+/// its own. The code can write to the same stdout, and could even write a reply of its own and
+/// exit, but that only forges its own result. A run that exits with an error has no result.
 fn reply(stdout: &[u8], exit: i32, limits: &Limits) -> ToolOutput {
     let last = stdout
         .split(|&b| b == b'\n')
         .rfind(|line| !line.is_empty())
         .unwrap_or_default();
-    let Ok(reply) = serde_json::from_slice::<Reply>(last) else {
+    let parsed = serde_json::from_slice::<Reply>(last);
+    let (0, Ok(reply)) = (exit, parsed) else {
         if stdout.len() >= OUTPUT_BYTES {
             return ToolOutput::error(format!(
                 "output over {} KiB: return an aggregate, not the rows",
@@ -379,6 +459,68 @@ fn reply(stdout: &[u8], exit: i32, limits: &Limits) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    /// Captures what the log would get.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Log {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_calls_fail_quietly() {
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let host = ComponentHost::new().unwrap();
+        let wat = r#"(module
+            (import "wasi_snapshot_preview1" "sock_accept" (func $accept (param i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "sock_recv" (func $recv (param i32 i32 i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "sock_send" (func $send (param i32 i32 i32 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "sock_shutdown" (func $shutdown (param i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (func (export "calls") (result i32 i32 i32 i32)
+              (call $accept (i32.const 0) (i32.const 0) (i32.const 0))
+              (call $recv (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+              (call $send (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+              (call $shutdown (i32.const 0) (i32.const 0))))"#;
+        let module = Module::new(host.engine(), wat).unwrap();
+        let pre = link(&host, &module).unwrap();
+        let mut store = Store::new(
+            host.engine(),
+            ScriptState {
+                wasi: WasiCtxBuilder::new().build_p1(),
+                limits: StoreLimitsBuilder::new().build(),
+            },
+        );
+        store.set_epoch_deadline(u64::MAX);
+        let instance = pre.instantiate_async(&mut store).await.unwrap();
+        let calls = instance
+            .get_typed_func::<(), (i32, i32, i32, i32)>(&mut store, "calls")
+            .unwrap();
+        for _ in 0..100 {
+            let errnos = calls.call_async(&mut store, ()).await.unwrap();
+            assert_eq!(
+                errnos,
+                (ERRNO_NOTSOCK, ERRNO_NOTSOCK, ERRNO_NOTSOCK, ERRNO_NOTSOCK)
+            );
+        }
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("not implemented"), "{logged}");
+    }
 
     fn importing(module: &str, name: &str) -> String {
         format!(

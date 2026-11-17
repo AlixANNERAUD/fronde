@@ -18,3 +18,4 @@ lcov.info
 /fronde_password
 /secrets/
 /python
+/python.lock

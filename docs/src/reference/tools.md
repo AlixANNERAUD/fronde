@@ -92,16 +92,22 @@ On success the result is an object with `value`, the result as plain JSON, and `
 code printed; each is left out when empty. The value is converted for JSON: `Decimal` and
 `Fraction` become strings (`"0.3"`, `"1/3"`), dates and times ISO 8601 strings, sets and tuples
 lists, NaN and infinities the strings `"nan"`, `"inf"` and `"-inf"`, keys strings, and any other
-object its `repr`, cut at 1000 characters.
+object its `repr`, cut at 1000 characters. An integer beyond ±2<sup>53</sup> becomes a string of
+its digits (`math.factorial(25)` is `"15511210043330985984000000"`), since a JSON number that
+large loses digits when read as a double; smaller integers stay numbers.
 
 A Python exception is a tool error naming the exception and the line of `code` it came from,
 such as `ZeroDivisionError: division by zero (line 3)`, followed by what the code printed before
-it. `sys.exit()` with no code or 0 is not an error.
+it. `sys.exit()` with no code or 0 is not an error; any other exit is, and its output is not a
+result.
 
 | Limit | Value | Past it |
 | --- | --- | --- |
 | CPU | about 10 s of running time | The run is stopped: "used up its compute budget". |
-| Wall clock | 30 s | The run is stopped: "timed out". |
+| Wall clock | 30 s, waiting for a turn included | The run is stopped: "timed out", or "busy with other runs" if it never got a turn. |
+| Runs at once | 2 | Others wait for a turn. |
+| Code and data | 16 MiB of JSON together | Refused before running, asking for fewer rows or an aggregate. |
+| Open files | 128 at once | The run is stopped, asking to close each file once read. |
 | Memory | 256 MiB | `MemoryError`. |
 | Result | 60 KiB of JSON | An error asking for an aggregate rather than the rows. |
 | Printed output | the first 16 KiB | Cut, with `"stdout_truncated": true`. |

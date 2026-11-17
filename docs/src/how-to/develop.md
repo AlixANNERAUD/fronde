@@ -56,7 +56,9 @@ CPython's own `Platforms/WASI` script, at
 [tzdata](https://pypi.org/project/tzdata/) wheel for time zones, which the build lacks. It checks
 both archives and `python.wasm` against hashes pinned in `mise.toml`, then byte-compiles the
 standard library with the wasmtime CLI, so that runs do not compile the modules they import. It
-does nothing when the pinned archives are already installed. The tests of `fronde-wasm` load the
+does nothing when the same recipe, archives and `python.wasm` are already installed (a stamp,
+`python/.installed`, records them). A lock, `python.lock`, keeps two runs from replacing
+`python/` at once. The tests of `fronde-wasm` load the
 runtime from `python/`, or from `FRONDE_PYTHON_DIR`.
 
 To upgrade Python or tzdata:

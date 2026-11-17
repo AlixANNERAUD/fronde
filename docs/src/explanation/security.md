@@ -212,7 +212,9 @@ What a run is granted:
 - its arguments, which are fixed: the interpreter in isolated mode and Fronde's own runner;
 - standard input, which carries the code, the data and the user's time zone as JSON;
 - standard output, to a buffer in memory of at most 64 KiB, which carries the reply;
-- standard error, to Fronde's log as warnings under `python`, at most 100 lines a run;
+- standard error, to Fronde's log as warnings under `python`, at most 100 lines a run. The socket
+  functions of WASI preview 1, which would each log a warning, are replaced by ones that fail
+  silently: no socket exists here;
 - the clocks and random numbers;
 - one directory, the standard library, read-only at `/lib`.
 
@@ -227,7 +229,10 @@ hub and the next run untouched:
 | --- | --- | --- |
 | Memory | 256 MiB | CPython reserves 40 MiB at start; loading and grouping 100 000 rows of JSON needs about 56 MiB in all. Only the pages touched are used. |
 | CPU | about 10 s of running time | Counted as for components; time spent waiting is free. Python under WASI is about four times slower than native. |
-| Wall clock | 30 s | A run cannot hold a tool call open longer, even while sleeping. |
+| Wall clock | 30 s, waiting for a turn included | A run cannot hold a tool call open longer, even while sleeping: every wait (`time.sleep`, `select`, `poll`) is a timer on Fronde's async runtime, never a blocked thread, so the timeout cancels it. Only lookups and reads of the standard library run on the calling thread, which keeps imports fast; the stock WASI would also sleep there when a lone relative timeout is asked for, so that setting covers the preopened directory alone. A test runs `select` and `poll` with a 60 s timeout on a runtime with a single thread and checks that both stop at the timeout while another run finishes. |
+| Runs at once | 2 | Each may use 256 MiB and a core; a third waits for a turn within its 30 s. |
+| Code and data | 16 MiB | The JSON sent in is refused above it, before anything runs. |
+| Open files and streams | 128 at once | Imports open one file at a time; a run over the cap is stopped. |
 | Output | 64 KiB | Results and prints go back to the agent's context: aggregates, not rows. Prints keep their first 16 KiB. |
 
 Fronde runs only the CPython build it pins: the SHA-256 of `python.wasm` is written in Fronde's

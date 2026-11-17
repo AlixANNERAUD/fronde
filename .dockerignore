@@ -7,3 +7,4 @@ mise.local.toml
 .env
 components/dist
 python
+python.lock

@@ -95,8 +95,10 @@ run = [
 # crates/wasm/src/python.rs pins the same python.wasm, and Fronde refuses any other. The standard
 # library is byte-compiled once here, with unchecked hashes, so that each run skips compiling the
 # modules it imports and the files' mtimes in the image do not matter. -j 0 would need
-# multiprocessing, which WASI lacks. A stamp records the archives installed: the task does nothing
-# when they are already there. Upgrading Python: docs/src/how-to/develop.md.
+# multiprocessing, which WASI lacks. A stamp records the recipe, the archives and the interpreter
+# installed: the task does nothing when they are already there and python.wasm still matches; bump
+# `recipe` when the steps change. A lock beside python/ keeps two runs (`check` runs `test` and
+# `lint` side by side) from replacing it at once. Upgrading Python: docs/src/how-to/develop.md.
 [tasks.python]
 description = "Fetch the pinned CPython WASI build into python/"
 run = '''
@@ -107,8 +109,12 @@ tzdata_url=https://files.pythonhosted.org/packages/0a/66/9a06c2227fedfd4919f0eaa
 tzdata_sha256=0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec
 # The same as PYTHON_WASM_SHA256 in crates/wasm/src/python.rs.
 wasm_sha256=dd076791fb6d1286a5dfe105852dfb3367e10562de68ca0a618e615625cdf636
-stamp="$python_sha256 $tzdata_sha256"
-if [ -f python/.installed ] && [ "$(cat python/.installed)" = "$stamp" ]; then
+recipe=2
+stamp="recipe=$recipe python=$python_sha256 tzdata=$tzdata_sha256 wasm=$wasm_sha256"
+exec 9> python.lock
+flock 9
+if [ -f python/.installed ] && [ "$(cat python/.installed)" = "$stamp" ] \
+  && echo "$wasm_sha256  python/python.wasm" | sha256sum --check --strict --quiet 2>/dev/null; then
   exit 0
 fi
 rm -rf python

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 KEEP = 16 * 1024  # characters of printed output kept
 REPLY = 60 * 1024  # bytes of reply, under the host's 64 KiB pipe
 REPR = 1000
+EXACT = 2**53  # beyond this, a JSON number read as a double loses digits
 AGGREGATE = "return an aggregate (counts, sums, a few rows), not the rows"
 FIX = "fix the code and run again; only the standard library is available"
 STDLIB = (
@@ -39,8 +40,10 @@ class Capped(io.TextIOBase):
 
 
 def plain(v):
-    if v is None or isinstance(v, (bool, int, str)):
+    if v is None or isinstance(v, (bool, str)):
         return v
+    if isinstance(v, int):
+        return v if -EXACT <= v <= EXACT else str(v)
     if isinstance(v, float):
         return v if math.isfinite(v) else str(v)
     if isinstance(v, (Decimal, Fraction)):
@@ -55,11 +58,19 @@ def plain(v):
 
 
 def describe(e):
+    # The exception is the code's: its __str__ or attributes may raise in turn.
     name = type(e).__name__
-    if isinstance(e, SyntaxError) and e.filename == "<code>":
-        return f"{name}: {e.msg} (line {e.lineno})"
-    text = f"{name}: {e}" if str(e) else name
-    lines = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename == "<code>"]
+    try:
+        if isinstance(e, SyntaxError) and e.filename == "<code>":
+            return f"{name}: {str(e.msg)[:REPR]} (line {int(e.lineno)})"
+        message = str(e)[:REPR]
+        text = f"{name}: {message}" if message else name
+    except BaseException:
+        text = name
+    try:
+        lines = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename == "<code>"]
+    except BaseException:
+        lines = []
     return f"{text} (line {lines[-1]})" if lines else text
 
 
@@ -108,7 +119,8 @@ def main(out):
         text = json.dumps(
             {"error": f"the result is {size} bytes, over the limit of {REPLY}", "next": AGGREGATE}
         )
-    out.write(text.encode() + b"\n")
+    # On a line of its own, whatever the code left unterminated on stdout.
+    out.write(b"\n" + text.encode() + b"\n")
     out.flush()
 
 

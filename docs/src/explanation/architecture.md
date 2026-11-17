@@ -78,11 +78,12 @@ standard output, through a fixed runner that Fronde passes as its argument. No `
 interface is involved, so the frozen WIT stays as it is. The script world has its own linker,
 with WASI preview 1 and nothing else, and its own limits, larger than a component's because
 CPython needs 40 MiB to start. It shares the engine, the epoch ticker that meters CPU, and the
-call timeout with the tool world.
+mechanism of the call timeout with the tool world, not its values: a Python run has 30 s of wall
+clock, waiting for a turn included, and a component call 60 s. Two runs go at once; others wait.
 
 The `python.wasm` is compiled once, in memory, when the source starts; each call gets a fresh
 instance, whose memory starts as a copy-on-write image of the compiled module. A call takes
-around 50 to 100 ms on top of the code's own work. CPython 3.16 moves to WASI 0.3 as a
+around 140 ms on top of the code's own work (release build, 8 cores). CPython 3.16 moves to WASI 0.3 as a
 component; moving to it means a component linker for this world, with no change to the tool. See
 [Security model](security.md#python-sandbox).
 
