@@ -8,13 +8,14 @@
 //! that it can never be taken for a secret row or the other way round. A wrong key is then
 //! reported as a wrong key, not as damaged rows, and a new key is never made while it exists.
 //! Beside it, `secrets`/`backend` records which backend holds the key
-//! ([`crate::master_key::Backends`]), written in the same transaction.
+//! ([`crate::master_key::Backends`]), and `secrets`/`keychain_entry` the keychain entry's user
+//! for a key in the keychain, written in the same transaction.
 //!
 //! Origins are stored as the caller gives them: canonical, written by `Origin::to_string()`
 //! (`fronde_hub::origin`). Values only leave this module as `SecretString`, and nothing here
 //! prints one.
 
-use crate::master_key::{Backend, MasterKey};
+use crate::master_key::{Backend, Backends, MasterKey};
 use anyhow::{Context as _, bail};
 use chacha20poly1305::aead::{Aead as _, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -26,6 +27,7 @@ use sea_orm::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use std::fmt;
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// The scope of every component credential, for now.
@@ -42,6 +44,8 @@ const CHECK_SCOPE: &str = "secrets";
 const CHECK_KEY: &str = "key_check";
 /// Where the record of the key's backend lives in `kv`, beside the key check.
 const BACKEND_KEY: &str = "backend";
+/// Where the record of the keychain entry's user lives in `kv`, for a key in the keychain.
+const KEYCHAIN_ENTRY_KEY: &str = "keychain_entry";
 /// The key check's format, its first byte; then the nonce, then the sealed text. Format 2 seals
 /// it under its own domain label; format 1, written by the first version of the store, sealed it
 /// under the secret rows' label: it is still accepted, and sealed again in format 2 by the next
@@ -238,21 +242,57 @@ pub async fn recorded_backend<C: ConnectionTrait>(db: &C) -> anyhow::Result<Opti
         .transpose()
 }
 
-/// Record `backend` as the one holding the key, unless it already is. Called only with a key
-/// that opened the key check, or with the first one: the record follows the key.
-async fn record_backend<C: ConnectionTrait>(db: &C, backend: Backend) -> anyhow::Result<()> {
-    if recorded_backend(db).await? == Some(backend) {
-        return Ok(());
+/// The user of the keychain entry that holds the master key, as recorded with the first secret
+/// stored under a key from the keychain; `None` before, or for a database from before the record.
+pub async fn recorded_keychain_entry<C: ConnectionTrait>(db: &C) -> anyhow::Result<Option<String>> {
+    crate::kv::get(db, CHECK_SCOPE, KEYCHAIN_ENTRY_KEY)
+        .await
+        .context("cannot read where the master key is kept")?
+        .map(|user| {
+            String::from_utf8(user)
+                .context("the database's record of the keychain entry is not text")
+        })
+        .transpose()
+}
+
+/// Record where `key` is kept, its backend and, for the keychain, its entry's user, unless they
+/// already are. Called only with a key that opened the key check, or with the first one: the
+/// record follows the key.
+async fn record_backend<C: ConnectionTrait>(db: &C, key: &MasterKey) -> anyhow::Result<()> {
+    let failed = || "cannot record where the master key is kept";
+    if recorded_backend(db).await? != Some(key.backend()) {
+        crate::kv::set(
+            db,
+            CHECK_SCOPE,
+            BACKEND_KEY,
+            key.backend().name().as_bytes().to_vec(),
+            None,
+        )
+        .await
+        .context(failed())?;
     }
-    crate::kv::set(
-        db,
-        CHECK_SCOPE,
-        BACKEND_KEY,
-        backend.name().as_bytes().to_vec(),
-        None,
-    )
-    .await
-    .context("cannot record where the master key is kept")
+    let recorded = recorded_keychain_entry(db).await?;
+    match key.keychain_entry() {
+        Some(entry) if recorded.as_deref() != Some(entry) => {
+            crate::kv::set(
+                db,
+                CHECK_SCOPE,
+                KEYCHAIN_ENTRY_KEY,
+                entry.as_bytes().to_vec(),
+                None,
+            )
+            .await
+            .context(failed())?;
+        }
+        Some(_) => {}
+        None if recorded.is_some() => {
+            crate::kv::delete(db, CHECK_SCOPE, KEYCHAIN_ENTRY_KEY)
+                .await
+                .context(failed())?;
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 async fn stored_check<C: ConnectionTrait>(db: &C) -> anyhow::Result<Option<Vec<u8>>> {
@@ -324,8 +364,8 @@ pub async fn upgrade_key_check(db: &DatabaseConnection, key: &MasterKey) -> anyh
     if older {
         write_check(&transaction, seal_check(&key.cipher())?).await?;
     }
-    // A database from before backends were recorded learns where its key is.
-    record_backend(&transaction, key.backend()).await?;
+    // A database from before backends, or keychain entries, were recorded learns where its key is.
+    record_backend(&transaction, key).await?;
     transaction
         .commit()
         .await
@@ -399,7 +439,7 @@ pub async fn set(
             write_check(&transaction, seal_check(&cipher)?).await?;
         }
     }
-    record_backend(&transaction, key.backend()).await?;
+    record_backend(&transaction, key).await?;
     let now = Utc::now();
     let created_at = secrets::Entity::find_by_id((scope.to_owned(), name.to_owned()))
         .one(&transaction)
@@ -438,6 +478,25 @@ pub async fn set(
         .commit()
         .await
         .context("cannot store the secret")
+}
+
+/// [`set`] with the key from `backends`, made there when nothing is sealed yet
+/// ([`Backends::load_or_create`]), all under the backends' [`crate::master_key::KeyLock`]: two
+/// first secrets stored at once, from two processes, use one key, and the keychain never ends up
+/// holding another key than the one that sealed. Returns the key and whether it was made now.
+pub async fn store(
+    db: &DatabaseConnection,
+    backends: &Backends,
+    scope: &str,
+    name: &str,
+    origin: &str,
+    value: &SecretString,
+) -> anyhow::Result<(Arc<MasterKey>, bool)> {
+    let lock = backends.lock().await?;
+    let (key, created) = backends.load_or_create_locked(db, &lock).await?;
+    set(db, &key, scope, name, origin, value).await?;
+    drop(lock);
+    Ok((key, created))
 }
 
 /// Remove the secret under `scope` and `name`; true if there was one. Removing the last secret

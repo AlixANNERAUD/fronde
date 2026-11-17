@@ -63,11 +63,11 @@ pub async fn set(
     let origin = Origin::parse(origin)?.to_string();
     let db = open(config).await?;
     let backends = config.master_key_backends()?;
-    let (key, created) = backends.load_or_create(&db).await?;
-    secrets::set(&db, &key, secrets::SOURCES, name, &origin, value).await?;
+    let (key, created) =
+        secrets::store(&db, &backends, secrets::SOURCES, name, &origin, value).await?;
     db.close().await?;
     if created {
-        let place = backends.place(key.backend());
+        let place = backends.place_of(&key);
         match key.backend() {
             Backend::File => writeln!(
                 out,

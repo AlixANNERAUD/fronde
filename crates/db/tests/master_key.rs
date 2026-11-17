@@ -420,3 +420,189 @@ async fn the_keychain_key_is_made_once() {
     s.store(&a, "caldav").await;
     assert!(s.opens(&b, "caldav").await);
 }
+
+/// Two first secrets stored at once, by two processes each with its own handle on the keychain,
+/// both reading an empty entry before either writes: the lock makes the second wait, so one key
+/// is made, both secrets are sealed with it, and the keychain holds that key.
+#[tokio::test]
+async fn two_first_writers_share_one_key() {
+    let s = Setup::new().await;
+    s.keychain
+        .slow_when_empty(std::time::Duration::from_millis(300));
+    let store = |name: &'static str| {
+        // Each writer as its own process: its own keychain handle, its own connection.
+        let backends = s.auto();
+        let data = s.data.clone();
+        async move {
+            let db = fronde_db::open(&data).await.unwrap();
+            secrets::store(
+                &db,
+                &backends,
+                SOURCES,
+                name,
+                ORIGIN,
+                &SecretString::from("v"),
+            )
+            .await
+        }
+    };
+    let (a, b) = tokio::join!(store("a"), store("b"));
+    let ((a, created_a), (b, created_b)) = (a.unwrap(), b.unwrap());
+    assert!(created_a ^ created_b, "one key is made");
+    s.keychain.unlock();
+    let stored = MasterKey::parse(
+        s.keychain.entry(&s.data).unwrap().as_bytes(),
+        Backend::Keychain,
+    )
+    .unwrap();
+    for key in [&*a, &*b, &stored] {
+        assert!(s.opens(key, "a").await && s.opens(key, "b").await);
+    }
+    assert!(s.data.join(fronde_db::master_key::LOCK_FILE).is_file());
+}
+
+/// A keychain that never answers, as behind an unlock prompt nobody sees: with nothing stored,
+/// `load` does not ask it; a first key times out within 2 s with an error and no key file; a
+/// second call waits for the first one's thread instead of starting another; and a runtime with
+/// that thread still blocked shuts down within its bound.
+#[test]
+fn a_keychain_that_hangs_does_not_hold_fronde() {
+    use std::time::{Duration, Instant};
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let s = runtime.block_on(Setup::new());
+    s.keychain.hang();
+    let backends = s.auto();
+    runtime.block_on(async {
+        assert!(backends.load(&s.db).await.unwrap().is_none());
+        assert_eq!(
+            s.keychain.opened(),
+            0,
+            "nothing stored: the keychain is not asked"
+        );
+
+        let start = Instant::now();
+        let e = err(backends.load_or_create(&s.db).await).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(e.contains("did not answer within 2 s"), "{e}");
+        assert!(e.contains("unlock it"), "{e}");
+        assert_eq!(s.keychain.opened(), 1);
+
+        let start = Instant::now();
+        let e = err(backends.load_or_create(&s.db).await).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(e.contains("is busy"), "{e}");
+        assert_eq!(s.keychain.opened(), 1, "no second blocking thread");
+    });
+    assert!(!s.key_file().exists(), "no key file in its place");
+    let start = Instant::now();
+    runtime.shutdown_timeout(Duration::from_millis(500));
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    // Lets the blocked thread end.
+    s.keychain.unlock();
+}
+
+/// A first key with `auto` and a keychain that is there but locked: an error that says to
+/// unlock it, never a key file, and once unlocked the key goes to the keychain.
+#[tokio::test]
+async fn a_locked_keychain_stops_the_first_key_too() {
+    let s = Setup::new().await;
+    s.keychain.lock();
+    let e = err(s.auto().load_or_create(&s.db).await).await;
+    assert!(e.contains("is locked") && e.contains("unlock it"), "{e}");
+    assert!(!s.key_file().exists(), "no key file");
+    assert_eq!(s.recorded().await, None);
+
+    s.keychain.unlock();
+    let (key, created) = s.auto().load_or_create(&s.db).await.unwrap();
+    assert!(created);
+    assert_eq!(key.backend(), Backend::Keychain);
+}
+
+/// The keychain entry is recorded with the first secret and used from then on: a data
+/// directory moved elsewhere, whose path names another entry, still finds its key. A database
+/// from before the record uses the entry its path names, and the next start records it.
+#[tokio::test]
+async fn the_recorded_keychain_entry_outlives_a_move() {
+    let s = Setup::new().await;
+    let (key, _) = s.auto().load_or_create(&s.db).await.unwrap();
+    s.store(&key, "caldav").await;
+    let entry = s.keychain.keychain(&s.data).user();
+    assert_eq!(
+        secrets::recorded_keychain_entry(&s.db).await.unwrap(),
+        Some(entry.clone())
+    );
+
+    let moved = s._root.path().join("moved");
+    std::fs::create_dir(&moved).unwrap();
+    let keychain = s.keychain.keychain(&moved);
+    assert_ne!(keychain.user(), entry);
+    let backends = Backends::new(Choice::Auto, s.key_file(), None, keychain);
+    let loaded = backends.load(&s.db).await.unwrap().unwrap();
+    assert!(s.opens(&loaded, "caldav").await);
+    assert_eq!(loaded.keychain_entry(), Some(entry.as_str()));
+
+    // Without the record, the path's entry is used, and the next start records it again.
+    fronde_db::kv::delete(&s.db, "secrets", "keychain_entry")
+        .await
+        .unwrap();
+    let e = err(backends.load(&s.db).await).await;
+    assert!(e.contains("secret-tool search service fronde"), "{e}");
+    let loaded = s.auto().load(&s.db).await.unwrap().unwrap();
+    secrets::upgrade_key_check(&s.db, &loaded).await.unwrap();
+    assert_eq!(
+        secrets::recorded_keychain_entry(&s.db).await.unwrap(),
+        Some(entry)
+    );
+    assert!(backends.load(&s.db).await.unwrap().is_some());
+}
+
+/// A `[secrets] backend` that is not the recorded one, while secrets are stored, is read all
+/// the same, since the owner may have moved the key there: without the key, the error names the
+/// recorded backend and the settings that work; with it, the key opens the secrets and the record
+/// follows it.
+#[tokio::test]
+async fn an_explicit_backend_that_is_not_the_recorded_one_says_so() {
+    let s = Setup::new().await;
+    s.keychain.make_unreachable();
+    let (key, _) = s.auto().load_or_create(&s.db).await.unwrap();
+    s.store(&key, "caldav").await;
+    assert_eq!(s.recorded().await, Some(Backend::File));
+    s.keychain.unlock();
+
+    let keychain = s.backends(Choice::Only(Backend::Keychain), false);
+    let e = err(keychain.load(&s.db).await).await;
+    assert!(
+        e.contains("the master key is missing from the keychain"),
+        "{e}"
+    );
+    assert!(e.contains("records that the master key"), "{e}");
+    assert!(e.contains("the file backend"), "{e}");
+    assert!(e.contains(&s.key_file().display().to_string()), "{e}");
+    assert!(e.contains("backend = \"auto\" or \"file\""), "{e}");
+    assert!(s.keychain.entry(&s.data).is_none(), "nothing is made");
+
+    // The key moved to the keychain by hand: it opens the secrets, and the record follows.
+    let line = std::fs::read_to_string(s.key_file()).unwrap();
+    s.keychain.put(&s.data, line.trim_end());
+    let moved = keychain.load(&s.db).await.unwrap().unwrap();
+    assert_eq!(moved.backend(), Backend::Keychain);
+    assert!(s.opens(&moved, "caldav").await);
+    secrets::upgrade_key_check(&s.db, &moved).await.unwrap();
+    assert_eq!(s.recorded().await, Some(Backend::Keychain));
+    assert!(s.auto().load(&s.db).await.unwrap().is_some());
+}

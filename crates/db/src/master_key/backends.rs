@@ -1,16 +1,26 @@
 //! Which backend holds the master key. `[secrets] backend` names one, or is `auto`: then the
 //! first key is made in a systemd credential if the service has one, else in the keychain if it
 //! answers, else in a file, and the database records the backend that holds it
-//! (`secrets`/`backend` in `kv`, written with the key check). From then on `auto` uses that one
-//! only: a keychain locked at boot is an error, never a reason to make a new key elsewhere, which
-//! would strand every stored secret.
+//! (`secrets`/`backend` in `kv`, written with the key check, and for the keychain the entry's
+//! user beside it). From then on `auto` uses that one only: a keychain locked at boot is an
+//! error, never a reason to make a new key elsewhere, which would strand every stored secret.
+//! For the first key too, a keychain that is there but locked is an error: only one that is
+//! absent or cannot be reached lets the key go to a file.
 
 use super::keychain::KeychainError;
 use super::{Backend, Keychain, MasterKey, systemd};
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use sea_orm::DatabaseConnection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// The lock file of [`KeyLock`], in the data directory.
+pub const LOCK_FILE: &str = "master-key.lock";
+
+/// How long [`Backends::lock`] waits for another Fronde storing a first secret.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// `[secrets] backend`: one backend, or `auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -20,6 +30,31 @@ pub enum Choice {
     Auto,
     /// This backend alone.
     Only(Backend),
+}
+
+/// Held while a first master key may be made, until the first secret is sealed with it: an
+/// exclusive lock on [`LOCK_FILE`] in the data directory, across processes, released when
+/// dropped. The keychain replaces an entry it writes, so without it two first writers could each
+/// make a key, the second overwriting the one the first sealed with. A key file is made without
+/// replacing one and a systemd credential is only read: with no keychain, nothing is locked.
+#[derive(Debug)]
+#[must_use = "the lock is released when dropped"]
+pub struct KeyLock {
+    file: Option<std::fs::File>,
+}
+
+impl KeyLock {
+    /// The lock file again, sharing the lock: a keychain call that times out keeps it on its
+    /// blocking thread, so that its write, if it ever comes, still happens under the lock.
+    fn share(&self) -> anyhow::Result<Option<std::fs::File>> {
+        self.file
+            .as_ref()
+            .map(|file| {
+                file.try_clone()
+                    .context("cannot share the master key's lock")
+            })
+            .transpose()
+    }
 }
 
 /// The places the master key may be kept, and which one to use.
@@ -70,7 +105,7 @@ impl Backends {
         &self.file
     }
 
-    /// Where `backend` keeps the key, for messages: a path or a keychain entry.
+    /// Where `backend` keeps a first key, for messages: a path or a keychain entry.
     pub fn place(&self, backend: Backend) -> String {
         match backend {
             Backend::File => self.file.display().to_string(),
@@ -82,50 +117,71 @@ impl Backends {
         }
     }
 
-    /// The key that opens the stored secrets, from the backend in use, checked against the
-    /// database. `None` when that backend holds no key and nothing is stored, or when, with
-    /// `auto`, no key was made yet. A key missing while secrets are stored, a backend that cannot
-    /// be read while they are, or a key that does not open them, is an error that says so;
-    /// another backend is never tried.
-    pub async fn load(&self, db: &DatabaseConnection) -> anyhow::Result<Option<Arc<MasterKey>>> {
-        let stored = crate::secrets::any_stored(db).await?;
-        let backend = match (self.choice, crate::secrets::recorded_backend(db).await?) {
-            (Choice::Only(backend), _) | (Choice::Auto, Some(backend)) => backend,
-            // Secrets stored before backends were recorded were sealed with the key file.
-            (Choice::Auto, None) if stored => Backend::File,
-            (Choice::Auto, None) => return Ok(None),
-        };
-        let mut key = match self.read(backend).await {
-            Ok(key) => key,
-            Err(KeychainError::Unavailable(why)) if !stored => {
-                tracing::debug!("no master key read from {}: it {why}", self.place(backend));
-                return Ok(None);
-            }
-            Err(e) => return Err(self.unavailable(backend, e)),
-        };
-        // A first secret stored since the key was read made the key before its row: read again.
-        if key.is_none() && !stored && crate::secrets::any_stored(db).await? {
-            key = self
-                .read(backend)
-                .await
-                .map_err(|e| self.unavailable(backend, e))?;
+    /// Where `key` is kept, for messages: its own keychain entry for a key in the keychain.
+    pub fn place_of(&self, key: &MasterKey) -> String {
+        match key.keychain_entry() {
+            Some(entry) => self.keychain.describe(entry),
+            None => self.place(key.backend()),
         }
+    }
+
+    /// The key that opens the stored secrets, from the backend in use, checked against the
+    /// database; `None` when nothing is sealed, without asking any backend (a keychain could
+    /// open a prompt). A key missing while secrets are stored, a backend that cannot be read
+    /// while they are, or a key that does not open them, is an error that says so, and names the
+    /// recorded backend when `[secrets] backend` names another; another backend is never tried.
+    pub async fn load(&self, db: &DatabaseConnection) -> anyhow::Result<Option<Arc<MasterKey>>> {
+        if !crate::secrets::any_stored(db).await? {
+            return Ok(None);
+        }
+        let entry = self.entry(db).await?;
+        // Secrets stored before backends were recorded were sealed with the key file.
+        let recorded = crate::secrets::recorded_backend(db)
+            .await?
+            .unwrap_or(Backend::File);
+        let backend = match self.choice {
+            Choice::Only(chosen) => chosen,
+            Choice::Auto => recorded,
+        };
+        // A named backend that is not the recorded one is read all the same: the owner may have
+        // moved the key there, and the record then follows it ([`crate::secrets::set`]).
+        self.load_from(db, backend, &entry)
+            .await
+            .map_err(|e| match backend == recorded {
+                true => e,
+                false => e.context(self.contradicts(backend, recorded, &entry)),
+            })
+    }
+
+    /// [`Backends::load`] from `backend`, while secrets are stored.
+    async fn load_from(
+        &self,
+        db: &DatabaseConnection,
+        backend: Backend,
+        entry: &str,
+    ) -> anyhow::Result<Option<Arc<MasterKey>>> {
+        let key = self
+            .read(backend, entry)
+            .await
+            .map_err(|e| self.unavailable(backend, entry, e))?;
         match key {
             Some(key) => {
                 crate::secrets::check_key(db, &key)
                     .await
-                    .map_err(|e| e.context(format!("master key {}", self.place(backend))))?;
+                    .map_err(|e| e.context(format!("master key {}", self.place_of(&key))))?;
                 Ok(Some(Arc::new(key)))
             }
-            None if crate::secrets::any_stored(db).await? => Err(self.missing(backend)),
-            None => Ok(None),
+            // The last secret was removed since.
+            None if !crate::secrets::any_stored(db).await? => Ok(None),
+            None => Err(self.missing(backend, entry)),
         }
     }
 
-    /// [`Backends::load`], or, when no key is there and nothing is stored, a new key in the
-    /// backend in use: the one `[secrets] backend` names, or, with `auto`, the recorded one, else
-    /// the first of the systemd credential, the keychain and a file that can hold it. The flag
-    /// says whether the key was made now.
+    /// [`Backends::load`], or, when nothing is sealed, the key in the backend in use, made there
+    /// if it holds none: the one `[secrets] backend` names, or, with `auto`, the recorded one,
+    /// else the first of the systemd credential, the keychain and a file that can hold it. The
+    /// flag says whether the key was made now. Takes the [`KeyLock`] to make a key: to seal the
+    /// first secret under it too, use [`crate::secrets::store`].
     ///
     /// The backend is recorded when the first secret is stored ([`crate::secrets::set`]), in the
     /// transaction that checks, as the real guard, that no secret was sealed under another key in
@@ -137,35 +193,110 @@ impl Backends {
         if let Some(key) = self.load(db).await? {
             return Ok((key, false));
         }
+        let lock = self.lock().await?;
+        self.load_or_create_locked(db, &lock).await
+    }
+
+    /// [`Backends::load_or_create`] while the caller holds `lock`, from [`Backends::lock`].
+    pub async fn load_or_create_locked(
+        &self,
+        db: &DatabaseConnection,
+        lock: &KeyLock,
+    ) -> anyhow::Result<(Arc<MasterKey>, bool)> {
+        if let Some(key) = self.load(db).await? {
+            return Ok((key, false));
+        }
+        let entry = self.entry(db).await?;
         let (key, created) = match (self.choice, crate::secrets::recorded_backend(db).await?) {
             (Choice::Only(backend), _) | (Choice::Auto, Some(backend)) => {
-                self.create(backend).await?
+                self.create(backend, &entry, lock).await?
             }
-            (Choice::Auto, None) => self.create_first().await?,
+            (Choice::Auto, None) => self.create_first(&entry, lock).await?,
         };
         Ok((Arc::new(key), created))
     }
 
-    /// The key in `backend`, if it holds one.
-    async fn read(&self, backend: Backend) -> Result<Option<MasterKey>, KeychainError> {
+    /// The [`KeyLock`] of the keychain's data directory, once no other process holds it; an
+    /// error after [`LOCK_WAIT`], or at once when a keychain call of this process that timed
+    /// out still holds it.
+    pub async fn lock(&self) -> anyhow::Result<KeyLock> {
+        let Some(dir) = self.keychain.data_dir() else {
+            return Ok(KeyLock { file: None });
+        };
+        self.keychain
+            .wait_idle()
+            .await
+            .map_err(|e| e.into_anyhow(&self.keychain.to_string()))?;
+        let path = dir.join(LOCK_FILE);
+        let file = fronde_fs::private_options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("cannot open the lock file {}", path.display()))?;
+        let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(KeyLock { file: Some(file) }),
+                Err(std::fs::TryLockError::WouldBlock)
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(LOCK_POLL).await;
+                }
+                Err(std::fs::TryLockError::WouldBlock) => bail!(
+                    "another Fronde has held {} for {} s while storing the first secret; try \
+                     again once it is done",
+                    path.display(),
+                    LOCK_WAIT.as_secs()
+                ),
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("cannot lock {}", path.display()));
+                }
+            }
+        }
+    }
+
+    /// The keychain entry's user: the one recorded with the first secret, else the one this data
+    /// directory's path gives.
+    async fn entry(&self, db: &DatabaseConnection) -> anyhow::Result<String> {
+        Ok(crate::secrets::recorded_keychain_entry(db)
+            .await?
+            .unwrap_or_else(|| self.keychain.user()))
+    }
+
+    /// The key in `backend`, if it holds one; `entry` is the keychain entry's user.
+    async fn read(
+        &self,
+        backend: Backend,
+        entry: &str,
+    ) -> Result<Option<MasterKey>, KeychainError> {
         match backend {
             Backend::File => super::read(&self.file).map_err(KeychainError::Failed),
             Backend::Systemd => {
                 systemd::read(self.credentials.as_deref()).map_err(KeychainError::Failed)
             }
-            Backend::Keychain => self.keychain.read().await,
+            Backend::Keychain => self.keychain.read(entry).await,
         }
     }
 
-    /// The key in `backend`, or a new one there.
-    async fn create(&self, backend: Backend) -> anyhow::Result<(MasterKey, bool)> {
+    /// The key in `backend`, or a new one there, and whether it was made now.
+    async fn create(
+        &self,
+        backend: Backend,
+        entry: &str,
+        lock: &KeyLock,
+    ) -> anyhow::Result<(MasterKey, bool)> {
         match backend {
-            Backend::File => Ok((super::create(&self.file)?, true)),
+            Backend::File => match super::read(&self.file)? {
+                Some(key) => Ok((key, false)),
+                None => Ok((super::create(&self.file)?, true)),
+            },
             Backend::Keychain => self
                 .keychain
-                .read_or_create()
+                .read_or_create(entry, lock.share()?)
                 .await
-                .map_err(|e| e.into_anyhow(&self.keychain)),
+                .map_err(|e| e.into_anyhow(&self.keychain.describe(entry))),
             Backend::Systemd => match systemd::read(self.credentials.as_deref())? {
                 Some(key) => Ok((key, false)),
                 None => Err(self.no_credential()),
@@ -174,34 +305,50 @@ impl Backends {
     }
 
     /// The first key with `auto`: the systemd credential when the service has one, else the
-    /// keychain when it answers, else a file.
-    async fn create_first(&self) -> anyhow::Result<(MasterKey, bool)> {
+    /// keychain when it answers, else a file. A keychain that is there but locked is an error:
+    /// unlocked later, it would hold no key while the file holds one, and the owner, who has a
+    /// keychain, did not choose a file.
+    async fn create_first(&self, entry: &str, lock: &KeyLock) -> anyhow::Result<(MasterKey, bool)> {
         if let Some(key) = systemd::read(self.credentials.as_deref())? {
             return Ok((key, false));
         }
-        match self.keychain.read_or_create().await {
+        match self.keychain.read_or_create(entry, lock.share()?).await {
             Ok(made) => return Ok(made),
-            Err(KeychainError::Unavailable(why)) => tracing::info!(
+            Err(KeychainError::Absent(why)) => tracing::info!(
                 "{} {why}: the master key goes to the file {} instead, for good",
-                self.keychain,
+                self.keychain.describe(entry),
                 self.file.display()
             ),
-            Err(e) => return Err(e.into_anyhow(&self.keychain)),
+            Err(e) => return Err(e.into_anyhow(&self.keychain.describe(entry))),
         }
-        self.create(Backend::File).await
+        self.create(Backend::File, entry, lock).await
     }
 
-    fn unavailable(&self, backend: Backend, e: KeychainError) -> anyhow::Error {
+    fn unavailable(&self, backend: Backend, entry: &str, e: KeychainError) -> anyhow::Error {
         match (backend, e) {
-            (Backend::Keychain, e) => e.into_anyhow(&self.keychain),
+            (Backend::Keychain, e) => e.into_anyhow(&self.keychain.describe(entry)),
             (_, KeychainError::Failed(e)) => e,
-            (_, KeychainError::Unavailable(why)) => {
+            (_, KeychainError::Locked(why) | KeychainError::Absent(why)) => {
                 anyhow::anyhow!("{} {why}", self.place(backend))
             }
         }
     }
 
-    fn missing(&self, backend: Backend) -> anyhow::Error {
+    /// `[secrets] backend` names `chosen`, but the database records that `recorded` holds the
+    /// key that sealed the stored secrets.
+    fn contradicts(&self, chosen: Backend, recorded: Backend, entry: &str) -> String {
+        let place = match recorded {
+            Backend::Keychain => self.keychain.describe(entry),
+            other => self.place(other),
+        };
+        format!(
+            "[secrets] backend = \"{chosen}\", but the database records that the master key of \
+             the stored secrets is kept in the {recorded} backend ({place}); set [secrets] \
+             backend = \"auto\" or \"{recorded}\", or put that key in the {chosen} backend"
+        )
+    }
+
+    fn missing(&self, backend: Backend, entry: &str) -> anyhow::Error {
         let without = "Fronde does not make a new key while secrets are stored: it could not \
                        open them. Without the key, remove each stored secret (`fronde secret \
                        list`, then `fronde secret remove <name>`) and store them again: once the \
@@ -214,8 +361,9 @@ impl Backends {
             ),
             Backend::Keychain => anyhow::anyhow!(
                 "the master key is missing from {}, but the database holds secrets sealed with \
-                 it; restore the entry from a backup of the key. {without}",
-                self.keychain
+                 it; restore the entry from a backup of the key (on Linux, `secret-tool search \
+                 service fronde` lists the entries Fronde made). {without}",
+                self.keychain.describe(entry)
             ),
             Backend::Systemd => self.no_credential().context(format!(
                 "the database holds secrets sealed with the master key, which is not there. \

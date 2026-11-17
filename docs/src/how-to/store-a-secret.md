@@ -38,23 +38,47 @@ it put it. By default (`[secrets] backend = "auto"`, see
 - under a systemd service that loads the credential `fronde-master-key`, the key is that
   credential's (see
   [Run as a systemd service](run-as-a-service.md#keep-the-master-key-in-a-systemd-credential));
-- on a desktop whose keychain is unlocked (GNOME Keyring, KWallet, KeePassXC with Secret
-  Service, the macOS Keychain, the Windows Credential Manager), the key goes there, as the entry
-  `fronde` / `master-key@…`: nothing to back up beside the keychain itself;
-- otherwise (a server, a container, a locked keychain), it goes to `master.key` beside the
-  configuration file (mode 0600), whose path it prints. That file is kept out of the data
-  directory, so that backups of the data directory do not hold it: back it up now, once, apart
-  from them, in a password manager for instance (see
+- on a desktop with a keychain (GNOME Keyring, KWallet, KeePassXC with Secret Service, the
+  macOS Keychain, the Windows Credential Manager), the key goes there, as the entry `fronde` /
+  `master-key@…`. If the keychain is locked, or waits on an unlock prompt, the command stops and
+  says to unlock it and try again: it does not put the key in a file instead;
+- otherwise (a server, a container, a session with no keychain to reach), it goes to
+  `master.key` beside the configuration file (mode 0600), whose path it prints. That file is kept
+  out of the data directory, so that backups of the data directory do not hold it: back it up
+  now, once, apart from them, in a password manager for instance (see
   [Data directory](../reference/data-directory.md)). To keep it elsewhere, set
   `[secrets] master_key = { file = "…" }` before storing the first secret.
 
-Fronde remembers where the key went and looks only there from then on. Without the key, the stored
-secrets cannot be read, and Fronde does not make a new key while secrets are stored. If the
-keychain is locked when Fronde starts, it stops and says to unlock it.
+Fronde remembers where the key went, and for the keychain the entry's name, and looks only there
+from then on, even if the data directory moves. Without the key, the stored secrets cannot be
+read, and Fronde does not make a new key while secrets are stored. If the keychain is locked when
+Fronde starts, it stops and says to unlock it.
 
 To choose instead of letting `auto` choose, set `backend` before storing the first secret, for
 instance `backend = "file"` for a service that starts at boot, before any desktop session unlocks
-the keychain.
+the keychain, or on a machine whose keychain asks to be unlocked in a session you do not see.
+
+## Back up a key kept in the keychain
+
+The keychain is backed up with your home directory, but only as long as you keep its password,
+and only on that machine's keychain. Keep a copy of the key line in a password manager as well.
+On Linux, `secret-tool` (from libsecret) prints it, without a final line break:
+
+```sh
+secret-tool search service fronde            # the entries Fronde made, with their user names
+secret-tool lookup service fronde username master-key@…
+```
+
+Copy the line, `fronde-key-v1:` and what follows, into the password manager, without saving it
+in a file or your shell history. To put it back after a loss, read it from the password manager
+into the entry Fronde names in its error:
+
+```sh
+secret-tool store --label='Fronde master key' service fronde username master-key@…
+```
+
+which asks for the line. On macOS, Keychain Access shows the item `fronde`; on Windows, the
+Credential Manager lists it under Windows Credentials, among the generic credentials.
 
 If the configuration's directory is read-only, as in a container, the key file cannot be created
 there: `fronde secret set` says so and names both fixes, a writable directory there or

@@ -87,9 +87,9 @@ fronde secret remove <name> --config <file>
   Setting a name again replaces its value and origin. The first secret creates the master key in
   the backend `[secrets] backend` picks (see
   [Configuration](configuration.md#secrets-1)): with `auto`, a systemd credential when the
-  command runs under one (read, never made), else the keychain when it answers, else
-  `master.key` beside the configuration file (or the file `[secrets] master_key` names), and
-  prints where; while secrets are stored, a missing or different key, or a keychain that is
+  command runs under one (read, never made), else the keychain (an error saying to unlock it if it
+  is locked), else, with no keychain to reach, `master.key` beside the configuration file (or the
+  file `[secrets] master_key` names), and prints where; while secrets are stored, a missing or different key, or a keychain that is
   locked or out of reach, is an error and no new key is made anywhere. Any argument besides the name and the options is refused, exit status 2,
   without being shown. It prints `stored secret <name> for <origin>`.
 - `list` prints one line per secret: its name, origin and last change (UTC), separated by tabs,

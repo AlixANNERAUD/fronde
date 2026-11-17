@@ -162,6 +162,15 @@ async fn a_key_file_open_to_others_is_refused() {
         .unwrap();
     let file = key_file(dir.path());
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // Nothing is stored: `load` needs no key, but a key for the first secret is refused.
+    let err = master_key::load_or_create(&db, &key_file(dir.path()))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("chmod 600"), "{err:#}");
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    store(&db, dir.path(), "caldav", CANARY).await;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
     let err = master_key::load(&db, &key_file(dir.path()))
         .await
         .unwrap_err();
@@ -450,9 +459,10 @@ async fn a_key_file_with_more_than_one_line_is_refused() {
     let (dir, db) = setup().await;
     let file = key_file(dir.path());
     fronde_fs::write(&file, format!("{}more", other_key_line())).unwrap();
+    // Nothing is stored, so `load` reads no key: the first secret's key is read and refused.
     let err = format!(
         "{:#}",
-        master_key::load(&db, &key_file(dir.path()))
+        master_key::load_or_create(&db, &key_file(dir.path()))
             .await
             .unwrap_err()
     );
@@ -618,7 +628,11 @@ async fn a_symbolic_link_or_a_fifo_is_refused() {
     fronde_fs::write(&target, other_key_line()).unwrap();
     let file = key_file(dir.path());
     std::os::unix::fs::symlink(&target, &file).unwrap();
-    let err = format!("{:#}", master_key::load(&db, &file).await.unwrap_err());
+    // Nothing is stored, so `load` reads no key: the first secret's key is read and refused.
+    let err = format!(
+        "{:#}",
+        master_key::load_or_create(&db, &file).await.unwrap_err()
+    );
     assert!(err.contains("is a symbolic link"), "{err}");
 
     std::fs::remove_file(&file).unwrap();
@@ -631,7 +645,10 @@ async fn a_symbolic_link_or_a_fifo_is_refused() {
     )
     .unwrap();
     // Without O_NONBLOCK, opening a FIFO blocks until a writer comes: this test would hang.
-    let err = format!("{:#}", master_key::load(&db, &file).await.unwrap_err());
+    let err = format!(
+        "{:#}",
+        master_key::load_or_create(&db, &file).await.unwrap_err()
+    );
     assert!(err.contains("is not a plain file"), "{err}");
 }
 

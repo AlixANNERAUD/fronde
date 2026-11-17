@@ -79,18 +79,25 @@ The backends:
 - `keychain`: the platform's keychain (Secret Service on Linux, such as GNOME Keyring or KWallet;
   the Keychain on macOS; the Credential Manager on Windows), entry `fronde` /
   `master-key@<hash of the data directory>`, one per data directory. Fronde makes the key there
-  with the first secret.
+  with the first secret, and the database records the entry's name, so that a data directory
+  moved elsewhere keeps using it. Each call has 2 seconds to answer, and one runs at a time.
 - `file`: the file `master_key` names.
 
 With `auto`, the first secret stored makes or finds the key in the first of these that can hold
-it: the systemd credential if the service has one, else the keychain if it answers within 2
-seconds and is unlocked, else the file. The database then records that backend, and `auto` uses
-it alone from then on, even after the last secret is removed. A keychain that is locked when
-Fronde starts, as after a reboot before the desktop session unlocks it, stops Fronde with an
-error that says to unlock it: Fronde never makes a key in another place while secrets are stored,
-since that key could not open them. A database from a version without backends keeps its key file.
-A backend named here is used alone, whatever the record says; the record then follows the key
-that opens the stored secrets.
+it: the systemd credential if the service has one, else the keychain, else, when there is no
+keychain or it cannot be reached, the file. A keychain that is there but locked, or that does not
+answer within 2 seconds (an unlock prompt), stops the first secret with an error that says to
+unlock it and try again, rather than putting the key in a file. The database then records that
+backend, and `auto` uses it alone from then on, even after the last secret is removed. A keychain
+that is locked when Fronde starts, as after a reboot before the desktop session unlocks it, stops
+Fronde with an error that says to unlock it: Fronde never makes a key in another place while
+secrets are stored, since that key could not open them. A database from a version without
+backends keeps its key file.
+
+A backend named here is used alone, even when the database records another: a key moved there by
+hand opens the stored secrets, and the record then follows it. If the key is not there, or does
+not open them, the error names the recorded backend and says to set `backend = "auto"` or that
+backend.
 
 The key file is kept out of the data directory, so that a backup of the data directory, or a
 snapshot of its volume, does not hold it with the secrets it opens (see

@@ -225,8 +225,11 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// How long the runtime waits, once the command is done, for blocking threads still running. A
+/// keychain call stuck behind an unlock prompt cannot be cancelled: Fronde exits without it.
+const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -234,7 +237,31 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let result: anyhow::Result<ExitCode> = match &cli.command {
+    // Built by hand rather than with `#[tokio::main]`, whose runtime waits on drop for every
+    // blocking thread, however long.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("error: cannot start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match runtime.block_on(run(&cli.command)) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    };
+    runtime.shutdown_timeout(SHUTDOWN);
+    code
+}
+
+async fn run(command: &Command) -> anyhow::Result<ExitCode> {
+    match command {
         Command::Init { config, force } => init(config, *force).map(|()| ExitCode::SUCCESS),
         Command::Check { config } => check(config).await.map(|()| {
             println!("config OK");
@@ -259,12 +286,5 @@ async fn main() -> ExitCode {
             ServiceCommand::Status => fronde::service::status(),
         },
         Command::Secret { action } => secret(action).await,
-    };
-    match result {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            ExitCode::FAILURE
-        }
     }
 }

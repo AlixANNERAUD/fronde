@@ -14,7 +14,7 @@ mod keychain;
 mod systemd;
 
 pub(crate) use backends::parse_recorded;
-pub use backends::{Backends, Choice};
+pub use backends::{Backends, Choice, KeyLock, LOCK_FILE};
 #[cfg(feature = "testing")]
 pub use keychain::FakeKeychain;
 pub use keychain::Keychain;
@@ -87,12 +87,15 @@ impl fmt::Display for Backend {
 pub struct MasterKey {
     key: SecretBox<[u8; 32]>,
     backend: Backend,
+    /// The keychain entry's user it was read from or written to, for a key in the keychain.
+    entry: Option<String>,
 }
 
 impl fmt::Debug for MasterKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MasterKey")
             .field("backend", &self.backend.name())
+            .field("entry", &self.entry)
             .finish_non_exhaustive()
     }
 }
@@ -103,7 +106,11 @@ impl MasterKey {
         let mut filled = Ok(());
         let key = SecretBox::init_with_mut(|key: &mut [u8; 32]| filled = getrandom::fill(key));
         filled.map_err(|e| anyhow::anyhow!("no randomness available: {e}"))?;
-        Ok(Self { key, backend })
+        Ok(Self {
+            key,
+            backend,
+            entry: None,
+        })
     }
 
     /// The key written `fronde-key-v1:<base64url>`, with one final line break allowed. The
@@ -132,12 +139,28 @@ impl MasterKey {
         let key = SecretBox::init_with_mut(|key: &mut [u8; 32]| {
             key.copy_from_slice(&decoded[..len]);
         });
-        Ok(Self { key, backend })
+        Ok(Self {
+            key,
+            backend,
+            entry: None,
+        })
     }
 
     /// Where the key came from.
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// For a key in the keychain, the user of its entry, which the database records with the
+    /// first secret ([`crate::secrets::set`]).
+    pub fn keychain_entry(&self) -> Option<&str> {
+        self.entry.as_deref()
+    }
+
+    /// This key, kept in the keychain entry of `user`.
+    fn in_entry(mut self, user: &str) -> Self {
+        self.entry = Some(user.to_owned());
+        self
     }
 
     /// The key's one line, to store it.
