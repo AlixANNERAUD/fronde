@@ -13,6 +13,9 @@ use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+/// The thread whose agent this is, until each thread has its own: the single chat.
+const MAIN_THREAD: i64 = 1;
+
 /// The subcommand of the `fronde` binary that runs [`run_helper`].
 pub const SUBCOMMAND: &str = "__confine";
 
@@ -143,14 +146,12 @@ pub struct HelperCommand {
 }
 
 impl Confine {
-    /// This confinement as the agent starts now. With a scope, it first stops what an earlier
-    /// agent left, then checks that the user manager makes a scope; when it does not, the agent
+    /// This confinement as the agent starts now. With a scope, it checks that the user manager makes a scope; when it does not, the agent
     /// starts without one, with a warning: the limits are a safeguard for the machine, not
     /// part of the agent's confinement, which Landlock and seccomp make.
     pub async fn ready(&self) -> Self {
         let mut confine = self.clone();
         if let Some(scope) = &self.scope {
-            scope.stop_leftovers().await;
             match scope.probe().await {
                 Ok(()) => {}
                 Err(Unavailable::Missing) => {
@@ -253,7 +254,7 @@ impl Confine {
             });
         };
         // `systemd-run --scope` puts itself in the scope and `exec`s the helper.
-        let unit = scope.new_unit();
+        let unit = scope.new_unit(MAIN_THREAD);
         let mut run_args = scope.args(Some(&unit));
         run_args.push(path_string(&self.helper)?);
         run_args.extend(helper_args);
@@ -1071,6 +1072,7 @@ mod tests {
                 "--property=MemoryHigh=805306368",
                 "--property=CPUQuota=150%",
                 "--property=TasksMax=100",
+                "--property=OOMPolicy=stop",
             ]
         );
         // Then the helper's own command, unchanged.

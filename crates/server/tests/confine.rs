@@ -1089,10 +1089,9 @@ async fn scope_wraps_the_helper() {
         return;
     };
 
-    // First the leftovers of this data directory are stopped, then the user manager is asked
-    // for a scope, then the agent starts in one.
-    let ctl = fake.calls("systemctl");
-    assert_eq!(ctl, [["--user", "stop", &format!("{prefix}-*.scope")]]);
+    // The user manager is asked for a scope, then the agent starts in one; starting an agent
+    // stops no leftover (the server does, once, at its start).
+    assert!(fake.calls("systemctl").is_empty());
     let runs = fake.calls("systemd-run");
     assert_eq!(runs.len(), 2, "{runs:#?}");
     let limits = [
@@ -1100,6 +1099,7 @@ async fn scope_wraps_the_helper() {
         "--property=MemoryHigh=1610612736",
         "--property=CPUQuota=200%",
         "--property=TasksMax=512",
+        "--property=OOMPolicy=stop",
     ];
     let options = [
         "--user",
@@ -1119,14 +1119,16 @@ async fn scope_wraps_the_helper() {
     assert_eq!(start[..5], options);
     let unit = start[5].strip_prefix("--unit=").expect("a unit name");
     assert!(
-        unit.starts_with(&format!("{prefix}-")) && unit.len() == prefix.len() + 9,
+        unit.starts_with(&format!("{prefix}-"))
+            && unit.starts_with(&format!("{prefix}-t1-"))
+            && unit.len() == prefix.len() + 12,
         "{unit}"
     );
-    assert_eq!(start[6..10], limits);
-    assert_eq!(start[10], "--");
-    assert_eq!(start[11], env!("CARGO_BIN_EXE_fronde"));
-    assert_eq!(start[12], "__confine");
-    assert_eq!(start[15..17], ["--", "/bin/sh"]);
+    assert_eq!(start[6..11], limits);
+    assert_eq!(start[11], "--");
+    assert_eq!(start[12], env!("CARGO_BIN_EXE_fronde"));
+    assert_eq!(start[13], "__confine");
+    assert_eq!(start[16..18], ["--", "/bin/sh"]);
     // systemd-run reached the user manager with Fronde's variable, in the check as at the start,
     // although the agent never gets it.
     let xdg = std::fs::read_to_string(fake.dir.path().join("xdg")).unwrap();
@@ -1149,6 +1151,40 @@ async fn scope_wraps_the_helper() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+async fn starting_a_thread_keeps_the_others_running() {
+    let (mut setup, spec) = acp_setup("");
+    let fake = FakeSystemd::new(true);
+    // The server's start stops the leftovers, once.
+    let scope = fronde::start_scope(&setup.config, Some(&fake.path()))
+        .await
+        .expect("systemd-run found");
+    let pattern = format!("{}-*.scope", scope.prefix);
+    assert_eq!(fake.calls("systemctl"), [["--user", "stop", &pattern]]);
+    setup.confine.scope = Some(scope);
+
+    // Two agents start one after the other: no `stop` between them or after.
+    let Some(first) = chat(&spec, &setup.confine).await else {
+        return;
+    };
+    let second = chat(&spec, &setup.confine).await.expect("a second agent");
+    assert_eq!(
+        fake.calls("systemctl").len(),
+        1,
+        "{:#?}",
+        fake.calls("systemctl")
+    );
+    let units: Vec<String> = fake
+        .calls("systemd-run")
+        .iter()
+        .filter_map(|call| call.iter().find_map(|a| a.strip_prefix("--unit=")))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(units.len(), 2, "{units:?}");
+    assert_ne!(units[0], units[1]);
+    drop((first, second));
 }
 
 #[tokio::test]
@@ -1412,6 +1448,9 @@ async fn real_scope_leftovers_are_stopped_at_the_next_start() {
     child.wait().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(systemctl(&["is-active", &unit]), "active");
+    // The next start of the server stops it; starting an agent does not.
     let _ = setup.confine.ready().await;
+    assert_eq!(systemctl(&["is-active", &unit]), "active");
+    let _ = fronde::start_scope(&setup.config, std::env::var_os("PATH").as_deref()).await;
     assert_ne!(systemctl(&["is-active", &unit]), "active");
 }

@@ -59,9 +59,11 @@ systemd-cgtop --user fronde.slice
 
 When Fronde stops the agent, it stops its scope too. If Fronde is killed (`kill -9`, a crash),
 the agent's input closes, so the agent and Claude Code exit, and the scope goes with them. A
-process that outlived them would keep the scope until Fronde next starts its agent, which first
-stops every scope its data directory's agent left; `systemctl --user stop 'fronde-agent-*'`
-stops them by hand. At each start of the agent, Fronde logs `agent limits: …` with the scope's
+process that outlived them would keep the scope until Fronde next starts, which stops every
+scope its data directory's agents left, once, before it accepts requests (starting an agent
+never stops another one that runs); `systemctl --user stop 'fronde-agent-*'` stops them by
+hand. A scope's name is `fronde-agent-<id>-t<thread>-<random>.scope`, and a scope whose main
+process the kernel OOM-killed goes as a whole (`OOMPolicy=stop`). At each start of the agent, Fronde logs `agent limits: …` with the scope's
 name, or why there is none.
 
 ## 5. Upgrade

@@ -126,10 +126,11 @@ impl Scope {
         self.run.with_file_name("systemctl")
     }
 
-    /// A new unit name for one start of the agent.
-    pub fn new_unit(&self) -> String {
+    /// A new unit name for one start of the agent of thread `thread`:
+    /// `<prefix>-t<thread>-<8 hex>`.
+    pub fn new_unit(&self, thread: i64) -> String {
         let random = uuid::Uuid::new_v4().simple().to_string();
-        format!("{}-{}", self.prefix, &random[..8])
+        format!("{}-t{thread}-{}", self.prefix, &random[..8])
     }
 
     /// `systemd-run`'s arguments up to `--`: the command follows. `unit` names the scope;
@@ -145,6 +146,8 @@ impl Scope {
         for property in self.limits.properties() {
             args.push(format!("--property={property}"));
         }
+        // A scope whose main process was OOM-killed goes as a whole.
+        args.push("--property=OOMPolicy=stop".to_owned());
         args.push("--".to_owned());
         args
     }
@@ -171,7 +174,8 @@ impl Scope {
     }
 
     /// Stops the scopes an earlier agent of this Fronde left: one whose process outlived a
-    /// Fronde killed with SIGKILL, say. Only this data directory's, and only before a new start.
+    /// Fronde killed with SIGKILL, say. Only this data directory's, and only once, when the server starts: later
+    /// starts of other agents must keep the running ones.
     pub async fn stop_leftovers(&self) {
         let pattern = format!("{}-*.scope", self.prefix);
         let args = ["--user", "stop", &pattern].map(str::to_owned);
@@ -307,10 +311,10 @@ mod tests {
     #[test]
     fn scope_arguments() {
         let scope = scope(DEFAULTS);
-        let unit = scope.new_unit();
-        assert!(unit.starts_with("fronde-agent-0123abcd-"), "{unit}");
-        assert_eq!(unit.len(), "fronde-agent-0123abcd-".len() + 8);
-        assert_ne!(unit, scope.new_unit());
+        let unit = scope.new_unit(7);
+        assert!(unit.starts_with("fronde-agent-0123abcd-t7-"), "{unit}");
+        assert_eq!(unit.len(), "fronde-agent-0123abcd-t7-".len() + 8);
+        assert_ne!(unit, scope.new_unit(7));
         assert_eq!(
             scope.args(Some(&unit)),
             [
@@ -324,6 +328,7 @@ mod tests {
                 "--property=MemoryHigh=1610612736".to_owned(),
                 "--property=CPUQuota=200%".to_owned(),
                 "--property=TasksMax=512".to_owned(),
+                "--property=OOMPolicy=stop".to_owned(),
                 "--".to_owned(),
             ]
         );

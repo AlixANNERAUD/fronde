@@ -354,7 +354,7 @@ pub async fn start_with_helper(
                 (line, true) => tracing::info!("agent sandbox: {line}"),
                 (line, false) => tracing::error!("agent sandbox: {line}; the agent cannot start"),
             }
-            confine.scope = agent_scope(&config, std::env::var_os("PATH").as_deref());
+            confine.scope = start_scope(&config, std::env::var_os("PATH").as_deref()).await;
             tracing::info!(
                 "agent limits: {}",
                 limits_line(&config, confine.scope.as_ref())
@@ -419,6 +419,14 @@ pub fn agent_scope(config: &Config, path: Option<&std::ffi::OsStr>) -> Option<Sc
     let digest = Sha256::digest(config.data.dir.as_os_str().as_encoded_bytes());
     let hex: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
     Scope::find(path, format!("fronde-agent-{hex}"), limits)
+}
+
+/// [`agent_scope`], and the scopes an earlier run left stopped: once, here, so that starting an
+/// agent later never stops another that runs.
+pub async fn start_scope(config: &Config, path: Option<&std::ffi::OsStr>) -> Option<Scope> {
+    let scope = agent_scope(config, path)?;
+    scope.stop_leftovers().await;
+    Some(scope)
 }
 
 fn agent_limits(config: &Config) -> Limits {
