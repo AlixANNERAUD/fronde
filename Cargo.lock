@@ -2284,6 +2284,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono-tz",
  "clap",
  "fronde-agent",
@@ -2296,6 +2297,7 @@ dependencies = [
  "iana-time-zone",
  "reqwest 0.13.5",
  "rmcp",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -2308,6 +2310,7 @@ dependencies = [
  "tower-sessions",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -2321,6 +2324,7 @@ dependencies = [
  "fronde-fs",
  "fronde-protocol",
  "futures",
+ "secrecy",
  "serde",
  "serde_json",
  "tempfile",
@@ -2388,6 +2392,7 @@ dependencies = [
  "rustix",
  "schemars 1.2.3",
  "sea-orm",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -2431,6 +2436,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "regex",
+ "secrecy",
  "semver",
  "serde",
  "serde_json",
@@ -5005,6 +5011,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
 ]
 
 [[package]]

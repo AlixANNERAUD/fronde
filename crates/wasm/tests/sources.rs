@@ -6,6 +6,7 @@ use fronde_wasm::{
     Approval, Checks, ComponentHost, ComponentSpec, Credential, Hashes, LoadedComponent, Shipped,
     prepare,
 };
+use secrecy::ExposeSecret;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -98,7 +99,7 @@ fn grants_what_the_manifest_asks() {
     };
     assert_eq!(origin.to_string(), "https://cloud.example");
     assert_eq!(username, "alix");
-    assert_eq!(*password, std::env::var("PATH").unwrap());
+    assert_eq!(password.expose_secret(), std::env::var("PATH").unwrap());
     // The host gives the user's time zone to a component that declares the setting.
     assert_eq!(spec.settings["timezone"], "Europe/Paris");
 }

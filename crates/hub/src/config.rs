@@ -2,6 +2,8 @@
 
 use crate::origin::{Locality, Origin};
 use anyhow::{Context, bail};
+use secrecy::SecretString;
+use secrecy::zeroize::Zeroize;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -279,17 +281,24 @@ impl Secret {
         }
     }
 
-    pub fn resolve(&self) -> anyhow::Result<String> {
+    pub fn resolve(&self) -> anyhow::Result<SecretString> {
         match self {
             Secret::File { file } => {
                 crate::private::check_secret_file(file)?;
-                let s = std::fs::read_to_string(file)
+                let mut s = std::fs::read_to_string(file)
                     .with_context(|| format!("cannot read secret file {}", file.display()))?;
-                Ok(s.trim_end_matches(['\n', '\r']).to_string())
+                let trimmed = s.trim_end_matches(['\n', '\r']).to_owned();
+                s.zeroize();
+                Ok(SecretString::from(trimmed))
             }
-            Secret::Env { env } => std::env::var(env).with_context(|| {
-                format!("environment variable {env} is not set; set it or use {{ file = \"…\" }}")
-            }),
+            Secret::Env { env } => {
+                let value = std::env::var(env).with_context(|| {
+                    format!(
+                        "environment variable {env} is not set; set it or use {{ file = \"…\" }}"
+                    )
+                })?;
+                Ok(SecretString::from(value))
+            }
         }
     }
 }

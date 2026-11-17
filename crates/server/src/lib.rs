@@ -22,21 +22,22 @@ use fronde_hub::source::ToolSource;
 use fronde_wasm::{Checks, ComponentHost, ComponentSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use secrecy::{ExposeSecret, SecretString};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
-pub fn check_token(token: &str) -> anyhow::Result<()> {
-    if token.chars().count() < 32 {
+pub fn check_token(token: &SecretString) -> anyhow::Result<()> {
+    if token.expose_secret().chars().count() < 32 {
         bail!("server.token must be at least 32 characters");
     }
     Ok(())
 }
 
 async fn require_token(
-    State(token): State<Arc<String>>,
+    State(token): State<Arc<SecretString>>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
@@ -46,14 +47,14 @@ async fn require_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
-    if bool::from(given.as_bytes().ct_eq(token.as_bytes())) {
+    if bool::from(given.as_bytes().ct_eq(token.expose_secret().as_bytes())) {
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
     }
 }
 
-pub fn router(hub: Arc<Hub>, token: String) -> Router {
+pub fn router(hub: Arc<Hub>, token: SecretString) -> Router {
     // Host checks are off: every /mcp request must carry the token, which a rebinding page cannot know.
     let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
     let mcp = StreamableHttpService::new(
@@ -100,8 +101,8 @@ pub async fn healthcheck(address: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn check_password(password: &str) -> anyhow::Result<()> {
-    if password.is_empty() {
+pub fn check_password(password: &SecretString) -> anyhow::Result<()> {
+    if password.expose_secret().is_empty() {
         bail!("web.password must not be empty");
     }
     Ok(())

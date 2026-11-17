@@ -19,7 +19,7 @@ When run in a checkout where `mise run agent` installed the Claude adapter, `fro
 fronde service install --config fronde.toml
 ```
 
-`--config` defaults to `fronde.toml` in the current directory. `install` resolves both the running `fronde` binary and the configuration file to absolute paths, writes `$XDG_CONFIG_HOME/systemd/user/fronde.service` (or `~/.config/systemd/user/fronde.service`) with mode 0644, reloads the systemd user daemon, and enables and starts `fronde.service`.
+`--config` defaults to `fronde.toml` in the current directory. `install` resolves both the running `fronde` binary and the configuration file to absolute paths, writes `$XDG_CONFIG_HOME/systemd/user/fronde.service` (or `~/.config/systemd/user/fronde.service`) with mode 0644, reloads the systemd user daemon, and enables and starts `fronde.service`. The generated unit sets `LimitCORE=0` so a crash writes no core dump containing secrets.
 
 Pass `--no-start` to write the unit file and reload systemd without enabling or starting the service yet.
 

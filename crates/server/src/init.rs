@@ -181,6 +181,7 @@ mod tests {
 
     #[test]
     fn writes_private_secrets_and_a_loadable_config() {
+        use secrecy::{ExposeSecret, SecretString};
         let t = tempfile::tempdir().unwrap();
         let c = run(t.path(), false).unwrap();
         for f in [&c.config, &c.token_file, &c.password_file] {
@@ -188,7 +189,7 @@ mod tests {
         }
         let token = std::fs::read_to_string(&c.token_file).unwrap();
         assert_eq!(token.len(), 64);
-        crate::check_token(&token).unwrap();
+        crate::check_token(&SecretString::from(token.clone())).unwrap();
         assert_eq!(
             std::fs::read_to_string(&c.password_file).unwrap(),
             c.password
@@ -198,8 +199,20 @@ mod tests {
         let config = fronde_hub::config::load(&c.config).unwrap();
         assert_eq!(config.data.user, "al\"ex");
         assert_eq!(config.server.listen.to_string(), "127.0.0.1:8484");
-        assert_eq!(config.server.token.resolve().unwrap(), token);
-        assert_eq!(config.web.unwrap().password.resolve().unwrap(), c.password);
+        assert_eq!(
+            config.server.token.resolve().unwrap().expose_secret(),
+            token
+        );
+        assert_eq!(
+            config
+                .web
+                .unwrap()
+                .password
+                .resolve()
+                .unwrap()
+                .expose_secret(),
+            c.password
+        );
         assert!(config.data.dir.ends_with("fronde"));
     }
 

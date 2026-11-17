@@ -12,9 +12,11 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ErrorCode};
 use anyhow::{Context, anyhow};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -28,10 +30,24 @@ pub struct AgentSpec {
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
     pub hub_url: String,
-    pub hub_token: String,
+    pub hub_token: SecretString,
     pub system_prompt: String,
     /// Claude Code's own tools the session gets besides the hub's, such as `WebSearch`.
     pub builtin_tools: Vec<String>,
+}
+
+impl fmt::Debug for AgentSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentSpec")
+            .field("command", &self.command)
+            .field("env", &self.env)
+            .field("cwd", &self.cwd)
+            .field("hub_url", &self.hub_url)
+            .field("hub_token", &"[REDACTED]")
+            .field("system_prompt", &self.system_prompt)
+            .field("builtin_tools", &self.builtin_tools)
+            .finish()
+    }
 }
 
 /// What the agent does during a turn.
@@ -417,7 +433,10 @@ impl Connection {
             stop,
         } = self;
         let hub = McpServer::Http(McpServerHttp::new("fronde", &spec.hub_url).headers(vec![
-            HttpHeader::new("Authorization", format!("Bearer {}", spec.hub_token)),
+            HttpHeader::new(
+                "Authorization",
+                format!("Bearer {}", spec.hub_token.expose_secret()),
+            ),
         ]));
         let system_prompt =
             (capabilities.system_prompt.is_some() && !spec.system_prompt.is_empty()).then(|| {

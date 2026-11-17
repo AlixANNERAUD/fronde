@@ -1,4 +1,5 @@
 use fronde_hub::config::{Secret, SourceConfig, load};
+use secrecy::ExposeSecret;
 use std::io::Write;
 
 fn load_str(s: &str) -> anyhow::Result<fronde_hub::config::Config> {
@@ -125,7 +126,10 @@ fn rejects_bad_tool_prefix_name() {
 fn secret_from_env_and_file() {
     // Setting a variable is unsafe in edition 2024, so read one every process already has.
     assert_eq!(
-        Secret::Env { env: "PATH".into() }.resolve().unwrap(),
+        Secret::Env { env: "PATH".into() }
+            .resolve()
+            .unwrap()
+            .expose_secret(),
         std::env::var("PATH").unwrap()
     );
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -135,7 +139,8 @@ fn secret_from_env_and_file() {
             file: f.path().into()
         }
         .resolve()
-        .unwrap(),
+        .unwrap()
+        .expose_secret(),
         "s3cret"
     );
 }
@@ -201,7 +206,10 @@ fn relative_secret_files_are_read_from_the_config_directory() {
     )
     .unwrap();
     let c = load(&path).unwrap();
-    assert_eq!(c.server.token.resolve().unwrap(), "from-config-dir");
+    assert_eq!(
+        c.server.token.resolve().unwrap().expose_secret(),
+        "from-config-dir"
+    );
 }
 
 #[test]

@@ -9,6 +9,7 @@ use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
+use secrecy::ExposeSecret;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,7 +108,7 @@ async fn open(cfg: &UpstreamConfig) -> anyhow::Result<Client> {
     if let Some(url) = &cfg.url {
         let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
         if let Some(t) = &cfg.token {
-            config = config.auth_header(t.resolve()?);
+            config = config.auth_header(t.resolve()?.expose_secret());
         }
         Ok(
             ().serve(StreamableHttpClientTransport::from_config(config))

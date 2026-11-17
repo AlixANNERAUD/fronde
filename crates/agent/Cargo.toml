@@ -17,6 +17,7 @@ chrono.workspace = true
 futures.workspace = true
 fronde-fs = { path = "../fs" }
 fronde-protocol = { path = "../protocol" }
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

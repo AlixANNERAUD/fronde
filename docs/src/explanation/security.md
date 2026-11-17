@@ -14,6 +14,19 @@ A secret file must be mode 0600 and owned by the user running Fronde; otherwise 
 read it. Setting `FRONDE_ALLOW_SHARED_SECRET_FILES=1` lifts the check for setups like Docker
 secrets, where the runtime sets the file's mode and owner.
 
+## Secrets in memory
+
+Resolved secrets (the `/mcp` bearer token, the web chat password, upstream MCP tokens and
+component credentials) are held in memory as `secrecy::SecretString` values. They redact when
+formatted with `Debug` and zeroize their memory when dropped. Component `Authorization` headers
+are marked sensitive so HTTP and tracing layers do not print them, and a secret is exposed only
+where it is checked or sent: the `/mcp` token check, the web sign-in check, the ACP MCP header,
+upstream MCP setup and the component HTTP gate.
+
+Zeroizing on drop cannot help if the process crashes and writes a core dump, which captures the
+whole address space. Disable core dumps where Fronde runs (`ulimit -c 0`, or `LimitCORE=0` under
+`[Service]` in a systemd unit). `fronde service install` sets `LimitCORE=0` in the generated unit.
+
 ## Personal data on disk
 
 Fronde creates its data directory and every directory inside it with mode 0700, and every file it

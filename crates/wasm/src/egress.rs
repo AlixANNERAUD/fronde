@@ -11,7 +11,8 @@ use http::HeaderValue;
 use http::header::{AUTHORIZATION, COOKIE};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
-use std::fmt;
+use secrecy::zeroize::Zeroize;
+use secrecy::{ExposeSecret, SecretString};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -25,34 +26,31 @@ use wasmtime_wasi_http::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A resolved secret the host sends to one origin.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Credential {
-    Basic { username: String, password: String },
-    Bearer(String),
-}
-
-impl fmt::Debug for Credential {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Basic { username, .. } => write!(f, "Basic({username}, <redacted>)"),
-            Self::Bearer(_) => f.write_str("Bearer(<redacted>)"),
-        }
-    }
+    Basic {
+        username: String,
+        password: SecretString,
+    },
+    Bearer(SecretString),
 }
 
 impl Credential {
     fn header(&self) -> anyhow::Result<HeaderValue> {
-        let text = match self {
+        let mut text = match self {
             Self::Basic { username, password } => {
-                format!(
-                    "Basic {}",
-                    STANDARD.encode(format!("{username}:{password}"))
-                )
+                let mut raw = format!("{username}:{}", password.expose_secret());
+                let mut encoded = STANDARD.encode(&raw);
+                raw.zeroize();
+                let header = format!("Basic {encoded}");
+                encoded.zeroize();
+                header
             }
-            Self::Bearer(token) => format!("Bearer {token}"),
+            Self::Bearer(token) => format!("Bearer {}", token.expose_secret()),
         };
-        let mut value =
-            HeaderValue::from_str(&text).context("credential is not a valid header value")?;
+        let value = HeaderValue::from_str(&text).context("credential is not a valid header value");
+        text.zeroize();
+        let mut value = value?;
         value.set_sensitive(true);
         Ok(value)
     }
@@ -353,6 +351,8 @@ mod tests {
         };
         assert!(!format!("{basic:?}").contains("hunter2"));
         assert!(!format!("{:?}", Credential::Bearer("tok".into())).contains("tok"));
-        assert_eq!(basic.header().unwrap(), "Basic bWU6aHVudGVyMg==");
+        let header = basic.header().unwrap();
+        assert_eq!(header, "Basic bWU6aHVudGVyMg==");
+        assert!(header.is_sensitive());
     }
 }

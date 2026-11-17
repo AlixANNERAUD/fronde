@@ -8,6 +8,8 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use fronde_agent::assistant::Assistant;
+use secrecy::zeroize::Zeroize;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::ErrorKind;
@@ -35,7 +37,7 @@ const NOT_BUILT: &str = "Interface non construite : lance `mise run web-build`."
 
 pub struct Web {
     pub assistant: Arc<Assistant>,
-    pub password: String,
+    pub password: SecretString,
     pub throttle: Mutex<Throttle>,
 }
 
@@ -77,9 +79,9 @@ async fn attempt(throttle: &Mutex<Throttle>, right: bool) -> Attempt {
 }
 
 /// Compares digests, so neither the content nor the length of the password leaks through timing.
-fn same_password(given: &str, expected: &str) -> bool {
+fn same_password(given: &str, expected: &SecretString) -> bool {
     let given = Sha256::digest(given.as_bytes());
-    let expected = Sha256::digest(expected.as_bytes());
+    let expected = Sha256::digest(expected.expose_secret().as_bytes());
     bool::from(given.as_slice().ct_eq(expected.as_slice()))
 }
 
@@ -199,9 +201,11 @@ struct SignInForm {
 async fn sign_in(
     State(web): State<Arc<Web>>,
     session: Session,
-    Form(form): Form<SignInForm>,
+    Form(mut form): Form<SignInForm>,
 ) -> Response {
-    match attempt(&web.throttle, same_password(&form.password, &web.password)).await {
+    let ok = same_password(&form.password, &web.password);
+    form.password.zeroize();
+    match attempt(&web.throttle, ok).await {
         Attempt::Accepted => {}
         Attempt::Wrong => return Redirect::to("/sign-in?error=1").into_response(),
         Attempt::TooMany => return Redirect::to("/sign-in?error=2").into_response(),

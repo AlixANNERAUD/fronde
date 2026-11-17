@@ -48,6 +48,7 @@ schemars = "1.1"
 sea-orm = { version = "2.0.4", default-features = false, features = ["sqlx-sqlite", "runtime-tokio", "macros", "with-chrono", "with-json"] }
 # Without the default `cli` feature, which pulls clap, dotenvy and sea-orm-cli.
 sea-orm-migration = { version = "2.0.4", default-features = false, features = ["sqlx-sqlite", "runtime-tokio"] }
+secrecy = "0.10"
 semver = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_path_to_error = "0.1"

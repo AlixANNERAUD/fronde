@@ -422,7 +422,7 @@ async fn ws_send_runs_a_turn() {
         spec.hub_url,
         format!("http://127.0.0.1:{}/mcp", addr.port())
     );
-    assert_eq!(spec.hub_token, TOKEN);
+    assert_eq!(secrecy::ExposeSecret::expose_secret(&spec.hub_token), TOKEN);
     assert_eq!(spec.cwd, dir.path().join("data").join("agent"));
     assert!(spec.cwd.is_dir());
     assert_eq!(
