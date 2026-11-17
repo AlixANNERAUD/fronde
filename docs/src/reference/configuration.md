@@ -27,9 +27,10 @@ The settings below marked *secret* take one of these forms, except `{ stored = "
 a component's credential takes: `server.token`, `web.password` and an upstream server's `token`
 refuse it, saying to use `{ file = "…" }` or `{ env = "…" }`.
 
-When secrets are stored, Fronde checks the master key as it starts: a key file that is not the one
-that sealed them, or no key file at all, stops it with an error that says to restore the key from
-a backup. `fronde check` does the same. The key file is set in [`[secrets]`](#secrets-1).
+When secrets are stored, Fronde checks the master key as it starts: a key that is not the one
+that sealed them, no key at all, or a keychain that is locked or out of reach, stops it with an
+error that says what to do. `fronde check` does the same. Where the key is kept is set in
+[`[secrets]`](#secrets-1).
 
 A secret file must be private. On Unix, Fronde refuses a file that group or others can read or
 write, or that another user owns, and says so: `secret file <path> is readable by other users; run
@@ -66,17 +67,40 @@ Optional.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `master_key` | `{ file = "…" }` | `master.key` beside the configuration file | The file holding the master key of the [stored secrets](../how-to/store-a-secret.md), created (mode 0600) with the first one. A relative path is read from the configuration file's directory. Only `{ file = "…" }`: the key never comes from an environment variable, which the agent inherits. |
+| `backend` | `"auto"`, `"systemd"`, `"keychain"` or `"file"` | `"auto"` | Where the master key of the [stored secrets](../how-to/store-a-secret.md) is kept. See below. |
+| `master_key` | `{ file = "…" }` | `master.key` beside the configuration file | The key file of the `file` backend, created (mode 0600) with the first secret. A relative path is read from the configuration file's directory. Only `{ file = "…" }`: the key never comes from an environment variable, which the agent inherits. |
 
-The key is kept out of the data directory, so that a backup of the data directory, or a snapshot
-of its volume, does not hold it with the secrets it opens (see
+The backends:
+
+- `systemd`: the credential `fronde-master-key`, which systemd decrypts into
+  `$CREDENTIALS_DIRECTORY` for a unit that has `LoadCredentialEncrypted=fronde-master-key:…`.
+  Fronde only reads it: create it with `systemd-creds encrypt` (see
+  [Run as a systemd service](../how-to/run-as-a-service.md#keep-the-master-key-in-a-systemd-credential)).
+- `keychain`: the platform's keychain (Secret Service on Linux, such as GNOME Keyring or KWallet;
+  the Keychain on macOS; the Credential Manager on Windows), entry `fronde` /
+  `master-key@<hash of the data directory>`, one per data directory. Fronde makes the key there
+  with the first secret.
+- `file`: the file `master_key` names.
+
+With `auto`, the first secret stored makes or finds the key in the first of these that can hold
+it: the systemd credential if the service has one, else the keychain if it answers within 2
+seconds and is unlocked, else the file. The database then records that backend, and `auto` uses
+it alone from then on, even after the last secret is removed. A keychain that is locked when
+Fronde starts, as after a reboot before the desktop session unlocks it, stops Fronde with an
+error that says to unlock it: Fronde never makes a key in another place while secrets are stored,
+since that key could not open them. A database from a version without backends keeps its key file.
+A backend named here is used alone, whatever the record says; the record then follows the key
+that opens the stored secrets.
+
+The key file is kept out of the data directory, so that a backup of the data directory, or a
+snapshot of its volume, does not hold it with the secrets it opens (see
 [Data directory](data-directory.md)). Pick a file outside `[data] dir`. Fronde must be able to
 create it in its directory when the first secret is stored: if the configuration's directory is
 read-only, as in a container where it is mounted read-only, set `master_key` to a file in a
 writable directory of its own (see [Run in Docker](../how-to/run-in-docker.md)). A key left in
 the data directory by an earlier version is moved to this file at the next start or
 `fronde secret` command; if both hold a key and they differ, Fronde refuses to start.
-Reading the key from the system's keychain or a systemd credential is **planned**.
+Moving the key from one backend to another (`fronde secret move-key`) is **planned**.
 
 ## `[memory]`
 

@@ -1,8 +1,9 @@
 # Data directory
 
 Everything Fronde keeps lives under `[data] dir`, except the master key of the stored secrets,
-which is kept apart on purpose: by default `master.key` beside the configuration file (see
-[Configuration](configuration.md#secrets-1)). Back up the data directory and, separately, the key.
+which is kept apart on purpose: in a systemd credential, the keychain, or `master.key` beside the
+configuration file (see [Configuration](configuration.md#secrets-1)). Back up the data directory
+and, separately, a key file.
 
 | Path | Holds |
 | --- | --- |

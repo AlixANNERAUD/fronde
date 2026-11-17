@@ -7,6 +7,10 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# A fake keychain for tests (`master_key::FakeKeychain`); only dev-dependencies turn it on.
+testing = []
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
@@ -16,9 +20,12 @@ fronde-entity = { path = "../entity" }
 fronde-fs = { path = "../fs" }
 fronde-migration = { path = "../migration" }
 getrandom.workspace = true
+keyring-core = "1.0.1"
 percent-encoding = "2"
 sea-orm.workspace = true
 secrecy.workspace = true
+sha2.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 
@@ -26,9 +33,20 @@ zeroize.workspace = true
 # The master key file must belong to the user running Fronde.
 rustix = { version = "1", features = ["fs", "process"] }
 
+# The keychain that may keep the master key, one store per platform. On Linux, Secret Service
+# over zbus (pure Rust D-Bus) with RustCrypto's ciphers: no libdbus, no OpenSSL.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-tokio-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1.0", default-features = false }
+
 [dev-dependencies]
+fronde-db = { path = ".", features = ["testing"] }
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

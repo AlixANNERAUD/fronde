@@ -39,25 +39,47 @@ one: the component is refused with the command that stores it for the right orig
 value goes to the component's gate, which adds it to requests for that origin; the component
 never sees it. The rows are read again each time a component starts, so a secret stored while
 Fronde runs reaches a component waiting for it, which Fronde tries again until it is there.
-Fronde checks the master key when it starts: a key that did not seal the stored secrets, or no
-key file while some are stored, stops it.
+Fronde checks the master key when it starts: a key that did not seal the stored secrets, no key
+while some are stored, or a backend holding it that cannot be read, stops it.
 
-The master key is one line, `fronde-key-v1:` followed by the key in base64url, in a file of mode
-0600 created with the first secret: `master.key` beside the configuration file, or the file
-`[secrets] master_key` names. It is kept out of the data directory on purpose. Fronde reads it
-only from a plain file it owns, never through a symbolic link, and never from an environment
-variable: the agent inherits Fronde's environment. Earlier versions kept it in the data
-directory; Fronde moves it from there at the next start or `fronde secret` command, and stops
-if both places hold different keys. Keeping it in the system's keychain or in a systemd
-credential is **planned**.
+The master key is one line, `fronde-key-v1:` followed by the key in base64url, the same in each
+place it can be kept (`[secrets] backend`, see
+[Configuration](../reference/configuration.md#secrets-1)):
+
+- A **systemd credential**, `fronde-master-key`, encrypted by `systemd-creds` with the machine's
+  key (and its TPM when it has one) and decrypted by systemd into the service's private
+  `$CREDENTIALS_DIRECTORY` as it starts. Fronde reads that file; it runs no `systemd-creds` and
+  writes nothing there. On disk, only the encrypted credential exists.
+- The **keychain** of the desktop session: Secret Service (spoken over D-Bus in Rust, with no
+  libdbus and no OpenSSL), the macOS Keychain or the Windows Credential Manager. The keychain
+  encrypts it with the session's password. Each call runs under a 2-second limit, so a keychain
+  that waits on an unlock prompt does not stall Fronde.
+- A **file** of mode 0600: `master.key` beside the configuration file, or the file
+  `[secrets] master_key` names. It is kept out of the data directory on purpose. Fronde reads it
+  only from a plain file it owns, never through a symbolic link. Earlier versions kept it in the
+  data directory; Fronde moves it from there at the next start or `fronde secret` command, and
+  stops if both places hold different keys.
+
+The key never comes from an environment variable: the agent inherits Fronde's environment.
+
+With `backend = "auto"`, the default, the first key goes to a systemd credential when the service
+has one, since only an operator puts one there; else to the keychain when it answers unlocked;
+else to a file. The database records where it went, beside the key check, in the transaction that
+seals the first secret, and Fronde uses that place alone from then on. This choice is sticky on
+purpose: a keychain that is locked at boot must stop Fronde with what to do, not make it mint a
+key file whose key opens nothing, which would strand every stored secret. Two rules back it:
+Fronde makes a key only when nothing is sealed, and every write checks, inside its transaction,
+that its key opens the key check.
 
 What this protects against, today: a backup of the data directory, or a snapshot of the volume
 that holds it, contains `fronde.db` but not the key, so it reveals no stored secret; and nothing
-in the database's files, its write-ahead log included, holds a value in clear. What it does not
-protect against yet: whoever can read both the key file and the data directory has the secrets,
-and that includes any process running as Fronde's user, the agent among them. Until the key
-moves to a keychain, treat a copy that holds both, such as a backup of the whole home directory,
-as holding the secrets themselves.
+in the database's files, its write-ahead log included, holds a value in clear. With the keychain
+or a systemd credential, the key is not in any plain file either: a copy of the home directory
+holds only the keychain's or the credential's encrypted form. What it does not protect against:
+any process running as Fronde's user, the agent among them, can ask the unlocked keychain for the
+key or read a key file, and root can read the credentials directory of a running service. With
+the file backend, treat a copy that holds both the key file and the data directory, such as a
+backup of the whole home directory, as holding the secrets themselves.
 
 ## Secrets in memory
 
@@ -270,7 +292,7 @@ needs write access to the installation, which would also allow replacing the `fr
 
 - Several users: there is one password and one conversation.
 - Encryption at rest, beyond stored secrets: file modes keep other users out, but not someone
-  with the disk, who finds the memory, the conversation and, unless it is kept on another disk,
-  the master key that opens the stored secrets. Protect the data directory with the machine's
-  own means.
+  with the disk, who finds the memory, the conversation and, with the file backend and unless it
+  is kept on another disk, the master key that opens the stored secrets. Protect the data
+  directory with the machine's own means.
 - TLS: put Fronde behind a reverse proxy for https. Built-in TLS is **planned** with federation.

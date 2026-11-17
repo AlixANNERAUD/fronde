@@ -6,18 +6,43 @@ use std::process::{Command, Output, Stdio};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const CANARY: &str = "canary-cli-secret-4d5e6f7a8b";
 
+/// A configuration in `dir`. The binary would use the platform's keychain: its key is kept in a
+/// file, so that no test touches a real keychain (the keychain and systemd backends are tested
+/// below with fakes).
 fn config(dir: &Path) -> PathBuf {
     fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
     let path = dir.join("fronde.toml");
     std::fs::write(
         &path,
         format!(
-            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n",
+            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[secrets]\nbackend = \"file\"\n",
             dir.join("data").display().to_string()
         ),
     )
     .unwrap();
     path
+}
+
+/// [`config`] in `auto`, loaded, with `keychain` instead of the platform's and no systemd
+/// credentials unless given.
+fn auto_config(
+    dir: &Path,
+    keychain: &fronde_db::master_key::FakeKeychain,
+    credentials: Option<PathBuf>,
+) -> fronde_hub::config::Config {
+    let path = config(dir);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.replace("backend = \"file\"", "backend = \"auto\""),
+    )
+    .unwrap();
+    let mut config = fronde_hub::config::load(&path).unwrap();
+    config
+        .secrets
+        .set_keychain(keychain.keychain(&config.data.dir));
+    config.secrets.set_credentials_dir(credentials);
+    config
 }
 
 fn fronde(args: &[&str], config: &Path, stdin: Option<&[u8]>) -> Output {
@@ -258,4 +283,89 @@ fn read_value_drops_one_line_break_only() {
     assert!(read(&long).unwrap_err().contains("longer than"));
     let max = vec![b'a'; fronde_db::secrets::MAX_VALUE_LEN];
     assert_eq!(read(&max).unwrap().len(), max.len());
+}
+
+/// With `auto`, `fronde secret set` makes the first key in the keychain when it answers, says
+/// where, and leaves no key file; a later locked keychain makes it fail without a key file.
+#[tokio::test]
+async fn set_keeps_the_first_key_in_the_keychain() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = fronde_db::master_key::FakeKeychain::new();
+    let config = auto_config(dir.path(), &keychain, None);
+    let value = secrecy::SecretString::from(CANARY.to_owned());
+
+    let mut out = Vec::new();
+    fronde::secret::set(&config, "caldav", "https://cloud.example", &value, &mut out)
+        .await
+        .unwrap();
+    let shown = String::from_utf8(out).unwrap();
+    assert!(
+        shown.contains("created the master key in the keychain (fake, entry fronde / master-key@"),
+        "{shown}"
+    );
+    assert!(!shown.contains(CANARY), "{shown}");
+    assert!(keychain.entry(&config.data.dir).is_some());
+    assert!(!config.master_key_file().unwrap().exists(), "no key file");
+
+    keychain.lock();
+    let e = fronde::secret::set(
+        &config,
+        "other",
+        "https://cloud.example",
+        &value,
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("is locked"), "{e:#}");
+    assert!(!config.master_key_file().unwrap().exists(), "no key file");
+    keychain.unlock();
+    assert_eq!(stored_with(&config, "caldav").await, CANARY);
+}
+
+/// Under a unit that loads the credential, `auto` reads the key from `$CREDENTIALS_DIRECTORY`
+/// (here a temporary directory): no key is made, in the keychain or in a file.
+#[tokio::test]
+async fn set_reads_the_systemd_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = tempfile::tempdir().unwrap();
+    fronde_hub::private::write(
+        credentials.path().join(fronde_db::master_key::CREDENTIAL),
+        "fronde-key-v1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\n",
+    )
+    .unwrap();
+    let keychain = fronde_db::master_key::FakeKeychain::new();
+    let config = auto_config(
+        dir.path(),
+        &keychain,
+        Some(credentials.path().to_path_buf()),
+    );
+    let value = secrecy::SecretString::from(CANARY.to_owned());
+
+    let mut out = Vec::new();
+    fronde::secret::set(&config, "caldav", "https://cloud.example", &value, &mut out)
+        .await
+        .unwrap();
+    let shown = String::from_utf8(out).unwrap();
+    assert!(!shown.contains("created the master key"), "{shown}");
+    assert!(keychain.entry(&config.data.dir).is_none());
+    assert!(!config.master_key_file().unwrap().exists());
+    assert_eq!(stored_with(&config, "caldav").await, CANARY);
+}
+
+/// The stored secret `name`, opened with the key from `config`'s backends.
+async fn stored_with(config: &fronde_hub::config::Config, name: &str) -> String {
+    let db = fronde_db::open(&config.data.dir).await.unwrap();
+    let key = config
+        .master_key_backends()
+        .unwrap()
+        .load(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let sealed = fronde_db::secrets::load_sealed(&db, fronde_db::secrets::SOURCES)
+        .await
+        .unwrap();
+    let row = sealed.iter().find(|s| s.name == name).unwrap();
+    row.open(&key).unwrap().expose_secret().to_owned()
 }

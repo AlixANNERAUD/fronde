@@ -7,12 +7,14 @@
 //! (`secrets`/`key_check`), under associated data of its own domain (`fronde key check`), so
 //! that it can never be taken for a secret row or the other way round. A wrong key is then
 //! reported as a wrong key, not as damaged rows, and a new key is never made while it exists.
+//! Beside it, `secrets`/`backend` records which backend holds the key
+//! ([`crate::master_key::Backends`]), written in the same transaction.
 //!
 //! Origins are stored as the caller gives them: canonical, written by `Origin::to_string()`
 //! (`fronde_hub::origin`). Values only leave this module as `SecretString`, and nothing here
 //! prints one.
 
-use crate::master_key::MasterKey;
+use crate::master_key::{Backend, MasterKey};
 use anyhow::{Context as _, bail};
 use chacha20poly1305::aead::{Aead as _, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -38,6 +40,8 @@ const NONCE_LEN: usize = 24;
 /// Where the key check lives in `kv`.
 const CHECK_SCOPE: &str = "secrets";
 const CHECK_KEY: &str = "key_check";
+/// Where the record of the key's backend lives in `kv`, beside the key check.
+const BACKEND_KEY: &str = "backend";
 /// The key check's format, its first byte; then the nonce, then the sealed text. Format 2 seals
 /// it under its own domain label; format 1, written by the first version of the store, sealed it
 /// under the secret rows' label: it is still accepted, and sealed again in format 2 by the next
@@ -225,6 +229,32 @@ pub async fn any_stored<C: ConnectionTrait>(db: &C) -> anyhow::Result<bool> {
     Ok(rows > 0 || stored_check(db).await?.is_some())
 }
 
+/// The backend that holds the master key, as recorded with the first secret; `None` before.
+pub async fn recorded_backend<C: ConnectionTrait>(db: &C) -> anyhow::Result<Option<Backend>> {
+    crate::kv::get(db, CHECK_SCOPE, BACKEND_KEY)
+        .await
+        .context("cannot read where the master key is kept")?
+        .map(|name| crate::master_key::parse_recorded(&name))
+        .transpose()
+}
+
+/// Record `backend` as the one holding the key, unless it already is. Called only with a key
+/// that opened the key check, or with the first one: the record follows the key.
+async fn record_backend<C: ConnectionTrait>(db: &C, backend: Backend) -> anyhow::Result<()> {
+    if recorded_backend(db).await? == Some(backend) {
+        return Ok(());
+    }
+    crate::kv::set(
+        db,
+        CHECK_SCOPE,
+        BACKEND_KEY,
+        backend.name().as_bytes().to_vec(),
+        None,
+    )
+    .await
+    .context("cannot record where the master key is kept")
+}
+
 async fn stored_check<C: ConnectionTrait>(db: &C) -> anyhow::Result<Option<Vec<u8>>> {
     crate::kv::get(db, CHECK_SCOPE, CHECK_KEY)
         .await
@@ -280,8 +310,9 @@ pub async fn check_key<C: ConnectionTrait>(db: &C, key: &MasterKey) -> anyhow::R
 }
 
 /// Check `key` as [`check_key`] does and, if the key check is in the older format, seal it again
-/// in the current one, in one write transaction. True if it was sealed again. `fronde serve` calls
-/// it at start, so that a database stays in the older format only until then.
+/// in the current one, in one write transaction, which also records the key's backend where it is
+/// not recorded yet, or recorded as another. True if the check was sealed again. `fronde serve`
+/// calls it at start, so that a database stays in the older format only until then.
 pub async fn upgrade_key_check(db: &DatabaseConnection, key: &MasterKey) -> anyhow::Result<bool> {
     let transaction = crate::begin_write(db)
         .await
@@ -289,15 +320,17 @@ pub async fn upgrade_key_check(db: &DatabaseConnection, key: &MasterKey) -> anyh
     let Some(check) = stored_check(&transaction).await? else {
         return Ok(false);
     };
-    if !opens(key, &check)? {
-        return Ok(false);
+    let older = opens(key, &check)?;
+    if older {
+        write_check(&transaction, seal_check(&key.cipher())?).await?;
     }
-    write_check(&transaction, seal_check(&key.cipher())?).await?;
+    // A database from before backends were recorded learns where its key is.
+    record_backend(&transaction, key.backend()).await?;
     transaction
         .commit()
         .await
         .context("cannot store the master key's check")?;
-    Ok(true)
+    Ok(older)
 }
 
 /// Whether the database has the secrets table. A database last opened by an older Fronde does
@@ -366,6 +399,7 @@ pub async fn set(
             write_check(&transaction, seal_check(&cipher)?).await?;
         }
     }
+    record_backend(&transaction, key.backend()).await?;
     let now = Utc::now();
     let created_at = secrets::Entity::find_by_id((scope.to_owned(), name.to_owned()))
         .one(&transaction)
@@ -472,7 +506,7 @@ mod tests {
     /// as another, whatever reads it.
     #[test]
     fn version_is_bound() {
-        let key = MasterKey::generate("test").unwrap();
+        let key = MasterKey::generate(Backend::File).unwrap();
         let cipher = key.cipher();
         let nonce = new_nonce().unwrap();
         let sealed = seal_with(
@@ -505,7 +539,7 @@ mod tests {
     /// not open as a row with the same scope, name and origin, nor the other way round.
     #[test]
     fn key_check_has_its_own_domain() {
-        let key = MasterKey::generate("test").unwrap();
+        let key = MasterKey::generate(Backend::File).unwrap();
         let check = seal_check(&key.cipher()).unwrap();
         assert_eq!(check[0], CHECK_VERSION);
         assert!(
@@ -536,8 +570,8 @@ mod tests {
     async fn older_key_check_is_accepted_and_sealed_again() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::open(dir.path()).await.unwrap();
-        let key = MasterKey::generate("test").unwrap();
-        let other = MasterKey::generate("test").unwrap();
+        let key = MasterKey::generate(Backend::File).unwrap();
+        let other = MasterKey::generate(Backend::File).unwrap();
         let old = row_labelled_check(&key);
         assert!(
             opens(&key, &old).unwrap(),

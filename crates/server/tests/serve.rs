@@ -635,6 +635,14 @@ async fn check_reports_stored_credentials() {
         ),
         "{shown}"
     );
+    // The key's place: the file the secrets were stored with, recorded as the backend.
+    assert!(
+        shown.contains(&format!(
+            "secrets: master key from {} (file), opens the stored secrets",
+            dir.path().join("master.key").display()
+        )),
+        "{shown}"
+    );
     assert!(!shown.contains(VALUE), "{shown}");
     // SQLite's read-only open of a WAL database leaves an empty `-wal` and its index `-shm`.
     let after: Vec<_> = snapshot(&data)
@@ -688,6 +696,38 @@ async fn start_refuses_a_wrong_or_missing_master_key() {
         "{e:#}"
     );
     assert!(!key_file.exists(), "no new key is made");
+}
+
+/// A keychain locked at start, as after a reboot before the desktop session unlocks it, stops
+/// `serve` with what to do, and no key file is made in its place. Once unlocked, Fronde starts.
+#[tokio::test]
+async fn start_refuses_a_locked_keychain_and_makes_no_other_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), TOKEN);
+    let keychain = fronde_db::master_key::FakeKeychain::new();
+    config
+        .secrets
+        .set_keychain(keychain.keychain(&config.data.dir));
+    config.secrets.set_credentials_dir(None);
+    let value = secrecy::SecretString::from("v".to_owned());
+    fronde::secret::set(
+        &config,
+        "caldav",
+        "https://cloud.example",
+        &value,
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap();
+    assert!(keychain.entry(&config.data.dir).is_some());
+
+    keychain.lock();
+    let e = format!("{:#}", fronde::start(config.clone()).await.unwrap_err());
+    assert!(e.contains("is locked") && e.contains("unlock it"), "{e}");
+    assert!(!config.master_key_file().unwrap().exists(), "no key file");
+
+    keychain.unlock();
+    fronde::start(config).await.unwrap();
 }
 
 /// A key an earlier version left in the data directory: `fronde check` reads it there and moves

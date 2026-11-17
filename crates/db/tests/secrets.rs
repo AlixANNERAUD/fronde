@@ -1,4 +1,4 @@
-use fronde_db::master_key::{self, MasterKey};
+use fronde_db::master_key::{self, Backend, MasterKey};
 use fronde_db::secrets::{self, SOURCES};
 use fronde_entity::secrets as rows;
 use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
@@ -172,8 +172,8 @@ async fn a_key_file_open_to_others_is_refused() {
 fn key_format_is_checked() {
     let good = "fronde-key-v1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
     for text in [good.to_owned(), format!("{good}\n"), format!("{good}\r\n")] {
-        let key = MasterKey::parse(text.as_bytes(), "test").unwrap();
-        assert_eq!(key.backend(), "test");
+        let key = MasterKey::parse(text.as_bytes(), Backend::Keychain).unwrap();
+        assert_eq!(key.backend(), Backend::Keychain);
     }
     for bad in [
         String::new(),
@@ -189,7 +189,7 @@ fn key_format_is_checked() {
         // 43 characters whose last one carries bits beyond the 32 bytes.
         "fronde-key-v1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQF".to_owned(),
     ] {
-        let err = MasterKey::parse(bad.as_bytes(), "test")
+        let err = MasterKey::parse(bad.as_bytes(), Backend::Keychain)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a Fronde master key"), "{bad:?}: {err}");
@@ -224,7 +224,7 @@ async fn wrong_key_is_reported_as_such() {
     assert!(err.contains("is not the one that sealed"), "{err}");
 
     // Writing with the wrong key is refused, and leaves the row as it was.
-    let wrong = MasterKey::parse(other_key_line().as_bytes(), "file").unwrap();
+    let wrong = MasterKey::parse(other_key_line().as_bytes(), Backend::File).unwrap();
     let before = rows::Entity::find().all(&db).await.unwrap();
     let err = secrets::set(
         &db,

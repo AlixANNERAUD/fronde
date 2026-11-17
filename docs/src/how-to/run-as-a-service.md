@@ -64,6 +64,59 @@ fronde service uninstall
 
 This stops and disables `fronde.service`, removes the unit file, and reloads systemd. Your configuration, secret files and data directory are kept.
 
+## Keep the master key in a systemd credential
+
+If you [store secrets](store-a-secret.md), the service needs their master key when it starts,
+often at boot, before any desktop session has unlocked a keychain. A systemd credential fits:
+the key is encrypted on disk with the machine's key (and its TPM when there is one), and systemd
+decrypts it for the service alone each time it starts. This needs systemd 256 or later, for
+credentials in user services. `fronde service install` leaves the unit as it is; you add the
+credential with a drop-in file.
+
+Do this before storing the first secret. Make a key and encrypt it, without ever writing it in
+clear:
+
+```sh
+{ printf 'fronde-key-v1:'; head -c 32 /dev/urandom | basenc --base64url | tr -d '=\n'; echo; } \
+  | systemd-creds --user encrypt --name=fronde-master-key - ~/.config/fronde/master-key.cred
+```
+
+To keep a key you already have in `master.key` instead, encrypt that file:
+`systemd-creds --user encrypt --name=fronde-master-key ~/.config/fronde/master.key
+~/.config/fronde/master-key.cred`, and delete `master.key` once Fronde has started with the
+credential.
+
+Load it in the unit, with `systemctl --user edit fronde.service`:
+
+```ini
+[Service]
+LoadCredentialEncrypted=fronde-master-key:%h/.config/fronde/master-key.cred
+```
+
+and name the backend in the configuration, so that Fronde looks for the key nowhere else:
+
+```toml
+[secrets]
+backend = "systemd"
+```
+
+Then `systemctl --user restart fronde.service`. Fronde reads the key from
+`$CREDENTIALS_DIRECTORY/fronde-master-key`, which only exists while the service runs. A
+`fronde secret set` or `fronde check` typed in a shell has no such directory: run it under the
+same credential with `systemd-run`, the value still on standard input:
+
+```sh
+systemd-run --user --pipe --wait --quiet \
+  -p LoadCredentialEncrypted=fronde-master-key:$HOME/.config/fronde/master-key.cred \
+  "$(command -v fronde)" secret set caldav --origin https://cloud.example \
+  --config $HOME/.config/fronde/fronde.toml < caldav-password
+```
+
+`fronde secret list` and `fronde secret remove` need no key. `master-key.cred` opens only on
+this machine: if the machine is lost, so is the key, and the secrets must be stored again on the
+next one. To keep a way back, encrypt a key line you also keep in a password manager rather than
+one made in the pipe above.
+
 ## Systems without systemd
 
 If `systemctl` is missing or no systemd user instance is running (for example inside a container or under another init system), `fronde service` exits with an error. Run `fronde serve --config fronde.toml` under your own supervisor instead, or see [Run in Docker](run-in-docker.md).

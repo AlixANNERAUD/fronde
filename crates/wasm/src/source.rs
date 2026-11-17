@@ -17,7 +17,7 @@ use crate::manifest::{Injection, Manifest, NetworkRule, World};
 use crate::{ComponentHost, ComponentSpec, LoadedComponent};
 use anyhow::{Context, bail, ensure};
 use async_trait::async_trait;
-use fronde_db::master_key::MasterKey;
+use fronde_db::master_key::{Backend, Backends, MasterKey};
 use fronde_db::secrets::Sealed;
 use fronde_hub::config::{ComponentConfig, Config, RESERVED_TOOL_PREFIXES, Secret, SourceConfig};
 use fronde_hub::origin::{Origin, is_local};
@@ -162,13 +162,21 @@ pub struct StoredSecrets {
 }
 
 impl StoredSecrets {
-    /// The rows of `db` in the `sources` scope, and the key in `key_file`, checked against `db`:
-    /// a key that did not seal them, or no key file while secrets are stored, is an error. Only
-    /// reads.
-    pub async fn load(db: &fronde_db::DatabaseConnection, key_file: &Path) -> anyhow::Result<Self> {
-        let key = fronde_db::master_key::load(db, key_file).await?;
+    /// The rows of `db` in the `sources` scope, and the master key from `backends`, checked
+    /// against `db`: a key that did not seal them, or no key while secrets are stored, is an
+    /// error. Only reads.
+    pub async fn load(
+        db: &fronde_db::DatabaseConnection,
+        backends: &Backends,
+    ) -> anyhow::Result<Self> {
+        let key = backends.load(db).await?;
         let sealed = fronde_db::secrets::load_sealed(db, fronde_db::secrets::SOURCES).await?;
         Ok(Self { key, sealed })
+    }
+
+    /// Where the master key came from, if one was read.
+    pub fn key_backend(&self) -> Option<Backend> {
+        self.key.as_ref().map(|key| key.backend())
     }
 
     /// The value of the secret `name`, which must have been stored for `origin`. A secret not
@@ -655,10 +663,10 @@ pub struct ComponentSource {
     config: ComponentConfig,
     checks: Checks,
     host: ComponentHost,
-    /// The database and data directory where the stored secrets and the master key are read
-    /// again at each start, so that a secret stored or changed since the last one applies.
+    /// The database and the master key's backends, where the stored secrets and the key are
+    /// read again at each start, so that a secret stored or changed since the last one applies.
     /// Without them, those of `checks`.
-    store: Option<(fronde_db::DatabaseConnection, PathBuf)>,
+    store: Option<(fronde_db::DatabaseConnection, Backends)>,
 }
 
 impl ComponentSource {
@@ -671,14 +679,14 @@ impl ComponentSource {
         }
     }
 
-    /// Read the stored secrets from `db`, and the master key from `key_file`, each time the
+    /// Read the stored secrets from `db`, and the master key from `backends`, each time the
     /// component starts.
     pub fn reading_secrets_from(
         mut self,
         db: fronde_db::DatabaseConnection,
-        key_file: PathBuf,
+        backends: Backends,
     ) -> Self {
-        self.store = Some((db, key_file));
+        self.store = Some((db, backends));
         self
     }
 }
@@ -691,9 +699,9 @@ impl ToolSource for ComponentSource {
 
     async fn start(&self) -> anyhow::Result<Session> {
         let prepared = match &self.store {
-            Some((db, key_file)) if uses_stored_secrets(&self.config) => {
+            Some((db, backends)) if uses_stored_secrets(&self.config) => {
                 let mut checks = self.checks.clone();
-                checks.secrets = StoredSecrets::load(db, key_file).await?;
+                checks.secrets = StoredSecrets::load(db, backends).await?;
                 prepare(&self.config, &checks)?
             }
             _ => prepare(&self.config, &self.checks)?,
@@ -740,7 +748,9 @@ mod tests {
             .open("api", &Origin::parse(origin).unwrap())
             .unwrap_err();
         assert!(e.downcast_ref::<Waiting>().is_some(), "{e:#}");
-        let loaded = StoredSecrets::load(&db, &file).await.unwrap();
+        let loaded = StoredSecrets::load(&db, &Backends::file(&file))
+            .await
+            .unwrap();
         assert!(loaded.open("api", &Origin::parse(origin).unwrap()).is_ok());
     }
 }

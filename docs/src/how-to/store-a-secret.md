@@ -29,15 +29,34 @@ value from a terminal, which would echo it. One final line break
 is dropped. The origin is stored as Fronde normalises it: `HTTPS://Cloud.Example:443` is stored as
 `https://cloud.example`. Setting a name again replaces its value and origin.
 
-The first secret creates the master key, `master.key` beside the configuration file (mode 0600),
-and prints its path. It is kept out of the data directory, so that backups of the data directory
-do not hold it: back it up now, once, apart from them, in a password manager for instance (see
-[Data directory](../reference/data-directory.md)). Without it, the stored secrets cannot be read,
-and Fronde does not make a new key while secrets are stored. To keep it elsewhere, set
-`[secrets] master_key = { file = "…" }` (see
-[Configuration](../reference/configuration.md#secrets-1)) before storing the first secret.
+## Where the master key goes
 
-If the configuration's directory is read-only, as in a container, the key cannot be created
+The first secret creates the master key that seals them all, and `fronde secret set` says where
+it put it. By default (`[secrets] backend = "auto"`, see
+[Configuration](../reference/configuration.md#secrets-1)):
+
+- under a systemd service that loads the credential `fronde-master-key`, the key is that
+  credential's (see
+  [Run as a systemd service](run-as-a-service.md#keep-the-master-key-in-a-systemd-credential));
+- on a desktop whose keychain is unlocked (GNOME Keyring, KWallet, KeePassXC with Secret
+  Service, the macOS Keychain, the Windows Credential Manager), the key goes there, as the entry
+  `fronde` / `master-key@…`: nothing to back up beside the keychain itself;
+- otherwise (a server, a container, a locked keychain), it goes to `master.key` beside the
+  configuration file (mode 0600), whose path it prints. That file is kept out of the data
+  directory, so that backups of the data directory do not hold it: back it up now, once, apart
+  from them, in a password manager for instance (see
+  [Data directory](../reference/data-directory.md)). To keep it elsewhere, set
+  `[secrets] master_key = { file = "…" }` before storing the first secret.
+
+Fronde remembers where the key went and looks only there from then on. Without the key, the stored
+secrets cannot be read, and Fronde does not make a new key while secrets are stored. If the
+keychain is locked when Fronde starts, it stops and says to unlock it.
+
+To choose instead of letting `auto` choose, set `backend` before storing the first secret, for
+instance `backend = "file"` for a service that starts at boot, before any desktop session unlocks
+the keychain.
+
+If the configuration's directory is read-only, as in a container, the key file cannot be created
 there: `fronde secret set` says so and names both fixes, a writable directory there or
 `[secrets] master_key`. [Run in Docker](run-in-docker.md#stored-secrets) shows the second.
 

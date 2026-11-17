@@ -1,6 +1,7 @@
 //! `fronde secret`: store, list and remove the secrets kept encrypted in `fronde.db`.
 
 use anyhow::{Context as _, bail};
+use fronde_db::master_key::Backend;
 use fronde_db::secrets;
 use fronde_hub::config::Config;
 use fronde_hub::origin::Origin;
@@ -61,17 +62,24 @@ pub async fn set(
     secrets::check_name(name)?;
     let origin = Origin::parse(origin)?.to_string();
     let db = open(config).await?;
-    let key_file = config.master_key_file()?;
-    let (key, created) = fronde_db::master_key::load_or_create(&db, key_file).await?;
+    let backends = config.master_key_backends()?;
+    let (key, created) = backends.load_or_create(&db).await?;
     secrets::set(&db, &key, secrets::SOURCES, name, &origin, value).await?;
     db.close().await?;
     if created {
-        writeln!(
-            out,
-            "created the master key {}: back it up apart from the data directory, without it the \
-             stored secrets are lost",
-            key_file.display()
-        )?;
+        let place = backends.place(key.backend());
+        match key.backend() {
+            Backend::File => writeln!(
+                out,
+                "created the master key {place}: back it up apart from the data directory, \
+                 without it the stored secrets are lost"
+            )?,
+            _ => writeln!(
+                out,
+                "created the master key in {place}, where it stays: without it the stored \
+                 secrets are lost"
+            )?,
+        }
     }
     writeln!(out, "stored secret {name} for {origin}")?;
     Ok(())

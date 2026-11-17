@@ -51,7 +51,8 @@ manifest, settings, tool prefixes, credentials over https) and prints which appr
 opens, stored for this origin`, never the value; a secret that is not stored, one stored for
 another origin, or one that does not open is an error saying how to fix it. It reads the
 approvals and secrets stored in `fronde.db` when the data directory has one, and checks the master
-key against them, as `serve` does at start (a key an earlier version left in the data directory
+key against them, from the backend `serve` would use, as `serve` does at start; when secrets are
+stored it prints `secrets: master key from <place> (<backend>), opens the stored secrets` (a key an earlier version left in the data directory
 is read there and not moved: `serve` moves it), and never creates, updates or writes the
 database: it
 opens it read-only, and a database an older Fronde left without the approvals or secrets table
@@ -83,15 +84,19 @@ fronde secret remove <name> --config <file>
   that is not UTF-8 or one over 64 KiB is refused. The name is 1 to 64 letters, digits, `-`, `_`
   or `.`. The origin is `scheme://host[:port]` over http or https, stored as Fronde normalises it
   (`HTTPS://Cloud.Example:443` becomes `https://cloud.example`); the secret is bound to it.
-  Setting a name again replaces its value and origin. The first secret creates the master key,
-  `master.key` beside the configuration file unless `[secrets] master_key` names another file,
-  and prints its path; while secrets are stored, a missing or different key file is an error and
-  no new key is made. Any argument besides the name and the options is refused, exit status 2,
+  Setting a name again replaces its value and origin. The first secret creates the master key in
+  the backend `[secrets] backend` picks (see
+  [Configuration](configuration.md#secrets-1)): with `auto`, a systemd credential when the
+  command runs under one (read, never made), else the keychain when it answers, else
+  `master.key` beside the configuration file (or the file `[secrets] master_key` names), and
+  prints where; while secrets are stored, a missing or different key, or a keychain that is
+  locked or out of reach, is an error and no new key is made anywhere. Any argument besides the name and the options is refused, exit status 2,
   without being shown. It prints `stored secret <name> for <origin>`.
 - `list` prints one line per secret: its name, origin and last change (UTC), separated by tabs,
   or `no stored secret`. It never prints a value.
 - `remove` removes one secret, and exits with 1 if there is none by that name. Removing the last
-  one also removes the key check, so a lost `master.key` then no longer blocks a new one.
+  one also removes the key check, so a lost key then no longer blocks a new one; the backend
+  recorded for it stays.
 
 A component's credential names a stored secret with `{ stored = "<name>" }` (see
 [Configuration](configuration.md#kind--component)).

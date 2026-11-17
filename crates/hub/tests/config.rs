@@ -754,11 +754,38 @@ fn master_key_is_only_a_file() {
             "{written}: {err}"
         );
     }
+    // A backend this Fronde does not have is refused, naming those it has.
     let err = format!(
         "{:#}",
         load_str(&format!("{MIN}[secrets]\nbackend = \"keyring\"\n")).unwrap_err()
     );
-    assert!(err.contains("unknown field"), "{err}");
+    assert!(err.contains("unknown variant `keyring`"), "{err}");
+    assert!(
+        err.contains("`auto`, `systemd`, `keychain`, `file`"),
+        "{err}"
+    );
+}
+
+/// `[secrets] backend` is `auto` by default, and names one backend otherwise; the key file is
+/// kept for the file backend whatever the choice.
+#[test]
+fn secrets_backend_is_auto_by_default() {
+    use fronde_hub::config::KeyBackend;
+    assert_eq!(load_str(MIN).unwrap().secrets.backend, KeyBackend::Auto);
+    for (written, expected) in [
+        ("auto", KeyBackend::Auto),
+        ("systemd", KeyBackend::Systemd),
+        ("keychain", KeyBackend::Keychain),
+        ("file", KeyBackend::File),
+    ] {
+        let c = load_str(&format!(
+            "{MIN}[secrets]\nbackend = {written:?}\nmaster_key = {{ file = \"/k/master.key\" }}\n"
+        ))
+        .unwrap();
+        assert_eq!(c.secrets.backend, expected, "{written}");
+        let backends = c.master_key_backends().unwrap();
+        assert_eq!(backends.key_file(), std::path::Path::new("/k/master.key"));
+    }
 }
 
 /// A configuration that `load` did not read has no master key location, rather than a guess.

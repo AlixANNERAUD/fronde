@@ -1,13 +1,24 @@
-//! The master key that seals stored secrets ([`crate::secrets`]), and where it is kept: for now a
-//! 0600 file, by default `master.key` beside the configuration file, never in the data directory,
-//! so that a backup of the data directory or a snapshot of its volume does not hold the key with
-//! the secrets it opens. Earlier versions kept it in the data directory: [`migrate`] moves it.
-//! The keychain and systemd credentials are planned. The key never comes from the environment:
-//! the agent inherits Fronde's.
+//! The master key that seals stored secrets ([`crate::secrets`]), and where it is kept: a
+//! systemd credential, the platform's keychain, or a 0600 file, by default `master.key` beside
+//! the configuration file, never in the data directory, so that a backup of the data directory or
+//! a snapshot of its volume does not hold the key with the secrets it opens. Earlier versions kept
+//! the file in the data directory: [`migrate`] moves it. [`Backends`] picks the place and keeps
+//! it. The key never comes from the environment: the agent inherits Fronde's.
 //!
 //! The key is written as one line, `fronde-key-v1:` followed by its 32 bytes in unpadded
 //! base64url, the same in a file, a keychain entry or a systemd credential, so that anything else
 //! is refused with a clear message.
+
+mod backends;
+mod keychain;
+mod systemd;
+
+pub(crate) use backends::parse_recorded;
+pub use backends::{Backends, Choice};
+#[cfg(feature = "testing")]
+pub use keychain::FakeKeychain;
+pub use keychain::Keychain;
+pub use systemd::CREDENTIAL;
 
 use anyhow::{Context as _, bail};
 use base64::Engine as _;
@@ -35,24 +46,60 @@ pub fn legacy_path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE_NAME)
 }
 
+/// Where a master key is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// `$CREDENTIALS_DIRECTORY/fronde-master-key`, which systemd decrypts for the service.
+    Systemd,
+    /// The platform's keychain: Secret Service, the macOS Keychain or the Windows Credential
+    /// Manager.
+    Keychain,
+    /// A 0600 file, `master.key` beside the configuration by default.
+    File,
+}
+
+impl Backend {
+    /// The name in `[secrets] backend` and in the database's record of where the key is.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Systemd => "systemd",
+            Self::Keychain => "keychain",
+            Self::File => "file",
+        }
+    }
+
+    /// The backend named `name`, as [`Backend::name`] writes it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Systemd, Self::Keychain, Self::File]
+            .into_iter()
+            .find(|b| b.name() == name)
+    }
+}
+
+impl fmt::Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The 256-bit key of XChaCha20-Poly1305 that seals stored secrets. It cannot be cloned: share
 /// it as an `Arc<MasterKey>`. Its `Debug` prints where it came from, never the key.
 pub struct MasterKey {
     key: SecretBox<[u8; 32]>,
-    backend: &'static str,
+    backend: Backend,
 }
 
 impl fmt::Debug for MasterKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MasterKey")
-            .field("backend", &self.backend)
+            .field("backend", &self.backend.name())
             .finish_non_exhaustive()
     }
 }
 
 impl MasterKey {
     /// A new random key, kept by `backend`.
-    pub fn generate(backend: &'static str) -> anyhow::Result<Self> {
+    pub fn generate(backend: Backend) -> anyhow::Result<Self> {
         let mut filled = Ok(());
         let key = SecretBox::init_with_mut(|key: &mut [u8; 32]| filled = getrandom::fill(key));
         filled.map_err(|e| anyhow::anyhow!("no randomness available: {e}"))?;
@@ -61,7 +108,7 @@ impl MasterKey {
 
     /// The key written `fronde-key-v1:<base64url>`, with one final line break allowed. The
     /// error never quotes the text.
-    pub fn parse(text: &[u8], backend: &'static str) -> anyhow::Result<Self> {
+    pub fn parse(text: &[u8], backend: Backend) -> anyhow::Result<Self> {
         let text = text
             .strip_suffix(b"\n")
             .map(|t| t.strip_suffix(b"\r").unwrap_or(t))
@@ -88,13 +135,13 @@ impl MasterKey {
         Ok(Self { key, backend })
     }
 
-    /// Where the key came from: `file` today.
-    pub fn backend(&self) -> &'static str {
+    /// Where the key came from.
+    pub fn backend(&self) -> Backend {
         self.backend
     }
 
     /// The key's one line, to store it.
-    fn encode(&self) -> Zeroizing<Vec<u8>> {
+    pub(crate) fn encode(&self) -> Zeroizing<Vec<u8>> {
         // Straight into a buffer zeroed on drop: `encode_string` goes through a chunked encoder
         // whose stack buffer keeps a copy of the encoded key.
         let mut encoded = Zeroizing::new([0u8; ENCODED_LEN]);
@@ -120,16 +167,24 @@ pub fn read(file: &Path) -> anyhow::Result<Option<MasterKey>> {
     let Some(text) = read_text(file)? else {
         return Ok(None);
     };
-    MasterKey::parse(&text, "file").map(Some).with_context(|| {
-        format!(
-            "the master key {} is unreadable; restore it from a backup",
-            file.display()
-        )
-    })
+    MasterKey::parse(&text, Backend::File)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "the master key {} is unreadable; restore it from a backup",
+                file.display()
+            )
+        })
 }
 
 /// The text of the key file `file`, not parsed, after the checks of [`read`].
 fn read_text(file: &Path) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+    read_line(file, true)
+}
+
+/// The text of the key file `file`, not parsed: a plain file, never followed through a link, and,
+/// if `private`, one that only Fronde's user owns and reads.
+fn read_line(file: &Path, private: bool) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     let shown = file.display();
     let mut opened = match open_plain(file) {
         Ok(opened) => opened,
@@ -140,7 +195,11 @@ fn read_text(file: &Path) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         ),
         Err(e) => return Err(e).with_context(|| format!("cannot read the master key {shown}")),
     };
-    check_private(&opened, file)?;
+    if private {
+        check_private(&opened, file)?;
+    } else {
+        check_plain(&opened, file)?;
+    }
     // A key file is one short line and its line break: read one byte more, enough to refuse a
     // longer file, into a buffer that never grows.
     let limit = PREFIX.len() + ENCODED_LEN + 3;
@@ -207,6 +266,11 @@ fn check_private(opened: &std::fs::File, file: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn check_private(opened: &std::fs::File, file: &Path) -> anyhow::Result<()> {
+    check_plain(opened, file)
+}
+
+/// Refuses anything but a plain file.
+fn check_plain(opened: &std::fs::File, file: &Path) -> anyhow::Result<()> {
     let meta = opened
         .metadata()
         .with_context(|| format!("cannot read the master key {}", file.display()))?;
@@ -222,7 +286,7 @@ fn check_private(opened: &std::fs::File, file: &Path) -> anyhow::Result<()> {
 /// Write a new key to `file`, 0600, unless the file exists. Returns the key in the file: the new
 /// one, or the one another writer put there first.
 fn create(file: &Path) -> anyhow::Result<MasterKey> {
-    let key = MasterKey::generate("file")?;
+    let key = MasterKey::generate(Backend::File)?;
     match place(file, &key.encode()) {
         Ok(()) => Ok(key),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -298,7 +362,7 @@ pub fn migrate(file: &Path, data_dir: &Path) -> anyhow::Result<bool> {
     let Some(old) = read_text(&legacy)? else {
         return Ok(false);
     };
-    MasterKey::parse(&old, "file").with_context(|| {
+    MasterKey::parse(&old, Backend::File).with_context(|| {
         format!(
             "the master key {} is unreadable; restore it from a backup",
             legacy.display()
@@ -409,48 +473,16 @@ fn sync_dir(file: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The key that opens the stored secrets, from `file`, checked against the database. `None`
-/// when the file is missing and nothing is stored. A missing file while secrets are stored, or a
-/// key that does not open them, is an error that says so.
+/// The key that opens the stored secrets, from the file `file` alone ([`Backends::file`]).
 pub async fn load(db: &DatabaseConnection, file: &Path) -> anyhow::Result<Option<Arc<MasterKey>>> {
-    let mut key = read(file)?;
-    // A first secret stored since the file was read made the key before its row: read it again.
-    if key.is_none() && crate::secrets::any_stored(db).await? {
-        key = read(file)?;
-    }
-    match key {
-        Some(key) => {
-            crate::secrets::check_key(db, &key)
-                .await
-                .with_context(|| format!("master key {}", file.display()))?;
-            Ok(Some(Arc::new(key)))
-        }
-        None if crate::secrets::any_stored(db).await? => bail!(
-            "the master key {} is missing, but the database holds secrets sealed with it; \
-             restore the file from a backup. Fronde does not make a new key while secrets are \
-             stored: it could not open them. Without the key, remove each stored secret \
-             (`fronde secret list`, then `fronde secret remove <name>`) and store them again: \
-             once the last one is removed, the first one stored makes a new key",
-            file.display()
-        ),
-        None => Ok(None),
-    }
+    Backends::file(file).load(db).await
 }
 
-/// [`load`], or, when nothing is stored and there is no key file yet, a new key in a new file.
-/// The flag says whether the key was created now.
-///
-/// The key is checked against the database here, but another process may store the first secret
-/// under its own key between this check and the caller's write: the check that
-/// [`crate::secrets::set`] makes inside its write transaction is what keeps a secret from being
-/// sealed under a key that does not match the stored ones.
+/// [`load`], or, when nothing is stored and there is no key file yet, a new key in a new file
+/// ([`Backends::load_or_create`] for the file alone).
 pub async fn load_or_create(
     db: &DatabaseConnection,
     file: &Path,
 ) -> anyhow::Result<(Arc<MasterKey>, bool)> {
-    if let Some(key) = load(db, file).await? {
-        return Ok((key, false));
-    }
-    let key = create(file)?;
-    Ok((Arc::new(key), true))
+    Backends::file(file).load_or_create(db).await
 }

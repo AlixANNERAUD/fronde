@@ -45,17 +45,74 @@ impl Config {
             ),
         }
     }
+
+    /// Where the master key may be kept, as `[secrets]` says: the backend, the key file, the
+    /// service's systemd credentials and the platform's keychain for this data directory.
+    pub fn master_key_backends(&self) -> anyhow::Result<fronde_db::master_key::Backends> {
+        use fronde_db::master_key::{Backend, Backends, Choice, Keychain};
+        let choice = match self.secrets.backend {
+            KeyBackend::Auto => Choice::Auto,
+            KeyBackend::Systemd => Choice::Only(Backend::Systemd),
+            KeyBackend::Keychain => Choice::Only(Backend::Keychain),
+            KeyBackend::File => Choice::Only(Backend::File),
+        };
+        let keychain = match &self.secrets.keychain {
+            Some(keychain) => keychain.clone(),
+            None => Keychain::platform(&self.data.dir),
+        };
+        Ok(Backends::new(
+            choice,
+            self.master_key_file()?.to_path_buf(),
+            self.secrets.credentials_dir.clone(),
+            keychain,
+        ))
+    }
 }
 
 /// `[secrets]`: where the master key that seals stored secrets is kept.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
-    /// `{ file = "…" }` only: never `{ env }`, which the agent inherits, nor `{ stored }`.
+    /// Which backend holds the key; `auto` by default.
+    #[serde(default)]
+    pub backend: KeyBackend,
+    /// The file backend's key file. `{ file = "…" }` only: never `{ env }`, which the agent
+    /// inherits, nor `{ stored }`.
     master_key: Option<Secret>,
     /// The key file, read from the configuration's directory when relative; [`load`] sets it.
     #[serde(skip)]
     master_key_file: Option<PathBuf>,
+    /// `$CREDENTIALS_DIRECTORY`, where systemd puts the service's credentials; [`load`] reads it.
+    #[serde(skip)]
+    credentials_dir: Option<PathBuf>,
+    /// The keychain to use instead of the platform's: tests set a fake one.
+    #[serde(skip)]
+    keychain: Option<fronde_db::master_key::Keychain>,
+}
+
+impl SecretsConfig {
+    /// Read systemd credentials from `dir` instead of `$CREDENTIALS_DIRECTORY`.
+    pub fn set_credentials_dir(&mut self, dir: Option<PathBuf>) {
+        self.credentials_dir = dir;
+    }
+
+    /// Use `keychain` instead of the platform's.
+    pub fn set_keychain(&mut self, keychain: fronde_db::master_key::Keychain) {
+        self.keychain = Some(keychain);
+    }
+}
+
+/// `[secrets] backend`: where the master key is kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyBackend {
+    /// For the first key, a systemd credential if the service has one, else the keychain if it
+    /// answers, else a file; then always the one that got it.
+    #[default]
+    Auto,
+    Systemd,
+    Keychain,
+    File,
 }
 
 /// `[python]`: where the Python runtime is, as `mise run python` lays it out.
@@ -467,6 +524,10 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
              the environment, which the agent inherits, nor from the store it opens"
         ),
     });
+    // Set by systemd, for this process only, when the unit loads credentials.
+    config.secrets.credentials_dir = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
     if let Some(python) = &mut config.python {
         python.dir = base.join(&python.dir).components().collect();
         if config.sources.iter().any(|s| s.name() == PYTHON_SOURCE) {

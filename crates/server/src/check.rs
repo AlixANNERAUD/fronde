@@ -17,6 +17,13 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         crate::check_password(&web.password.resolve().context("web.password")?)?;
     }
     let checks = approval_checks(config).await?;
+    if let Some(backend) = checks.secrets.key_backend() {
+        writeln!(
+            out,
+            "secrets: master key from {} ({backend}), opens the stored secrets",
+            config.master_key_backends()?.place(backend)
+        )?;
+    }
     for source in &config.sources {
         let name = source.name();
         match source {
@@ -94,7 +101,8 @@ async fn approval_checks(config: &Config) -> anyhow::Result<fronde_wasm::Checks>
         // Where serving would read the key, without moving one an earlier version left in the
         // data directory: serving moves it.
         let key_file = fronde_db::master_key::locate(config.master_key_file()?, &config.data.dir)?;
-        checks.secrets = fronde_wasm::StoredSecrets::load(&db, &key_file).await?;
+        let backends = config.master_key_backends()?.with_file(key_file);
+        checks.secrets = fronde_wasm::StoredSecrets::load(&db, &backends).await?;
     }
     db.close().await?;
     Ok(checks)

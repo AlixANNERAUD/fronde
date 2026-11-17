@@ -186,13 +186,13 @@ async fn wasm_sources(
     }
     let host = ComponentHost::new()?;
     let checks = Checks::load(config, db).await?;
-    let key_file = config.master_key_file()?;
+    let backends = config.master_key_backends()?;
     let mut sources: Vec<Arc<dyn ToolSource>> = entries
         .into_iter()
         .map(|c| {
             Arc::new(
                 ComponentSource::new(c, checks.clone(), host.clone())
-                    .reading_secrets_from(db.clone(), key_file.to_path_buf()),
+                    .reading_secrets_from(db.clone(), backends.clone()),
             ) as Arc<dyn ToolSource>
         })
         .collect();
@@ -278,14 +278,15 @@ pub async fn start_with(
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
     let agent = config.agent.clone();
-    let key_file = config.master_key_file()?.to_path_buf();
+    let backends = config.master_key_backends()?;
     fronde_hub::private::prepare_data_dir(&data_dir)?;
     // A key an earlier version kept in the data directory moves to the configured key file.
-    fronde_db::master_key::migrate(&key_file, &data_dir)?;
+    fronde_db::master_key::migrate(backends.key_file(), &data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
-    // A wrong master key, or none while secrets are stored, stops Fronde here, whether or not a
-    // component needs a stored secret.
-    if let Some(key) = fronde_db::master_key::load(&db, &key_file).await? {
+    // A wrong master key, none while secrets are stored, or a backend holding them that cannot
+    // be read (a locked keychain), stops Fronde here, whether or not a component needs a stored
+    // secret.
+    if let Some(key) = backends.load(&db).await? {
         fronde_db::secrets::upgrade_key_check(&db, &key).await?;
     }
     let components = wasm_sources(&config, &db).await?;

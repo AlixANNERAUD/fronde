@@ -91,8 +91,12 @@ name the file in the configuration:
 
 ```toml
 [secrets]
+backend = "file"
 master_key = { file = "/keys/master.key" }
 ```
+
+(`backend = "file"` says what `auto` would find anyway in a container, which has no keychain and
+no systemd credential.)
 
 and add `-v ./fronde-keys:/keys` to `docker run` (or `- ./fronde-keys:/keys` to the Compose
 volumes). Do not mount the configuration's directory writable instead: the agent runs as the

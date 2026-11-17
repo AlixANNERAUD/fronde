@@ -2,6 +2,7 @@
 //! origin through the gate, only that origin, and is read again each time the component starts.
 
 use fronde_db::DatabaseConnection;
+use fronde_db::master_key::Backends;
 use fronde_hub::config::ComponentConfig;
 use fronde_hub::source::{Health, Supervisor, ToolSource, Waiting};
 use fronde_hub::tools::Registry;
@@ -106,7 +107,9 @@ async fn expect_bearer(server: &MockServer, token: &str, times: u64) {
 async fn checks(db: &DatabaseConnection, data: &Path) -> Checks {
     Checks {
         timezone: "UTC".into(),
-        secrets: StoredSecrets::load(db, &key_file(data)).await.unwrap(),
+        secrets: StoredSecrets::load(db, &Backends::file(key_file(data)))
+            .await
+            .unwrap(),
         ..Checks::default()
     }
 }
@@ -146,7 +149,7 @@ async fn stored_credential_reaches_the_gate() {
     assert_eq!(token.expose_secret(), "stored-token");
 
     let source = ComponentSource::new(config, Checks::default(), ComponentHost::new().unwrap())
-        .reading_secrets_from(db, key_file(data.path()));
+        .reading_secrets_from(db, Backends::file(key_file(data.path())));
     let registry = Arc::new(Registry::new());
     Supervisor::new(registry.clone())
         .start(Arc::new(source))
@@ -271,13 +274,18 @@ async fn wrong_key_is_refused() {
     fronde_hub::private::write(&file, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
     let config = entry(dir.path(), &server, "{ stored = \"api\" }");
 
-    let e = format!("{:#}", StoredSecrets::load(&db, &file).await.unwrap_err());
+    let e = format!(
+        "{:#}",
+        StoredSecrets::load(&db, &Backends::file(&file))
+            .await
+            .unwrap_err()
+    );
     assert!(
         e.contains("is not the one that sealed the stored secrets") && e.contains("restore"),
         "{e}"
     );
     let source = ComponentSource::new(config, Checks::default(), ComponentHost::new().unwrap())
-        .reading_secrets_from(db.clone(), file.clone());
+        .reading_secrets_from(db.clone(), Backends::file(&file));
     let e = format!("{:#}", source.start().await.err().unwrap());
     assert!(
         e.contains("is not the one that sealed the stored secrets"),
@@ -286,7 +294,12 @@ async fn wrong_key_is_refused() {
 
     // No key file at all while secrets are stored.
     std::fs::remove_file(&file).unwrap();
-    let e = format!("{:#}", StoredSecrets::load(&db, &file).await.unwrap_err());
+    let e = format!(
+        "{:#}",
+        StoredSecrets::load(&db, &Backends::file(&file))
+            .await
+            .unwrap_err()
+    );
     assert!(e.contains("is missing") && e.contains("restore"), "{e}");
     assert!(!file.exists(), "no new key is made");
 }
@@ -303,7 +316,7 @@ async fn restart_picks_up_a_new_secret() {
     let config = entry(dir.path(), &server, "{ stored = \"api\" }");
     let source = Arc::new(
         ComponentSource::new(config, Checks::default(), ComponentHost::new().unwrap())
-            .reading_secrets_from(db.clone(), key_file(data.path())),
+            .reading_secrets_from(db.clone(), Backends::file(key_file(data.path()))),
     );
     let registry = Arc::new(Registry::new());
     let supervisor = Supervisor::new(registry.clone());

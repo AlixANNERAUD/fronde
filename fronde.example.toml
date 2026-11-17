@@ -20,10 +20,13 @@ memory_limit = 4000
 user_limit = 2000
 git = true
 
-# Optional: where the master key of stored secrets (`fronde secret`) is kept, apart from the data
-# directory so that its backups do not hold it. Left out, master.key beside this file; in a
-# container, whose /config is read-only, a writable directory of its own (see Run in Docker).
+# Optional: where the master key of stored secrets (`fronde secret`) is kept. backend is "auto"
+# (a systemd credential, else the keychain, else a file, then always that one), "systemd",
+# "keychain" or "file". The file is apart from the data directory so that its backups do not hold
+# it: left out, master.key beside this file; in a container, whose /config is read-only, a
+# writable directory of its own (see Run in Docker).
 [secrets]
+backend = "file"
 master_key = { file = "/keys/master.key" }
 
 # Optional: code_run_python, which runs short Python for exact arithmetic, dates and aggregates,
