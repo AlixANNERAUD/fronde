@@ -224,9 +224,11 @@ What it may change is narrow:
 - **Who writes.** The agent only names the component and suggests non-secret settings
   (`prefill`), each checked against the manifest's schema. Fronde's own process builds the card
   from the manifest, and writes `fronde.toml` only after an admin answered it, never from the
-  agent's arguments. The card is `admin_only`, refused in a turn a sub-agent's result started (as
-  a secret card and a lasting permission are), refused outside the caller's turn, and never
-  offered to an outside MCP client.
+  agent's arguments, each value the agent suggested marked so on the card. The card is
+  `admin_only`, refused in a turn a sub-agent's result started (as a secret card and a lasting
+  permission are), refused to a sub-agent whatever its turn, refused outside the caller's turn,
+  and never offered to an outside MCP client, which `search_tools` does not tell of the
+  integrations. Only the threads check the turn, so the tool is served only with them.
 - **Secrets.** A password or token is typed in a secret field of that card. Such a field is
   accepted only in a card this tool builds: a request refuses one from `user_ask`, an elicitation
   or anyone else, and for anyone but an admin. The value goes from the page to the requests, then
@@ -235,12 +237,22 @@ What it may change is narrow:
   The entry names it as `{ stored = "…" }`, sealed for the origin it is sent to.
 - **Origins.** Where each secret goes follows from the URL settings, and the card says it. When
   the answer sends a secret or allows an origin the card did not show, a second card asks the
-  admin to confirm, before anything is kept. A dry run of `prepare` checks the entry before any
-  secret is sealed (allowed origins within the manifest's, a local address only when the card's
-  toggle, off by default, allows it), and again with the stored secrets before anything is
-  written.
-- **The file.** Edited with `toml_edit`, keeping comments and order, replaced atomically through
-  `fronde-fs` with its own mode (never wider), never written through a link. When it cannot be
+  admin to confirm, before anything is kept; so does ticking the toggle for local addresses
+  (listing each origin it allows) and replacing a stored secret the card did not name. The toggle
+  applies only to hosts that look local (loopback or private addresses, names without a dot,
+  `.lan`, `.local`, `.home.arpa`): a public name is refused rather than allowed to resolve to the
+  local network. A dry run of `prepare` checks the entry before any secret is sealed (allowed
+  origins within the manifest's, a local address only when the toggle allows it, and only the
+  files the build ships: neither hashes pinned in the entry nor an approval in the database
+  stand in for them), and again with the stored secrets before anything is written. Two setups
+  of one integration never store over each other (a lock per integration from the first secret
+  stored to the entry added), and a call cut keeps nothing more.
+- **The file.** Read again before it is written: an entry of the same name added by hand
+  meanwhile is refused, and the new text must pass every check `config::load` makes, so that a
+  setup never leaves a Fronde that cannot start. Edited with `toml_edit`, keeping comments and
+  order, replaced atomically through `fronde-fs` with its own mode (never wider), never written
+  through a link; a hard link is detached by the rename. A change between the read and the
+  rename (inode, modification time, size) reads it again once, then refuses. When it cannot be
   written (Docker's read-only `/config`), Fronde shows the entry to paste instead, which holds
   only stored names. Keep the configuration out of the agent's reach as before: the sandbox does
   not let it write the file, and a read-only mount is still the stronger guard.

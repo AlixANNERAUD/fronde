@@ -441,61 +441,99 @@ impl ToolHandler for UseTool {
     }
 }
 
+/// `search_tools`: the deferred tools that match a need and, for a thread's agent, the
+/// integrations that may bring some.
+struct SearchTools {
+    registry: std::sync::Weak<Registry>,
+    integrations: Option<Arc<dyn Integrations>>,
+}
+
+impl SearchTools {
+    /// The tools matching `a.need`; with `integrations` (a thread's agent calls), the shipped
+    /// components not set up yet it may be about too.
+    async fn search(&self, a: SearchArgs, integrations: bool) -> ToolOutput {
+        let Some(r) = self.registry.upgrade() else {
+            return ToolOutput::error("hub is shutting down");
+        };
+        let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
+        let mut found: Vec<Value> = r
+            .search(&a.need, limit)
+            .await
+            .into_iter()
+            .map(|d| json!({"name": d.name, "description": d.description, "input_schema": d.input_schema}))
+            .collect();
+        let tools = found.len();
+        let available = self
+            .integrations
+            .as_ref()
+            .filter(|_| integrations)
+            .map(|integrations| integrations.available())
+            .unwrap_or_default();
+        let mut listed = crate::integrations::matching(&available, &a.need);
+        if tools == 0 && listed.is_empty() {
+            listed = available.iter().collect();
+        }
+        for integration in &listed {
+            found.push(json!({
+                "integration": integration.name,
+                "description": integration.description,
+                "status": crate::integrations::AVAILABLE,
+            }));
+        }
+        match (tools, listed.len()) {
+            (0, 0) => ToolOutput::ok(found)
+                .with_next("No tool matches. Rephrase the need, or answer without a tool."),
+            (0, _) => ToolOutput::ok(found).with_next(
+                "No tool matches yet. An integration listed may bring some: call integrations_request_setup with its name, and the owner sets it up.",
+            ),
+            (_, 0) => ToolOutput::ok(found).with_next("Call use_tool with one of these names."),
+            _ => ToolOutput::ok(found).with_next(
+                "Call use_tool with one of these names. An integration listed is not set up: integrations_request_setup asks the owner to.",
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SearchTools {
+    async fn call(&self, args: Value) -> ToolOutput {
+        match parse::<SearchArgs>(args) {
+            Ok(a) => self.search(a, false).await,
+            Err(error) => error,
+        }
+    }
+
+    /// Only a thread's agent may set an integration up: anyone else is not told of them.
+    async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
+        match parse::<SearchArgs>(args) {
+            Ok(a) => {
+                self.search(a, matches!(context.caller, Caller::Thread(_)))
+                    .await
+            }
+            Err(error) => error,
+        }
+    }
+}
+
 /// `search_tools` and `use_tool`, over `registry`. With `integrations`, `search_tools` also
-/// lists the shipped components not set up yet that the need may be about (every one when no
-/// tool matches), each as an `integration` to set up with `integrations_request_setup`.
+/// lists to a thread's agent the shipped components not set up yet that the need may be about
+/// (every one when no tool matches), each as an `integration` to set up with
+/// `integrations_request_setup`; an outside client is not told of them.
 pub fn meta_tools(
     registry: &Arc<Registry>,
     integrations: Option<Arc<dyn Integrations>>,
 ) -> Vec<Tool> {
-    let r = Arc::downgrade(registry);
-    let (def, h) = typed_tool(
-        "search_tools",
-        "Find extra tools by need (e.g. 'add to shopping list'). Returns their schemas. Use before use_tool.",
-        false,
-        move |a: SearchArgs| {
-            let r = r.clone();
-            let integrations = integrations.clone();
-            async move {
-                let Some(r) = r.upgrade() else {
-                    return ToolOutput::error("hub is shutting down");
-                };
-                let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
-                let mut found: Vec<Value> = r
-                    .search(&a.need, limit)
-                    .await
-                    .into_iter()
-                    .map(|d| json!({"name": d.name, "description": d.description, "input_schema": d.input_schema}))
-                    .collect();
-                let tools = found.len();
-                let available = integrations
-                    .map(|integrations| integrations.available())
-                    .unwrap_or_default();
-                let mut listed = crate::integrations::matching(&available, &a.need);
-                if tools == 0 && listed.is_empty() {
-                    listed = available.iter().collect();
-                }
-                for integration in &listed {
-                    found.push(json!({
-                        "integration": integration.name,
-                        "description": integration.description,
-                        "status": crate::integrations::AVAILABLE,
-                    }));
-                }
-                match (tools, listed.len()) {
-                    (0, 0) => ToolOutput::ok(found)
-                        .with_next("No tool matches. Rephrase the need, or answer without a tool."),
-                    (0, _) => ToolOutput::ok(found).with_next(
-                        "No tool matches yet. An integration listed may bring some: call integrations_request_setup with its name, and the owner sets it up.",
-                    ),
-                    (_, 0) => ToolOutput::ok(found).with_next("Call use_tool with one of these names."),
-                    _ => ToolOutput::ok(found).with_next(
-                        "Call use_tool with one of these names. An integration listed is not set up: integrations_request_setup asks the owner to.",
-                    ),
-                }
-            }
-        },
-    );
+    let def = ToolDef {
+        name: "search_tools".to_string(),
+        description: "Find extra tools by need (e.g. 'add to shopping list'). Returns their schemas. Use before use_tool.".to_string(),
+        input_schema: schema_of::<SearchArgs>(),
+        deferred: false,
+        source: "hub".to_string(),
+    };
+    let h: Arc<dyn ToolHandler> = Arc::new(SearchTools {
+        registry: Arc::downgrade(registry),
+        integrations,
+    });
     let search = (def, h);
     let def = ToolDef {
         name: "use_tool".to_string(),

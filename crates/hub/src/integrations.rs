@@ -183,12 +183,34 @@ struct SetupArgs {
 /// What `integrations_request_setup` works with.
 pub struct Setup {
     pub requests: Arc<Requests>,
+    /// The threads, which show a card during the turn that asks and refuse it in a turn a
+    /// sub-agent's result started, or from a sub-agent: without them, every setup is refused.
     pub threads: Option<Arc<dyn ThreadControl>>,
     pub integrations: Arc<dyn Integrations>,
     pub sources: Supervisor,
     pub registry: Arc<Registry>,
     /// The admin, who answers every setup card, whoever the caller acts for.
     pub admin: String,
+    /// Held per integration from the first secret stored to the entry added, so that two
+    /// setups of one integration answered at once never store over each other.
+    pub(crate) setting_up: SettingUp,
+}
+
+/// A lock per integration name.
+#[derive(Default)]
+pub(crate) struct SettingUp(std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl SettingUp {
+    async fn lock(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(name.to_owned())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
 }
 
 /// `integrations_request_setup`, over `setup`.
@@ -340,12 +362,41 @@ fn check_prefill(
     Ok(checked)
 }
 
+/// What the card says of a value the agent suggested: the admin checks it, a URL above all,
+/// since the secrets go there.
+const SUGGESTED: &str = "Suggéré par l'agent : vérifie-le.";
+const SUGGESTED_URL: &str =
+    "Suggéré par l'agent : vérifie que c'est bien ton serveur, ses mots de passe y iront.";
+
+/// `description` with `mark` before it, when the agent suggested the value.
+fn marked(mark: Option<&str>, description: Option<String>, notes: &mut Notes) -> Option<String> {
+    match (mark, description) {
+        (Some(mark), Some(description)) => Some(line(
+            &format!("{mark} {description}"),
+            MAX_DESCRIPTION,
+            notes,
+        )),
+        (Some(mark), None) => Some(mark.to_owned()),
+        (None, description) => description,
+    }
+}
+
+/// Whether some of `reaches` follow from a URL the agent suggested.
+fn from_prefill(reaches: &[Reach], prefill: &BTreeMap<String, String>) -> bool {
+    reaches
+        .iter()
+        .any(|reach| matches!(reach, Reach::Setting(key) if prefill.contains_key(key)))
+}
+
 /// The setup card: the settings, a user name and a secret per credential, the toggle for local
-/// addresses, and a message that says what Fronde will do and where each secret goes.
+/// addresses, and a message that says what Fronde will do, where each secret goes and which
+/// stored secret it replaces (`replaces`, planned from the prefill). Each value the agent
+/// suggested is marked so.
 fn setup_card(
     integration: &Integration,
     prefill: &BTreeMap<String, String>,
     family: Option<&str>,
+    replaces: &[Planned],
 ) -> Result<Card, String> {
     let mut notes = Notes::default();
     let mut fields = Vec::new();
@@ -356,6 +407,10 @@ fn setup_card(
             .map(|d| line(d, MAX_DESCRIPTION, &mut notes));
         let title = line(&setting.key, MAX_QUESTION, &mut notes);
         let default = prefill.get(&setting.key).cloned();
+        let mark = default.is_some().then_some(match setting.kind {
+            SettingKind::Url => SUGGESTED_URL,
+            _ => SUGGESTED,
+        });
         fields.push(match &setting.kind {
             SettingKind::Choice(values) => Field::Choice {
                 key: setting.key.clone(),
@@ -363,11 +418,14 @@ fn setup_card(
                 question: description.unwrap_or(title),
                 options: values
                     .iter()
-                    .map(|value| ChoiceOption {
-                        label: line(value, MAX_LABEL, &mut notes),
-                        description: None,
-                        preview: None,
-                        recommended: default.as_deref() == Some(value),
+                    .map(|value| {
+                        let suggested = default.as_deref() == Some(value);
+                        ChoiceOption {
+                            label: line(value, MAX_LABEL, &mut notes),
+                            description: suggested.then(|| SUGGESTED.to_owned()),
+                            preview: None,
+                            recommended: suggested,
+                        }
                     })
                     .collect(),
                 multi: false,
@@ -378,7 +436,7 @@ fn setup_card(
             kind => Field::Text {
                 key: setting.key.clone(),
                 title,
-                description,
+                description: marked(mark, description, &mut notes),
                 placeholder: None,
                 format: (*kind == SettingKind::Url).then_some(TextFormat::Uri),
                 min_length: None,
@@ -408,15 +466,17 @@ fn setup_card(
             CredentialKind::Bearer => ("jeton", "Jeton"),
         };
         if credential.kind == CredentialKind::Basic {
+            let key = username_key(&credential.name);
+            let default = prefill.get(&key).cloned();
             fields.push(Field::Text {
-                key: username_key(&credential.name),
+                key,
                 title: format!("Identifiant « {} »", credential.name),
-                description: None,
+                description: default.is_some().then(|| SUGGESTED.to_owned()),
                 placeholder: None,
                 format: None,
                 min_length: None,
                 max_length: None,
-                default: prefill.get(&username_key(&credential.name)).cloned(),
+                default,
                 required: true,
             });
         }
@@ -434,18 +494,33 @@ fn setup_card(
             "\nSon {what} « {} » sera gardé scellé dans Fronde et envoyé seulement à : {places}.",
             credential.name
         ));
+        for planned in replaces.iter().filter(|p| p.credential == credential.name) {
+            message.push_str(&format!(
+                "\nIl remplace le secret « {} » déjà gardé pour {}.",
+                planned.name, planned.origin
+            ));
+        }
     }
-    let from_settings = integration
+    let reaches: Vec<Reach> = integration
         .network
         .iter()
         .chain(integration.credentials.iter().flat_map(|c| &c.origins))
+        .cloned()
+        .collect();
+    if from_prefill(&reaches, prefill) {
+        message.push_str(
+            "\nCes adresses viennent d'URL suggérées par l'agent : vérifie-les avant d'ajouter.",
+        );
+    }
+    let from_settings = reaches
+        .iter()
         .any(|reach| matches!(reach, Reach::Setting(_)));
     if from_settings {
         fields.push(Field::Toggle {
             key: LOCAL.to_owned(),
             title: "Serveur sur cette machine ou son réseau local".to_owned(),
             description: Some(
-                "Permet ses adresses locales (localhost, 192.168…, nas.lan). Laisse décoché pour un service sur Internet."
+                "Permet ses adresses locales (localhost, 192.168…, nas.lan), après confirmation. Laisse décoché pour un service sur Internet."
                     .to_owned(),
             ),
             default: false,
@@ -530,6 +605,13 @@ fn read_answer(integration: &Integration, values: BTreeMap<String, FieldValue>) 
 struct Failed(String);
 
 async fn request_setup(setup: &Setup, context: CallContext, args: SetupArgs) -> ToolOutput {
+    // Only the threads check whose turn asks: without them, nothing would refuse a turn a
+    // sub-agent's result started.
+    if setup.threads.is_none() {
+        return ToolOutput::error(
+            "integrations_request_setup needs Fronde's threads, which are not running; the owner adds a [[sources]] entry to fronde.toml instead",
+        );
+    }
     match &context.caller {
         Caller::Thread(_) if context.turn.is_some() => {}
         Caller::Thread(_) => {
@@ -577,7 +659,12 @@ async fn request_setup(setup: &Setup, context: CallContext, args: SetupArgs) -> 
         Err(message) => return ToolOutput::error(message),
     };
     let family = (context.user != setup.admin).then_some(context.user.as_str());
-    let card = match setup_card(integration, &prefill, family) {
+    let shown = Destinations::of(integration, &prefill);
+    let replaces: Vec<Planned> = match plan(setup, integration, &shown).await {
+        Ok(planned) => planned.into_iter().filter(|p| p.replaces).collect(),
+        Err(Failed(message)) => return ToolOutput::error(message),
+    };
+    let card = match setup_card(integration, &prefill, family, &replaces) {
         Ok(card) => card,
         Err(error) => {
             tracing::error!(
@@ -590,7 +677,6 @@ async fn request_setup(setup: &Setup, context: CallContext, args: SetupArgs) -> 
             ));
         }
     };
-    let shown = Destinations::of(integration, &prefill);
     let answer = match ask(setup, &context, card, timeout).await {
         Ok(Resolution::Answered(Response::Form { values })) => read_answer(integration, values),
         Ok(Resolution::Declined) => {
@@ -608,6 +694,10 @@ async fn request_setup(setup: &Setup, context: CallContext, args: SetupArgs) -> 
         }
         Ok(_) => return ToolOutput::error("the answer does not fit the card; nothing was set up"),
         Err(output) => return output,
+    };
+    let shown = Shown {
+        destinations: shown,
+        replaces,
     };
     match apply(setup, &context, integration, answer, &shown, timeout).await {
         Ok(output) => output,
@@ -657,7 +747,10 @@ async fn ask(
         }
     };
     let id = waiter.id();
+    // An answer that came first is taken; `apply` then sees a call cut since and acts on
+    // nothing.
     tokio::select! {
+        biased;
         resolution = waiter.wait() => Ok(resolution),
         () = context.cancelled.cancelled() => {
             if let Err(error) = setup.requests.cancel(id).await {
@@ -668,15 +761,72 @@ async fn ask(
     }
 }
 
+/// What the setup card showed: where the prefill sent what, and the stored secrets it said it
+/// replaces.
+struct Shown {
+    destinations: Destinations,
+    replaces: Vec<Planned>,
+}
+
+/// Why the call stops once it was cut, for nobody (the caller is gone) and the log.
+fn cut(stored: &[String]) -> Failed {
+    Failed(if stored.is_empty() {
+        "the call was cut before the integration was set up; nothing was kept or written".into()
+    } else {
+        format!(
+            "the call was cut before the integration was added; its secrets stay stored ({}), the configuration is unchanged",
+            stored.join(", ")
+        )
+    })
+}
+
+/// Whether `origin`'s host looks like this machine or its network: a loopback or private
+/// address, or a name only a local resolver knows (no dot, `.lan`, `.local`, `.home.arpa`).
+/// Only such an origin may be allowed as local from a card; any other is written by hand.
+fn looks_local(origin: &Origin) -> bool {
+    let v4 = |ip: std::net::Ipv4Addr| ip.is_loopback() || ip.is_private();
+    match origin.host() {
+        url::Host::Domain(name) => {
+            let name = name.strip_suffix('.').unwrap_or(name);
+            !name.contains('.')
+                || [".lan", ".local", ".home.arpa"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        }
+        url::Host::Ipv4(ip) => v4(*ip),
+        url::Host::Ipv6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => v4(mapped),
+            None => ip.is_loopback() || ip.is_unique_local(),
+        },
+    }
+}
+
+/// A user name typed on the card, checked as `prefill`'s are: one line of plain text, without
+/// `:`, which Basic authorization cannot carry. What to fix, else.
+fn check_username(credential: &str, username: &str) -> Result<(), String> {
+    if username.chars().count() > MAX_TEXT || first_hidden(username, false).is_some() {
+        return Err(format!(
+            "the user name typed for {credential} must be one line of plain text of at most {MAX_TEXT} characters"
+        ));
+    }
+    if username.contains(':') {
+        return Err(format!(
+            "the user name typed for {credential} contains ':', which a user name sent as Basic authorization cannot hold"
+        ));
+    }
+    Ok(())
+}
+
 /// Sets the integration up as the admin answered: checks, a confirmation when the answer sends
-/// something where the card did not say, the secrets sealed, a dry run, then the entry written
-/// and started.
+/// something where the card did not say, allows local addresses or replaces a stored secret the
+/// card did not name, then, under the integration's lock, the secrets sealed, a dry run, and the
+/// entry written and started. A call cut meanwhile keeps nothing more.
 async fn apply(
     setup: &Setup,
     context: &CallContext,
     integration: &Integration,
     answer: Answer,
-    shown: &Destinations,
+    shown: &Shown,
     timeout: Duration,
 ) -> Result<ToolOutput, Failed> {
     let name = &integration.name;
@@ -688,6 +838,10 @@ async fn apply(
                 "the owner's settings do not fit {name}: {error}; nothing was set up, ask again with corrected prefill"
             ))
         })?;
+    for (credential, username) in &answer.usernames {
+        check_username(credential, username)
+            .map_err(|error| Failed(format!("{error}; nothing was set up, ask again")))?;
+    }
     let destinations = Destinations::of(integration, &answer.settings);
     let from_settings: Vec<Origin> = integration
         .network
@@ -697,6 +851,23 @@ async fn apply(
             Reach::Origin(_) => None,
         })
         .collect();
+    // The toggle allows local addresses for the origins of the URL settings only, and only
+    // those that look local: any other is refused, not allowed quietly.
+    let local: Vec<Origin> = if answer.local {
+        if let Some(far) = from_settings.iter().find(|origin| !looks_local(origin)) {
+            return Err(Failed(format!(
+                "the owner ticked the box for a server on this machine or its local network, but {far} does not look local: a card allows local addresses only for a loopback or private address, a name without a dot, or one ending in .lan, .local or .home.arpa; nothing was set up. Ask again with the box unticked, or the owner writes {{ origin = \"{far}\", local = true }} in fronde.toml by hand"
+            )));
+        }
+        destinations
+            .allow
+            .iter()
+            .filter(|origin| from_settings.contains(origin))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut entry = ComponentConfig {
         name: name.clone(),
         path: integration.path.clone(),
@@ -708,7 +879,7 @@ async fn apply(
             .iter()
             .map(|origin| Allow {
                 origin: origin.clone(),
-                local: answer.local && from_settings.contains(origin),
+                local: local.contains(origin),
             })
             .collect(),
         settings: answer.settings.clone(),
@@ -732,30 +903,48 @@ async fn apply(
             "{name} cannot be set up as answered: {error:#}; nothing was set up"
         ))
     })?;
-    if !destinations.within(shown) {
+    let planned = plan(setup, integration, &destinations).await?;
+    let unannounced: Vec<&Planned> = planned
+        .iter()
+        .filter(|p| p.replaces && !shown.replaces.contains(p))
+        .collect();
+    if answer.local || !destinations.within(&shown.destinations) || !unannounced.is_empty() {
         confirm(
             setup,
             context,
             integration,
             &destinations,
-            answer.local,
+            answer.local.then_some(local.as_slice()),
+            &planned,
             timeout,
         )
         .await?;
     }
-    let (credentials, new_key) = keep_secrets(setup, integration, &destinations, &answer).await?;
-    entry.credentials = credentials;
-    let stored: Vec<String> = entry
-        .credentials
+    if context.cancelled.is_cancelled() {
+        return Err(cut(&[]));
+    }
+    // From the first secret stored to the entry added, no other setup of this integration
+    // runs: one set up meanwhile is refused here, before anything is stored over it.
+    let _setting_up = setup.setting_up.lock(name).await;
+    if !setup
+        .integrations
+        .available()
         .iter()
-        .filter_map(|c| {
-            let secret = c.basic.as_ref().map(|b| &b.password).or(c.bearer.as_ref());
-            match secret {
-                Some(Secret::Stored { stored }) => Some(stored.clone()),
-                _ => None,
-            }
-        })
-        .collect();
+        .any(|available| available.name == *name)
+    {
+        return Err(Failed(format!(
+            "{name} was set up meanwhile, by another card; nothing was kept from this one"
+        )));
+    }
+    if plan(setup, integration, &destinations).await? != planned {
+        return Err(Failed(
+            "the stored secrets changed while the card was open; nothing was kept, ask again"
+                .into(),
+        ));
+    }
+    let (credentials, new_key) = keep_secrets(setup, integration, &planned, &answer).await?;
+    entry.credentials = credentials;
+    let stored: Vec<String> = planned.iter().map(|p| p.name.clone()).collect();
     drop(answer);
     setup.integrations.dry_run(&entry).await.map_err(|error| {
         Failed(format!(
@@ -763,6 +952,9 @@ async fn apply(
             stored.join(", ")
         ))
     })?;
+    if context.cancelled.is_cancelled() {
+        return Err(cut(&stored));
+    }
     let written = setup
         .integrations
         .add(&entry, &setup.sources)
@@ -817,14 +1009,18 @@ fn key_place(place: KeyPlace) -> &'static str {
     }
 }
 
-/// Asks the admin to confirm where the entry sends what, when the answer changed it from what
-/// the card said, or allows local addresses.
+/// Asks the admin to confirm where the entry sends what, before anything is kept: when the
+/// answer sends a secret or allows an origin the card did not show, when it allows local
+/// addresses (always: `local`, each origin they are allowed for), or when a secret replaces a
+/// stored one the card did not name. The card lists every origin, every local one, and every
+/// secret replaced.
 async fn confirm(
     setup: &Setup,
     context: &CallContext,
     integration: &Integration,
     destinations: &Destinations,
-    local: bool,
+    local: Option<&[Origin]>,
+    planned: &[Planned],
     timeout: Duration,
 ) -> Result<(), Failed> {
     let mut message = format!("Confirme l'ajout de « {} ».", integration.name);
@@ -832,16 +1028,28 @@ async fn confirm(
         let places: Vec<String> = destinations.allow.iter().map(ToString::to_string).collect();
         message.push_str(&format!("\nElle pourra joindre : {}.", places.join(", ")));
     }
-    if local {
-        message.push_str(
-            "\nAdresses locales permises : ces origines peuvent être sur cette machine ou son réseau.",
-        );
+    if let Some(local) = local {
+        let places: Vec<String> = local.iter().map(ToString::to_string).collect();
+        message.push_str(&format!(
+            "\nAdresses locales permises (cette machine ou son réseau) pour : {}.",
+            if places.is_empty() {
+                "aucune origine".to_owned()
+            } else {
+                places.join(", ")
+            }
+        ));
     }
     for (credential, origins) in &destinations.credentials {
         let places: Vec<String> = origins.iter().map(ToString::to_string).collect();
         message.push_str(&format!(
             "\nSon secret « {credential} » ira seulement à : {}.",
             places.join(", ")
+        ));
+    }
+    for planned in planned.iter().filter(|p| p.replaces) {
+        message.push_str(&format!(
+            "\nIl remplace le secret « {} » déjà gardé pour {}.",
+            planned.name, planned.origin
         ));
     }
     let card = Card::Form {
@@ -864,24 +1072,24 @@ async fn confirm(
     }
 }
 
-/// Seals each secret answered, once per origin of its credential, and returns the entry's
-/// credentials naming them, and where the master key was made, if keeping them made it.
-async fn keep_secrets(
+/// Where one secret of the answer is kept: its credential, the origin it is sealed for, and the
+/// name it is stored under, which `replaces` a secret stored there for that origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Planned {
+    credential: String,
+    origin: Origin,
+    name: String,
+    replaces: bool,
+}
+
+/// Where each credential's secret would be kept, once per origin of its credential.
+async fn plan(
     setup: &Setup,
     integration: &Integration,
     destinations: &Destinations,
-    answer: &Answer,
-) -> Result<(Vec<CredentialConfig>, Option<KeyPlace>), Failed> {
-    let mut credentials = Vec::new();
-    let mut taken = Vec::new();
-    let mut new_key = None;
+) -> Result<Vec<Planned>, Failed> {
+    let mut planned: Vec<Planned> = Vec::new();
     for credential in &integration.credentials {
-        let Some(secret) = answer.secrets.get(&credential.name) else {
-            return Err(Failed(format!(
-                "the owner gave no secret for {}; nothing was set up",
-                credential.name
-            )));
-        };
         let origins = destinations
             .credentials
             .iter()
@@ -889,53 +1097,98 @@ async fn keep_secrets(
             .map(|(_, origins)| origins.clone())
             .unwrap_or_default();
         for origin in origins {
-            let name = free_name(setup, integration, &credential.name, &origin, &taken).await?;
-            let made = setup
-                .requests
-                .keep_secret(&name, &origin.to_string(), secret)
-                .await
-                .map_err(|error| {
-                    tracing::error!("{TOOL}: cannot keep the secret {name}: {error:#}");
-                    Failed(format!(
-                        "the secret {name} could not be kept; nothing was written to the configuration"
-                    ))
-                })?;
-            new_key = new_key.or(made);
-            taken.push(name.clone());
-            let stored = Secret::Stored { stored: name };
-            credentials.push(match credential.kind {
-                CredentialKind::Basic => CredentialConfig {
-                    origin,
-                    basic: Some(BasicCredential {
-                        username: answer
-                            .usernames
-                            .get(&credential.name)
-                            .cloned()
-                            .unwrap_or_default(),
-                        password: stored,
-                    }),
-                    bearer: None,
-                },
-                CredentialKind::Bearer => CredentialConfig {
-                    origin,
-                    basic: None,
-                    bearer: Some(stored),
-                },
+            let taken: Vec<String> = planned.iter().map(|p| p.name.clone()).collect();
+            let (name, replaces) =
+                free_name(setup, integration, &credential.name, &origin, &taken).await?;
+            planned.push(Planned {
+                credential: credential.name.clone(),
+                origin,
+                name,
+                replaces,
             });
         }
+    }
+    Ok(planned)
+}
+
+/// Seals each secret answered as `planned`, and returns the entry's credentials naming them, and
+/// where the master key was made, if keeping them made it.
+async fn keep_secrets(
+    setup: &Setup,
+    integration: &Integration,
+    planned: &[Planned],
+    answer: &Answer,
+) -> Result<(Vec<CredentialConfig>, Option<KeyPlace>), Failed> {
+    for credential in &integration.credentials {
+        if !answer.secrets.contains_key(&credential.name) {
+            return Err(Failed(format!(
+                "the owner gave no secret for {}; nothing was set up",
+                credential.name
+            )));
+        }
+    }
+    let mut credentials = Vec::new();
+    let mut new_key = None;
+    for planned in planned {
+        let Some(credential) = integration
+            .credentials
+            .iter()
+            .find(|c| c.name == planned.credential)
+        else {
+            continue;
+        };
+        let Some(secret) = answer.secrets.get(&credential.name) else {
+            continue;
+        };
+        let name = &planned.name;
+        let made = setup
+            .requests
+            .keep_secret(name, &planned.origin.to_string(), secret)
+            .await
+            .map_err(|error| {
+                tracing::error!("{TOOL}: cannot keep the secret {name}: {error:#}");
+                Failed(format!(
+                    "the secret {name} could not be kept; nothing was written to the configuration"
+                ))
+            })?;
+        new_key = new_key.or(made);
+        let stored = Secret::Stored {
+            stored: name.clone(),
+        };
+        let origin = planned.origin.clone();
+        credentials.push(match credential.kind {
+            CredentialKind::Basic => CredentialConfig {
+                origin,
+                basic: Some(BasicCredential {
+                    username: answer
+                        .usernames
+                        .get(&credential.name)
+                        .cloned()
+                        .unwrap_or_default(),
+                    password: stored,
+                }),
+                bearer: None,
+            },
+            CredentialKind::Bearer => CredentialConfig {
+                origin,
+                basic: None,
+                bearer: Some(stored),
+            },
+        });
     }
     Ok((credentials, new_key))
 }
 
 /// A name to store `credential`'s secret for `origin` under: `<integration>_<credential>`, with
-/// a number after it when that name is taken by this setup or stored for another origin.
+/// a number after it when that name is taken by this setup or stored for another origin; and
+/// whether a secret is stored under it for `origin` already, which keeping replaces.
 async fn free_name(
     setup: &Setup,
     integration: &Integration,
     credential: &str,
     origin: &Origin,
     taken: &[String],
-) -> Result<String, Failed> {
+) -> Result<(String, bool), Failed> {
     let base = format!("{}_{}", integration.name, credential.replace('-', "_"));
     let base = if is_valid_name(&base) {
         base
@@ -955,8 +1208,10 @@ async fn free_name(
             tracing::error!("{TOOL}: cannot read the stored secrets: {error:#}");
             Failed("the stored secrets cannot be read; nothing was set up".into())
         })?;
-        if stored.is_none_or(|stored| stored == origin.to_string()) {
-            return Ok(name);
+        match stored {
+            None => return Ok((name, false)),
+            Some(stored) if stored == origin.to_string() => return Ok((name, true)),
+            Some(_) => {}
         }
     }
     Err(Failed(format!(
@@ -1045,7 +1300,7 @@ mod tests {
         )]);
         let Card::Form {
             message, fields, ..
-        } = setup_card(&integration(), &prefill, None).unwrap()
+        } = setup_card(&integration(), &prefill, None, &[]).unwrap()
         else {
             panic!("a form");
         };
@@ -1066,7 +1321,7 @@ mod tests {
             Field::Secret { description: Some(d), .. } if d.contains("https://cloud.example")
         )));
         let Card::Form { message, .. } =
-            setup_card(&integration(), &BTreeMap::new(), Some("lea")).unwrap()
+            setup_card(&integration(), &BTreeMap::new(), Some("lea"), &[]).unwrap()
         else {
             panic!("a form");
         };
@@ -1074,6 +1329,53 @@ mod tests {
         assert!(
             message.contains("Demande envoyée à l'administrateur"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn only_a_local_looking_host_may_be_allowed_as_local() {
+        let local = |origin: &str| looks_local(&Origin::parse(origin).unwrap());
+        for origin in [
+            "http://localhost:5232",
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://192.168.1.10",
+            "https://10.0.0.2",
+            "https://172.16.4.1",
+            "https://[fd00::1]",
+            "https://nas",
+            "https://nas.lan",
+            "https://nas.local",
+            "https://nas.home.arpa",
+        ] {
+            assert!(local(origin), "{origin}");
+        }
+        for origin in [
+            "https://cloud.example",
+            "https://nas.example.com",
+            "https://8.8.8.8",
+            "https://169.254.169.254",
+            "https://100.64.0.1",
+            "https://[2001:db8::1]",
+            "https://lan.example",
+        ] {
+            assert!(!local(origin), "{origin}");
+        }
+    }
+
+    #[test]
+    fn a_typed_user_name_is_one_line_without_a_colon() {
+        assert!(check_username("caldav", "alix").is_ok());
+        assert!(check_username("caldav", "a:b").unwrap_err().contains("':'"));
+        assert!(
+            check_username("caldav", "a\nb")
+                .unwrap_err()
+                .contains("one line")
+        );
+        assert!(
+            check_username("caldav", "a\u{202e}b")
+                .unwrap_err()
+                .contains("one line")
         );
     }
 

@@ -1,6 +1,9 @@
 //! No secret reaches the log, whatever the level, the thread or the logging crate. Its own test
 //! binary: it installs the process's global subscriber.
 
+#[path = "support/asks.rs"]
+mod asks;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use fronde_hub::config::{ComponentConfig, Config};
@@ -19,6 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const CALDAV_CANARY: &str = "canary-caldav-secret-9f8e7d6c";
 const MCP_CANARY: &str = "canary-mcp-token-0123456789abcdef0123456789";
 const WEB_CANARY: &str = "canary-web-secret-4a5b6c7d";
+const SETUP_CANARY: &str = "canary-setup-secret-3b9d1e";
 
 fn dist(file: &str) -> PathBuf {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -920,4 +924,161 @@ async fn secret_answer_never_appears() {
         .unwrap()
         .unwrap();
     assert_eq!(sealed[0].open(&key).unwrap().expose_secret(), STORED);
+}
+
+/// Hands each card shown to the test.
+struct Cards(tokio::sync::mpsc::UnboundedSender<fronde_protocol::RequestId>);
+
+#[async_trait::async_trait]
+impl fronde_requests::Journal for Cards {
+    async fn announce(
+        &self,
+        _topic: &str,
+        id: fronde_protocol::RequestId,
+        _card: &fronde_protocol::Card,
+        _caller: &fronde_requests::Caller,
+    ) -> anyhow::Result<u64> {
+        let _ = self.0.send(id);
+        Ok(id)
+    }
+
+    async fn close(
+        &self,
+        _topic: &str,
+        _id: fronde_protocol::RequestId,
+        _outcome: &fronde_protocol::Outcome,
+        _by: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A password typed on an integration's setup card never reaches the log: not as the card is
+/// answered, nor as the admin confirms another origin, the secret is sealed, the entry checked
+/// with it, written to `fronde.toml` and started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_secret_never_appears() {
+    use fronde_protocol::{FieldValue, Response, SecretAnswer, SecretValue};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    const WAIT: Duration = Duration::from_secs(30);
+    const URL: &str = "https://dav.example.org/calendars/alix/";
+    let _serial = SERIAL.lock().await;
+    let scanner = capture();
+    let basic = STANDARD.encode(format!("alix:{SETUP_CANARY}"));
+    *scanner.0.lock().unwrap() = Scan {
+        secrets: [SETUP_CANARY, &basic].map(String::from).to_vec(),
+        // The capture sees the setup through to the entry written.
+        wanted: vec!["calendar: added to".to_string()],
+        ..Scan::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let etc = dir.path().join("etc");
+    std::fs::create_dir(&etc).unwrap();
+    let path = etc.join("fronde.toml");
+    std::fs::write(
+        &path,
+        "[server]\ntoken = { env = \"UNUSED\" }\n[data]\ndir = \"../data\"\ntimezone = \"Europe/Paris\"\nuser = \"alix\"\n[memory]\ngit = false\n[secrets]\nbackend = \"file\"\nmaster_key = { file = \"../master.key\" }\n",
+    )
+    .unwrap();
+    let config = fronde_hub::config::load(&path).unwrap();
+    fronde_hub::private::prepare_data_dir(&config.data.dir).unwrap();
+    let db = fronde_db::open(&config.data.dir).await.unwrap();
+    let (send, mut cards) = tokio::sync::mpsc::unbounded_channel();
+    let store = fronde_requests::SecretStore::new(
+        fronde_db::master_key::Backends::file(dir.path().join("master.key")),
+        Arc::new(fronde_db::ephemeral::EphemeralSecrets::new()),
+    );
+    let requests =
+        fronde_requests::Requests::open_with(db.clone(), Arc::new(Cards(send)), Some(store))
+            .await
+            .unwrap();
+    let integrations = Arc::new(fronde::integrations::Shipped::new(&config, db.clone()).unwrap());
+    let hub = Arc::new(
+        fronde_hub::Hub::start(
+            config,
+            db,
+            vec![],
+            Some(requests.clone()),
+            Some(Arc::new(asks::Asks(requests.clone()))),
+            Some(integrations),
+        )
+        .await
+        .unwrap(),
+    );
+    let context = fronde_hub::tools::CallContext {
+        caller: fronde_requests::Caller::Thread(fronde_protocol::ThreadId::MAIN),
+        user: "alix".into(),
+        topic: "conversation".into(),
+        turn: Some(3),
+        cancelled: tokio_util::sync::CancellationToken::new(),
+    };
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            hub.registry
+                .call_as(
+                    &context,
+                    "integrations_request_setup",
+                    json!({
+                        "integration": "calendar",
+                        "prefill": {"events_url": "https://cloud.example/dav/", "caldav.username": "alix"},
+                    }),
+                )
+                .await
+        }
+    });
+    let admin = fronde_requests::User {
+        name: "alix".into(),
+        admin: true,
+    };
+    // Another server than the card showed: the admin confirms it on a second card.
+    let card = timeout(WAIT, cards.recv()).await.unwrap().unwrap();
+    let answer = Response::Form {
+        values: [
+            ("events_url".to_owned(), FieldValue::Text(URL.into())),
+            ("reminders_url".to_owned(), FieldValue::Text(URL.into())),
+            (
+                "caldav.username".to_owned(),
+                FieldValue::Text("alix".into()),
+            ),
+            (
+                "caldav.secret".to_owned(),
+                FieldValue::Secret(SecretAnswer {
+                    secret: SecretValue::new(SETUP_CANARY.into()),
+                }),
+            ),
+            ("allow.local".to_owned(), FieldValue::Toggle(false)),
+        ]
+        .into(),
+    };
+    requests.answer(card, answer, &admin).await.unwrap();
+    let confirm = timeout(WAIT, cards.recv()).await.unwrap().unwrap();
+    requests
+        .answer(
+            confirm,
+            Response::Form {
+                values: Default::default(),
+            },
+            &admin,
+        )
+        .await
+        .unwrap();
+    let out = timeout(WAIT, call).await.unwrap().unwrap();
+    assert!(!out.is_error, "{}", out.to_text());
+    assert!(!out.to_text().contains(SETUP_CANARY));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#"stored = "calendar_caldav""#)
+    );
+
+    let scan = std::mem::take(&mut *scanner.0.lock().unwrap());
+    assert!(scan.lines > 0, "nothing was captured");
+    assert!(scan.leaked.is_empty(), "{:#?}", scan.leaked);
+    for want in &scan.wanted {
+        assert!(scan.seen.contains(want), "{want} is not in the log");
+    }
 }

@@ -1123,7 +1123,8 @@ impl Assistant {
     /// are: a turn that ends or is stopped meanwhile waits for the card and cancels it with its
     /// other requests, before its end is logged. `None`, with nothing asked, once that turn is
     /// over or ending: its card would outlive it. In a turn of wake origin, the card says so, as
-    /// the agent's own do, and a secret card is refused.
+    /// the agent's own do, and a secret card or an admin's card is refused; a sub-agent's
+    /// admin's card is refused whatever its turn.
     pub async fn ask_during(&self, ask: Ask) -> anyhow::Result<Option<Waiter>> {
         anyhow::ensure!(
             ask.topic == self.topic && ask.caller == Caller::Thread(self.thread),
@@ -1148,6 +1149,11 @@ impl Assistant {
         // Nor anything lasting only an admin grants, such as an integration's setup.
         if woken && ask.admin_only {
             return Err(LastingInWake.into());
+        }
+        // A sub-agent follows its parent's task, not the owner's words: what only an admin
+        // grants is asked by the agent the owner talks to.
+        if self.parent.is_some() && ask.admin_only {
+            return Err(AdminFromSubAgent.into());
         }
         let waiter = requests.ask(ask).await?;
         drop(turn);
@@ -1776,6 +1782,21 @@ impl std::fmt::Display for LastingInWake {
 }
 
 impl std::error::Error for LastingInWake {}
+
+/// A sub-agent asked the admin for something only an admin grants (an integration's setup):
+/// refused, whatever its turn. The text is for the agent.
+#[derive(Debug)]
+pub struct AdminFromSubAgent;
+
+impl std::fmt::Display for AdminFromSubAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "a sub-agent cannot ask the owner for a lasting change such as setting up an integration; say in your final answer what you need, and the agent that started you asks",
+        )
+    }
+}
+
+impl std::error::Error for AdminFromSubAgent {}
 
 /// The agent did not start within [`START_TIMEOUT`].
 #[derive(Debug)]

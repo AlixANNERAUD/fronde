@@ -5,8 +5,8 @@ entry by hand (see [Configure the calendar](configure-calendar.md)), you can let
 for it: you fill one card in the chat, and Fronde adds the entry to `fronde.toml` and starts it.
 
 Only an admin (today the owner) can answer that card, and only a component shipped with this
-build of Fronde that has no `[[sources]]` entry yet can be set up this way. Anything else needs a
-hand-written entry.
+build of Fronde, with the very files the build approves, that has no `[[sources]]` entry yet can
+be set up this way. Anything else needs a hand-written entry.
 
 ## Ask for it
 
@@ -19,17 +19,28 @@ knows, such as the URL you gave it; it never fills in a password.
 
 The card *Ajouter l'intégration « calendar »* shows:
 
-- every setting of the component, as its manifest describes it, with what the assistant suggested;
-  change any of them;
+- every setting of the component, as its manifest describes it, with what the assistant suggested,
+  each such value marked *Suggéré par l'agent*; change any of them. Check a suggested URL above
+  all: the password goes to that server;
 - for each credential, a user name and a masked box for the password or token. What you type there
   is sealed in `fronde.db` and never shown to the assistant, the conversation or the log;
 - which origins the component may reach, and where each password goes: *envoyé seulement à
   https://cloud.example*. They follow from the URLs you give;
+- *Il remplace le secret « calendar_caldav » déjà gardé pour https://cloud.example*, when a secret
+  is stored under the name the setup keeps it under, for the same server (from an earlier setup
+  whose entry you removed, say): keeping the new password replaces it;
 - *Serveur sur cette machine ou son réseau local*, unticked. Tick it only for a server at a local
-  address (`localhost`, `192.168…`, `nas.lan`): Fronde refuses local addresses otherwise.
+  address: Fronde refuses local addresses otherwise. A card allows them only for a host that
+  looks local: `localhost` or another loopback address, a private address (`192.168…`, `10…`,
+  `172.16…` to `172.31…`, `fd…` in IPv6), a name without a dot (`nas`), or one ending in `.lan`,
+  `.local` or `.home.arpa`. Ticked for any other host (`nas.example.com`, even if it resolves to
+  a local address), the setup is refused, saying why: write that entry by hand, with
+  `{ origin = "…", local = true }`.
 
-Press *Ajouter*. If you changed a URL so that a password would go to another server than the card
-said, a second card asks you to confirm the new origins before anything is kept.
+Press *Ajouter*. A second card asks you to confirm before anything is kept when you changed a
+URL so that a password would go to another server than the card said, when you ticked the local
+box (it lists each origin it allows as local), or when a stored secret would be replaced that the
+first card did not name.
 
 ## What Fronde does
 
@@ -43,6 +54,20 @@ said, a second card asks you to confirm the new origins before anything is kept.
    was, and so does its mode. The password appears only as `{ stored = "calendar_caldav" }`.
 4. It starts the component; the assistant gets the names of its tools and can use them at once.
 
+The dry runs take only the component's files as the build ships them: changed on disk, they are
+refused, even if the entry would pin their new hashes or you approved them.
+
+Fronde reads `fronde.toml` again just before writing it. If you added an entry of that name by
+hand meanwhile, or if the file with the new entry would no longer start Fronde (any check
+`fronde check` makes on the configuration), nothing is written and the setup says why. If the
+file changes while Fronde writes it, Fronde reads it again once, then gives up rather than lose
+your edit. The file is replaced by a new one (an atomic rename): a hard link to it keeps the old
+content, so edit `fronde.toml` itself, not a hard link to it.
+
+Two setups of the same integration answered at once never store over each other: the first sets
+it up, the other is refused before it keeps anything. If the assistant's call is cut (its client
+gives up), the setup stops: no secret is kept and nothing is written.
+
 ## When `fronde.toml` is read-only
 
 In Docker the configuration is mounted read-only (`/config/fronde.toml:ro`), and Fronde never
@@ -51,13 +76,18 @@ at the end of your `fronde.toml`. It holds no secret, only the stored names. The
 until Fronde restarts; paste the entry to keep it.
 
 The master key goes beside the configuration by default, and a read-only `/config` cannot hold
-it: set `[secrets] master_key` to a file in a writable place, or use the keychain, before
-setting up an integration with a password there (see [Run in Docker](run-in-docker.md)).
+it. A container has no keychain: before setting up an integration with a password there, mount a
+writable directory at `/keys` and set `[secrets] master_key = { file = "/keys/master.key" }` (see
+[Run in Docker](run-in-docker.md)).
 
 ## Limits
 
-- The assistant may ask only during a turn you started: a turn a sub-agent's result started
-  cannot ask for it, and an outside MCP client cannot either.
+- Only the assistant of a thread you talk to may ask, during a turn your message started. A
+  sub-agent cannot ask, whatever its turn: setting up an integration is an admin's change, and a
+  sub-agent follows its task, not your words; it says what it needs, and the assistant that
+  started it asks. A turn a sub-agent's result started cannot ask either.
+- An outside MCP client cannot ask, and `search_tools` does not list the integrations to it.
+- The setup needs the chat with its threads (`[web]`): without them, the tool is not served.
 - A card left unanswered expires (10 minutes by default) and a restart expires it: the setup is
   not resumed later.
 - A component that asks for any subdomain of a domain, or sends a credential in a header, is set

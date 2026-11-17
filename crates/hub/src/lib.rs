@@ -44,8 +44,9 @@ impl Hub {
     /// with a warning, unless it is waiting for a stored secret: that one is tried again) and
     /// connect upstream servers in the background. With `requests` (the chat runs), the `user_*`
     /// tools ask the user through it; with `threads`, the `threads_*` tools let a thread's agent
-    /// start and follow sub-agents; with `integrations` too, `integrations_request_setup` lets
-    /// a thread's agent ask the admin to set up a shipped component, which `search_tools` lists.
+    /// start and follow sub-agents; with both and `integrations`, `integrations_request_setup`
+    /// lets a thread's agent ask the admin to set up a shipped component, which `search_tools`
+    /// lists to the threads' agents.
     pub async fn start(
         config: Config,
         db: DatabaseConnection,
@@ -67,8 +68,10 @@ impl Hub {
 
         let registry = Arc::new(Registry::new());
         let sources = Supervisor::new(registry.clone());
-        // Set up from a card only where a card can be answered: with the chat's requests.
-        let integrations = integrations.filter(|_| requests.is_some());
+        // Set up from a card only where a card can be answered (the chat's requests) and where
+        // the threads check the turn that asks: without them, a turn a sub-agent's result
+        // started would not be refused.
+        let integrations = integrations.filter(|_| requests.is_some() && threads.is_some());
         let mut own = meta_tools(&registry, integrations.clone());
         own.extend(memory_tools(memory.clone(), index, config.memory.git));
         // Upstream servers' forms go to the admin; the one user so far is the owner, an admin.
@@ -88,6 +91,7 @@ impl Hub {
                     sources: sources.clone(),
                     registry: registry.clone(),
                     admin: config.data.user.clone(),
+                    setting_up: integrations::SettingUp::default(),
                 }));
             }
             own.extend(user::user_tools(requests, threads.clone()));

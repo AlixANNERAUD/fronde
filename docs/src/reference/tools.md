@@ -26,7 +26,7 @@ the current `USER.md` and `MEMORY.md`. The client does not need to search memory
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `search_tools` | `need` (text), `limit` (1 to 10, default 5) | Finds deferred tools by need, best first, and returns their names, descriptions and input schemas. With the chat, it also lists the shipped components not set up yet that the need may be about (all of them when no tool matches), as `{"integration", "description", "status": "available, not set up: call integrations_request_setup"}`. |
+| `search_tools` | `need` (text), `limit` (1 to 10, default 5) | Finds deferred tools by need, best first, and returns their names, descriptions and input schemas. With the chat, it also lists to a thread's agent (never to an outside client) the shipped components not set up yet that the need may be about (all of them when no tool matches), as `{"integration", "description", "status": "available, not set up: call integrations_request_setup"}`. |
 | `use_tool` | `name`, `arguments` (object) | Calls a tool found with `search_tools`. |
 
 Deferred tools are hidden from the tool list to keep the agent's context small. Today the
@@ -162,8 +162,8 @@ served only while the chat runs, beside `user_ask`. See
 
 ## Setting up an integration
 
-Served only with `[web]`, to Fronde's own agents (an outside MCP client is not offered it, and is
-refused).
+Served only with `[web]` and its threads, to Fronde's own agents (an outside MCP client is not
+offered it, and is refused; a sub-agent is refused).
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
@@ -174,23 +174,32 @@ refused).
 setting the manifest does not declare) is refused, and so is a value the manifest's schema
 refuses (not one of an `enum`, a URL that is not one or that holds a user name or password, a
 `pattern` it does not match), a value on several lines or with a hidden character, and a user name
-holding `:`. Nothing is shown then.
+holding `:`. Nothing is shown then. A user name typed on the card is checked the same way.
 
 The card is the admin's (`admin_only`, for the admin whoever the caller acts for: a family
 member's agent gets a card that says *Demande envoyée à l'administrateur*). It shows the
 component's settings, a user name and a masked box for each credential (a `Field::Secret`, which
-only this tool can put on a card), where each secret goes (the origins of the URL settings), and
-a toggle for local addresses, off. Once answered, Fronde:
+only this tool can put on a card), each value `prefill` gave marked *Suggéré par l'agent*, where
+each secret goes (the origins of the URL settings), the stored secret it replaces (*remplace le
+secret …*, a name stored for the same origin), and a toggle for local addresses, off. The toggle
+applies only to origins of URL settings whose host looks local (a loopback or private address, a
+name without a dot, `.lan`, `.local`, `.home.arpa`); ticked for any other, the setup is refused,
+saying why. Once answered, Fronde:
 
 1. checks the entry with a dry run of `prepare` (settings, allowed origins within the manifest's,
-   a local address only with the toggle), keeping nothing yet;
+   a local address only with the toggle, and only the files shipped with the build: changed files
+   are refused, even pinned by hashes or approved in the database), keeping nothing yet;
 2. asks the admin to confirm on a second card when the answer sends a secret or allows an origin
-   the first card did not show (a URL changed to another server);
-3. seals each secret in `fronde.db` for each origin of its credential (`<integration>_<credential>`,
-   numbered when that name is stored for another origin);
-4. checks the whole entry again, with the stored secrets, then writes it at the end of
-   `fronde.toml` (comments, order and file mode kept, never through a link) or, when the file
-   cannot be written, shows the entry to paste on a card of its own;
+   the first card did not show (a URL changed to another server), allows local addresses (each
+   origin listed), or replaces a stored secret the first card did not name;
+3. under a lock per integration, held until the entry is added (a second setup of it is refused
+   before keeping anything), seals each secret in `fronde.db` for each origin of its credential
+   (`<integration>_<credential>`, numbered when that name is stored for another origin);
+4. checks the whole entry again, with the stored secrets, then reads `fronde.toml` again and
+   writes it at the end (comments, order and file mode kept, never through a link, replaced by an
+   atomic rename that detaches a hard link) when the file has no entry of that name and still
+   passes every check of `fronde check` with it, read again once if it changed meanwhile; when
+   the file cannot be written, shows the entry to paste on a card of its own;
 5. starts the component.
 
 ```json
@@ -203,9 +212,10 @@ says where the first secret kept made the master key. A declined, expired or can
 returns `{"status": "declined"}`, `"expired"` or `"cancelled"`. A failure after the answer is an
 error saying what was kept (stored secrets) and that the configuration is unchanged.
 
-The card is tied to the call: a call its client cuts cancels it, a restart expires it, and its
-answer never comes later as a message. A turn a sub-agent's result started cannot ask for it (the
-call is refused), nor a call outside the caller's turn. See
+The card is tied to the call: a call its client cuts cancels it (cut after the answer, it keeps
+no secret and writes nothing), a restart expires it, and its answer never comes later as a
+message. A turn a sub-agent's result started cannot ask for it (the call is refused), nor a
+sub-agent in any turn, nor a call outside the caller's turn. See
 [Set up an integration from the chat](../how-to/set-up-an-integration-from-the-chat.md).
 
 ## Calendar

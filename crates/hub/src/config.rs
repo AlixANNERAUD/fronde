@@ -858,14 +858,6 @@ pub fn is_valid_name(name: &str) -> bool {
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config {}", path.display()))?;
-    replaced_sections(&text).with_context(|| format!("invalid config {}", path.display()))?;
-    let mut config: Config =
-        toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
-    if config.data.dir.as_os_str().is_empty() {
-        config.data.dir = default_data_dir().context(
-            "cannot work out the default data directory (no home directory); set [data] dir",
-        )?;
-    }
     // Relative paths in the file are read from its directory, made absolute so that every path
     // derived from them (agent cwd, memory, database) is absolute too.
     let abs = std::path::absolute(path)
@@ -875,7 +867,34 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         .unwrap_or(Path::new("/"))
         .components()
         .collect();
-    let base = base.as_path();
+    let mut config = parse(&text, &base, &path.display().to_string())?;
+    config.path = Some(base.join(abs.file_name().unwrap_or_default()));
+    Ok(config)
+}
+
+/// The configuration `text` holds, for a file in the directory `base` (absolute), with every
+/// check [`load`] makes: what Fronde would start with if the file held `text`. Its `path` is
+/// unset.
+pub fn load_str(text: &str, base: &Path) -> anyhow::Result<Config> {
+    parse(text, base, "")
+}
+
+/// [`load_str`], its errors naming the file `name` when there is one.
+fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
+    let invalid = || {
+        if name.is_empty() {
+            "invalid config".to_owned()
+        } else {
+            format!("invalid config {name}")
+        }
+    };
+    replaced_sections(text).with_context(invalid)?;
+    let mut config: Config = toml::from_str(text).with_context(invalid)?;
+    if config.data.dir.as_os_str().is_empty() {
+        config.data.dir = default_data_dir().context(
+            "cannot work out the default data directory (no home directory); set [data] dir",
+        )?;
+    }
     if config.data.dir.is_relative() {
         config.data.dir = base.join(&config.data.dir).components().collect();
     }
@@ -966,7 +985,6 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
             );
         }
     }
-    config.path = Some(base.join(abs.file_name().unwrap_or_default()));
     for tool in &config.agent.builtin_tools {
         if !SAFE_BUILTIN_TOOLS.contains(&tool.as_str()) {
             bail!(

@@ -1,7 +1,7 @@
 //! The components shipped with this build, as integrations a setup card can add: the hub's
 //! [`Integrations`] over their manifests, `prepare` and the configuration file.
 
-use crate::config_edit;
+use crate::config_edit::{self, NotAdded};
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use fronde_db::DatabaseConnection;
@@ -12,11 +12,12 @@ use fronde_hub::integrations::{
 };
 use fronde_hub::source::Supervisor;
 use fronde_wasm::{
-    Checks, ComponentHost, ComponentSource, Hashes, Injection, Manifest, NetworkRule,
+    Approval, Checks, ComponentHost, ComponentSource, Hashes, Injection, Manifest, NetworkRule,
     StoredSecrets, check_manifest_settings, prepare,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The components shipped with this build, found beside the binary or in the checkout it was
@@ -26,15 +27,17 @@ pub struct Shipped {
     config: Config,
     db: DatabaseConnection,
     backends: Backends,
-    /// Each shipped component, with its manifest: read once, they do not change while Fronde
-    /// runs.
-    shipped: Vec<(Integration, Manifest)>,
+    /// Each shipped component, with its manifest and the hashes the build approves: read once,
+    /// they do not change while Fronde runs.
+    shipped: Vec<(Integration, Manifest, Hashes)>,
     /// The `[[sources]]` entries: the configuration's, and those added since.
     sources: Mutex<Vec<SourceConfig>>,
     /// Held while an entry is added, so that two cards answered at once add it once.
     adding: tokio::sync::Mutex<()>,
     /// The engine new components run in, made at the first one.
     host: tokio::sync::OnceCell<ComponentHost>,
+    /// How `fronde.toml` is replaced.
+    write: config_edit::Write,
 }
 
 impl Shipped {
@@ -56,12 +59,13 @@ impl Shipped {
                 settings: BTreeMap::new(),
                 credentials: Vec::new(),
             };
+            let approved = Hashes {
+                sha256: component.sha256.clone(),
+                manifest_sha256: component.manifest_sha256.clone(),
+            };
             // Other files than the build's would not be approved: never offered.
-            match Hashes::of(&probe) {
-                Ok(hashes)
-                    if hashes.sha256 == component.sha256
-                        && hashes.manifest_sha256 == component.manifest_sha256 => {}
-                _ => continue,
+            if Hashes::of(&probe).ok().as_ref() != Some(&approved) {
+                continue;
             }
             let manifest = match Manifest::load(&probe.manifest_path()) {
                 Ok(manifest) => manifest,
@@ -70,7 +74,11 @@ impl Shipped {
                     continue;
                 }
             };
-            shipped.push((integration(&component.name, path, &manifest), manifest));
+            shipped.push((
+                integration(&component.name, path, &manifest),
+                manifest,
+                approved,
+            ));
         }
         Ok(Self {
             config: config.clone(),
@@ -80,7 +88,21 @@ impl Shipped {
             sources: Mutex::new(config.sources.clone()),
             adding: tokio::sync::Mutex::default(),
             host: tokio::sync::OnceCell::new(),
+            write: config_edit::write_atomic,
         })
+    }
+
+    /// For tests: `fronde.toml` replaced by `write` instead (one that fails, as a read-only
+    /// mount would make it, whoever runs the test).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn writing_with(mut self, write: config_edit::Write) -> Self {
+        self.write = write;
+        self
+    }
+
+    fn set_sources(&self, sources: Vec<SourceConfig>) {
+        *self.sources.lock().unwrap_or_else(PoisonError::into_inner) = sources;
     }
 
     fn sources(&self) -> Vec<SourceConfig> {
@@ -195,12 +217,12 @@ impl Integrations for Shipped {
         let sources = self.sources();
         self.shipped
             .iter()
-            .filter(|(integration, _)| {
+            .filter(|(integration, ..)| {
                 !sources
                     .iter()
                     .any(|source| source.name() == integration.name)
             })
-            .map(|(integration, _)| integration.clone())
+            .map(|(integration, ..)| integration.clone())
             .collect()
     }
 
@@ -210,18 +232,33 @@ impl Integrations for Shipped {
         settings: &BTreeMap<String, String>,
         complete: bool,
     ) -> Result<(), String> {
-        let Some((_, manifest)) = self.shipped.iter().find(|(i, _)| i.name == name) else {
+        let Some((_, manifest, _)) = self.shipped.iter().find(|(i, ..)| i.name == name) else {
             return Err(format!("{name} is not shipped with this build"));
         };
         check_manifest_settings(manifest, settings, complete).map_err(|error| format!("{error:#}"))
     }
 
     async fn dry_run(&self, entry: &ComponentConfig) -> anyhow::Result<()> {
+        let Some((_, _, hashes)) = self.shipped.iter().find(|(i, ..)| i.name == entry.name) else {
+            bail!("{} is not shipped with this build", entry.name);
+        };
         let mut checks = self.checks(entry).await?;
         if !entry.credentials.is_empty() {
             checks.secrets = StoredSecrets::load(&self.db, &self.backends).await?;
         }
-        prepare(entry, &checks).map(|_| ())
+        let prepared = prepare(entry, &checks)?;
+        // Only the build's own files: not an entry pinning other hashes, nor files the owner
+        // approved for this name, nor another shipped component's.
+        let shipped = Approval::Shipped {
+            name: entry.name.clone(),
+        };
+        if *prepared.approval() != shipped || prepared.sha256() != hashes.sha256 {
+            bail!(
+                "its files are not the ones shipped with this build ({}): set it up by hand",
+                prepared.approval()
+            );
+        }
+        Ok(())
     }
 
     async fn add(&self, entry: &ComponentConfig, sources: &Supervisor) -> anyhow::Result<Written> {
@@ -235,25 +272,38 @@ impl Integrations for Shipped {
         }
         let checks = self.checks(entry).await?;
         let written = match self.config.path() {
-            Some(path) => match config_edit::add_component(path, entry) {
-                Ok(()) => {
-                    tracing::info!("{}: added to {}", entry.name, path.display());
-                    Written::File
+            Some(path) => {
+                let base = path.parent().unwrap_or(Path::new("/"));
+                match config_edit::add_component(path, base, entry, self.write) {
+                    Ok(sources) => {
+                        tracing::info!("{}: added to {}", entry.name, path.display());
+                        // The file's entries, those added by hand since the start included.
+                        self.set_sources(sources);
+                        Written::File
+                    }
+                    Err(NotAdded::Refused { error, sources }) => {
+                        if let Some(sources) = sources {
+                            self.set_sources(sources);
+                        }
+                        return Err(error);
+                    }
+                    Err(NotAdded::Unwritable(error)) => {
+                        tracing::warn!(
+                            "{}: the entry goes to the owner to paste instead: {error:#}",
+                            entry.name
+                        );
+                        Written::Snippet(config_edit::snippet(entry)?)
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        "{}: the entry goes to the owner to paste instead: {error:#}",
-                        entry.name
-                    );
-                    Written::Snippet(config_edit::snippet(entry)?)
-                }
-            },
+            }
             None => Written::Snippet(config_edit::snippet(entry)?),
         };
-        self.sources
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(SourceConfig::Component(entry.clone()));
+        if written != Written::File {
+            self.sources
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(SourceConfig::Component(entry.clone()));
+        }
         let host = self
             .host
             .get_or_try_init(|| async { ComponentHost::new() })

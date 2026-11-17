@@ -2864,6 +2864,21 @@ async fn a_wake_turn_asks_no_secret_and_names_its_sub_agent() {
             .contains("started by a sub-agent's result"),
         "{refused}"
     );
+    // Nor an integration's setup, which only an admin grants, for good: the threads refuse its
+    // card through the bridge, before anything is shown.
+    let shown = requests_in(&main_assistant);
+    let refused = call(
+        &main,
+        "integrations_request_setup",
+        json!({"arguments": {"integration": "echo"}}),
+    )
+    .await;
+    assert_eq!(
+        refused,
+        json!({"error": fronde_agent::assistant::LastingInWake.to_string()}),
+        "{refused}"
+    );
+    assert_eq!(requests_in(&main_assistant), shown, "no card was shown");
     let before = main_assistant.log().last_seq();
     let asked = call_in_background(&main, "user_ask", question());
     let (id, seq) = next_request(&main_assistant, before).await;
@@ -2885,5 +2900,81 @@ async fn a_wake_turn_asks_no_secret_and_names_its_sub_agent() {
     );
     bench.requests.cancel(id).await.unwrap();
     asked.await.unwrap();
+    bench.gate.notify_waiters();
+}
+
+/// A setup card is tied to its call: the client cutting the call cancels the card at once,
+/// and the turn goes on.
+#[tokio::test]
+async fn a_cut_setup_call_cancels_its_card() {
+    let bench = Bench::held().await;
+    let token = bench.start(ThreadId::MAIN).await;
+    let main = bench.client(&token, "claude-code", &[]).await;
+    let assistant = bench.assistant(ThreadId::MAIN).await;
+    let before = assistant.log().last_seq();
+    let mut asked = Box::pin(
+        main.peer().call_tool_once(
+            CallToolRequestParams::new("integrations_request_setup")
+                .with_arguments(json!({"integration": "echo"}).as_object().unwrap().clone()),
+        ),
+    );
+    let (id, _) = tokio::select! {
+        ended = &mut asked => panic!("the call ended before its card was shown: {ended:?}"),
+        shown = next_request(&assistant, before) => shown,
+    };
+    // The client gives up: dropping the call sends `notifications/cancelled`.
+    drop(asked);
+    timeout(WAIT, async {
+        while !assistant.log().since(0).iter().any(|entry| {
+            matches!(
+                entry.event,
+                Event::RequestClosed { id: closed, outcome: Outcome::Cancelled, .. } if closed == id
+            )
+        }) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the card was not cancelled");
+    assert_eq!(
+        bench.requests.answer(id, Response::Decline, &alix()).await,
+        Err(fronde_requests::Refusal::Closed)
+    );
+    assert!(assistant.current_turn().await.is_some(), "the turn goes on");
+    bench.gate.notify_waiters();
+}
+
+/// A sub-agent follows its parent's task, not the owner's words: it cannot ask the admin to set
+/// up an integration, whatever its turn.
+#[tokio::test]
+async fn a_sub_agent_cannot_ask_for_a_setup() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let child = start_child(&main, TASK).await;
+    let child_client = bench
+        .client(&token_of(&bench, child).await, "claude-code", &[])
+        .await;
+    let assistant = bench.assistant(child).await;
+    timeout(WAIT, async {
+        while assistant.current_turn().await.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent's turn never started");
+    let refused = call(
+        &child_client,
+        "integrations_request_setup",
+        json!({"arguments": {"integration": "echo"}}),
+    )
+    .await;
+    assert_eq!(
+        refused,
+        json!({"error": fronde_agent::assistant::AdminFromSubAgent.to_string()}),
+        "{refused}"
+    );
+    assert_eq!(requests_in(&assistant), 0, "no card was shown");
     bench.gate.notify_waiters();
 }

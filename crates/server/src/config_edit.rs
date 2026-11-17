@@ -2,10 +2,11 @@
 //! order, formatting. Only Fronde's own process calls it, once an admin answered a setup card.
 //!
 //! The file is replaced atomically (`fronde-fs`), keeps its mode (never wider), and is never
-//! written through a link. An entry never holds a secret: its credentials name stored ones.
+//! written through a link; a hard link to it is detached by the rename. An entry never holds a
+//! secret: its credentials name stored ones.
 
 use anyhow::{Context, bail};
-use fronde_hub::config::{ComponentConfig, Secret};
+use fronde_hub::config::{ComponentConfig, Secret, SourceConfig};
 use std::path::Path;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
@@ -86,7 +87,7 @@ pub fn snippet(entry: &ComponentConfig) -> anyhow::Result<String> {
 }
 
 /// The text of `fronde.toml`, `text`, with `entry` added as its last `[[sources]]` entry: the
-/// rest kept as written. The result must still read as a configuration.
+/// rest kept as written. Whether the result still loads is for [`add_component`] to check.
 pub fn with_entry(text: &str, entry: &ComponentConfig) -> anyhow::Result<String> {
     let mut document: DocumentMut = text.parse().context("cannot read it as TOML")?;
     let sources = document
@@ -96,16 +97,46 @@ pub fn with_entry(text: &str, entry: &ComponentConfig) -> anyhow::Result<String>
         bail!("its sources are not written as [[sources]] tables");
     };
     sources.push(table(entry)?);
-    let text = document.to_string();
-    toml::from_str::<fronde_hub::config::Config>(&text)
-        .context("with the new entry, it would no longer read as a configuration")?;
-    Ok(text)
+    Ok(document.to_string())
 }
 
-/// Adds `entry` to the configuration file `path`: refused for a link, a file that does not read,
-/// or one that cannot be written (a read-only mount); then the entry is pasted by hand. The file
-/// keeps its mode.
-pub fn add_component(path: &Path, entry: &ComponentConfig) -> anyhow::Result<()> {
+/// How the file is replaced: [`fronde_fs::write_atomic_mode`], unless a test makes it fail.
+pub type Write = fn(&Path, &str, u32) -> std::io::Result<()>;
+
+/// Replaces `path` with `text`, mode `mode`, atomically.
+pub fn write_atomic(path: &Path, text: &str, mode: u32) -> std::io::Result<()> {
+    fronde_fs::write_atomic_mode(path, text, mode)
+}
+
+/// Why an entry was not added to the file.
+#[derive(Debug)]
+pub enum NotAdded {
+    /// The file cannot be written as it is (a read-only mount, a link, a file that does not
+    /// read): the owner pastes the entry by hand.
+    Unwritable(anyhow::Error),
+    /// Adding it would leave a configuration Fronde cannot start with (a source of that name
+    /// added by hand meanwhile, a check of `config::load` that fails), or the file kept changing:
+    /// nothing is written, and pasting the entry would not do either. `sources` are the file's
+    /// entries, when it could be read.
+    Refused {
+        error: anyhow::Error,
+        sources: Option<Vec<SourceConfig>>,
+    },
+}
+
+/// What identifies the file's content as read: replaced or edited, it changes.
+#[derive(Debug, PartialEq, Eq)]
+struct Stamp {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+/// The file at `path` as it is now, refused for a link or anything but a file, and its mode.
+fn stamp(path: &Path) -> anyhow::Result<(Stamp, u32)> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -118,17 +149,91 @@ pub fn add_component(path: &Path, entry: &ComponentConfig) -> anyhow::Result<()>
         bail!("{} is not a file", path.display());
     }
     #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o777
+    let (dev, ino, mode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (metadata.dev(), metadata.ino(), metadata.mode() & 0o777)
     };
     #[cfg(not(unix))]
     let mode = 0o600;
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let text = with_entry(&text, entry).with_context(|| format!("{}", path.display()))?;
-    fronde_fs::write_atomic_mode(path, text, mode)
-        .with_context(|| format!("cannot write {}", path.display()))
+    Ok((
+        Stamp {
+            #[cfg(unix)]
+            dev,
+            #[cfg(unix)]
+            ino,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        },
+        mode,
+    ))
+}
+
+/// Adds `entry` to the configuration file `path`, whose relative paths are read from `base`,
+/// and returns the file's `[[sources]]` entries with it.
+///
+/// The file is read again: an entry of the same name added by hand since Fronde started is
+/// refused, and the new text must pass every check `config::load` makes, so that Fronde still
+/// starts. The file is replaced atomically by a rename, keeping its mode: a hard link to it
+/// keeps the old content, detached. Just before the rename, the file's inode, modification time
+/// and size are compared with those read: a change (an edit meanwhile) reads it again, once,
+/// then refuses. An edit in the instant between that check and the rename is lost.
+pub fn add_component(
+    path: &Path,
+    base: &Path,
+    entry: &ComponentConfig,
+    write: Write,
+) -> Result<Vec<SourceConfig>, NotAdded> {
+    let unwritable = |error: anyhow::Error| NotAdded::Unwritable(error);
+    for _ in 0..2 {
+        let (before, mode) = stamp(path).map_err(unwritable)?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))
+            .map_err(unwritable)?;
+        let current =
+            fronde_hub::config::load_str(&text, base).map_err(|error| NotAdded::Refused {
+                error: error.context(format!(
+                    "{} no longer loads as it is; fix it first",
+                    path.display()
+                )),
+                sources: None,
+            })?;
+        if current.sources.iter().any(|s| s.name() == entry.name) {
+            return Err(NotAdded::Refused {
+                error: anyhow::anyhow!(
+                    "{} already has a [[sources]] entry named {}, added since Fronde started; nothing was written",
+                    path.display(),
+                    entry.name
+                ),
+                sources: Some(current.sources),
+            });
+        }
+        let new = with_entry(&text, entry)
+            .with_context(|| format!("{}", path.display()))
+            .map_err(unwritable)?;
+        let added =
+            fronde_hub::config::load_str(&new, base).map_err(|error| NotAdded::Refused {
+                error: error.context(format!(
+                    "with the new entry, {} would no longer load; nothing was written",
+                    path.display()
+                )),
+                sources: Some(current.sources.clone()),
+            })?;
+        let (now, _) = stamp(path).map_err(unwritable)?;
+        if now != before {
+            continue;
+        }
+        write(path, &new, mode)
+            .with_context(|| format!("cannot write {}", path.display()))
+            .map_err(unwritable)?;
+        return Ok(added.sources);
+    }
+    Err(NotAdded::Refused {
+        error: anyhow::anyhow!(
+            "{} kept changing while Fronde added the entry; nothing was written",
+            path.display()
+        ),
+        sources: None,
+    })
 }
 
 #[cfg(test)]
@@ -192,6 +297,83 @@ mod tests {
              origin = \"https://cloud.example\"\n\
              basic = { username = \"alix\", password = { stored = \"calendar_caldav\" } }\n"
         );
+    }
+
+    const CONFIG: &str = "# Mine.\n[server]\ntoken = { env = \"UNUSED\" }\n[data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n";
+
+    fn never(_: &Path, _: &str, _: u32) -> std::io::Result<()> {
+        panic!("nothing is written")
+    }
+
+    /// `fronde.toml` holding `text` in a new directory.
+    fn file(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fronde.toml");
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn the_entry_is_added_and_the_file_still_loads() {
+        let (dir, path) = file(CONFIG);
+        let sources = add_component(&path, dir.path(), &entry(), write_atomic).unwrap();
+        assert_eq!(sources.len(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(CONFIG), "{text}");
+        assert_eq!(
+            fronde_hub::config::load(&path).unwrap().sources[0].name(),
+            "calendar"
+        );
+    }
+
+    #[test]
+    fn a_name_the_file_has_already_is_refused() {
+        let by_hand = format!(
+            "{CONFIG}[[sources]]\nkind = \"mcp\"\nname = \"calendar\"\nurl = \"https://mcp.example\"\n"
+        );
+        let (dir, path) = file(&by_hand);
+        let Err(NotAdded::Refused { error, sources }) =
+            add_component(&path, dir.path(), &entry(), never)
+        else {
+            panic!("refused");
+        };
+        assert!(
+            format!("{error:#}").contains("already has a [[sources]] entry named calendar"),
+            "{error:#}"
+        );
+        assert_eq!(sources.unwrap()[0].name(), "calendar");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), by_hand);
+    }
+
+    #[test]
+    fn an_entry_load_would_refuse_is_not_written() {
+        let (dir, path) = file(CONFIG);
+        let mut reserved = entry();
+        reserved.name = "fronde".into();
+        let Err(NotAdded::Refused { error, .. }) =
+            add_component(&path, dir.path(), &reserved, never)
+        else {
+            panic!("refused");
+        };
+        assert!(
+            format!("{error:#}").contains("would no longer load"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CONFIG);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_never_written_through() {
+        let (dir, path) = file(CONFIG);
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let Err(NotAdded::Unwritable(error)) = add_component(&link, dir.path(), &entry(), never)
+        else {
+            panic!("unwritable");
+        };
+        assert!(format!("{error:#}").contains("is a link"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CONFIG);
     }
 
     #[test]

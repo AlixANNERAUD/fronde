@@ -3,6 +3,9 @@
 //! paste) and the component started. The components come from `components/dist`, as the build
 //! approves them.
 
+#[path = "support/asks.rs"]
+mod asks;
+
 use async_trait::async_trait;
 use fronde::integrations::Shipped;
 use fronde_db::ephemeral::EphemeralSecrets;
@@ -19,9 +22,10 @@ use fronde_requests::{Caller, Journal, Refusal, Requests, SecretStore, ThreadId,
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const WAIT: Duration = Duration::from_secs(30);
 const CANARY: &str = "canary-setup-password-7e41";
@@ -56,8 +60,23 @@ struct Shown {
     card: Card,
 }
 
-/// Hands each card shown to the test, and records every end.
-struct Cards(mpsc::UnboundedSender<Shown>);
+/// Hands each card shown to the test, and records every end: a call to cut at the next end is
+/// cut then, as its client giving it up at the moment the answer comes.
+struct Cards {
+    shown: mpsc::UnboundedSender<Shown>,
+    closed: Arc<Mutex<Vec<(RequestId, Outcome)>>>,
+    cut: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+impl Cards {
+    fn new(shown: mpsc::UnboundedSender<Shown>) -> Self {
+        Self {
+            shown,
+            closed: Arc::default(),
+            cut: Arc::default(),
+        }
+    }
+}
 
 #[async_trait]
 impl Journal for Cards {
@@ -68,7 +87,7 @@ impl Journal for Cards {
         card: &Card,
         _caller: &Caller,
     ) -> anyhow::Result<u64> {
-        let _ = self.0.send(Shown {
+        let _ = self.shown.send(Shown {
             topic: topic.to_owned(),
             id,
             card: card.clone(),
@@ -79,10 +98,14 @@ impl Journal for Cards {
     async fn close(
         &self,
         _topic: &str,
-        _id: RequestId,
-        _outcome: &Outcome,
+        id: RequestId,
+        outcome: &Outcome,
         _by: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.closed.lock().unwrap().push((id, outcome.clone()));
+        if let Some(cut) = self.cut.lock().unwrap().take() {
+            cut.cancel();
+        }
         Ok(())
     }
 }
@@ -92,6 +115,8 @@ struct Bench {
     requests: Arc<Requests>,
     integrations: Arc<Shipped>,
     cards: mpsc::UnboundedReceiver<Shown>,
+    /// A call cut at the next request's end.
+    cut: Arc<Mutex<Option<CancellationToken>>>,
     config: PathBuf,
     dir: tempfile::TempDir,
 }
@@ -100,9 +125,18 @@ async fn bench() -> Bench {
     bench_with(|_| {}).await
 }
 
-/// A Fronde with the chat's requests and the shipped components to set up; `prepare` runs on
-/// the directory holding `fronde.toml` (`etc`, beside `data` and the key) before the configuration is read.
+/// A Fronde with the chat's requests, the threads (showing cards only) and the shipped
+/// components to set up; `prepare` runs on the directory holding `fronde.toml` (`etc`, beside
+/// `data` and the key) before the configuration is read.
 async fn bench_with(prepare: impl FnOnce(&Path)) -> Bench {
+    bench_writing(prepare, None).await
+}
+
+/// [`bench_with`], `fronde.toml` replaced by `write` when given.
+async fn bench_writing(
+    prepare: impl FnOnce(&Path),
+    write: Option<fronde::config_edit::Write>,
+) -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let etc = dir.path().join("etc");
     std::fs::create_dir(&etc).unwrap();
@@ -117,16 +151,22 @@ async fn bench_with(prepare: impl FnOnce(&Path)) -> Bench {
         Backends::file(dir.path().join("master.key")),
         Arc::new(EphemeralSecrets::new()),
     );
-    let requests = Requests::open_with(db.clone(), Arc::new(Cards(send)), Some(store))
+    let journal = Cards::new(send);
+    let cut = journal.cut.clone();
+    let requests = Requests::open_with(db.clone(), Arc::new(journal), Some(store))
         .await
         .unwrap();
-    let integrations = Arc::new(Shipped::new(&loaded, db.clone()).unwrap());
+    let mut shipped = Shipped::new(&loaded, db.clone()).unwrap();
+    if let Some(write) = write {
+        shipped = shipped.writing_with(write);
+    }
+    let integrations = Arc::new(shipped);
     let hub = Hub::start(
         loaded,
         db,
         vec![],
         Some(requests.clone()),
-        None,
+        Some(Arc::new(asks::Asks(requests.clone()))),
         Some(integrations.clone() as Arc<dyn Integrations>),
     )
     .await
@@ -136,6 +176,7 @@ async fn bench_with(prepare: impl FnOnce(&Path)) -> Bench {
         requests,
         integrations,
         cards,
+        cut,
         config,
         dir,
     }
@@ -167,6 +208,13 @@ fn calendar_prefill() -> Value {
             "caldav.username": "alix",
         },
     })
+}
+
+/// The answer that confirms a confirmation card, which has no field.
+fn confirmed() -> Response {
+    Response::Form {
+        values: Default::default(),
+    }
 }
 
 fn text(value: &str) -> FieldValue {
@@ -262,9 +310,10 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
-/// The card shows the manifest's settings with the prefill, a user name and a password for its
-/// credential, the origins that follow from the URLs, and the toggle for local addresses, off.
-/// It is the admin's, and a secret card: refused unless the hub built it.
+/// The card shows the manifest's settings with the prefill, each value the agent suggested
+/// marked so, a user name and a password for its credential, the origins that follow from the
+/// URLs, and the toggle for local addresses, off. It is the admin's, and a secret card: refused
+/// unless the hub built it.
 #[tokio::test]
 async fn setup_card_from_manifest() {
     let mut bench = bench().await;
@@ -288,6 +337,23 @@ async fn setup_card_from_manifest() {
         &fields[0],
         Field::Text { default: Some(url), required: true, format: Some(fronde_protocol::TextFormat::Uri), .. } if url == EVENTS
     ));
+    // What the agent suggested is marked so, a URL above all; what it did not suggest is not.
+    for suggested in [&fields[0], &fields[1], &fields[3]] {
+        assert!(
+            matches!(suggested, Field::Text { description: Some(d), .. } if d.starts_with("Suggéré par l'agent")),
+            "{suggested:?}"
+        );
+    }
+    assert!(
+        matches!(&fields[0], Field::Text { description: Some(d), .. } if d.contains("ton serveur")),
+        "{:?}",
+        fields[0]
+    );
+    assert!(
+        !matches!(&fields[2], Field::Text { description: Some(d), .. } if d.contains("Suggéré")),
+        "{:?}",
+        fields[2]
+    );
     assert!(matches!(
         &fields[2],
         Field::Text {
@@ -313,18 +379,31 @@ async fn setup_card_from_manifest() {
         message.contains("envoyé seulement à : https://cloud.example."),
         "{message}"
     );
-    // Only the admin answers it.
-    let lea = User {
-        name: "alix".into(),
-        admin: false,
-    };
-    assert_eq!(
-        bench
-            .requests
-            .answer(shown.id, Response::Decline, &lea)
-            .await,
-        Err(Refusal::NotYours)
+    assert!(
+        message.contains("URL suggérées par l'agent : vérifie-les"),
+        "{message}"
     );
+    // Only the admin answers it: neither another user, nor the admin's own name without the
+    // admin's rights.
+    for not_admin in [
+        User {
+            name: "lea".into(),
+            admin: false,
+        },
+        User {
+            name: "alix".into(),
+            admin: false,
+        },
+    ] {
+        assert_eq!(
+            bench
+                .requests
+                .answer(shown.id, Response::Decline, &not_admin)
+                .await,
+            Err(Refusal::NotYours),
+            "{not_admin:?}"
+        );
+    }
     bench
         .requests
         .answer(shown.id, Response::Decline, &alix())
@@ -391,18 +470,18 @@ async fn setup_writes_toml_keeping_comments() {
     );
 }
 
+/// Writes nothing, as a read-only mount refuses it, whoever runs the test (root writes through
+/// a mode).
+fn read_only(_: &Path, _: &str, _: u32) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem))
+}
+
 /// A configuration Fronde cannot write (a read-only mount in Docker) is left as it is: the
 /// owner gets the entry to paste on a card of its own, with the stored secret's name, never its
 /// value, and the integration runs until the next start.
-#[cfg(unix)]
 #[tokio::test]
 async fn setup_read_only_config_gives_snippet() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mut bench = bench().await;
-    let config_dir = bench.config.parent().unwrap().to_owned();
-    // Neither the file nor its directory can be written, as with a read-only mount.
-    std::fs::set_permissions(&bench.config, std::fs::Permissions::from_mode(0o400)).unwrap();
-    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut bench = bench_writing(|_| {}, Some(read_only)).await;
     let call = bench.call(context("alix"), calendar_prefill());
     let shown = bench.card().await;
     bench
@@ -411,7 +490,6 @@ async fn setup_read_only_config_gives_snippet() {
         .await
         .unwrap();
     let out = result(call).await;
-    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(out["result"]["config"], "not_written", "{out}");
     let snippet = out["result"]["snippet"].as_str().unwrap();
     assert!(snippet.starts_with("# Added by Fronde"), "{snippet}");
@@ -682,7 +760,8 @@ async fn dry_run_refuses_an_origin_outside_the_manifest() {
 }
 
 /// A server on the local network needs the card's toggle: unticked, nothing is kept or written;
-/// ticked, the entry allows its origin as local.
+/// ticked, a confirmation card lists the origins allowed as local, and once confirmed the entry
+/// allows its origin as local.
 #[tokio::test]
 async fn a_local_server_needs_the_toggle() {
     const LOCAL: &str = "https://192.168.1.10/dav/personal/";
@@ -719,6 +798,28 @@ async fn a_local_server_needs_the_toggle() {
     bench
         .requests
         .answer(shown.id, calendar_answer(LOCAL, LOCAL, true), &alix())
+        .await
+        .unwrap();
+    let confirm = bench.card().await;
+    let text = message(&confirm.card);
+    assert!(
+        text.contains(
+            "Adresses locales permises (cette machine ou son réseau) pour : https://192.168.1.10."
+        ),
+        "{text}"
+    );
+    assert!(
+        bench
+            .requests
+            .stored_origin("calendar_caldav")
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing kept before the confirmation"
+    );
+    bench
+        .requests
+        .answer(confirm.id, confirmed(), &alix())
         .await
         .unwrap();
     let out = result(call).await;
@@ -771,4 +872,552 @@ async fn another_origin_than_shown_is_confirmed() {
         out.to_text()
     );
     assert_eq!(bench.config_text(), CONFIG);
+}
+
+/// The calendar's answer with the password `password`.
+fn calendar_answer_with(password: &str) -> Response {
+    let Response::Form { mut values } = calendar_answer(EVENTS, REMINDERS, false) else {
+        unreachable!()
+    };
+    values.insert("caldav.secret".to_owned(), secret(password));
+    Response::Form { values }
+}
+
+/// The stored secret `name`, opened for `origin`.
+async fn stored(bench: &Bench, name: &str, origin: &str) -> Option<String> {
+    let db = fronde_db::open(&bench.dir.path().join("data"))
+        .await
+        .unwrap();
+    let stored =
+        fronde_wasm::StoredSecrets::load(&db, &Backends::file(bench.dir.path().join("master.key")))
+            .await
+            .unwrap();
+    stored
+        .open(name, &Origin::parse(origin).unwrap())
+        .ok()
+        .map(|value| value.expose_secret().to_owned())
+}
+
+/// The toggle for local addresses applies only to an origin that looks local: ticked for a
+/// server on the Internet, the setup is refused, saying why, before any card or secret.
+#[tokio::test]
+async fn the_local_toggle_is_refused_for_a_public_host() {
+    let mut bench = bench().await;
+    let call = bench.call(context("alix"), calendar_prefill());
+    let shown = bench.card().await;
+    bench
+        .requests
+        .answer(shown.id, calendar_answer(EVENTS, REMINDERS, true), &alix())
+        .await
+        .unwrap();
+    let out = output(call).await;
+    assert!(out.is_error, "{}", out.to_text());
+    assert!(
+        out.to_text()
+            .contains("https://cloud.example does not look local"),
+        "{}",
+        out.to_text()
+    );
+    bench.no_card();
+    assert_eq!(bench.config_text(), CONFIG);
+    assert!(
+        bench
+            .requests
+            .stored_origin("calendar_caldav")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// An entry of the same name added by hand to `fronde.toml` while the card was open is
+/// refused: Fronde would not start with two. The file stays as the owner wrote it, and the
+/// integration is no longer offered.
+#[tokio::test]
+async fn a_hand_added_entry_of_the_same_name_is_refused() {
+    let mut bench = bench().await;
+    let call = bench.call(context("alix"), json!({"integration": "echo"}));
+    let shown = bench.card().await;
+    let by_hand = format!(
+        "{CONFIG}\n[[sources]]\nkind = \"component\"\nname = \"echo\"\npath = {:?}\n",
+        fronde_hub::config::shipped_component("echo")
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    std::fs::write(&bench.config, &by_hand).unwrap();
+    bench
+        .requests
+        .answer(shown.id, confirmed(), &alix())
+        .await
+        .unwrap();
+    let out = output(call).await;
+    assert!(
+        out.is_error
+            && out
+                .to_text()
+                .contains("already has a [[sources]] entry named echo"),
+        "{}",
+        out.to_text()
+    );
+    assert_eq!(bench.config_text(), by_hand);
+    fronde_hub::config::load(&bench.config).unwrap();
+    assert!(
+        bench
+            .integrations
+            .available()
+            .iter()
+            .all(|i| i.name != "echo")
+    );
+    assert!(bench.hub.registry.get("echo_text").is_none());
+}
+
+/// A configuration whose entry would not pass `config::load`'s checks is never written: here
+/// the file itself no longer loads (an edit by hand meanwhile), so nothing is added to it.
+#[tokio::test]
+async fn an_entry_is_written_only_to_a_file_that_still_loads() {
+    let mut bench = bench().await;
+    let call = bench.call(context("alix"), json!({"integration": "echo"}));
+    let shown = bench.card().await;
+    let broken =
+        format!("{CONFIG}\n[[sources]]\nkind = \"mcp\"\nname = \"hub\"\ncommand = [\"x\"]\n");
+    std::fs::write(&bench.config, &broken).unwrap();
+    bench
+        .requests
+        .answer(shown.id, confirmed(), &alix())
+        .await
+        .unwrap();
+    let out = output(call).await;
+    assert!(
+        out.is_error && out.to_text().contains("no longer loads"),
+        "{}",
+        out.to_text()
+    );
+    assert_eq!(bench.config_text(), broken);
+}
+
+/// `fronde.toml` as a link is never written through: the entry goes to the owner to paste, and
+/// the file the link names is unchanged.
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_refuses_to_write_through_a_link() {
+    let mut bench = bench_with(|dir| {
+        std::fs::rename(dir.join("fronde.toml"), dir.join("real.toml")).unwrap();
+        std::os::unix::fs::symlink("real.toml", dir.join("fronde.toml")).unwrap();
+    })
+    .await;
+    let call = bench.call(context("alix"), json!({"integration": "echo"}));
+    let shown = bench.card().await;
+    bench
+        .requests
+        .answer(shown.id, confirmed(), &alix())
+        .await
+        .unwrap();
+    let out = result(call).await;
+    assert_eq!(out["result"]["config"], "not_written", "{out}");
+    let real = bench.config.parent().unwrap().join("real.toml");
+    assert_eq!(std::fs::read_to_string(real).unwrap(), CONFIG);
+    assert!(
+        std::fs::symlink_metadata(&bench.config)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let paste = bench.card().await;
+    assert!(
+        message(&paste.card).contains("[[sources]]"),
+        "{:?}",
+        paste.card
+    );
+}
+
+/// Two setups of one integration answered at once: one sets it up, the other is refused before
+/// it stores anything, so the stored secret is the one the entry was set up with.
+#[tokio::test]
+async fn concurrent_setups_never_store_over_each_other() {
+    let mut bench = bench().await;
+    let first = bench.call(context("alix"), calendar_prefill());
+    let first_card = bench.card().await;
+    let second = bench.call(context("alix"), calendar_prefill());
+    let second_card = bench.card().await;
+    // The later one may see the first one's secret stored before its own turn, and ask to
+    // confirm replacing it: confirmed, it still finds the integration set up meanwhile.
+    let mut cards = std::mem::replace(&mut bench.cards, mpsc::unbounded_channel().1);
+    let confirming = tokio::spawn({
+        let requests = bench.requests.clone();
+        async move {
+            while let Some(card) = cards.recv().await {
+                let _ = requests.answer(card.id, confirmed(), &alix()).await;
+            }
+        }
+    });
+    let admin = alix();
+    let (answered_first, answered_second) = tokio::join!(
+        bench.requests.answer(
+            first_card.id,
+            calendar_answer_with("first-password"),
+            &admin
+        ),
+        bench.requests.answer(
+            second_card.id,
+            calendar_answer_with("second-password"),
+            &admin
+        ),
+    );
+    answered_first.unwrap();
+    answered_second.unwrap();
+    let (first, second) = (output(first).await, output(second).await);
+    let winner = match (first.is_error, second.is_error) {
+        (false, true) => {
+            assert!(
+                second.to_text().contains("set up meanwhile"),
+                "{}",
+                second.to_text()
+            );
+            "first-password"
+        }
+        (true, false) => {
+            assert!(
+                first.to_text().contains("set up meanwhile"),
+                "{}",
+                first.to_text()
+            );
+            "second-password"
+        }
+        _ => panic!("{} / {}", first.to_text(), second.to_text()),
+    };
+    confirming.abort();
+    assert_eq!(
+        stored(&bench, "calendar_caldav", "https://cloud.example")
+            .await
+            .as_deref(),
+        Some(winner)
+    );
+    assert_eq!(bench.config_text().matches("[[sources]]").count(), 1);
+}
+
+/// A secret already stored under the name the setup keeps its secret under, for the same
+/// origin, is replaced: the card says so before anything is kept.
+#[tokio::test]
+async fn the_card_says_which_stored_secret_it_replaces() {
+    let mut bench = bench().await;
+    bench
+        .requests
+        .keep_secret(
+            "calendar_caldav",
+            "https://cloud.example",
+            &secrecy::SecretString::from("old-password"),
+        )
+        .await
+        .unwrap();
+    let call = bench.call(context("alix"), calendar_prefill());
+    let shown = bench.card().await;
+    let text = message(&shown.card);
+    assert!(
+        text.contains(
+            "remplace le secret « calendar_caldav » déjà gardé pour https://cloud.example."
+        ),
+        "{text}"
+    );
+    bench
+        .requests
+        .answer(shown.id, calendar_answer(EVENTS, REMINDERS, false), &alix())
+        .await
+        .unwrap();
+    let out = result(call).await;
+    assert_eq!(out["result"]["status"], "set_up", "{out}");
+    assert_eq!(
+        stored(&bench, "calendar_caldav", "https://cloud.example")
+            .await
+            .as_deref(),
+        Some(CANARY)
+    );
+}
+
+/// A user name typed on the card is checked as `prefill`'s are: nothing is kept for one that
+/// holds `:` or a hidden character.
+#[tokio::test]
+async fn a_typed_user_name_is_checked() {
+    let mut bench = bench().await;
+    for (username, why) in [("al:ix", "':'"), ("al\nix", "one line")] {
+        let call = bench.call(context("alix"), calendar_prefill());
+        let shown = bench.card().await;
+        let Response::Form { mut values } = calendar_answer(EVENTS, REMINDERS, false) else {
+            unreachable!()
+        };
+        values.insert("caldav.username".to_owned(), text(username));
+        bench
+            .requests
+            .answer(shown.id, Response::Form { values }, &alix())
+            .await
+            .unwrap();
+        let out = output(call).await;
+        assert!(
+            out.is_error && out.to_text().contains(why),
+            "{username:?}: {}",
+            out.to_text()
+        );
+    }
+    assert_eq!(bench.config_text(), CONFIG);
+    assert!(
+        bench
+            .requests
+            .stored_origin("calendar_caldav")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Confirmed, another origin than the card showed gets the secret, sealed for it alone.
+#[tokio::test]
+async fn a_confirmed_new_origin_stores_the_secret_for_it_only() {
+    const OTHER: &str = "https://dav.example.org/calendars/alix/";
+    let mut bench = bench().await;
+    let call = bench.call(context("alix"), calendar_prefill());
+    let shown = bench.card().await;
+    bench
+        .requests
+        .answer(shown.id, calendar_answer(OTHER, OTHER, false), &alix())
+        .await
+        .unwrap();
+    let confirm = bench.card().await;
+    bench
+        .requests
+        .answer(confirm.id, confirmed(), &alix())
+        .await
+        .unwrap();
+    let out = result(call).await;
+    assert_eq!(out["result"]["status"], "set_up", "{out}");
+    assert_eq!(
+        stored(&bench, "calendar_caldav", "https://dav.example.org")
+            .await
+            .as_deref(),
+        Some(CANARY)
+    );
+    assert_eq!(
+        stored(&bench, "calendar_caldav", "https://cloud.example").await,
+        None,
+        "not for the origin the card first showed"
+    );
+    let text = bench.config_text();
+    assert!(
+        text.contains(r#"allow = ["https://dav.example.org"]"#),
+        "{text}"
+    );
+    assert!(!text.contains("cloud.example"), "{text}");
+}
+
+/// A call cut as the answer comes keeps nothing: no secret stored, nothing written.
+#[tokio::test]
+async fn a_cut_call_stores_and_writes_nothing() {
+    let mut bench = bench().await;
+    let context = context("alix");
+    let token = context.cancelled.clone();
+    let call = bench.call(context, calendar_prefill());
+    let shown = bench.card().await;
+    *bench.cut.lock().unwrap() = Some(token);
+    bench
+        .requests
+        .answer(shown.id, calendar_answer(EVENTS, REMINDERS, false), &alix())
+        .await
+        .unwrap();
+    let out = output(call).await;
+    assert!(
+        out.is_error && out.to_text().contains("cut"),
+        "{}",
+        out.to_text()
+    );
+    bench.no_card();
+    assert_eq!(bench.config_text(), CONFIG);
+    assert!(
+        bench
+            .requests
+            .stored_origin("calendar_caldav")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        bench
+            .integrations
+            .available()
+            .iter()
+            .any(|i| i.name == "calendar")
+    );
+}
+
+/// The setup card is tied to its call: after a restart nobody would act on its answer, so the
+/// requests opened again expire it, and an answer is refused.
+#[tokio::test]
+async fn a_restart_expires_the_setup_card() {
+    let mut bench = bench().await;
+    let call = bench.call(context("alix"), calendar_prefill());
+    let shown = bench.card().await;
+    // Fronde starts again on the same database.
+    let db = fronde_db::open(&bench.dir.path().join("data"))
+        .await
+        .unwrap();
+    let (send, _cards) = mpsc::unbounded_channel();
+    let journal = Cards::new(send);
+    let closed = journal.closed.clone();
+    let store = SecretStore::new(
+        Backends::file(bench.dir.path().join("master.key")),
+        Arc::new(EphemeralSecrets::new()),
+    );
+    let restarted = Requests::open_with(db, Arc::new(journal), Some(store))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed.lock().unwrap().as_slice(), [(id, Outcome::Expired)] if *id == shown.id),
+        "{:?}",
+        closed.lock().unwrap()
+    );
+    assert_eq!(
+        restarted
+            .answer(shown.id, calendar_answer(EVENTS, REMINDERS, false), &alix())
+            .await,
+        Err(Refusal::Closed)
+    );
+    call.abort();
+    assert_eq!(bench.config_text(), CONFIG);
+    assert!(
+        restarted
+            .stored_origin("calendar_caldav")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The dry run takes only the files shipped with this build: changed files on disk are refused,
+/// even pinned by their hashes in the entry or approved by the owner for that name.
+#[tokio::test]
+async fn dry_run_takes_only_the_shipped_files() {
+    let bench = bench().await;
+    let shipped = fronde_hub::config::shipped_component("echo").unwrap();
+    let copy = bench.dir.path().join("changed");
+    std::fs::create_dir(&copy).unwrap();
+    let wasm = copy.join("echo.wasm");
+    std::fs::copy(&shipped, &wasm).unwrap();
+    let mut manifest = std::fs::read_to_string(shipped.with_extension("toml")).unwrap();
+    let entry = |sha256: Option<String>, manifest_sha256: Option<String>| ComponentConfig {
+        name: "echo".into(),
+        path: wasm.clone(),
+        manifest: None,
+        sha256,
+        manifest_sha256,
+        allow: Vec::new(),
+        settings: Default::default(),
+        credentials: Vec::new(),
+    };
+    // The same files elsewhere are the shipped ones.
+    std::fs::write(copy.join("echo.toml"), &manifest).unwrap();
+    bench
+        .integrations
+        .dry_run(&entry(None, None))
+        .await
+        .unwrap();
+    // Changed, they are refused, however else they would be approved.
+    manifest.push_str("\n# changed on disk\n");
+    std::fs::write(copy.join("echo.toml"), &manifest).unwrap();
+    let hashes = fronde_wasm::Hashes::of(&entry(None, None)).unwrap();
+    let pinned = entry(
+        Some(hashes.sha256.clone()),
+        Some(hashes.manifest_sha256.clone()),
+    );
+    let error = bench.integrations.dry_run(&pinned).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not the ones shipped with this build"),
+        "{error:#}"
+    );
+    let db = fronde_db::open(&bench.dir.path().join("data"))
+        .await
+        .unwrap();
+    fronde_db::approvals::add(&db, "echo", &hashes.sha256, &hashes.manifest_sha256)
+        .await
+        .unwrap();
+    let error = bench
+        .integrations
+        .dry_run(&entry(None, None))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not the ones shipped with this build"),
+        "{error:#}"
+    );
+}
+
+/// An outside MCP client is not told of the integrations it cannot set up; a thread's agent is.
+#[tokio::test]
+async fn search_tools_lists_integrations_to_threads_only() {
+    let bench = bench().await;
+    let search = |context: CallContext| {
+        let hub = bench.hub.clone();
+        async move {
+            hub.registry
+                .call_as(&context, "search_tools", json!({"need": "echo some text"}))
+                .await
+                .to_text()
+        }
+    };
+    assert!(
+        search(context("alix"))
+            .await
+            .contains(r#""integration":"echo""#),
+        "a thread's agent is told"
+    );
+    let outside = search(CallContext {
+        caller: Caller::Mcp("Codex".into()),
+        ..context("alix")
+    })
+    .await;
+    assert!(!outside.contains(r#""integration":"#), "{outside}");
+    let anonymous = bench
+        .hub
+        .registry
+        .call("search_tools", json!({"need": "echo some text"}))
+        .await
+        .to_text();
+    assert!(!anonymous.contains(r#""integration":"#), "{anonymous}");
+}
+
+/// Without the threads, nothing would check the turn that asks: the setup is not served, and
+/// `search_tools` lists no integration.
+#[tokio::test]
+async fn no_setup_without_the_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let etc = dir.path().join("etc");
+    std::fs::create_dir(&etc).unwrap();
+    let config = etc.join("fronde.toml");
+    std::fs::write(&config, CONFIG).unwrap();
+    let loaded = fronde_hub::config::load(&config).unwrap();
+    fronde_hub::private::prepare_data_dir(&loaded.data.dir).unwrap();
+    let db = fronde_db::open(&loaded.data.dir).await.unwrap();
+    let (send, _cards) = mpsc::unbounded_channel();
+    let requests = Requests::open_with(db.clone(), Arc::new(Cards::new(send)), None)
+        .await
+        .unwrap();
+    let integrations = Arc::new(Shipped::new(&loaded, db.clone()).unwrap());
+    let hub = Hub::start(
+        loaded,
+        db,
+        vec![],
+        Some(requests),
+        None,
+        Some(integrations as Arc<dyn Integrations>),
+    )
+    .await
+    .unwrap();
+    assert!(hub.registry.get(TOOL).is_none());
+    let found = hub
+        .registry
+        .call_as(
+            &context("alix"),
+            "search_tools",
+            json!({"need": "echo some text"}),
+        )
+        .await
+        .to_text();
+    assert!(!found.contains(r#""integration":"#), "{found}");
 }
