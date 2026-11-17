@@ -300,5 +300,5 @@ read = ["/home/alex/.local/share/claude"]
 | Variable | Meaning |
 | --- | --- |
 | `FRONDE_SITE_ROOT` | Directory of the built web interface. Default `target/dx/fronde-web/release/web/public`, relative to the working directory. |
-| `RUST_LOG` | Log filter, such as `debug` or `fronde_hub=debug`. Default `info`. |
+| `RUST_LOG` | Log filter, such as `debug` or `fronde_hub=debug`. Default `info`. The WebSocket library's targets (`tungstenite`, `tokio_tungstenite`) stay off whatever it says: they would log the chat's messages, secrets typed in a card included. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Read by the agent, not by Fronde: the token from `claude setup-token`. |

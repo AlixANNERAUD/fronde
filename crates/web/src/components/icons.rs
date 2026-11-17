@@ -40,6 +40,16 @@ macro_rules! icons {
 icons! {
     ArrowUp => ["m5 12 7-7 7 7", "M12 19V5"];
     Check => ["M20 6 9 17l-5-5"];
+    ExternalLink => [
+        "M15 3h6v6",
+        "M10 14 21 3",
+        "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
+    ];
+    // Lucide's dot is a circle of radius 0.5; a round-capped stroke of no length draws the same.
+    KeyRound => [
+        "M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z",
+        "M16.5 7.5h.01",
+    ];
     Loader => [
         "M12 2v4",
         "m16.2 7.8 2.9-2.9",

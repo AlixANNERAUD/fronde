@@ -19,7 +19,7 @@ A request ends in one of four ways:
 
 | Status | When | The card says |
 | --- | --- | --- |
-| `answered` | You sent an answer | *Réponse : …* |
+| `answered` | You sent an answer | *Réponse : …*, or for a secret where it was kept |
 | `declined` | You pressed *Refuser* | *Refusée* |
 | `expired` | Its time ran out | *Expirée* |
 | `cancelled` | The asker gave up (its tool call was cancelled), the assistant's turn that asked ended or was stopped, or the request could not be shown | *Annulée* |
@@ -63,12 +63,41 @@ takes messages of at most 64 KiB, and closes on a bigger one.
 
 A closed card says how it ended, and who answered when it was not you.
 
+## Secret cards
+
+`user_secret` asks for one secret on a card of its own, never in a question card. The card shows
+why it is needed, a button to the sign-in or setup page when the agent gave one (https only, named
+by its host), and a masked box that neither checks spelling nor fills itself in; *Afficher* shows
+what you typed, *Masquer* hides it again. *Enregistrer* sends it, *Refuser* declines.
+
+By default the secret is kept **for this conversation**: in Fronde's memory only, never in
+`fronde.db`, for the agent that asked and in this conversation only, for one hour, and used up by
+its first use. When the agent proposes a name and an origin, an admin also gets a box *Garder pour
+<origin>*: ticked, the secret is sealed in `fronde.db` under that name, to be sent to that origin
+only, as `fronde secret set` would store it. Nobody else sees the box, and the server refuses a
+kept secret from anyone but an admin.
+
+The answer travels from the page to the server on the chat's WebSocket and goes straight to the
+secret store. The page empties the box once it is sent, and never shows the secret again. On the
+server, the message is wiped once read, and the value becomes a `SecretString`, wiped once it is
+stored. Then the request closes: its row keeps where the secret went (`{"kept": "conversation",
+"secret_ref": …}` or `{"kept": "stored", "name": …, "origin": …}`), the conversation says
+*Enregistré, jamais montré à l'agent* or *Gardé pour <origin>*, and the agent gets the reference
+or the name. Two pages answering at once keep one secret: the first answer wins, and the second
+is refused before anything is kept.
+
+A `secret_ref` is useless outside its conversation and to another asker, and every refusal says
+the same thing, so a guess learns nothing. No tool takes one yet (see
+[Tools](../reference/tools.md#user_secret)); the stored name is what a component can use today.
+
 ## Restarts and retries
 
 The table is the source of truth. After a restart, a request whose time ran out expires; one
 whose card never reached the conversation, because Fronde stopped in between, is shown then; the
 others stay answerable. A tool call that is retried with the same `client_request_id` joins the
-request it started instead of showing a second card.
+request it started instead of showing a second card. Secrets kept for a conversation do not
+survive a restart: they live in memory only. A secret card still pending after a restart stays
+answerable.
 
 The id alone proves nothing: the assistant reuses ids from one turn to the next, and outside
 clients choose their names, so two of them can share one. A retry therefore joins a request only
@@ -99,13 +128,18 @@ changes a few things:
 - Answers are typed and checked against the card, rather than returned as text.
 - Any signed-in page answers, the first answer wins, rather than only the thread that asked.
 - Statuses tell a refusal (`declined`) from a dismissal (`cancelled`) and a timeout (`expired`).
+- A secret's reference works only in its conversation and for the asker, and the card itself
+  offers to keep the secret for an origin, which only the owner can choose. A `url` must be
+  given, over https; it is never guessed from the reason's text. There is no `value` argument for
+  a secret already pasted in the chat: that one went through the model and the logs, and storing
+  it would hide the leak.
 
 ## Planned
 
 These use the same requests and cards, and are **not built yet**:
 
-- **Secrets** (`user_secret`): one secret per card, sent to the secret store and never to the
-  agent, which gets a reference instead.
+- **Tools that take a `secret_ref`**: integration setup from the chat, and commands that read a
+  secret from a file in threads that have a shell.
 - **Permissions**: the agent's requests to use a tool become cards too, expiring after 30 minutes
   with a refusal. Until then they keep their own card, answered with the same `answer` message.
 - **Elicitations**: forms that Claude's `AskUserQuestion` and upstream MCP servers send, shown as

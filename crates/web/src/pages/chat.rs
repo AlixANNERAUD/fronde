@@ -58,7 +58,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
                     class: "mx-auto flex w-full max-w-3xl flex-col gap-3 px-4 py-4",
                     for row in chat.rows() {
                         li { key: "{row.generation}-{row.seq}", class: "flex flex-col",
-                            RowView { item: row.item.clone(), open, on_send }
+                            RowView { item: row.item.clone(), open, admin: chat.admin(), on_send }
                         }
                     }
                 }
@@ -71,7 +71,7 @@ pub fn ChatView(chat: Chat, status: Status, on_send: EventHandler<Outgoing>) -> 
 }
 
 #[component]
-fn RowView(item: Item, open: bool, on_send: EventHandler<Outgoing>) -> Element {
+fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>) -> Element {
     match item {
         Item::User { text } => rsx! {
             Message { align: MessageAlign::End,
@@ -116,6 +116,7 @@ fn RowView(item: Item, open: bool, on_send: EventHandler<Outgoing>) -> Element {
                 refusal,
                 by,
                 open,
+                admin,
                 on_send,
             }
         },

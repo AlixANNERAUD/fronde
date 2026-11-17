@@ -397,7 +397,9 @@ async fn retry_with_client_request_id_reuses_the_request() {
 
 /// `ask` with another question, under the same `client_request_id`.
 fn other_question(mut ask: Ask) -> Ask {
-    let Card::Form { fields, .. } = &mut ask.card;
+    let Card::Form { fields, .. } = &mut ask.card else {
+        unreachable!("a question");
+    };
     let Field::Choice { question, .. } = &mut fields[0];
     *question = "Et laquelle ensuite ?".into();
     ask
@@ -782,4 +784,313 @@ async fn unannounced_row_is_announced_at_start() {
         .answer(crashed, pick("Seerr"), &alix())
         .await
         .unwrap();
+}
+
+mod secrets {
+    use super::*;
+    use fronde_db::ephemeral::{EphemeralScope, EphemeralSecrets};
+    use fronde_db::master_key::Backends;
+    use fronde_protocol::{Keep, Remember, SecretValue};
+    use fronde_requests::{Saved, SecretStore};
+    use secrecy::ExposeSecret as _;
+
+    const CANARY: &str = "canary-card-secret-7d1e9b";
+
+    fn card(remember: bool) -> Card {
+        Card::Secret {
+            label: "Mot de passe Nextcloud".into(),
+            reason: "Pour lire ton agenda.".into(),
+            placeholder: None,
+            url: None,
+            remember: remember.then(|| Remember {
+                name: "nextcloud".into(),
+                origin: "https://cloud.example".into(),
+            }),
+        }
+    }
+
+    fn ask_secret(remember: bool) -> Ask {
+        Ask {
+            card: card(remember),
+            ..ask()
+        }
+    }
+
+    fn secret(value: &str, keep: Keep) -> Response {
+        Response::Secret {
+            value: SecretValue::new(value.into()),
+            keep,
+        }
+    }
+
+    struct Bench {
+        requests: Arc<Requests>,
+        journal: Arc<FakeJournal>,
+        ephemeral: Arc<EphemeralSecrets>,
+        key_file: std::path::PathBuf,
+        dir: tempfile::TempDir,
+    }
+
+    async fn bench() -> Bench {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let key_file = dir.path().join("master.key");
+        let db = fronde_db::open(&data).await.unwrap();
+        let journal = Arc::new(FakeJournal::default());
+        let ephemeral = Arc::new(EphemeralSecrets::new());
+        let store = SecretStore::new(Backends::file(&key_file), ephemeral.clone());
+        let requests = Requests::open_with(db, journal.clone(), Some(store))
+            .await
+            .unwrap();
+        Bench {
+            requests,
+            journal,
+            ephemeral,
+            key_file,
+            dir,
+        }
+    }
+
+    impl Bench {
+        fn data(&self) -> std::path::PathBuf {
+            self.dir.path().join("data")
+        }
+
+        /// No file of the data directory holds `text`: the database, its WAL and shared memory.
+        fn assert_on_no_disk(&self, text: &str) {
+            let mut scanned = 0;
+            for entry in std::fs::read_dir(self.data()).unwrap() {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                scanned += 1;
+                assert!(
+                    !bytes
+                        .windows(text.len())
+                        .any(|window| window == text.as_bytes()),
+                    "{} holds the secret",
+                    path.display()
+                );
+            }
+            assert!(scanned >= 2, "the database files are missing");
+        }
+    }
+
+    fn assistant_scope(turn: Option<u64>) -> EphemeralScope {
+        EphemeralScope {
+            topic: TOPIC.into(),
+            asker: "assistant".into(),
+            turn,
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_for_the_conversation_never_leaves_the_store() {
+        let bench = bench().await;
+        let waiter = bench.requests.ask(ask_secret(false)).await.unwrap();
+        let id = waiter.id();
+        assert_eq!(row(&bench.data(), id).await.kind, "secret");
+        bench
+            .requests
+            .answer(id, secret(CANARY, Keep::Conversation), &alix())
+            .await
+            .unwrap();
+        let Resolution::Saved(Saved::Conversation {
+            secret_ref,
+            expires_at,
+        }) = resolved(waiter).await
+        else {
+            panic!("not saved for the conversation");
+        };
+        assert!(secret_ref.starts_with("sr_"), "{secret_ref}");
+        assert!(expires_at > chrono::Utc::now() + chrono::Duration::minutes(59));
+        assert_eq!(
+            bench.journal.shown().last(),
+            Some(&Shown::Closed {
+                id,
+                outcome: Outcome::Saved {
+                    kept: Keep::Conversation
+                },
+                by: Some("alix".into()),
+            })
+        );
+        let saved = row(&bench.data(), id).await;
+        assert_eq!(saved.status, "answered");
+        let response = saved.response.unwrap().to_string();
+        assert!(response.contains(r#""kept":"conversation""#), "{response}");
+        assert!(!response.contains(CANARY), "{response}");
+        bench.assert_on_no_disk(CANARY);
+
+        // Only for the asker in this conversation, once.
+        let mut codex = assistant_scope(None);
+        codex.asker = "mcp:Codex".into();
+        assert!(bench.ephemeral.take(&secret_ref, &codex).is_err());
+        let value = bench
+            .ephemeral
+            .take(&secret_ref, &assistant_scope(Some(2)))
+            .unwrap();
+        assert_eq!(value.expose_secret(), CANARY);
+        assert!(
+            bench
+                .ephemeral
+                .take(&secret_ref, &assistant_scope(Some(2)))
+                .is_err()
+        );
+        // Nothing sealed.
+        assert!(!bench.key_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_secret_from_the_wrong_user_is_refused() {
+        let bench = bench().await;
+        let waiter = bench.requests.ask(ask_secret(true)).await.unwrap();
+        let id = waiter.id();
+        let sam = User {
+            name: "sam".into(),
+            admin: true,
+        };
+        for keep in [Keep::Conversation, Keep::Stored] {
+            assert_eq!(
+                bench.requests.answer(id, secret(CANARY, keep), &sam).await,
+                Err(Refusal::NotYours)
+            );
+        }
+        assert!(bench.ephemeral.is_empty());
+        assert_eq!(row(&bench.data(), id).await.status, "pending");
+        assert!(!bench.key_file.exists());
+        bench.assert_on_no_disk(CANARY);
+    }
+
+    #[tokio::test]
+    async fn secret_kept_for_origin_needs_admin() {
+        let bench = bench().await;
+        let waiter = bench.requests.ask(ask_secret(true)).await.unwrap();
+        let id = waiter.id();
+        let family = User {
+            name: "alix".into(),
+            admin: false,
+        };
+        let refusal = bench
+            .requests
+            .answer(id, secret(CANARY, Keep::Stored), &family)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "Seul un administrateur peut garder un secret."
+        );
+        assert_eq!(row(&bench.data(), id).await.status, "pending");
+        assert!(!bench.key_file.exists());
+
+        bench
+            .requests
+            .answer(id, secret(CANARY, Keep::Stored), &alix())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved(waiter).await,
+            Resolution::Saved(Saved::Stored {
+                name: "nextcloud".into(),
+                origin: "https://cloud.example".into(),
+            })
+        );
+        assert!(bench.ephemeral.is_empty());
+        bench.assert_on_no_disk(CANARY);
+        // Sealed, bound to its origin, and opened by the key made for it.
+        let db = fronde_db::open(&bench.data()).await.unwrap();
+        let sealed = fronde_db::secrets::load_sealed(&db, fronde_db::secrets::SOURCES)
+            .await
+            .unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].name, "nextcloud");
+        assert_eq!(sealed[0].origin, "https://cloud.example");
+        let key = Backends::file(&bench.key_file)
+            .load(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sealed[0].open(&key).unwrap().expose_secret(), CANARY);
+        let response = row(&bench.data(), id).await.response.unwrap().to_string();
+        assert!(response.contains(r#""kept":"stored""#), "{response}");
+        assert!(!response.contains(CANARY), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_stored_name_never_moves_to_another_origin() {
+        let bench = bench().await;
+        let mut elsewhere = ask_secret(true);
+        elsewhere.card = Card::Secret {
+            label: "Mot de passe".into(),
+            reason: "Pour un autre site.".into(),
+            placeholder: None,
+            url: None,
+            remember: Some(Remember {
+                name: "nextcloud".into(),
+                origin: "https://other.example".into(),
+            }),
+        };
+        let first = bench.requests.ask(ask_secret(true)).await.unwrap();
+        bench
+            .requests
+            .answer(first.id(), secret("first-value", Keep::Stored), &alix())
+            .await
+            .unwrap();
+        let second = bench.requests.ask(elsewhere).await.unwrap();
+        let refusal = bench
+            .requests
+            .answer(second.id(), secret(CANARY, Keep::Stored), &alix())
+            .await
+            .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("est déjà gardé pour https://cloud.example"),
+            "{refusal}"
+        );
+        assert_eq!(
+            bench.requests.stored_origin("nextcloud").await.unwrap(),
+            Some("https://cloud.example".into())
+        );
+        assert_eq!(row(&bench.data(), second.id()).await.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_secret_is_kept_once_whatever_answers_twice() {
+        let bench = bench().await;
+        let mut first = ask_secret(false);
+        first.client_request_id = Some("token".into());
+        let waiter = bench.requests.ask(first.clone()).await.unwrap();
+        let id = waiter.id();
+        let alix = alix();
+        let (a, b) = tokio::join!(
+            bench
+                .requests
+                .answer(id, secret(CANARY, Keep::Conversation), &alix),
+            bench
+                .requests
+                .answer(id, secret("other", Keep::Conversation), &alix),
+        );
+        assert!(a.is_ok() != b.is_ok(), "{a:?} {b:?}");
+        assert_eq!(a.err().or(b.err()), Some(Refusal::Closed));
+        assert_eq!(bench.ephemeral.len(), 1);
+        let saved = resolved(waiter).await;
+        // A retry in the same turn learns where it was kept, from the row.
+        let retry = bench.requests.ask(first).await.unwrap();
+        assert_eq!(retry.id(), id);
+        assert_eq!(resolved(retry).await, saved);
+    }
+
+    #[tokio::test]
+    async fn a_secret_answer_without_a_store_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (requests, _journal) = open(dir.path()).await;
+        let waiter = requests.ask(ask_secret(false)).await.unwrap();
+        assert_eq!(
+            requests
+                .answer(waiter.id(), secret(CANARY, Keep::Conversation), &alix())
+                .await,
+            Err(Refusal::Failed)
+        );
+        assert_eq!(row(dir.path(), waiter.id()).await.status, "pending");
+    }
 }

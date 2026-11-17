@@ -9,6 +9,8 @@ version.workspace = true
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
+# A secret typed in a card is wiped from memory once used.
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

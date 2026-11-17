@@ -152,6 +152,37 @@ Some plain copies remain:
   decrypted secret and zbus's D-Bus message buffers. An entry that is not text comes back as
   bytes inside keyring-core's `BadEncoding` error: Fronde zeroes the bytes it gets, not the copies
   made before.
+- A secret typed in a card crosses the WebSocket library's read buffer, which is not zeroed.
+  Fronde wipes the message it is handed once read, and the value it parses becomes a
+  `SecretString` at once. In the browser, the page empties the box once the secret is sent, but
+  the browser's own copies (the input's history, the outgoing message) are its own.
+
+## Secrets given in a card
+
+`user_secret` asks for a secret on a card; see [Requests and cards](requests.md#secret-cards).
+The value goes from the page to the store and nowhere else: not to the agent, which gets a
+reference or a name; not to the conversation stream or any message the pages get; not to the
+request's row, which keeps where it went; not to the log. Tests check each of these with known
+values: the stream, the rows, every file of the data directory (`fronde.db`, its `-wal` and
+`-shm`), the tool's result and the log captured at TRACE from every library. The WebSocket
+library writes every message it receives at TRACE, so Fronde's log filter turns its targets
+(`tungstenite`, `tokio_tungstenite`) off, whatever `RUST_LOG` says.
+
+A secret kept **for this conversation** lives in Fronde's memory only: never on disk, gone at the
+next restart. Its reference, `sr_` and 128 random bits, works for the asker that got it, in that
+conversation, once, for one hour (at most a day); every refusal gives the same message, so a
+probe learns nothing. Expired ones are wiped at the next use of the store and every hour, all of
+them when Fronde stops. No tool takes a reference yet.
+
+A secret **kept for an origin** is sealed like one stored with `fronde secret set`, and only an
+admin can choose that: the box is shown to admins only, and the server refuses it from anyone
+else. The agent proposes the name and origin, and the card shows the origin. A name already
+stored for another origin is refused: a card cannot move a stored secret to another origin. The
+first secret kept this way makes the master key, as `fronde secret set` does, and Fronde logs
+where, to be backed up.
+
+The card's link button takes an `https://` address only, with no user name or password before
+the host, and names the host it opens: the agent's text never becomes a link otherwise.
 
 ## Core dumps and other processes
 
@@ -312,6 +343,7 @@ one answer, or an answer to a closed request are refused, and the request does n
 refusal goes to that page only and is never logged; a message that does not parse is logged with
 its position only, never its content. A question card is not for secrets: `user_ask` tells agents
 never to ask for a password or key, and its answers are kept in `fronde.db` as an audit trail.
+Secrets have their own card, `user_secret` (see above).
 Cards show agents' text as text, never as HTML. See [Requests and cards](requests.md).
 
 ## Untrusted content

@@ -1,9 +1,11 @@
 //! The `user_*` tools: ask the user, through a card in the chat, and wait for the answer.
 
+use crate::config::is_valid_name;
+use crate::origin::Origin;
 use crate::source::Tool;
 use crate::tools::{CallContext, ToolOutput, typed_tool_with_context};
-use fronde_protocol::{Card, ChoiceOption, Field, Response};
-use fronde_requests::{Ask, Caller, Requests, Resolution, Reused};
+use fronde_protocol::{Card, ChoiceOption, Field, Remember, Response};
+use fronde_requests::{Ask, Caller, Requests, Resolution, Reused, Saved, Waiter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,6 +31,14 @@ const MAX_PREVIEW: usize = 4000;
 const MAX_CLIENT_NAME: usize = 40;
 /// Names an outside client may not take: a card headed with them would pass for Fronde's own.
 const RESERVED_CLIENT_NAMES: [&str; 2] = ["fronde", "assistant"];
+
+/// A secret card's texts.
+const MAX_SECRET_LABEL: usize = 60;
+const MAX_REASON: usize = 300;
+const MAX_PLACEHOLDER: usize = 60;
+const MAX_URL: usize = 2000;
+
+const SECRET_DESCRIPTION: &str = "Ask the user for one secret (password, token, key) in a private card and wait. The value never reaches you: you get a one-use secret_ref for this conversation, or, if the owner keeps it, the name it is stored under. One secret per call; never ask for a secret in chat or in user_ask. Blocks up to timeout_ms (default 10 min).";
 
 const DESCRIPTION: &str = "Ask the user 1 to 4 multiple-choice questions and wait for the answers. Use when a choice is theirs, not to confirm what you can decide. Recommended option first, with recommended: true. The user can always answer in their own words. Never ask for a password or key here. Blocks up to timeout_ms (default 10 min).";
 
@@ -70,18 +80,280 @@ struct OptionArg {
     recommended: bool,
 }
 
-/// The `user_*` tools, asking through `requests`.
+#[derive(Deserialize, JsonSchema)]
+struct SecretArgs {
+    /// What to type, a few words (at most 60 characters), such as "Mot de passe Nextcloud".
+    label: String,
+    /// Why you need it, one sentence (at most 300 characters).
+    reason: String,
+    /// A hint shown in the empty box (at most 60 characters), such as "xxxx-xxxx-xxxx".
+    placeholder: Option<String>,
+    /// The sign-in or setup page where the user finds or makes the secret: an https:// address,
+    /// shown as a button.
+    url: Option<String>,
+    /// Lets the owner keep the secret for good, sealed, sent only to this origin, under this
+    /// name; a component can then use it as a { stored = "name" } credential. Leave it out for
+    /// a secret needed in this conversation only.
+    remember: Option<RememberArg>,
+    /// How long to wait for the answer, in milliseconds: 1000 to 3600000 (default 600000).
+    timeout_ms: Option<u64>,
+    /// Give the same value, with the same arguments, when retrying this call in the same turn,
+    /// so the user sees one card, not two. A new secret needs a new value.
+    client_request_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RememberArg {
+    /// The name to store it under: lower-case letters, digits and _, starting with a letter, at
+    /// most 64 characters, such as "nextcloud_password".
+    name: String,
+    /// The only origin it may be sent to, scheme://host[:port], such as
+    /// "https://cloud.example.com": over https, or http to this machine.
+    origin: String,
+}
+
+/// The `user_*` tools, asking through `requests`; `user_secret` only when `requests` keeps
+/// secrets.
 pub fn user_tools(requests: Arc<Requests>) -> Vec<Tool> {
-    let ask = typed_tool_with_context(
-        "user_ask",
-        DESCRIPTION,
-        false,
+    let ask = typed_tool_with_context("user_ask", DESCRIPTION, false, {
+        let requests = requests.clone();
         move |context: CallContext, args: AskArgs| {
             let requests = requests.clone();
             async move { user_ask(&requests, context, args).await }
-        },
-    );
-    vec![ask]
+        }
+    });
+    let mut tools = vec![ask];
+    if requests.secrets().is_some() {
+        tools.push(typed_tool_with_context(
+            "user_secret",
+            SECRET_DESCRIPTION,
+            false,
+            move |context: CallContext, args: SecretArgs| {
+                let requests = requests.clone();
+                async move { user_secret(&requests, context, args).await }
+            },
+        ));
+    }
+    tools
+}
+
+/// Waits for the request's end, or cancels it when the caller gives the call up: the card must
+/// not stay open for an answer nobody reads.
+async fn wait(requests: &Requests, context: &CallContext, waiter: Waiter) -> Resolution {
+    let id = waiter.id();
+    tokio::select! {
+        resolution = waiter.wait() => resolution,
+        () = context.cancelled.cancelled() => {
+            if let Err(error) = requests.cancel(id).await {
+                tracing::error!("cannot cancel request {id}: {error:#}");
+            }
+            Resolution::Cancelled
+        }
+    }
+}
+
+async fn user_secret(requests: &Requests, context: CallContext, args: SecretArgs) -> ToolOutput {
+    if let Err(message) = check_asker(&context.caller) {
+        return ToolOutput::error(message);
+    }
+    let (card, timeout) = match check_secret(&args) {
+        Ok(checked) => checked,
+        Err(message) => return ToolOutput::error(message),
+    };
+    if let Card::Secret {
+        remember: Some(remember),
+        ..
+    } = &card
+    {
+        match requests.stored_origin(&remember.name).await {
+            Ok(Some(other)) if other != remember.origin => {
+                return ToolOutput::error(format!(
+                    "remember.name {:?} is already stored for {other}; give another name, or {other} as remember.origin to replace it",
+                    remember.name
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!("user_secret cannot read the stored secrets: {error:#}");
+                return ToolOutput::error(
+                    "the stored secrets cannot be read; ask again without remember",
+                );
+            }
+        }
+    }
+    let ask = Ask {
+        topic: context.topic.clone(),
+        turn: context.turn,
+        caller: context.caller.clone(),
+        client_request_id: args.client_request_id,
+        card,
+        for_user: context.user.clone(),
+        admin_only: false,
+        timeout,
+    };
+    let waiter = match requests.ask(ask).await {
+        Ok(waiter) => waiter,
+        Err(error) if error.is::<Reused>() => {
+            return ToolOutput::error(format!(
+                "{error}; give a new client_request_id for a new secret, or retry with exactly the same arguments"
+            ));
+        }
+        Err(error) => {
+            tracing::error!("user_secret cannot open its request: {error:#}");
+            return ToolOutput::error(
+                "the card could not be shown to the user; say in your reply that you need this secret, and never ask for it in chat",
+            );
+        }
+    };
+    match wait(requests, &context, waiter).await {
+        Resolution::Saved(Saved::Conversation {
+            secret_ref,
+            expires_at,
+        }) => ToolOutput::ok(json!({
+            "status": "saved",
+            "secret_ref": secret_ref,
+            "expires_at": expires_at,
+        }))
+        .with_next(
+            "Kept for this conversation only, usable once until expires_at. No tool accepts a secret_ref yet: it expires unused. For a component's credential, ask again with remember so the owner can store it.",
+        ),
+        Resolution::Saved(Saved::Stored { name, origin }) => ToolOutput::ok(json!({
+            "status": "saved",
+            "stored": name,
+            "origin": origin,
+        }))
+        .with_next(format!(
+            "Stored for {origin} only. A component sends it there when its [[sources.credentials]] entry for {origin} names it as {{ stored = \"{name}\" }}; the owner edits the configuration."
+        )),
+        Resolution::Answered(_) => {
+            ToolOutput::error("the answer is not a secret; ask again with user_secret")
+        }
+        Resolution::Declined => ToolOutput::ok(json!({"status": "declined"}))
+            .with_next("The user declined to give it; do not ask again this turn."),
+        Resolution::Expired => ToolOutput::ok(json!({"status": "expired"}))
+            .with_next("No answer in time; go on without it if you can, or say what you need in your reply."),
+        Resolution::Cancelled => ToolOutput::ok(json!({"status": "cancelled"}))
+            .with_next("The request was cancelled; stop and wait for the user's next message."),
+    }
+}
+
+/// The secret card the arguments describe, or what to fix in them.
+fn check_secret(args: &SecretArgs) -> Result<(Card, Duration), String> {
+    let timeout = check_timeout(args.timeout_ms)?;
+    check_client_request_id(args.client_request_id.as_deref())?;
+    let label = args.label.trim();
+    if label.is_empty() {
+        return Err(
+            "label is empty; say what to type in a few words, such as \"Mot de passe Nextcloud\""
+                .into(),
+        );
+    }
+    check_text(
+        "label",
+        label,
+        MAX_SECRET_LABEL,
+        false,
+        "and put the details in reason",
+    )?;
+    let reason = args.reason.trim();
+    if reason.is_empty() {
+        return Err("reason is empty; say in one sentence why you need the secret".into());
+    }
+    check_text("reason", reason, MAX_REASON, false, "one sentence at most")?;
+    let placeholder = args
+        .placeholder
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    if let Some(placeholder) = placeholder {
+        check_text(
+            "placeholder",
+            placeholder,
+            MAX_PLACEHOLDER,
+            false,
+            "a short hint",
+        )?;
+    }
+    let url = args.url.as_deref().map(check_url).transpose()?;
+    let remember = args.remember.as_ref().map(check_remember).transpose()?;
+    let card = Card::Secret {
+        label: label.to_owned(),
+        reason: reason.to_owned(),
+        placeholder: placeholder.map(str::to_owned),
+        url,
+        remember,
+    };
+    Ok((card, timeout))
+}
+
+/// A sign-in or setup page the card may link to: https, with a host, and no user name or
+/// password before it, which would make the button's host read as another. Normalised.
+fn check_url(url: &str) -> Result<String, String> {
+    let url = url.trim();
+    check_text("url", url, MAX_URL, false, "give the page's address alone")?;
+    let parsed = url::Url::parse(url).map_err(|error| {
+        format!("url {url:?} is not a URL ({error}); give a full https:// address, or leave it out")
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "url must be an https:// address, not {}:; give the sign-in or setup page over https, or leave it out",
+            parsed.scheme()
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "url must not carry a user name or password before its host; give the page's address alone"
+                .into(),
+        );
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err("url has no host; give a full https:// address, or leave it out".into());
+    }
+    Ok(parsed.to_string())
+}
+
+/// Where the card may offer to keep the secret: a valid name, and an origin that may carry it,
+/// canonical.
+fn check_remember(remember: &RememberArg) -> Result<Remember, String> {
+    if !is_valid_name(&remember.name) {
+        return Err(format!(
+            "remember.name {:?} is not allowed; use lower-case letters, digits and _, starting with a letter, at most 64 characters, such as \"nextcloud_password\"",
+            remember.name
+        ));
+    }
+    let origin = Origin::parse(remember.origin.trim()).map_err(|error| {
+        format!("remember.origin: {error:#}; give scheme://host[:port], such as \"https://cloud.example.com\"")
+    })?;
+    if !origin.carries_credentials() {
+        return Err(format!(
+            "remember.origin {origin} is plain http to another machine, where a secret would cross the network readable; use its https:// origin"
+        ));
+    }
+    Ok(Remember {
+        name: remember.name.clone(),
+        origin: origin.to_string(),
+    })
+}
+
+fn check_timeout(timeout_ms: Option<u64>) -> Result<Duration, String> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(format!(
+            "timeout_ms {timeout_ms} is out of range; give {MIN_TIMEOUT_MS} to {MAX_TIMEOUT_MS}, or leave it out for {DEFAULT_TIMEOUT_MS}"
+        ));
+    }
+    Ok(Duration::from_millis(timeout_ms))
+}
+
+fn check_client_request_id(id: Option<&str>) -> Result<(), String> {
+    if let Some(id) = id
+        && (id.is_empty() || id.chars().count() > MAX_CLIENT_REQUEST_ID)
+    {
+        return Err(format!(
+            "client_request_id must have 1 to {MAX_CLIENT_REQUEST_ID} characters; leave it out if you do not retry"
+        ));
+    }
+    Ok(())
 }
 
 async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> ToolOutput {
@@ -94,12 +366,12 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
     };
     let questions: Vec<String> = args.questions.into_iter().map(|q| q.question).collect();
     let ask = Ask {
-        topic: context.topic,
+        topic: context.topic.clone(),
         turn: context.turn,
-        caller: context.caller,
+        caller: context.caller.clone(),
         client_request_id: args.client_request_id,
         card,
-        for_user: context.user,
+        for_user: context.user.clone(),
         admin_only: false,
         timeout,
     };
@@ -117,18 +389,7 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
             );
         }
     };
-    let id = waiter.id();
-    let resolution = tokio::select! {
-        resolution = waiter.wait() => resolution,
-        // The caller gave up: the card must not stay open for an answer nobody reads.
-        () = context.cancelled.cancelled() => {
-            if let Err(error) = requests.cancel(id).await {
-                tracing::error!("cannot cancel request {id}: {error:#}");
-            }
-            Resolution::Cancelled
-        }
-    };
-    match resolution {
+    match wait(requests, &context, waiter).await {
         Resolution::Answered(Response::Form { values }) => {
             let answers: Vec<Value> = questions
                 .iter()
@@ -145,7 +406,7 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
                 .collect();
             ToolOutput::ok(json!({"status": "answered", "answers": answers}))
         }
-        Resolution::Answered(_) => {
+        Resolution::Answered(_) | Resolution::Saved(_) => {
             ToolOutput::error("the answer does not fit the question; ask it in your reply instead")
         }
         Resolution::Declined => ToolOutput::ok(json!({"status": "declined"}))
@@ -237,19 +498,8 @@ fn check(args: &AskArgs) -> Result<(Card, Duration), String> {
             "questions has {count} items; give 1 to {MAX_QUESTIONS}, and ask more in a later call"
         ));
     }
-    let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
-        return Err(format!(
-            "timeout_ms {timeout_ms} is out of range; give {MIN_TIMEOUT_MS} to {MAX_TIMEOUT_MS}, or leave it out for {DEFAULT_TIMEOUT_MS}"
-        ));
-    }
-    if let Some(id) = &args.client_request_id
-        && (id.is_empty() || id.chars().count() > MAX_CLIENT_REQUEST_ID)
-    {
-        return Err(format!(
-            "client_request_id must have 1 to {MAX_CLIENT_REQUEST_ID} characters; leave it out if you do not retry"
-        ));
-    }
+    let timeout = check_timeout(args.timeout_ms)?;
+    check_client_request_id(args.client_request_id.as_deref())?;
     let mut fields = Vec::with_capacity(count);
     for (index, q) in args.questions.iter().enumerate() {
         let n = index + 1;
@@ -372,5 +622,5 @@ fn check(args: &AskArgs) -> Result<(Card, Duration), String> {
         fields,
         submit: None,
     };
-    Ok((card, Duration::from_millis(timeout_ms)))
+    Ok((card, timeout))
 }

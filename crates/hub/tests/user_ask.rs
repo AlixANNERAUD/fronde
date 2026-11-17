@@ -279,7 +279,9 @@ async fn user_ask_returns_typed_answers() {
     ]}));
     let (id, card, from) = bench.card().await;
     assert_eq!(from, None, "the assistant asks as Fronde");
-    let Card::Form { fields, .. } = &card;
+    let Card::Form { fields, .. } = &card else {
+        panic!("not a question card: {card:?}");
+    };
     assert_eq!(fields.len(), 2);
     let Field::Choice {
         key,
@@ -459,7 +461,9 @@ async fn user_ask_preview_keeps_its_lines() {
         ],
     }]}));
     let (id, card, _) = bench.card().await;
-    let Card::Form { fields, .. } = &card;
+    let Card::Form { fields, .. } = &card else {
+        panic!("not a question card: {card:?}");
+    };
     let Field::Choice { options, .. } = &fields[0];
     assert_eq!(options[0].preview.as_deref(), Some("| A | B |\n|\tC |"));
     bench.requests.cancel(id).await.unwrap();

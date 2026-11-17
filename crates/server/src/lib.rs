@@ -22,11 +22,12 @@ use fronde_agent::confine::{
     CONNECT_PORTS, Confine, GrantRequest, KEEP_ENV, Policy, SYSTEM_READ, Sandbox, Support, grants,
     url_port,
 };
+use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::{HubServer, McpCaller};
 use fronde_hub::source::ToolSource;
-use fronde_requests::Requests;
+use fronde_requests::{Requests, SecretStore};
 use fronde_wasm::{Checks, ComponentHost, ComponentSource, PythonSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -39,6 +40,53 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tower_sessions::ExpiredDeletion;
+
+/// Log targets never written, whatever `RUST_LOG` says: tungstenite writes every WebSocket
+/// message at TRACE, and a page's message may carry a secret typed in a card.
+pub const SILENCED_LOG_TARGETS: [&str; 2] = ["tungstenite", "tokio_tungstenite"];
+
+/// The log filter: `RUST_LOG`, else `info`, with [`SILENCED_LOG_TARGETS`] off.
+pub fn log_filter() -> tracing_subscriber::EnvFilter {
+    log_filter_from(
+        std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`log_filter`] from the directives `spec` (`RUST_LOG`'s syntax), `info` when none or invalid.
+/// A directive naming a silenced target, or one inside it, is dropped: a more precise one would
+/// win over the silencing.
+fn log_filter_from(spec: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let silenced = |directive: &str| {
+        let target = directive
+            .split(['[', '='])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        SILENCED_LOG_TARGETS.iter().any(|silenced| {
+            target
+                .strip_prefix(silenced)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+        })
+    };
+    let kept = spec.map(|spec| {
+        spec.split(',')
+            .filter(|directive| !silenced(directive))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let filter = kept
+        .and_then(|spec| tracing_subscriber::EnvFilter::try_new(spec).ok())
+        .unwrap_or_else(|| "info".into());
+    SILENCED_LOG_TARGETS.iter().fold(filter, |filter, target| {
+        filter.add_directive(
+            format!("{target}=off")
+                .parse()
+                .expect("a target name is a valid directive"),
+        )
+    })
+}
 
 /// How often expired web sessions and key-value entries are deleted.
 const PURGE_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -210,10 +258,15 @@ async fn wasm_sources(
     Ok(sources)
 }
 
-/// Deletes expired web sessions and key-value entries. Reads already refuse them (the session
-/// store and `fronde_db::kv::get` check the expiry), so this only frees their rows: a failure is
-/// logged, never fatal.
-async fn purge_expired(db: &fronde_db::DatabaseConnection, sessions: &Sessions) {
+/// Deletes expired web sessions, key-value entries and ephemeral secrets. Reads already refuse
+/// them (the session store, `fronde_db::kv::get` and the ephemeral store check the expiry), so
+/// this only frees their rows and wipes the secrets: a failure is logged, never fatal.
+async fn purge_expired(
+    db: &fronde_db::DatabaseConnection,
+    sessions: &Sessions,
+    ephemeral: &EphemeralSecrets,
+) {
+    ephemeral.sweep();
     if let Err(error) = sessions.delete_expired().await {
         tracing::error!("cannot delete expired web sessions: {error}");
     }
@@ -223,12 +276,26 @@ async fn purge_expired(db: &fronde_db::DatabaseConnection, sessions: &Sessions) 
 }
 
 /// [`purge_expired`] every `period`, the first one `period` from now, for as long as it is polled.
-async fn purge_every(db: fronde_db::DatabaseConnection, sessions: Sessions, period: Duration) {
+async fn purge_every(
+    db: fronde_db::DatabaseConnection,
+    sessions: Sessions,
+    ephemeral: Arc<EphemeralSecrets>,
+    period: Duration,
+) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
-        purge_expired(&db, &sessions).await;
+        purge_expired(&db, &sessions, &ephemeral).await;
+    }
+}
+
+/// Forgets every ephemeral secret when dropped: with the server's task, when Fronde stops.
+struct ForgetOnDrop(Arc<EphemeralSecrets>);
+
+impl Drop for ForgetOnDrop {
+    fn drop(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -435,11 +502,13 @@ pub async fn start_with(
             fronde_db::path(&data_dir).display()
         )
     })?;
-    purge_expired(&db, &sessions).await;
+    // Secrets given in a card "for this conversation": in memory only.
+    let ephemeral = Arc::new(EphemeralSecrets::new());
+    purge_expired(&db, &sessions, &ephemeral).await;
     let purge = {
-        let (db, sessions) = (db.clone(), sessions.clone());
+        let (db, sessions, ephemeral) = (db.clone(), sessions.clone(), ephemeral.clone());
         restart_on_panic("the purge of expired entries", RESTART_AFTER, move || {
-            purge_every(db.clone(), sessions.clone(), PURGE_EVERY)
+            purge_every(db.clone(), sessions.clone(), ephemeral.clone(), PURGE_EVERY)
         })
     };
     let listener = tokio::net::TcpListener::bind(listen)
@@ -465,7 +534,9 @@ pub async fn start_with(
                 builtin_tools: agent.builtin_tools,
             };
             let assistant = Assistant::open(spec, &data_dir, db.clone(), connector).await?;
-            let requests = Requests::open(db.clone(), assistant.clone()).await?;
+            let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
+            let requests =
+                Requests::open_with(db.clone(), assistant.clone(), Some(secrets)).await?;
             assistant.set_requests(&requests);
             Some((
                 assistant,
@@ -498,6 +569,7 @@ pub async fn start_with(
         ));
     }
     let handle = tokio::spawn(async move {
+        let _forget = ForgetOnDrop(ephemeral);
         // A task of its own, so that not even a panic there stops the server, and owned by the
         // server's task, so that it stops with the server. A panic restarts it.
         let mut background = tokio::task::JoinSet::new();
@@ -576,6 +648,7 @@ mod tests {
         let purge = tokio::spawn(purge_every(
             db.clone(),
             sessions.clone(),
+            Arc::new(EphemeralSecrets::new()),
             Duration::from_millis(20),
         ));
 
@@ -663,6 +736,35 @@ mod tests {
             logs.text()
         );
         supervisor.abort();
+    }
+
+    #[test]
+    fn websocket_messages_are_never_logged() {
+        for spec in [
+            None,
+            Some("trace"),
+            Some("tungstenite=trace,tokio_tungstenite=trace,fronde=error"),
+            Some("trace,tungstenite::protocol=trace"),
+            Some("trace,tokio_tungstenite[x]=trace"),
+        ] {
+            let logs = Logs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(log_filter_from(spec))
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::trace!(target: "tungstenite::protocol", "Received message secret");
+                tracing::error!(target: "tokio_tungstenite", "frame secret");
+                tracing::error!(target: "fronde", "kept");
+            });
+            let text = logs.text();
+            assert!(!text.contains("secret"), "{spec:?}: {text}");
+            assert!(text.contains("kept"), "{spec:?}: {text}");
+        }
     }
 
     #[test]

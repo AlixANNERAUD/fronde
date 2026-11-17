@@ -5,28 +5,42 @@
 //! Every change of status is a compare-and-set on `status = 'pending'`, so the first answer
 //! wins and a closed request never reopens. Each pending request has a timer that expires it:
 //! no answer means no.
+//!
+//! A secret answered in a card goes to the [`SecretStore`] before the request closes, and only
+//! where it was kept comes back to the asker ([`Saved`]): an ephemeral reference for the
+//! conversation, or the name it was stored under. The value never reaches the request's row, the
+//! journal, the asker or the log.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
+use fronde_db::ephemeral::{EphemeralScope, EphemeralSecrets};
+use fronde_db::master_key::Backends;
 use fronde_entity::requests;
-use fronde_protocol::request::{self, Card, Invalid, Outcome, RequestId, Response};
+use fronde_protocol::request::{
+    self, Card, Invalid, Keep, Outcome, RequestId, Response, SecretValue,
+};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
 };
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::oneshot;
+use zeroize::Zeroize as _;
 
 const PENDING: &str = "pending";
 const ANSWERED: &str = "answered";
 const DECLINED: &str = "declined";
 const EXPIRED: &str = "expired";
 const CANCELLED: &str = "cancelled";
+/// The kind of a secret card's row, whose answer is where the secret was kept.
+const SECRET: &str = "secret";
 /// How long an asker waits past its request's expiry for the timer to close it, before it
 /// gives up on the timer: a database that failed to close the request must not leave the asker
 /// waiting forever.
@@ -102,9 +116,54 @@ pub struct Ask {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolution {
     Answered(Response),
+    /// A secret card was answered: where the secret is, never what it is.
+    Saved(Saved),
     Declined,
     Expired,
     Cancelled,
+}
+
+/// Where a secret answered in a card was kept: what its asker gets instead of the value, and
+/// what the request's row keeps as its answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kept", rename_all = "snake_case")]
+pub enum Saved {
+    /// In memory, for the asker in this conversation, until used once or `expires_at`.
+    Conversation {
+        secret_ref: String,
+        expires_at: DateTime<Utc>,
+    },
+    /// Sealed in the database under `name`, for `origin` only.
+    Stored { name: String, origin: String },
+}
+
+impl Saved {
+    pub fn keep(&self) -> Keep {
+        match self {
+            Self::Conversation { .. } => Keep::Conversation,
+            Self::Stored { .. } => Keep::Stored,
+        }
+    }
+}
+
+/// Where secrets answered in cards go: the ephemeral store for "this conversation", the sealed
+/// store (its master key from `backends`) for "keep for this origin".
+pub struct SecretStore {
+    backends: Backends,
+    ephemeral: Arc<EphemeralSecrets>,
+}
+
+impl SecretStore {
+    pub fn new(backends: Backends, ephemeral: Arc<EphemeralSecrets>) -> Self {
+        Self {
+            backends,
+            ephemeral,
+        }
+    }
+
+    pub fn ephemeral(&self) -> &Arc<EphemeralSecrets> {
+        &self.ephemeral
+    }
 }
 
 /// Why an answer was refused; the request did not change. Displayed in French, for the page.
@@ -226,6 +285,10 @@ pub struct Requests {
     journal: Arc<dyn Journal>,
     /// The askers waiting, by request. Several when a retried call joined the request.
     waiters: Mutex<HashMap<RequestId, Vec<oneshot::Sender<Resolution>>>>,
+    secrets: Option<SecretStore>,
+    /// Held while a secret is kept and its request closed, so that two pages answering at once
+    /// never both keep one.
+    saving: tokio::sync::Mutex<()>,
     this: Weak<Self>,
 }
 
@@ -237,10 +300,22 @@ impl Requests {
         db: DatabaseConnection,
         journal: Arc<dyn Journal>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::open_with(db, journal, None).await
+    }
+
+    /// [`Requests::open`], with `secrets` keeping what secret cards are answered with; without
+    /// it, a secret answer is refused.
+    pub async fn open_with(
+        db: DatabaseConnection,
+        journal: Arc<dyn Journal>,
+        secrets: Option<SecretStore>,
+    ) -> anyhow::Result<Arc<Self>> {
         let requests = Arc::new_cyclic(|this| Self {
             db,
             journal,
             waiters: Mutex::default(),
+            secrets,
+            saving: tokio::sync::Mutex::default(),
             this: this.clone(),
         });
         requests.expire_due().await?;
@@ -261,6 +336,22 @@ impl Requests {
             }
         }
         Ok(requests)
+    }
+
+    /// Where secret answers go, when the service keeps them.
+    pub fn secrets(&self) -> Option<&SecretStore> {
+        self.secrets.as_ref()
+    }
+
+    /// The origin the secret `name` is stored for, if one is.
+    pub async fn stored_origin(&self, name: &str) -> anyhow::Result<Option<String>> {
+        Ok(
+            fronde_db::secrets::list(&self.db, fronde_db::secrets::SOURCES)
+                .await?
+                .into_iter()
+                .find(|listed| listed.name == name)
+                .map(|listed| listed.origin),
+        )
     }
 
     /// Shows a pending request again if it never was, and starts its timer.
@@ -343,11 +434,14 @@ impl Requests {
         if row.status != PENDING {
             return Err(Refusal::Closed);
         }
-        let card: Card = serde_json::from_value(row.card)
+        let card: Card = serde_json::from_value(row.card.clone())
             .context("the request's card is not readable by this version of Fronde")
             .map_err(failed)?;
         request::check(&card, &response).map_err(Refusal::Invalid)?;
         let (status, outcome, resolution) = match response {
+            Response::Secret { value, keep } => {
+                return self.save_secret(&row, &card, value, keep, by).await;
+            }
             Response::Decline => (DECLINED, Outcome::Declined, Resolution::Declined),
             response => (
                 ANSWERED,
@@ -358,7 +452,11 @@ impl Requests {
             ),
         };
         let stored = match &resolution {
-            Resolution::Answered(response) => Some(response),
+            Resolution::Answered(response) => Some(
+                serde_json::to_value(response)
+                    .context("cannot encode the answer")
+                    .map_err(failed)?,
+            ),
             _ => None,
         };
         let won = self
@@ -369,6 +467,120 @@ impl Requests {
             return Err(Refusal::Closed);
         }
         self.wake(id, resolution);
+        Ok(())
+    }
+
+    /// Keeps the secret answering the request `row` as `keep` says, then closes the request and
+    /// wakes its asker with where it was kept. The value is wiped when this returns.
+    async fn save_secret(
+        &self,
+        row: &requests::Model,
+        card: &Card,
+        value: SecretValue,
+        keep: Keep,
+        by: &User,
+    ) -> Result<(), Refusal> {
+        let id = row_id(row).map_err(failed)?;
+        let Some(store) = &self.secrets else {
+            return Err(failed(anyhow::anyhow!(
+                "request {id} got a secret, but this Fronde keeps none"
+            )));
+        };
+        if keep == Keep::Stored && !by.admin {
+            return Err(refused("Seul un administrateur peut garder un secret."));
+        }
+        let value = secret_string(value);
+        let _saving = self.saving.lock().await;
+        // Another page may have answered while this one waited.
+        let current = self.find(id).await.map_err(failed)?;
+        if current.is_none_or(|current| current.status != PENDING) {
+            return Err(Refusal::Closed);
+        }
+        let saved = match (keep, card) {
+            (Keep::Conversation, _) => {
+                let scope = EphemeralScope {
+                    topic: row.topic.clone(),
+                    asker: row.caller.clone(),
+                    turn: None,
+                };
+                let (reference, expires_at) = store
+                    .ephemeral
+                    .put(scope, value, fronde_db::ephemeral::DEFAULT_TTL, true)
+                    .map_err(failed)?;
+                Saved::Conversation {
+                    secret_ref: reference.as_str().to_owned(),
+                    expires_at,
+                }
+            }
+            (
+                Keep::Stored,
+                Card::Secret {
+                    remember: Some(remember),
+                    ..
+                },
+            ) => {
+                // Never moved to another origin behind the owner's back: a secret stored for one
+                // origin is replaced only for that origin.
+                if let Some(other) = self.stored_origin(&remember.name).await.map_err(failed)?
+                    && other != remember.origin
+                {
+                    return Err(refused(format!(
+                        "Un secret « {} » est déjà gardé pour {other} : garde celui-ci pour cette \
+                         conversation seulement, ou retire l'autre avec « fronde secret remove {} ».",
+                        remember.name, remember.name
+                    )));
+                }
+                let (key, created) = store
+                    .backends
+                    .load_or_create(&self.db)
+                    .await
+                    .map_err(failed)?;
+                fronde_db::secrets::set(
+                    &self.db,
+                    &key,
+                    fronde_db::secrets::SOURCES,
+                    &remember.name,
+                    &remember.origin,
+                    &value,
+                )
+                .await
+                .map_err(failed)?;
+                if created {
+                    tracing::warn!(
+                        "made the master key in {}: back it up apart from the data directory, \
+                         without it the stored secrets are lost",
+                        store.backends.place(key.backend())
+                    );
+                }
+                Saved::Stored {
+                    name: remember.name.clone(),
+                    origin: remember.origin.clone(),
+                }
+            }
+            // `check` refuses it before.
+            (Keep::Stored, _) => {
+                return Err(refused("Cette demande ne propose pas de garder le secret."));
+            }
+        };
+        let answer = serde_json::to_value(&saved)
+            .context("cannot encode where the secret was kept")
+            .map_err(failed)?;
+        let outcome = Outcome::Saved { kept: keep };
+        let won = self
+            .close(id, ANSWERED, Some(answer), outcome, Some(&by.name))
+            .await;
+        if !matches!(won, Ok(true)) {
+            match &saved {
+                Saved::Conversation { secret_ref, .. } => {
+                    store.ephemeral.forget(secret_ref);
+                }
+                Saved::Stored { name, .. } => tracing::warn!(
+                    "request {id} closed while the secret {name} was being stored: it stays stored"
+                ),
+            }
+            return Err(won.map_err(failed).err().unwrap_or(Refusal::Closed));
+        }
+        self.wake(id, Resolution::Saved(saved));
         Ok(())
     }
 
@@ -434,14 +646,13 @@ impl Requests {
         &self,
         id: RequestId,
         status: &str,
-        response: Option<&Response>,
+        response: Option<serde_json::Value>,
         outcome: Outcome,
         by: Option<&str>,
     ) -> anyhow::Result<bool> {
         let Some(row) = self.find(id).await? else {
             return Ok(false);
         };
-        let response = response.map(serde_json::to_value).transpose()?;
         let changed = requests::Entity::update_many()
             .col_expr(requests::Column::Status, Expr::value(status))
             .col_expr(requests::Column::Response, Expr::value(response))
@@ -606,12 +817,36 @@ fn resolution_of(row: &requests::Model) -> anyhow::Result<Resolution> {
                 .response
                 .clone()
                 .context("an answered request without its answer")?;
-            Resolution::Answered(serde_json::from_value(response)?)
+            if row.kind == SECRET {
+                Resolution::Saved(serde_json::from_value(response)?)
+            } else {
+                Resolution::Answered(serde_json::from_value(response)?)
+            }
         }
         DECLINED => Resolution::Declined,
         EXPIRED => Resolution::Expired,
         _ => Resolution::Cancelled,
     })
+}
+
+fn refused(message: impl Into<String>) -> Refusal {
+    Refusal::Invalid(Invalid {
+        key: None,
+        message: message.into(),
+    })
+}
+
+/// The value as a `SecretString`, moved, never copied: an allocation larger than the text would
+/// be copied by the conversion, so it is copied here first and the original wiped.
+fn secret_string(value: SecretValue) -> SecretString {
+    let mut text = value.into_inner();
+    if text.capacity() != text.len() {
+        let mut exact = String::with_capacity(text.len());
+        exact.push_str(&text);
+        text.zeroize();
+        text = exact;
+    }
+    SecretString::from(text)
 }
 
 fn failed(error: anyhow::Error) -> Refusal {

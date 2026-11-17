@@ -3,6 +3,7 @@
 //! are the entities of `fronde-entity`.
 
 pub mod approvals;
+pub mod ephemeral;
 pub mod kv;
 pub mod master_key;
 pub mod secrets;

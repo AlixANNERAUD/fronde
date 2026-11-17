@@ -103,7 +103,8 @@ fn capture() -> Scanner {
         .get_or_init(|| {
             let scanner = Scanner::default();
             let out = scanner.clone();
-            let targets = COMPILER.iter().fold(
+            // The targets Fronde's own filter silences are off too, as in production.
+            let targets = COMPILER.iter().chain(&fronde::SILENCED_LOG_TARGETS).fold(
                 Targets::new().with_default(LevelFilter::TRACE),
                 |t, target| t.with_target(*target, LevelFilter::OFF),
             );
@@ -436,4 +437,306 @@ async fn assistant_token_never_appears() {
         leaks.is_empty(),
         "the assistant's token is in the log: {leaks:#?}"
     );
+}
+
+/// A secret typed in a card goes from the page to the store and nowhere else: not to the log
+/// (at TRACE, every crate), not to the conversation stream or any message the pages get, not to
+/// the request's row or any file of the data directory, not to the tool's result. A malformed
+/// answer carrying one is not logged either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_answer_never_appears() {
+    use fronde_agent::acp::{AgentClient, AgentSpec};
+    use fronde_agent::assistant::Connector;
+    use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
+    use fronde_protocol::{Card, ClientMsg, Event, Keep, Response, SecretValue, ServerMsg};
+    use futures::{SinkExt, StreamExt};
+    use secrecy::ExposeSecret as _;
+    use std::time::Duration;
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    const WAIT: Duration = Duration::from_secs(10);
+    // The file backend, named: the default would try the machine's real keychain.
+    const KEPT: &str = "canary-card-conversation-5e6f7a8b";
+    const STORED: &str = "canary-card-stored-1c2d3e4f";
+    const MALFORMED: &str = "canary-card-malformed-9a8b7c6d";
+    let canaries = [KEPT, STORED, MALFORMED];
+    let _serial = SERIAL.lock().await;
+    let scanner = capture();
+    *scanner.0.lock().unwrap() = Scan {
+        secrets: [MCP_CANARY, WEB_CANARY, KEPT, STORED, MALFORMED]
+            .map(String::from)
+            .to_vec(),
+        wanted: vec!["user_secret".to_string()],
+        ..Scan::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let key_file = dir.path().join("master.key");
+    let token_file = dir.path().join("mcp_token");
+    let web_file = dir.path().join("web_pass");
+    fronde_hub::private::write(&token_file, MCP_CANARY).unwrap();
+    fronde_hub::private::write(&web_file, WEB_CANARY).unwrap();
+    let config: Config = toml::from_str(&format!(
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n\
+         [data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+         [memory]\ngit = false\n\
+         [secrets]\nbackend = \"file\"\nmaster_key = {{ file = {:?} }}\n\
+         [web]\npassword = {{ file = {:?} }}\n",
+        token_file.display().to_string(),
+        data.display().to_string(),
+        key_file.display().to_string(),
+        web_file.display().to_string(),
+    ))
+    .unwrap();
+    // The fake agent holds its turn open, so the assistant's calls belong to it.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let script = FakeScript {
+        updates: vec![text_chunk("Je demande."), text_chunk(" Merci.")],
+        pause: Some((1, gate.clone())),
+        ..FakeScript::default()
+    };
+    let seen: Arc<Mutex<Option<AgentSpec>>> = Arc::default();
+    let connector: Connector = Arc::new({
+        let seen = seen.clone();
+        move |spec: &AgentSpec, resume, events| {
+            *seen.lock().unwrap() = Some(spec.clone());
+            let (spec, script) = (spec.clone(), script.clone());
+            Box::pin(async move {
+                let (transport, _handle) = fake_agent(script);
+                AgentClient::connect(transport, &spec, resume, events).await
+            })
+        }
+    });
+    let (addr, server) = fronde::start_with(config, connector, &dir.path().join("site"))
+        .await
+        .unwrap();
+
+    let signed_in = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(format!("http://{addr}/auth/sign-in"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("password={WEB_CANARY}"))
+        .send()
+        .await
+        .unwrap();
+    let cookie = signed_in.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("cookie", cookie.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("origin", format!("http://{addr}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    for message in [
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+        ClientMsg::Send {
+            text: "Salut".into(),
+        },
+    ] {
+        let json = serde_json::to_string(&message).unwrap();
+        socket.send(Message::text(json)).await.unwrap();
+    }
+    let token = timeout(WAIT, async {
+        loop {
+            if let Some(spec) = seen.lock().unwrap().clone() {
+                return spec.hub_token.expose_secret().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(token),
+    );
+    let client = ().serve(transport).await.unwrap();
+
+    // Everything the page is sent, kept to be searched.
+    let mut received: Vec<String> = Vec::new();
+    let mut hello_admin = None;
+    for (args, value, keep) in [
+        (
+            json!({"label": "Jeton", "reason": "Pour un essai."}),
+            KEPT,
+            Keep::Conversation,
+        ),
+        (
+            json!({"label": "Mot de passe", "reason": "Pour l'agenda.", "remember": {"name": "nextcloud", "origin": "https://cloud.example"}}),
+            STORED,
+            Keep::Stored,
+        ),
+    ] {
+        let peer = client.peer().clone();
+        let call = tokio::spawn(async move {
+            peer.call_tool(
+                CallToolRequestParams::new("user_secret")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+        });
+        let id = timeout(WAIT, async {
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                received.push(text.to_string());
+                match serde_json::from_str::<ServerMsg>(&text).unwrap() {
+                    ServerMsg::Hello { admin, .. } => hello_admin = Some(admin),
+                    ServerMsg::Entry(entry) => {
+                        if let Event::Request {
+                            id,
+                            card: Card::Secret { .. },
+                            ..
+                        } = entry.event
+                        {
+                            return id;
+                        }
+                    }
+                    ServerMsg::Refused { .. } => {}
+                }
+            }
+            panic!("the socket closed");
+        })
+        .await
+        .unwrap();
+        // A malformed answer, with a secret in it: ignored, and not logged.
+        let malformed = format!(
+            r#"{{"type":"answer","id":{id},"response":{{"type":"secret","value":"{MALFORMED}","keep":"forever"}}}}"#
+        );
+        socket.send(Message::text(malformed)).await.unwrap();
+        let answer = ClientMsg::Answer {
+            id,
+            response: Response::Secret {
+                value: SecretValue::new(value.into()),
+                keep,
+            },
+        };
+        let json = serde_json::to_string(&answer).unwrap();
+        socket.send(Message::text(json)).await.unwrap();
+        let result = timeout(WAIT, call).await.unwrap().unwrap().unwrap();
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        let text = serde_json::to_string(&result).unwrap();
+        for canary in canaries {
+            assert!(
+                !text.contains(canary),
+                "the tool result holds {canary}: {text}"
+            );
+        }
+        assert!(text.contains("saved"), "{text}");
+        let expected = match keep {
+            Keep::Conversation => "sr_",
+            Keep::Stored => "nextcloud",
+        };
+        assert!(text.contains(expected), "{text}");
+    }
+    assert_eq!(hello_admin, Some(true), "the owner may keep secrets");
+    gate.notify_one();
+    timeout(WAIT, async {
+        while let Some(Ok(message)) = socket.next().await {
+            if let Message::Text(text) = message {
+                let ended = text.contains("turn_ended");
+                received.push(text.to_string());
+                if ended {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    drop(socket);
+    server.abort();
+
+    for message in &received {
+        for canary in canaries {
+            assert!(!message.contains(canary), "a page got {canary}: {message}");
+        }
+    }
+    assert!(
+        received.iter().any(|m| m.contains(r#""kept":"stored""#)),
+        "{received:#?}"
+    );
+    let scan = std::mem::take(&mut *scanner.0.lock().unwrap());
+    assert!(scan.lines > 0, "nothing was captured");
+    assert!(scan.leaked.is_empty(), "{:#?}", scan.leaked);
+    for want in &scan.wanted {
+        assert!(scan.seen.contains(want), "{want} is not in the log");
+    }
+
+    // The data directory's files, the database's WAL and shared memory among them.
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&data).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{}{suffix}", fronde_db::FILE_NAME);
+        assert!(
+            files
+                .iter()
+                .any(|f| f.file_name().unwrap() == name.as_str()),
+            "{name} is missing: {files:?}"
+        );
+    }
+    for file in &files {
+        let bytes = std::fs::read(file).unwrap();
+        for canary in canaries {
+            assert!(
+                !bytes
+                    .windows(canary.len())
+                    .any(|window| window == canary.as_bytes()),
+                "{} holds {canary}",
+                file.display()
+            );
+        }
+    }
+    // Rows and entries say where it went, never what it was.
+    let db = fronde_db::open(&data).await.unwrap();
+    let rows: Vec<String> = <fronde_entity::requests::Entity as sea_orm::EntityTrait>::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| format!("{:?} {:?}", row.card, row.response))
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        for canary in canaries {
+            assert!(!row.contains(canary), "{row}");
+        }
+    }
+    // The kept one is sealed, for its origin, and opens with the key made for it.
+    let sealed = fronde_db::secrets::load_sealed(&db, fronde_db::secrets::SOURCES)
+        .await
+        .unwrap();
+    assert_eq!(sealed.len(), 1);
+    assert_eq!(
+        (sealed[0].name.as_str(), sealed[0].origin.as_str()),
+        ("nextcloud", "https://cloud.example")
+    );
+    let key = fronde_db::master_key::Backends::file(&key_file)
+        .load(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sealed[0].open(&key).unwrap().expose_secret(), STORED);
 }

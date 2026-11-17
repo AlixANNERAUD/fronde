@@ -52,6 +52,7 @@ owner answers.
 | Tool | Arguments | Does |
 | --- | --- | --- |
 | `user_ask` | `questions` (1 to 4), `timeout_ms` (1000 to 3600000, default 600000), `client_request_id` (optional, 1 to 128 characters) | Asks the user multiple-choice questions on one card and waits for the answers. |
+| `user_secret` | `label`, `reason`, `placeholder` (optional), `url` (optional), `remember` (optional), `timeout_ms`, `client_request_id` (as for `user_ask`) | Asks the user for one secret on a private card and waits; returns where it was kept, never the value. |
 
 Each question has `question` (the full text), `header` (a chip of at most 12 characters, such as
 "Appli"), `multi_select` (default `false`) and `options`: 2 to 4 of `{ label, description,
@@ -92,6 +93,55 @@ than the question's: Codex, for instance, gives up after `tool_timeout_sec` (60 
 A call the client cancels closes its card as cancelled, and so does the end of the assistant's
 turn, or *Stop*, for the questions that turn asked.
 See [Requests and cards](../explanation/requests.md).
+
+### `user_secret`
+
+One secret per call: a password, a token, a key. The card shows `label` (at most 60 characters)
+above a masked box, `reason` (at most 300) above it, and `placeholder` (at most 60) in the empty
+box. `url`, when given, is the sign-in or setup page where the user finds or makes the secret:
+the card shows it as a button naming its host. It must be an `https://` address with a host and
+no user name or password before it (`https://site@evil.example` is refused): `http:`,
+`javascript:`, `data:` and anything else are refused. The texts follow `user_ask`'s rules: no
+control character, no bidirectional control, no line break. The same outside client names are
+refused.
+
+The user picks how long the secret is kept:
+
+- **For this conversation** (always offered, the default). The secret stays in Fronde's memory
+  only, for the asker that asked, in this conversation, for one hour, and is used up by its first
+  use. The call returns a reference:
+
+  ```json
+  {"result": {"status": "saved", "secret_ref": "sr_k3Jq…", "expires_at": "2026-11-17T11:00:00Z"},
+   "next": "Kept for this conversation only, … No tool accepts a secret_ref yet: …"}
+  ```
+
+  **No tool accepts a `secret_ref` yet.** The first ones to take one will be integration setup
+  from the chat and commands that read a secret from a file (both **planned**); until then the
+  reference expires unused, and the `next` says so. To give a component a credential now, use
+  `remember`.
+
+- **Kept for an origin**, offered only when the call gives `remember: { name, origin }`, and only
+  to an admin (today the owner). `name` is lower-case letters, digits and `_`, starting with a
+  letter, at most 64 characters; `origin` is `scheme://host[:port]`, over https, or http to this
+  machine, and is stored normalised (`HTTPS://Cloud.Example:443` becomes
+  `https://cloud.example`). The secret is sealed in `fronde.db` as `fronde secret set` would
+  store it, sent only to that origin, and the call returns its name:
+
+  ```json
+  {"result": {"status": "saved", "stored": "nextcloud", "origin": "https://cloud.example"}}
+  ```
+
+  A component then uses it as `{ stored = "nextcloud" }` in its `[[sources.credentials]]` for
+  that origin; the owner writes that in the configuration. A name already stored for another
+  origin is refused, before the card is shown and again when the answer comes: a stored secret is
+  never moved to another origin behind the owner's back. The same name for the same origin
+  replaces the value.
+
+The value never reaches the agent, the conversation, the request's row, a log or any file but the
+sealed row. Declined, expired and cancelled calls return as `user_ask`'s do. `user_secret` is
+served only while the chat runs, beside `user_ask`. See
+[Requests and cards](../explanation/requests.md#secret-cards).
 
 ## Calendar
 

@@ -30,7 +30,8 @@ When Fronde runs its chat (`[web]`), an agent can ask you a question with `user_
 shows in the chat, headed with the client's name, and the call waits for your answer, up to 10
 minutes by default. Raise the client's tool timeout above that, for example Codex's
 `tool_timeout_sec`, which is 60 s by default; a call cut short leaves the card answerable, but the
-answer no longer reaches the agent.
+answer no longer reaches the agent. It asks for a password or token with `user_secret`, the same
+way: it gets a reference or the name the secret was stored under, never the value.
 
 ## Check the connection
 

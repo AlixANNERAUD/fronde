@@ -100,6 +100,8 @@ pub struct Chat {
     generation: u32,
     /// Whom the page is signed in as, from the server's hello.
     viewer: Option<String>,
+    /// That user is an admin, who may keep a secret for good.
+    admin: bool,
 }
 
 impl Chat {
@@ -115,6 +117,11 @@ impl Chat {
         self.running
     }
 
+    /// Whether the page's user is an admin, as the server's hello said.
+    pub fn admin(&self) -> bool {
+        self.admin
+    }
+
     /// The log the rows come from, to name in the next hello.
     pub fn log_id(&self) -> Option<&str> {
         self.log_id.as_deref()
@@ -127,6 +134,7 @@ impl Chat {
                 log_id,
                 last_seq,
                 user,
+                admin,
             } => {
                 // Another log, or one shorter than what the page shows (deleted and started
                 // again): what the page shows is gone, the server replays the whole new log.
@@ -140,6 +148,7 @@ impl Chat {
                 }
                 self.log_id = Some(log_id.clone());
                 self.viewer = user.clone();
+                self.admin = *admin;
             }
             ServerMsg::Entry(entry) => self.apply_entry(entry.clone()),
             ServerMsg::Refused { id, reason } => {
@@ -358,6 +367,7 @@ mod tests {
             log_id: log_id.into(),
             last_seq,
             user: None,
+            admin: false,
         }
     }
 
@@ -618,6 +628,61 @@ mod tests {
     }
 
     #[test]
+    fn secret_request_closes_saved_and_admin_comes_from_hello() {
+        let mut chat = Chat::default();
+        chat.apply(&ServerMsg::Hello {
+            log_id: "a".into(),
+            last_seq: 0,
+            user: Some("alix".into()),
+            admin: true,
+        });
+        assert!(chat.admin());
+        let card = Card::Secret {
+            label: "Mot de passe".into(),
+            reason: "Pour l'agenda.".into(),
+            placeholder: None,
+            url: None,
+            remember: None,
+        };
+        apply_all(
+            &mut chat,
+            [
+                user(1, "Go"),
+                entry(
+                    2,
+                    Event::Request {
+                        id: 9,
+                        card,
+                        from: None,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(chat.open_requests().count(), 1);
+        let saved = Outcome::Saved {
+            kept: fronde_protocol::Keep::Conversation,
+        };
+        apply_all(
+            &mut chat,
+            [entry(
+                3,
+                Event::RequestClosed {
+                    id: 9,
+                    outcome: saved.clone(),
+                    by: Some("alix".into()),
+                },
+            )],
+        );
+        assert_eq!(
+            request_status(&chat, 1),
+            (RequestStatus::Closed(saved), None)
+        );
+        // Another hello says who the page is now.
+        chat.apply(&hello("a", 3));
+        assert!(!chat.admin());
+    }
+
+    #[test]
     fn request_open_until_closed() {
         let mut chat = Chat::default();
         apply_all(&mut chat, [user(1, "Go"), question(2, 7)]);
@@ -695,7 +760,9 @@ mod tests {
             log_id: "a".into(),
             last_seq: 0,
             user: Some("alix".into()),
+            admin: true,
         });
+        assert!(chat.admin());
         apply_all(
             &mut chat,
             [

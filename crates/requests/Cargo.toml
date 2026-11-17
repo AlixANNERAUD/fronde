@@ -15,9 +15,12 @@ fronde-db = { path = "../db" }
 fronde-entity = { path = "../entity" }
 fronde-protocol = { path = "../protocol" }
 sea-orm.workspace = true
+secrecy.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

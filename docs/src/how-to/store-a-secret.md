@@ -1,8 +1,8 @@
 # Store a secret
 
 Fronde can keep a secret, such as a CalDAV password, encrypted in its database, bound to the one
-origin it is for. You type it once into `fronde secret set`; it never goes in the configuration
-file, and a component's credential names it with `{ stored = "…" }`.
+origin it is for. You type it once, into `fronde secret set` or into a card in the chat; it never
+goes in the configuration file, and a component's credential names it with `{ stored = "…" }`.
 
 ## Store it
 
@@ -29,10 +29,25 @@ value from a terminal, which would echo it. One final line break
 is dropped. The origin is stored as Fronde normalises it: `HTTPS://Cloud.Example:443` is stored as
 `https://cloud.example`. Setting a name again replaces its value and origin.
 
+## Or type it in the chat
+
+When an agent needs a secret, it asks with a card (`user_secret`) rather than in a message. Type
+the value in the masked box and press *Enregistrer*:
+
+- left as it is, the secret is kept **for this conversation only**, in memory, for an hour, and
+  used once. Nothing is stored.
+- when the agent proposed a name and an origin, you also see *Garder pour <origin>* (only as the
+  owner). Tick it to store the secret, exactly as `fronde secret set <name> --origin <origin>`
+  would: it is listed by `fronde secret list` and used as below. Check the origin on the card
+  before ticking: the secret will only ever be sent there.
+
+Never paste a secret in a chat message: that one goes through the model and the conversation.
+Refuse the card if you did not expect it.
+
 ## Where the master key goes
 
 The first secret creates the master key that seals them all, and `fronde secret set` says where
-it put it. By default (`[secrets] backend = "auto"`, see
+it put it (a secret kept from a card writes it in Fronde's log). By default (`[secrets] backend = "auto"`, see
 [Configuration](../reference/configuration.md#secrets-1)):
 
 - under a systemd service that loads the credential `fronde-master-key`, the key is that

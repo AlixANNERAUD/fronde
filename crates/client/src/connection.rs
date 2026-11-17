@@ -122,6 +122,7 @@ mod tests {
             log_id: "a".into(),
             last_seq: 0,
             user: None,
+            admin: false,
         });
         assert_eq!(connection.state(), State::Open);
         assert_eq!(

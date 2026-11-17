@@ -50,6 +50,9 @@ pub fn Input(
     #[props(optional)] autofocus: bool,
     // fronde: a name for an input no label names.
     #[props(into, optional)] aria_label: Option<String>,
+    // fronde: a secret box neither checks spelling nor capitalises what is typed.
+    #[props(into, optional)] spellcheck: Option<String>,
+    #[props(into, optional)] autocapitalize: Option<String>,
 ) -> Element {
     let merged_class = tw_merge!(
         "text-foreground file:text-foreground placeholder:text-muted-foreground selection:bg-primary selection:text-primary-foreground dark:bg-input/30 border-input flex h-9 w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none file:inline-flex file:h-7 file:border-0 file:bg-transparent file:text-sm file:font-medium disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 md:text-sm",
@@ -76,6 +79,9 @@ pub fn Input(
             autofocus: autofocus,
             // fronde: see `aria_label`.
             "aria-label": aria_label,
+            // fronde: see `spellcheck`.
+            spellcheck: spellcheck,
+            autocapitalize: autocapitalize,
             oninput: move |e| {
                 if let Some(handler) = &oninput {
                     handler.call(e);

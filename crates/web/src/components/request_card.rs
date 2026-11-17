@@ -1,26 +1,29 @@
-//! A request's card: questions with options, answered once from any page. The page checks the
-//! answer with the server's own rules before sending it; the server stays the judge.
+//! A request's card: questions with options, or one secret, answered once from any page. The
+//! page checks the answer with the server's own rules before sending it; the server stays the
+//! judge. A secret is typed in a masked box, emptied once sent, and never shown again.
 
 use dioxus::html::Key;
 use dioxus::prelude::*;
 use fronde_client::RequestStatus;
 use fronde_protocol::request::check;
 use fronde_protocol::{
-    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, Invalid, Outcome, RequestId, Response,
+    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, Invalid, Keep, Outcome, Remember,
+    RequestId, Response, SecretValue,
 };
 use std::collections::BTreeMap;
 
 use crate::{
+    components::icons::{ExternalLink, KeyRound},
     components::ui::{
         badge::{Badge, BadgeSize, BadgeVariant},
-        button::{Button, ButtonVariant},
+        button::{Button, ButtonSize, ButtonVariant},
         card::{Card as CardBox, CardContent, CardDescription, CardFooter, CardHeader, CardSize},
         checkbox::Checkbox,
         field::{
             Field as FieldRow, FieldContent, FieldDescription, FieldError, FieldLabel, FieldLegend,
             FieldSet, FieldTitle, FieldVariant,
         },
-        input::Input,
+        input::{Input, InputType},
         radio_button::{RadioGroup, RadioGroupItem},
         textarea::Textarea,
     },
@@ -57,13 +60,44 @@ pub fn RequestCard(
     by: Option<String>,
     /// The socket is open: an answer can go out.
     open: bool,
+    /// The page's user is an admin, who may keep a secret for good.
+    #[props(default)]
+    admin: bool,
     on_send: EventHandler<Outgoing>,
 ) -> Element {
-    let Card::Form {
-        message,
-        fields,
-        submit,
-    } = card;
+    let (message, fields, submit) = match card {
+        Card::Form {
+            message,
+            fields,
+            submit,
+        } => (message, fields, submit),
+        Card::Secret {
+            label,
+            reason,
+            placeholder,
+            url,
+            remember,
+        } => {
+            let title = secret_asker(from.as_deref());
+            return rsx! {
+                SecretCard {
+                    id,
+                    title,
+                    label,
+                    reason,
+                    placeholder,
+                    url,
+                    remember,
+                    admin,
+                    status,
+                    refusal,
+                    by,
+                    open,
+                    on_send,
+                }
+            };
+        }
+    };
     let title = asker(from.as_deref(), fields.len());
     match status {
         RequestStatus::Open => rsx! {
@@ -113,6 +147,14 @@ fn asker(from: Option<&str>, questions: usize) -> String {
     }
 }
 
+/// Who asks for a secret, as [`asker`] says it for questions.
+fn secret_asker(from: Option<&str>) -> String {
+    match from {
+        None => "Secret demandé par Fronde".into(),
+        Some(name) => format!("Secret demandé par « {name} » (client MCP)"),
+    }
+}
+
 fn question(field: &Field) -> &str {
     let Field::Choice { question, .. } = field;
     question
@@ -126,6 +168,9 @@ fn closed_badge(outcome: &Outcome) -> Element {
         Outcome::Answered { summary } => rsx! {
             Badge { class: "whitespace-normal", "Réponse : {summary}" }
         },
+        Outcome::Saved { .. } => rsx! {
+            Badge { "Enregistré" }
+        },
         Outcome::Declined => rsx! {
             Badge { variant: BadgeVariant::Destructive, "Refusée" }
         },
@@ -135,6 +180,291 @@ fn closed_badge(outcome: &Outcome) -> Element {
         Outcome::Cancelled => rsx! {
             Badge { variant: BadgeVariant::Muted, "Annulée" }
         },
+    }
+}
+
+/// How a secret card ended. Never the secret.
+fn secret_badge(outcome: &Outcome, remember: Option<&Remember>) -> Element {
+    match outcome {
+        Outcome::Saved {
+            kept: Keep::Conversation,
+        } => rsx! {
+            Badge { class: "whitespace-normal", "Enregistré, jamais montré à l'agent" }
+        },
+        Outcome::Saved { kept: Keep::Stored } => match remember {
+            Some(remember) => rsx! {
+                Badge { class: "whitespace-normal", "Gardé pour {remember.origin}" }
+            },
+            None => rsx! {
+                Badge { "Gardé" }
+            },
+        },
+        Outcome::Answered { .. } => rsx! {
+            Badge { "Répondu" }
+        },
+        Outcome::Declined => rsx! {
+            Badge { variant: BadgeVariant::Destructive, "Refusé" }
+        },
+        Outcome::Expired => rsx! {
+            Badge { variant: BadgeVariant::Muted, "Expirée" }
+        },
+        Outcome::Cancelled => rsx! {
+            Badge { variant: BadgeVariant::Muted, "Annulée" }
+        },
+    }
+}
+
+/// The page a secret card links to and the host its button names, for an https address only:
+/// anything else (another scheme, a user before the host) gets no link, whatever the server let
+/// through.
+fn link(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let clean = !host.is_empty()
+        && !host.contains('@')
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace());
+    clean.then(|| (url.to_owned(), host.to_owned()))
+}
+
+#[component]
+fn SecretCard(
+    id: RequestId,
+    title: String,
+    label: String,
+    reason: String,
+    placeholder: Option<String>,
+    url: Option<String>,
+    remember: Option<Remember>,
+    admin: bool,
+    status: RequestStatus,
+    refusal: Option<String>,
+    by: Option<String>,
+    open: bool,
+    on_send: EventHandler<Outgoing>,
+) -> Element {
+    match status {
+        RequestStatus::Open => rsx! {
+            OpenSecretCard {
+                id,
+                title,
+                label,
+                reason,
+                placeholder,
+                url,
+                remember,
+                admin,
+                refusal,
+                open,
+                on_send,
+            }
+        },
+        RequestStatus::Closed(outcome) => rsx! {
+            CardBox { size: CardSize::Sm, class: CARD_CLASS,
+                CardHeader {
+                    CardDescription { class: "flex items-center gap-2 text-xs font-medium",
+                        KeyRound { class: "size-4" }
+                        "{title}"
+                    }
+                }
+                CardContent {
+                    p { class: "text-muted-foreground text-sm wrap-break-word", "{label}" }
+                }
+                CardFooter { class: "flex-wrap gap-2",
+                    {secret_badge(&outcome, remember.as_ref())}
+                    if let Some(by) = by {
+                        span { class: "text-muted-foreground text-xs", "par {by}" }
+                    }
+                }
+            }
+        },
+    }
+}
+
+#[component]
+fn OpenSecretCard(
+    id: RequestId,
+    title: String,
+    label: String,
+    reason: String,
+    placeholder: Option<String>,
+    url: Option<String>,
+    remember: Option<Remember>,
+    admin: bool,
+    refusal: Option<String>,
+    open: bool,
+    on_send: EventHandler<Outgoing>,
+) -> Element {
+    let mut value = use_signal(String::new);
+    let mut shown = use_signal(|| false);
+    let mut keep = use_signal(|| false);
+    let mut invalid = use_signal(|| None::<Invalid>);
+    let mut sent = use_signal(|| false);
+    let delivered = use_callback(move |()| sent.set(true));
+    let disabled = !open || sent() && refusal.is_none();
+    // Only an admin keeps a secret for good, and only where the asker offered it.
+    let keepable = remember.clone().filter(|_| admin);
+    let card = Card::Secret {
+        label: label.clone(),
+        reason: reason.clone(),
+        placeholder: placeholder.clone(),
+        url: url.clone(),
+        remember: remember.clone(),
+    };
+    let send = use_callback({
+        let keepable = keepable.is_some();
+        move |()| {
+            let keep = if keepable && keep() {
+                Keep::Stored
+            } else {
+                Keep::Conversation
+            };
+            let response = Response::Secret {
+                value: SecretValue::new(value.peek().clone()),
+                keep,
+            };
+            if let Err(error) = check(&card, &response) {
+                invalid.set(Some(error));
+                return;
+            }
+            invalid.set(None);
+            // Not kept in the page once sent, not even to send again: a refused answer is typed
+            // anew.
+            value.set(String::new());
+            on_send.call(Outgoing {
+                message: ClientMsg::Answer { id, response },
+                sent: Some(delivered),
+            });
+        }
+    });
+    let decline = move |_| {
+        invalid.set(None);
+        value.set(String::new());
+        on_send.call(Outgoing {
+            message: ClientMsg::Answer {
+                id,
+                response: Response::Decline,
+            },
+            sent: Some(delivered),
+        });
+    };
+    let error = invalid
+        .read()
+        .as_ref()
+        .map(|error| error.message.clone())
+        .or(refusal);
+    let input_id = format!("r{id}-secret");
+    let keep_id = format!("r{id}-keep");
+    let link_class = format!(
+        "inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium [&_svg]:size-4 {} {} {BUTTON_CLASS}",
+        ButtonVariant::Outline.as_str(),
+        ButtonSize::Default.as_str()
+    );
+    rsx! {
+        CardBox { size: CardSize::Sm, class: CARD_CLASS,
+            CardHeader {
+                CardDescription { class: "flex items-center gap-2 text-xs font-medium",
+                    KeyRound { class: "size-4" }
+                    "{title}"
+                }
+            }
+            CardContent { class: "flex flex-col gap-4",
+                p { class: "text-sm whitespace-pre-wrap wrap-break-word", "{reason}" }
+                if let Some((href, host)) = url.as_deref().and_then(link) {
+                    a {
+                        id: "r{id}-url",
+                        href,
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        class: "{link_class}",
+                        ExternalLink {}
+                        "Ouvrir {host}"
+                    }
+                }
+                FieldRow {
+                    FieldLabel { html_for: input_id.clone(), "{label}" }
+                    div {
+                        class: "flex items-center gap-2",
+                        onkeydown: move |event: KeyboardEvent| {
+                            if event.key() == Key::Enter && !event.is_composing() && !disabled {
+                                event.prevent_default();
+                                send.call(());
+                            }
+                        },
+                        Input {
+                            id: input_id.clone(),
+                            r#type: if shown() { InputType::Text } else { InputType::Password },
+                            value: value(),
+                            placeholder,
+                            autocomplete: "off",
+                            spellcheck: "false",
+                            autocapitalize: "off",
+                            disabled,
+                            class: "h-11 md:h-9",
+                            oninput: move |event: FormEvent| value.set(event.value()),
+                        }
+                        Button {
+                            id: "r{id}-show",
+                            variant: ButtonVariant::Ghost,
+                            class: "h-11 shrink-0 px-3 md:h-9",
+                            disabled,
+                            onclick: move |_| shown.toggle(),
+                            if shown() {
+                                "Masquer"
+                            } else {
+                                "Afficher"
+                            }
+                        }
+                    }
+                    if let Some(remember) = &keepable {
+                        if keep() {
+                            FieldDescription {
+                                "Scellé sous le nom « {remember.name} », envoyé seulement à {remember.origin}."
+                            }
+                        } else {
+                            FieldDescription { "Pour cette conversation seulement, jamais montré à l'agent." }
+                        }
+                    } else {
+                        FieldDescription { "Pour cette conversation seulement, jamais montré à l'agent." }
+                    }
+                }
+                if let Some(remember) = &keepable {
+                    FieldLabel { html_for: keep_id.clone(), class: "min-h-11 w-full",
+                        FieldRow { variant: FieldVariant::Horizontal,
+                            Checkbox {
+                                id: keep_id.clone(),
+                                checked: keep(),
+                                disabled,
+                                aria_label: format!("Garder pour {}", remember.origin),
+                                on_checked_change: move |on: bool| keep.set(on),
+                            }
+                            FieldContent {
+                                FieldTitle { class: "wrap-break-word", "Garder pour {remember.origin}" }
+                            }
+                        }
+                    }
+                }
+                if let Some(error) = error {
+                    FieldError { "{error}" }
+                }
+            }
+            CardFooter { class: "flex-col-reverse items-stretch sm:flex-row sm:items-center sm:justify-end",
+                Button {
+                    id: "r{id}-decline",
+                    variant: ButtonVariant::Outline,
+                    class: BUTTON_CLASS,
+                    disabled,
+                    onclick: decline,
+                    "Refuser"
+                }
+                Button {
+                    id: "r{id}-send",
+                    class: BUTTON_CLASS,
+                    disabled,
+                    onclick: move |_| send.call(()),
+                    "Enregistrer"
+                }
+            }
+        }
     }
 }
 
@@ -651,7 +981,13 @@ mod tests {
     }
 
     #[component]
-    fn Harness(card: Card, status: RequestStatus, refusal: Option<String>, open: bool) -> Element {
+    fn Harness(
+        card: Card,
+        status: RequestStatus,
+        refusal: Option<String>,
+        open: bool,
+        admin: bool,
+    ) -> Element {
         rsx! {
             RequestCard {
                 id: ID,
@@ -660,6 +996,7 @@ mod tests {
                 status,
                 refusal,
                 open,
+                admin,
                 on_send: move |outgoing: Outgoing| {
                     SENT.with_borrow_mut(|sent| sent.push(outgoing.message));
                     if let Some(sent) = outgoing.sent {
@@ -676,6 +1013,7 @@ mod tests {
             status: RequestStatus::Open,
             refusal: None,
             open: true,
+            admin: false,
         }
     }
 
@@ -1204,5 +1542,216 @@ mod tests {
             assert!(page.contains("Quelle appli installer ?"), "{page}");
             assert!(!page.contains("<button"), "{page}");
         }
+    }
+
+    const CANARY: &str = "canary-typed-secret-0b7f";
+
+    fn secret_card(url: Option<&str>, remember: bool) -> Card {
+        Card::Secret {
+            label: "Mot de passe Nextcloud".into(),
+            reason: "Pour lire ton agenda.".into(),
+            placeholder: Some("xxxx-xxxx".into()),
+            url: url.map(str::to_owned),
+            remember: remember.then(|| Remember {
+                name: "nextcloud".into(),
+                origin: "https://cloud.example".into(),
+            }),
+        }
+    }
+
+    fn secret_answer(value: &str, keep: Keep) -> ClientMsg {
+        ClientMsg::Answer {
+            id: ID,
+            response: Response::Secret {
+                value: SecretValue::new(value.into()),
+                keep,
+            },
+        }
+    }
+
+    fn admin(card: Card) -> HarnessProps {
+        HarnessProps {
+            admin: true,
+            ..props(card)
+        }
+    }
+
+    #[test]
+    fn secret_card_input_is_a_password() {
+        let mut card = Live::new(props(secret_card(None, false)));
+        let page = card.html();
+        for text in [
+            "Secret demandé par Fronde",
+            "Pour lire ton agenda.",
+            "Mot de passe Nextcloud",
+            "Pour cette conversation seulement, jamais montré à l&#39;agent.",
+            "Enregistrer",
+            "Refuser",
+        ] {
+            assert!(page.contains(text), "{text}: {page}");
+        }
+        let input = tag(&page, "r7-secret").unwrap();
+        for attribute in [
+            r#"type="password""#,
+            r#"autocomplete="off""#,
+            r#"spellcheck="false""#,
+            r#"autocapitalize="off""#,
+            r#"placeholder="xxxx-xxxx""#,
+        ] {
+            assert!(input.contains(attribute), "{attribute}: {input}");
+        }
+        // The label names the box.
+        assert!(page.contains(r#"for="r7-secret""#), "{page}");
+        // Shown only on demand, and masked again.
+        card.click("r7-show");
+        assert!(
+            tag(&card.html(), "r7-secret")
+                .unwrap()
+                .contains(r#"type="text""#)
+        );
+        assert!(card.html().contains("Masquer"));
+        card.click("r7-show");
+        assert!(
+            tag(&card.html(), "r7-secret")
+                .unwrap()
+                .contains(r#"type="password""#)
+        );
+    }
+
+    #[test]
+    fn secret_card_sends_once_and_echoes_nothing() {
+        let mut card = Live::new(props(secret_card(None, false)));
+        // Empty: nothing goes.
+        card.click("r7-send");
+        assert_eq!(sent(), []);
+        assert!(
+            card.html()
+                .contains("Saisis le secret, ou refuse la demande."),
+            "{}",
+            card.html()
+        );
+        card.type_text("r7-secret", CANARY);
+        card.key_in("r7-secret", Key::Enter, Code::Enter);
+        assert_eq!(sent(), [secret_answer(CANARY, Keep::Conversation)]);
+        let page = card.html();
+        assert!(!page.contains(CANARY), "the page still shows it: {page}");
+        assert!(!page.contains("Saisis le secret"), "{page}");
+        assert!(disabled(&page, "r7-send") && disabled(&page, "r7-decline"));
+        assert!(tag(&page, "r7-secret").unwrap().contains("disabled=true"));
+
+        // Closed, it says where the secret went, never what it was.
+        let cases = [
+            (
+                Outcome::Saved {
+                    kept: Keep::Conversation,
+                },
+                "Enregistré, jamais montré à l&#39;agent",
+            ),
+            (
+                Outcome::Saved { kept: Keep::Stored },
+                "Gardé pour https://cloud.example",
+            ),
+            (Outcome::Declined, "Refusé"),
+            (Outcome::Expired, "Expirée"),
+            (Outcome::Cancelled, "Annulée"),
+        ];
+        for (outcome, text) in cases {
+            let page = render(HarnessProps {
+                status: RequestStatus::Closed(outcome),
+                ..admin(secret_card(Some("https://cloud.example/"), true))
+            });
+            assert!(page.contains(text), "{text}: {page}");
+            assert!(page.contains("Mot de passe Nextcloud"), "{page}");
+            assert!(
+                !page.contains("<input") && !page.contains("<button"),
+                "{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn remember_checkbox_only_for_admin() {
+        // Offered by the asker, but the page's user is no admin.
+        let page = render(props(secret_card(None, true)));
+        assert!(tag(&page, "r7-keep").is_none(), "{page}");
+        assert!(!page.contains("Garder pour"), "{page}");
+        // An admin, but nothing offered.
+        let page = render(admin(secret_card(None, false)));
+        assert!(tag(&page, "r7-keep").is_none(), "{page}");
+
+        let mut card = Live::new(admin(secret_card(None, true)));
+        assert!(card.html().contains("Garder pour https://cloud.example"));
+        assert!(!checked(&card.html(), "r7-keep"), "never kept by default");
+        card.click("r7-keep");
+        assert!(
+            card.html().contains(
+                "Scellé sous le nom « nextcloud », envoyé seulement à https://cloud.example."
+            ),
+            "{}",
+            card.html()
+        );
+        card.type_text("r7-secret", CANARY);
+        card.click("r7-send");
+        assert_eq!(sent(), [secret_answer(CANARY, Keep::Stored)]);
+
+        // Without ticking it, for the conversation only.
+        let mut card = Live::new(admin(secret_card(None, true)));
+        card.type_text("r7-secret", CANARY);
+        card.click("r7-send");
+        assert_eq!(sent(), [secret_answer(CANARY, Keep::Conversation)]);
+    }
+
+    #[test]
+    fn secret_card_url_only_https() {
+        let page = render(props(secret_card(
+            Some("https://cloud.example/settings/security"),
+            false,
+        )));
+        let link = tag(&page, "r7-url").unwrap_or_else(|| panic!("{page}"));
+        assert!(
+            link.contains(r#"href="https://cloud.example/settings/security""#),
+            "{link}"
+        );
+        assert!(link.contains(r#"rel="noopener noreferrer""#), "{link}");
+        assert!(link.contains(r#"target="_blank""#), "{link}");
+        assert!(page.contains("Ouvrir cloud.example"), "{page}");
+        for url in [
+            "javascript:alert(1)",
+            "http://cloud.example/",
+            "https://cloud.example@evil.example/",
+            "https:///nohost",
+            "data:text/html,x",
+            " https://cloud.example/",
+        ] {
+            let page = render(props(secret_card(Some(url), false)));
+            assert!(tag(&page, "r7-url").is_none(), "{url}: {page}");
+            assert!(!page.contains("Ouvrir"), "{url}: {page}");
+        }
+    }
+
+    #[test]
+    fn secret_card_from_an_outside_client_says_so() {
+        let mut dom = VirtualDom::new_with_props(
+            |props: HarnessProps| {
+                rsx! {
+                    RequestCard {
+                        id: ID,
+                        card: props.card,
+                        from: Some("Fronde".into()),
+                        status: props.status,
+                        refusal: props.refusal,
+                        open: props.open,
+                        on_send: |_| {},
+                    }
+                }
+            },
+            props(secret_card(None, false)),
+        );
+        dom.rebuild_in_place();
+        let page = dioxus_ssr::render(&dom);
+        assert!(
+            page.contains("Secret demandé par « Fronde » (client MCP)"),
+            "{page}"
+        );
     }
 }

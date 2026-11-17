@@ -2434,10 +2434,12 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono-tz",
  "clap",
  "fronde-agent",
  "fronde-db",
+ "fronde-entity",
  "fronde-hub",
  "fronde-migration",
  "fronde-protocol",
@@ -2599,6 +2601,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -2612,10 +2615,13 @@ dependencies = [
  "fronde-entity",
  "fronde-protocol",
  "sea-orm",
+ "secrecy",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

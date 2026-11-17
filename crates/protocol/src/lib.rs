@@ -5,7 +5,10 @@ pub mod request;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use request::{Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Outcome, RequestId, Response};
+pub use request::{
+    Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Keep, Outcome, Remember, RequestId, Response,
+    SecretValue,
+};
 
 /// State of a tool call shown in the conversation.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -118,12 +121,15 @@ pub enum ServerMsg {
     /// The answer to [`ClientMsg::Hello`], before any entry. `log_id` changes when the log is
     /// started over, so a page can tell that what it shows is gone even when seqs overlap;
     /// `last_seq` is the newest entry at that moment. `user`: whom the page is signed in as, so
-    /// a closed card can say who answered when it was someone else.
+    /// a closed card can say who answered when it was someone else. `admin`: that user may keep
+    /// a secret for good, so its card offers it.
     Hello {
         log_id: String,
         last_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        admin: bool,
     },
     Entry(Entry),
     /// The answer to the request `id` was refused, for this page only: the request did not
@@ -297,6 +303,7 @@ mod tests {
             log_id: "0f3c".into(),
             last_seq: 12,
             user: None,
+            admin: false,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(json, r#"{"type":"hello","log_id":"0f3c","last_seq":12}"#);
@@ -305,11 +312,12 @@ mod tests {
             log_id: "0f3c".into(),
             last_seq: 12,
             user: Some("alix".into()),
+            admin: true,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"hello","log_id":"0f3c","last_seq":12,"user":"alix"}"#
+            r#"{"type":"hello","log_id":"0f3c","last_seq":12,"user":"alix","admin":true}"#
         );
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), hello);
 

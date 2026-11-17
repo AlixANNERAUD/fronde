@@ -261,9 +261,7 @@ fn main() -> ExitCode {
         return confine(policy, command);
     }
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(fronde::log_filter())
         .with_writer(std::io::stderr)
         .init();
     // Built by hand rather than with `#[tokio::main]`, whose runtime waits on drop for every

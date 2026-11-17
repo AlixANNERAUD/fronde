@@ -2,14 +2,20 @@
 //! the rules an answer must follow. The server and the page check answers with the same
 //! [`check`], so the page can say what is wrong before sending, and the server stays the judge.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use zeroize::Zeroize;
 
 /// A request's number: unique for the life of the database, whatever stream shows it.
 pub type RequestId = u64;
 
 /// The longest free text an answer may carry ("Autre" or a note), in characters.
 pub const MAX_TEXT: usize = 2000;
+
+/// The longest secret a card takes, in bytes: far more than any password or token, and well
+/// under the chat's largest message.
+pub const MAX_SECRET: usize = 16 * 1024;
 
 /// What a request's card shows. Never a secret.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -25,6 +31,23 @@ pub enum Card {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         submit: Option<String>,
     },
+    /// One secret, typed in a password box. Its value never comes back: not in the card, the
+    /// stream, the request's row or the asker's answer.
+    Secret {
+        /// What to type, in a few words.
+        label: String,
+        /// Why it is needed.
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        /// A sign-in or setup page, over https, shown as a button naming its host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Offered to an admin besides "this conversation": keep the secret, sealed, under this
+        /// name for this origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remember: Option<Remember>,
+    },
 }
 
 impl Card {
@@ -32,7 +55,75 @@ impl Card {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Form { .. } => "form",
+            Self::Secret { .. } => "secret",
         }
+    }
+}
+
+/// Where a secret card offers to keep the secret: under `name`, for the canonical `origin`
+/// only.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Remember {
+    pub name: String,
+    pub origin: String,
+}
+
+/// How long a secret given in a card is kept.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum Keep {
+    /// In memory, for this conversation, until used once or expired.
+    Conversation,
+    /// Sealed in the database, as the card's [`Remember`] says.
+    Stored,
+}
+
+/// A secret on its way from the page to the server's store. It prints as `[REDACTED]` and is
+/// wiped from memory when dropped; the server turns it into a `SecretString` at once.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretValue(String);
+
+impl SecretValue {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Its length in bytes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The value itself, moved out so that no copy is left behind.
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for SecretValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self)
     }
 }
 
@@ -90,6 +181,8 @@ pub enum Response {
     /// One of a permission request's options. Until permissions are requests, it answers a
     /// [`crate::Event::Permission`] by its id, with `allow_once` or `reject_once`.
     Permission { choice: String },
+    /// The secret a [`Card::Secret`] asks for, and how long to keep it.
+    Secret { value: SecretValue, keep: Keep },
     /// The user refuses to answer.
     Decline,
 }
@@ -115,6 +208,10 @@ pub enum Outcome {
     /// `summary`: what was answered, short (see [`summary`]).
     Answered {
         summary: String,
+    },
+    /// A secret was kept as `kept` says; never its value.
+    Saved {
+        kept: Keep,
     },
     Declined,
     Expired,
@@ -142,18 +239,48 @@ fn invalid(key: Option<&str>, message: impl Into<String>) -> Invalid {
     }
 }
 
-/// Checks that `response` answers `card`: known fields only, offered options only, one pick
-/// for a single choice, required fields answered, free text non-empty and short enough.
+/// Checks that `response` answers `card`: for a form, known fields only, offered options only,
+/// one pick for a single choice, required fields answered, free text non-empty and short
+/// enough; for a secret, a value of at most [`MAX_SECRET`] bytes, kept only where the card
+/// offers it. A decline answers any card.
 pub fn check(card: &Card, response: &Response) -> Result<(), Invalid> {
-    let (Card::Form { fields, .. }, Response::Form { values }) = (card, response) else {
-        return match response {
-            Response::Decline => Ok(()),
-            _ => Err(invalid(
-                None,
-                "Cette réponse ne correspond pas à la demande.",
-            )),
-        };
-    };
+    match (card, response) {
+        (_, Response::Decline) => Ok(()),
+        (Card::Form { fields, .. }, Response::Form { values }) => check_form(fields, values),
+        (Card::Secret { remember, .. }, Response::Secret { value, keep }) => {
+            check_secret(remember.as_ref(), value, *keep)
+        }
+        _ => Err(invalid(
+            None,
+            "Cette réponse ne correspond pas à la demande.",
+        )),
+    }
+}
+
+fn check_secret(
+    remember: Option<&Remember>,
+    value: &SecretValue,
+    keep: Keep,
+) -> Result<(), Invalid> {
+    if value.is_empty() {
+        return Err(invalid(None, "Saisis le secret, ou refuse la demande."));
+    }
+    if value.len() > MAX_SECRET {
+        return Err(invalid(
+            None,
+            format!("Secret trop long : {MAX_SECRET} octets au plus."),
+        ));
+    }
+    if keep == Keep::Stored && remember.is_none() {
+        return Err(invalid(
+            None,
+            "Cette demande ne propose pas de garder le secret.",
+        ));
+    }
+    Ok(())
+}
+
+fn check_form(fields: &[Field], values: &BTreeMap<String, ChoiceAnswer>) -> Result<(), Invalid> {
     if let Some(unknown) = values
         .keys()
         .find(|key| !fields.iter().any(|field| field.key() == key.as_str()))
@@ -234,6 +361,8 @@ pub fn check(card: &Card, response: &Response) -> Result<(), Invalid> {
 /// and "Autre" texts, field after field. Notes are left out.
 pub fn summary(card: &Card, response: &Response) -> String {
     match (card, response) {
+        // A secret is never summed up, not even by its length.
+        (Card::Secret { .. }, _) | (_, Response::Secret { .. }) => String::new(),
         (Card::Form { fields, .. }, Response::Form { values }) => fields
             .iter()
             .filter_map(|field| values.get(field.key()))
@@ -466,6 +595,108 @@ mod tests {
             },
         );
         assert_eq!(error.key, None);
+    }
+
+    fn secret_card(remember: bool) -> Card {
+        Card::Secret {
+            label: "Mot de passe Nextcloud".into(),
+            reason: "Pour lire ton agenda.".into(),
+            placeholder: None,
+            url: Some("https://cloud.example/settings".into()),
+            remember: remember.then(|| Remember {
+                name: "nextcloud".into(),
+                origin: "https://cloud.example".into(),
+            }),
+        }
+    }
+
+    fn secret(value: &str, keep: Keep) -> Response {
+        Response::Secret {
+            value: SecretValue::new(value.into()),
+            keep,
+        }
+    }
+
+    #[test]
+    fn secret_card_and_answer_json_shape() {
+        let card = secret_card(true);
+        let json = serde_json::to_string(&card).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"secret","label":"Mot de passe Nextcloud","reason":"Pour lire ton agenda.","url":"https://cloud.example/settings","remember":{"name":"nextcloud","origin":"https://cloud.example"}}"#
+        );
+        assert_eq!(serde_json::from_str::<Card>(&json).unwrap(), card);
+        assert_eq!(card.kind(), "secret");
+
+        let answer = secret("s3cret", Keep::Conversation);
+        let json = serde_json::to_string(&answer).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"secret","value":"s3cret","keep":"conversation"}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), answer);
+        assert_eq!(
+            serde_json::to_string(&Outcome::Saved { kept: Keep::Stored }).unwrap(),
+            r#"{"type":"saved","kept":"stored"}"#
+        );
+    }
+
+    #[test]
+    fn secret_answer_debug_is_redacted() {
+        let canary = "canary-secret-debug-51f0";
+        let answer = secret(canary, Keep::Stored);
+        for text in [format!("{answer:?}"), format!("{answer:#?}")] {
+            assert!(!text.contains(canary), "{text}");
+            assert!(text.contains("[REDACTED]"), "{text}");
+        }
+        let message = crate::ClientMsg::Answer {
+            id: 3,
+            response: answer,
+        };
+        assert!(!format!("{message:?}").contains(canary));
+        // Moved out whole.
+        assert_eq!(SecretValue::new(canary.into()).into_inner(), canary);
+    }
+
+    #[test]
+    fn secret_answer_rules() {
+        let card = secret_card(false);
+        assert_eq!(check(&card, &secret("s3cret", Keep::Conversation)), Ok(()));
+        assert_eq!(check(&card, &Response::Decline), Ok(()));
+        assert_eq!(
+            check(&secret_card(true), &secret("s3cret", Keep::Stored)),
+            Ok(())
+        );
+        let long = "x".repeat(MAX_SECRET + 1);
+        let cases = [
+            (
+                secret("", Keep::Conversation),
+                "Saisis le secret, ou refuse la demande.",
+            ),
+            (
+                secret(&long, Keep::Conversation),
+                "Secret trop long : 16384 octets au plus.",
+            ),
+            (
+                secret("s3cret", Keep::Stored),
+                "Cette demande ne propose pas de garder le secret.",
+            ),
+            (
+                values(&[("q1", answer(&["Mealie"], None))]),
+                "Cette réponse ne correspond pas à la demande.",
+            ),
+        ];
+        for (response, message) in cases {
+            assert_eq!(refused(&card, &response).message, message);
+        }
+        // A form never takes a secret.
+        let form = form(vec![choice("q1", false, true, true)]);
+        assert_eq!(
+            refused(&form, &secret("s3cret", Keep::Conversation)).message,
+            "Cette réponse ne correspond pas à la demande."
+        );
+        // Nor does any summary show one.
+        assert_eq!(summary(&card, &secret("s3cret", Keep::Conversation)), "");
     }
 
     #[test]

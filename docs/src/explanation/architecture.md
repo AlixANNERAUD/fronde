@@ -56,8 +56,8 @@ database, the topic `conversation`; the session id is saved there too.
 ## Requests
 
 Anything that waits on a human is a **request**: a row in the `requests` table, shown as a card in
-the conversation and answered once, from whichever signed-in page. `user_ask` is the first tool to
-ask this way. See [Requests and cards](requests.md).
+the conversation and answered once, from whichever signed-in page. `user_ask` asks questions this way,
+and `user_secret` one secret, which goes to the secret store and never to the agent. See [Requests and cards](requests.md).
 
 ## The web interface
 
