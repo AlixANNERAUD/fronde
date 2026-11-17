@@ -46,6 +46,13 @@ sign-in forms (`/auth/…`) to the server, so any route only the backend answers
 of those. `mise run dev` writes its configuration, a random token and its data under `target/dev`,
 and needs the Claude adapter on the `PATH` to chat.
 
+For the agent to answer, sign it in once: run `claude setup-token` in your own terminal, then keep
+the token where `mise run dev` looks for it, readable by you alone:
+
+```sh
+(umask 077; cat > target/dev/claude-token)   # paste the token, press Enter, then Ctrl-D
+```
+
 ## The Python runtime
 
 `code_run_python` runs CPython built for WASI (`wasm32-wasip1`). python.org publishes no WASI

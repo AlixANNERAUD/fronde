@@ -185,6 +185,11 @@ password = { file = "$PWD/$dev/password" }
 [python]
 dir = "$PWD/python"
 EOF
+# A Claude token from `claude setup-token`, kept in target/dev/claude-token (mode 0600), signs the
+# agent in; without it the chat opens but the agent cannot answer.
+if [ -f "$dev/claude-token" ]; then
+  printf '\n[agent]\noauth_token = { file = "%s" }\n' "$PWD/$dev/claude-token" >> "$dev/fronde.toml"
+fi
 cargo run --package fronde -- serve --config "$dev/fronde.toml"
 '''
 
