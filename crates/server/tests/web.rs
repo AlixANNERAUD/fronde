@@ -2472,3 +2472,80 @@ async fn old_page_still_talks_to_the_main_thread() {
         .unwrap()
         .unwrap();
 }
+
+/// A Claude `rate_limit_info` with both windows: the 5-hour one at `session`, resetting in two
+/// hours, and the weekly one at 18 %.
+fn rate_limit(session: f64) -> serde_json::Value {
+    let now = chrono::Utc::now().timestamp();
+    serde_json::json!({
+        "status": "allowed",
+        "resetsAt": now + 7200,
+        "rateLimitType": "five_hour",
+        "utilization": session,
+        "unifiedWindows": {
+            "five_hour": {"utilization": session, "resetsAt": now + 7200, "status": "allowed"},
+            "seven_day": {"utilization": 0.18, "resetsAt": now + 86400, "status": "allowed"}
+        }
+    })
+}
+
+/// The meter's usage reaches the admin's page: nothing before a reading, then each new reading
+/// as the agent sends it, and the latest at once after a later hello.
+#[tokio::test]
+async fn usage_pushed_on_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        updates: vec![
+            text_chunk("Bonjour"),
+            fronde_agent::fake::usage_update(rate_limit(0.42)),
+        ],
+        ..FakeScript::default()
+    });
+    let addr = start_with(config(dir.path(), true), connector, &site(dir.path())).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    let mut seen = Vec::new();
+    let usage = loop {
+        match next_message(&mut socket).await {
+            ServerMsg::Usage { reserve, usage } => break (reserve, usage),
+            other => seen.push(other),
+        }
+    };
+    assert!(
+        matches!(
+            seen.first(),
+            Some(ServerMsg::Entry(Entry {
+                event: Event::User { .. },
+                ..
+            }))
+        ),
+        "nothing before the turn: {seen:?}"
+    );
+    let (reserve, usage) = usage;
+    assert_eq!(reserve, 30);
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].provider, "claude");
+    let session = usage[0]
+        .window(&fronde_protocol::usage::WindowKind::Session)
+        .unwrap();
+    assert_eq!(session.used, Some(0.42));
+
+    // A later page gets the latest reading right after its hello and the log.
+    let mut later = open_chat(addr, &cookie).await;
+    hello(&mut later, 0, None).await;
+    let again = loop {
+        if let ServerMsg::Usage { usage, .. } = next_message(&mut later).await {
+            break usage;
+        }
+    };
+    assert_eq!(again, usage);
+}

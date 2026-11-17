@@ -682,6 +682,23 @@ impl Threads {
         fronde_protocol::usage::background(usage.as_ref(), self.limits().reserve, Utc::now())
     }
 
+    /// The latest usage of `user`'s own subscription accounts, one per configured provider read
+    /// so far: what the chat's meter shows that user. Empty without a usage book or a reading.
+    pub fn usage_of(&self, user: &str) -> Vec<fronde_protocol::usage::ProviderUsage> {
+        let Some(book) = &self.spec.usage else {
+            return Vec::new();
+        };
+        self.providers()
+            .into_iter()
+            .filter_map(|provider| book.get(&crate::usage::account_of(user, provider)))
+            .collect()
+    }
+
+    /// Moves on each new usage reading; `None` without a usage book.
+    pub fn usage_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.spec.usage.as_ref().map(|book| book.changes())
+    }
+
     /// Refuses background work past the owner's reserve of `account`; whether the daily counts
     /// apply: only when no usage reading decides.
     fn check_reserve(&self, account: &str) -> Result<bool, Delegation> {

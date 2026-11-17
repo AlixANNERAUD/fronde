@@ -352,7 +352,7 @@ pub struct ThreadSummary {
 }
 
 /// What the server sends over the WebSocket.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
     /// The answer to [`ClientMsg::Hello`], before any entry. `log_id` changes when the log is
@@ -398,6 +398,14 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
         reason: String,
+    },
+    /// How much of the page's user's own subscription accounts is used, one reading per
+    /// account read so far, and the share of each window kept for the owner
+    /// (`[threads] reserve`, in percent): after a hello, and on each new reading. Sent to
+    /// admins only, and only once there is a reading.
+    Usage {
+        reserve: u8,
+        usage: Vec<usage::ProviderUsage>,
     },
 }
 

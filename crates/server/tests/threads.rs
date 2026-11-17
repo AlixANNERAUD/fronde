@@ -3001,6 +3001,34 @@ async fn threads_list_says_whether_background_may_run() {
     bench.gate.notify_waiters();
 }
 
+/// Only an admin's page gets the meter's usage, and only their own accounts', once read.
+#[tokio::test]
+async fn usage_sent_to_admins_only() {
+    let bench = bench(FakeScript::default()).await;
+    assert_eq!(
+        fronde::usage_message(&bench.threads, &alix()),
+        None,
+        "no reading yet"
+    );
+    let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+    let windows = reading(0.42, 0.18, resets_at);
+    bench.usage.record("claude", windows.clone());
+    let Some(fronde_protocol::ServerMsg::Usage { reserve, usage }) =
+        fronde::usage_message(&bench.threads, &alix())
+    else {
+        panic!("the admin gets the usage");
+    };
+    assert_eq!(reserve, 30);
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].provider, "claude");
+    assert_eq!(usage[0].windows, windows);
+    let family = User {
+        name: "lea".into(),
+        admin: false,
+    };
+    assert_eq!(fronde::usage_message(&bench.threads, &family), None);
+}
+
 /// A setup card is tied to its call: the client cutting the call cancels the card at once,
 /// and the turn goes on.
 #[tokio::test]

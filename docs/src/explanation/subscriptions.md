@@ -98,7 +98,9 @@ and Antigravity send no reading Fronde reads yet.
 Fronde keeps a share of each window for your own turns: past `[threads] reserve` (30 % by
 default), sub-agents are neither started nor sent messages, and their results wait for your next
 message (see [What background work may spend](threads.md#what-background-work-may-spend)).
-Showing the windows in the chat and in `fronde check` is **planned**.
+The chat's header shows the windows as a meter, to an admin (see
+[Use several conversations](../how-to/use-threads.md#see-how-much-of-your-subscription-is-used));
+showing them in `fronde check` is **planned**.
 
 ## Why MCP for the tools
 

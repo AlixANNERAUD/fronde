@@ -11,6 +11,7 @@ pub mod sessions;
 pub mod thread_control;
 mod web;
 mod ws;
+pub use ws::usage_message;
 
 use anyhow::{Context, bail};
 use axum::Router;

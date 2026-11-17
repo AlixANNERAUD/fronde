@@ -9,7 +9,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fronde_agent::assistant::Assistant;
-use fronde_agent::threads::{Refusal, ThreadRow};
+use fronde_agent::threads::{Refusal, ThreadRow, Threads};
 use fronde_protocol::{
     CLOSE_SIGNED_OUT, ClientMsg, Entry, MAX_CLIENT_ID, ServerMsg, ThreadId, ThreadSummary,
     check_title,
@@ -74,6 +74,7 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>) {
         last_sent: 0,
         list: None,
         shown: None,
+        usage: None,
     };
     loop {
         tokio::select! {
@@ -128,6 +129,13 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>) {
                     return;
                 }
             }
+            changed = next_change(&mut talk.usage) => {
+                if !changed {
+                    talk.usage = None;
+                } else if talk.send_usage(&mut socket).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -146,6 +154,21 @@ struct Talk<'a> {
     list: Option<watch::Receiver<u64>>,
     /// The thread list last sent.
     shown: Option<Vec<ThreadSummary>>,
+    /// The usage book's changes, once a hello came, for a user who sees the meter.
+    usage: Option<watch::Receiver<u64>>,
+}
+
+/// The usage `user` is sent for the meter: their own accounts' readings and the reserve, to an
+/// admin only for now (the subscription is the owner's), and only once there is a reading.
+pub fn usage_message(threads: &Threads, user: &User) -> Option<ServerMsg> {
+    if !user.admin {
+        return None;
+    }
+    let usage = threads.usage_of(&user.name);
+    (!usage.is_empty()).then(|| ServerMsg::Usage {
+        reserve: threads.limits().reserve,
+        usage,
+    })
 }
 
 /// Why a thread message failed, when it is not the page's fault.
@@ -265,7 +288,20 @@ impl Talk<'_> {
             self.shown = None;
             self.send_list(socket).await?;
         }
-        self.replay(socket).await
+        self.replay(socket).await?;
+        // After the log: the meter, again at each hello, and on each new reading from then on.
+        if self.user.admin && self.usage.is_none() {
+            self.usage = self.web.threads.usage_changes();
+        }
+        self.send_usage(socket).await
+    }
+
+    /// Sends the meter's usage, if the page's user gets one.
+    async fn send_usage(&mut self, socket: &mut WebSocket) -> Result<(), ()> {
+        match usage_message(&self.web.threads, self.user) {
+            Some(message) => send(socket, &message).await,
+            None => Ok(()),
+        }
     }
 
     /// Makes the thread the page asked for with its first message, says which, and sends the

@@ -88,6 +88,23 @@ thread says when it can run again, in the server's time:
 The turn ends as failed. Send your message again after that time. Fronde keeps the reading the
 refusal carried (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)).
 
+## See how much of your subscription is used
+
+Once Fronde has a reading (it comes with a turn, see
+[Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)), the chat's header shows a
+pill with the window nearest its line, such as « 5 h 42 % ». Its colour says how close it is:
+grey well below your reserve's line, amber within 10 points of it, orange at the line (background
+work paused), red when Claude refuses turns until the window resets; the words say the same for a
+screen reader. Tap it to see each window with its use and when it resets in your time
+(« réinitialisée à 16:40 », « réinitialisée lun. 09:00 », or « réinitialisée depuis le relevé »),
+how old the reading is (« relevé il y a 12 min »), and whether background work runs:
+« Tâches de fond permises (réserve 30 %) », « Tâches de fond en pause jusqu'à 16:40 (réserve
+30 %) », or, when no reading decides, that the daily counts limit it. Escape or a tap elsewhere
+closes it. The pill follows each new reading without reloading the page.
+
+The meter shows the signed-in user's own subscription and, for now, only to an admin: the one
+subscription is the owner's. Without a reading yet, there is no pill.
+
 ## Change the limits on sub-agents
 
 Sub-agents spend your subscription's quota in the background. When an agent says it hit a limit,

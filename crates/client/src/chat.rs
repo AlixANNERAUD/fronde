@@ -207,7 +207,8 @@ impl Chat {
             // The thread list's messages: see [`crate::Threads`].
             ServerMsg::Threads { .. }
             | ServerMsg::Created { .. }
-            | ServerMsg::ThreadRefused { .. } => {}
+            | ServerMsg::ThreadRefused { .. }
+            | ServerMsg::Usage { .. } => {}
         }
     }
 

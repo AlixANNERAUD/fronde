@@ -120,7 +120,7 @@ pub fn activity(at: DateTime<Utc>, now: DateTime<Utc>, offset: i32) -> String {
 
 /// Now, and the browser's offset from UTC at `at`, in minutes east.
 #[cfg(target_arch = "wasm32")]
-fn now_and_offset(at: DateTime<Utc>) -> (DateTime<Utc>, i32) {
+pub(crate) fn now_and_offset(at: DateTime<Utc>) -> (DateTime<Utc>, i32) {
     let now = DateTime::from_timestamp_millis(js_sys::Date::now() as i64).unwrap_or(at);
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
         at.timestamp_millis() as f64
@@ -131,7 +131,7 @@ fn now_and_offset(at: DateTime<Utc>) -> (DateTime<Utc>, i32) {
 
 /// Natively there is no browser: UTC.
 #[cfg(not(target_arch = "wasm32"))]
-fn now_and_offset(_at: DateTime<Utc>) -> (DateTime<Utc>, i32) {
+pub(crate) fn now_and_offset(_at: DateTime<Utc>) -> (DateTime<Utc>, i32) {
     (Utc::now(), 0)
 }
 

@@ -8,6 +8,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# The meter's times and ages (`usage.rs`).
+chrono.workspace = true
 fronde-protocol = { path = "../protocol" }
 
 [dev-dependencies]

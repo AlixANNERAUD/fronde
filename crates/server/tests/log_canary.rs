@@ -797,7 +797,8 @@ async fn secret_answer_never_appears() {
                     ServerMsg::Refused { .. }
                     | ServerMsg::Threads { .. }
                     | ServerMsg::Created { .. }
-                    | ServerMsg::ThreadRefused { .. } => {}
+                    | ServerMsg::ThreadRefused { .. }
+                    | ServerMsg::Usage { .. } => {}
                 }
             }
             panic!("the socket closed");
