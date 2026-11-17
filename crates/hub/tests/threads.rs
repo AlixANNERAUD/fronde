@@ -10,6 +10,7 @@ use fronde_hub::threads::{
     Child, NewChild, ProviderModels, ReadThread, Started, ThreadControl, ThreadError, Waited,
 };
 use fronde_protocol::{ThreadId, ThreadStatus};
+use fronde_requests::{Ask, Waiter};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientConfig, Implementation};
 use serde_json::{Value, json};
@@ -91,6 +92,11 @@ impl ThreadControl for Recording {
     ) -> Result<Waited, ThreadError> {
         self.record("wait");
         Ok(Waited::TimedOut)
+    }
+
+    async fn ask(&self, _: ThreadId, _: Ask) -> Result<Option<Waiter>, ThreadError> {
+        self.record("ask");
+        Ok(None)
     }
 }
 

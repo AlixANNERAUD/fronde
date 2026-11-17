@@ -16,7 +16,7 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_protocol::{Card, Outcome, RequestId, ThreadStatus};
-use fronde_requests::{Ask, Caller, Requests, Resolution, User};
+use fronde_requests::{Ask, Caller, Requests, Resolution, User, Waiter};
 use futures::future::BoxFuture;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -710,12 +710,30 @@ impl Assistant {
     /// The seq of the running turn's user message, `None` when idle or ending: what a request
     /// asked during the turn is tied to.
     pub async fn current_turn(&self) -> Option<u64> {
-        self.turn
-            .lock()
-            .await
-            .as_ref()
-            .filter(|turn| !turn.ending)
-            .and_then(|turn| turn.seq)
+        running(self.turn.lock().await.as_ref())
+    }
+
+    /// Opens `ask`, a request this thread's agent makes through the hub during its turn
+    /// [`Ask::turn`], and shows its card while that turn still runs, as the agent's own cards
+    /// are: a turn that ends or is stopped meanwhile waits for the card and cancels it with its
+    /// other requests, before its end is logged. `None`, with nothing asked, once that turn is
+    /// over or ending: its card would outlive it.
+    pub async fn ask_during(&self, ask: Ask) -> anyhow::Result<Option<Waiter>> {
+        anyhow::ensure!(
+            ask.topic == self.topic && ask.caller == Caller::Thread(self.thread),
+            "a request of thread {} asked for another thread or stream",
+            self.thread
+        );
+        let requests = self
+            .requests()
+            .context("the thread has no requests to show a card")?;
+        let turn = self.turn.lock().await;
+        if ask.turn.is_none() || running(turn.as_ref()) != ask.turn {
+            return Ok(None);
+        }
+        let waiter = requests.ask(ask).await?;
+        drop(turn);
+        Ok(Some(waiter))
     }
 
     fn requests(&self) -> Option<Arc<Requests>> {
@@ -813,13 +831,9 @@ impl Assistant {
         // The turn stays locked until the card is shown: a turn that ends or is stopped meanwhile
         // marks itself ending under this lock, so it waits for the card and cancels it with its
         // other requests, before its end is logged.
-        let running = self.turn.lock().await;
-        let Some(turn) = running
-            .as_ref()
-            .filter(|turn| !turn.ending)
-            .and_then(|turn| turn.seq)
-        else {
-            drop(running);
+        let running_turn = self.turn.lock().await;
+        let Some(turn) = running(running_turn.as_ref()) else {
+            drop(running_turn);
             tracing::warn!("a {what} request came outside a turn: refused");
             reply.send(refusal);
             return;
@@ -838,7 +852,7 @@ impl Assistant {
                 tied: true,
             })
             .await;
-        drop(running);
+        drop(running_turn);
         let waiter = match asked {
             Ok(waiter) => waiter,
             Err(error) => {
@@ -1237,6 +1251,12 @@ async fn stop_prompt(
             Ok(TurnEnd::Cancelled)
         }
     }
+}
+
+/// The seq of `turn`'s user message while it runs, `None` when idle or ending: what a request
+/// may still be tied to.
+fn running(turn: Option<&Turn>) -> Option<u64> {
+    turn.filter(|turn| !turn.ending).and_then(|turn| turn.seq)
 }
 
 /// A duration as `[threads]` writes it: `30m`, `1h 30m`, `90s`.

@@ -11,9 +11,11 @@ use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_db::master_key::Backends;
 use fronde_hub::Hub;
 use fronde_hub::threads::ThreadControl;
-use fronde_hub::tools::{CallContext, ToolOutput, typed_tool_with_context};
-use fronde_protocol::{ChoiceAnswer, Keep, Response, SecretValue};
-use fronde_requests::{Requests, SecretStore, User};
+use fronde_hub::tools::{CallContext, Registry, ToolOutput, typed_tool_with_context};
+use fronde_protocol::{
+    Card, ChoiceAnswer, Keep, Outcome, RequestId, Response, SecretValue, TurnOutcome,
+};
+use fronde_requests::{Caller, Journal, Requests, SecretStore, User};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientConfig, Implementation};
@@ -42,6 +44,10 @@ struct Bench {
     addr: SocketAddr,
     threads: Arc<Threads>,
     requests: Arc<Requests>,
+    /// The requests' journal: the threads, a step held when the test asks.
+    journal: Arc<HeldJournal>,
+    /// The hub's tools, called as the gate would with a context the test makes.
+    registry: Arc<Registry>,
     /// Each agent start's thread and hub token, in order.
     starts: Arc<Mutex<Vec<(ThreadId, String)>>>,
     /// Each agent start's fake agent, in order.
@@ -121,7 +127,12 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         Backends::file(dir.path().join("master.key")),
         ephemeral.clone(),
     );
-    let requests = Requests::open_with(db.clone(), threads.clone(), Some(store))
+    let journal = Arc::new(HeldJournal {
+        threads: threads.clone(),
+        hold: Mutex::default(),
+        reached: Notify::new(),
+    });
+    let requests = Requests::open_with(db.clone(), journal.clone(), Some(store))
         .await
         .unwrap();
     threads.set_requests(&requests).await;
@@ -160,6 +171,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         }
     });
     hub.registry.register(def, handler).unwrap();
+    let registry = hub.registry.clone();
     let app = fronde::router(
         Arc::new(hub),
         SecretString::from(TOKEN),
@@ -172,11 +184,85 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         addr,
         threads,
         requests,
+        journal,
+        registry,
         starts,
         fakes,
         gate: Arc::new(Notify::new()),
         data,
         _dir: dir,
+    }
+}
+
+/// A step of the requests' journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Announce,
+    Close,
+}
+
+/// The threads as the requests' journal, the next step of a kind held when the test asks: it
+/// sees what happens while a card is being shown or closed.
+struct HeldJournal {
+    threads: Arc<Threads>,
+    /// The next step of this kind waits for the notify.
+    hold: Mutex<Option<(Step, Arc<Notify>)>>,
+    /// Told when a held step is reached.
+    reached: Notify,
+}
+
+impl HeldJournal {
+    /// Holds the next `step` until the returned notify is told once.
+    fn hold(&self, step: Step) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        *self.hold.lock().unwrap() = Some((step, gate.clone()));
+        gate
+    }
+
+    /// Returns once a held step is reached.
+    async fn reached(&self) {
+        timeout(WAIT, self.reached.notified())
+            .await
+            .expect("the held step was never reached");
+    }
+
+    async fn pass(&self, step: Step) {
+        let gate = {
+            let mut hold = self.hold.lock().unwrap();
+            match &*hold {
+                Some((held, _)) if *held == step => hold.take().map(|(_, gate)| gate),
+                _ => None,
+            }
+        };
+        if let Some(gate) = gate {
+            self.reached.notify_one();
+            gate.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Journal for HeldJournal {
+    async fn announce(
+        &self,
+        topic: &str,
+        id: RequestId,
+        card: &Card,
+        caller: &Caller,
+    ) -> anyhow::Result<u64> {
+        self.pass(Step::Announce).await;
+        self.threads.announce(topic, id, card, caller).await
+    }
+
+    async fn close(
+        &self,
+        topic: &str,
+        id: RequestId,
+        outcome: &Outcome,
+        by: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.pass(Step::Close).await;
+        self.threads.close(topic, id, outcome, by).await
     }
 }
 
@@ -2297,4 +2383,218 @@ async fn stop_on_parent_leaves_children_running() {
         [(child, fronde_protocol::TurnOutcome::Cancelled)]
     );
     bench.gate.notify_waiters();
+}
+
+/// A call of the hub's `tool` by the main thread's agent, with the context the gate made when
+/// its turn was `turn`.
+fn call_in_turn(
+    bench: &Bench,
+    turn: Option<u64>,
+    tool: &'static str,
+    arguments: Value,
+) -> tokio::task::JoinHandle<Value> {
+    let registry = bench.registry.clone();
+    tokio::spawn(async move {
+        let context = CallContext {
+            caller: Caller::Thread(ThreadId::MAIN),
+            user: "alix".into(),
+            topic: "conversation".into(),
+            turn,
+            cancelled: tokio_util::sync::CancellationToken::new(),
+        };
+        let output = registry.call_as(&context, tool, arguments).await;
+        serde_json::from_str(&output.to_text()).unwrap()
+    })
+}
+
+fn question() -> Value {
+    json!({"questions": [{
+        "question": "Quelle appli installer ?",
+        "header": "Appli",
+        "options": [
+            {"label": "Mealie", "description": "Les recettes"},
+            {"label": "Seerr", "description": "Les films"},
+        ],
+    }]})
+}
+
+fn secret() -> Value {
+    json!({"label": "Mot de passe Nextcloud", "reason": "Pour lire ton agenda."})
+}
+
+/// The cards shown and closed in `assistant`'s stream, and the ends of its turns, in order.
+fn cards_and_ends(assistant: &Assistant) -> Vec<Event> {
+    assistant
+        .log()
+        .since(0)
+        .into_iter()
+        .map(|entry| entry.event)
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Request { .. } | Event::RequestClosed { .. } | Event::TurnEnded { .. }
+            )
+        })
+        .collect()
+}
+
+/// Waits until `assistant`'s stream satisfies `done`.
+async fn wait_for_stream(assistant: &Assistant, done: impl Fn(&[Event]) -> bool) {
+    timeout(WAIT, async {
+        loop {
+            let events: Vec<Event> = assistant
+                .log()
+                .since(0)
+                .into_iter()
+                .map(|entry| entry.event)
+                .collect();
+            if done(&events) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out; the stream has {:?}", assistant.log().since(0)));
+}
+
+fn turn_ended(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, Event::TurnEnded { .. }))
+}
+
+/// The main thread's agent calls `tool` as its turn ends, the call first: the card is being
+/// shown when the agent ends the turn. The turn's end waits for the card, then cancels it: its
+/// end comes before the turn's.
+async fn hub_card_shown_as_the_turn_ends_closes_before_its_end(tool: &'static str, args: Value) {
+    let bench = Bench::held().await;
+    let main = bench.assistant(ThreadId::MAIN).await;
+    main.send("Salut".into()).await;
+    let turn = main.current_turn().await;
+    assert!(turn.is_some());
+
+    let shown = bench.journal.hold(Step::Announce);
+    let call = call_in_turn(&bench, turn, tool, args);
+    bench.journal.reached().await;
+    // The card is being shown: the agent ends its turn meanwhile.
+    bench.gate.notify_one();
+    wait_for_stream(&main, |events| {
+        events.contains(&Event::Assistant {
+            text: " Voilà.".into(),
+        })
+    })
+    .await;
+    // Time enough for the turn's end to be logged, were it not waiting for the card.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !turn_ended(&cards_and_ends(&main)),
+        "{:?}",
+        cards_and_ends(&main)
+    );
+    shown.notify_one();
+
+    let result = timeout(WAIT, call).await.unwrap().unwrap();
+    assert_eq!(result["result"]["status"], "cancelled", "{result}");
+    wait_for_stream(&main, turn_ended).await;
+    let events = cards_and_ends(&main);
+    let [
+        Event::Request { id, .. },
+        Event::RequestClosed {
+            id: closed,
+            outcome: Outcome::Cancelled,
+            ..
+        },
+        Event::TurnEnded {
+            outcome: TurnOutcome::Done,
+        },
+    ] = events.as_slice()
+    else {
+        panic!("{events:?}");
+    };
+    assert_eq!(id, closed);
+    assert!(bench.requests.pending_by_topic().await.unwrap().is_empty());
+}
+
+/// The main thread's agent calls `tool` as its turn ends, the turn first: the turn is
+/// cancelling its cards when the call comes, then has ended. Each time the call is refused, and
+/// no card is shown: none is left open after the turn's end.
+async fn hub_card_asked_as_the_turn_ends_is_refused(tool: &'static str, args: Value) {
+    let bench = Bench::held().await;
+    let main = bench.assistant(ThreadId::MAIN).await;
+    main.send("Salut".into()).await;
+    let turn = main.current_turn().await;
+    assert!(turn.is_some());
+    // A card of the turn, whose cancel the turn's end is slow to show.
+    let first = call_in_turn(&bench, turn, tool, args.clone());
+    let (first_id, _) = next_request(&main, 0).await;
+    let closing = bench.journal.hold(Step::Close);
+    bench.gate.notify_one();
+    bench.journal.reached().await;
+    assert!(!turn_ended(&cards_and_ends(&main)));
+
+    // The turn is ending: the call made during it is refused at once.
+    let refused = timeout(WAIT, call_in_turn(&bench, turn, tool, args.clone()))
+        .await
+        .expect("the call waits on a card its ending turn left open")
+        .unwrap();
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("your turn ended before it could be")),
+        "{refused}"
+    );
+    closing.notify_one();
+    let result = timeout(WAIT, first).await.unwrap().unwrap();
+    assert_eq!(result["result"]["status"], "cancelled", "{result}");
+    wait_for_stream(&main, turn_ended).await;
+
+    // The turn has ended: a call made during it is refused too.
+    let late = timeout(WAIT, call_in_turn(&bench, turn, tool, args))
+        .await
+        .expect("the call waits on a card shown after its turn ended")
+        .unwrap();
+    assert!(
+        late["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("your turn ended before it could be")),
+        "{late}"
+    );
+    let events = cards_and_ends(&main);
+    assert_eq!(
+        events[1..],
+        [
+            Event::RequestClosed {
+                id: first_id,
+                outcome: Outcome::Cancelled,
+                by: None,
+            },
+            Event::TurnEnded {
+                outcome: TurnOutcome::Done,
+            },
+        ],
+        "{events:?}"
+    );
+    assert_eq!(requests_in(&main), 1);
+    assert!(bench.requests.pending_by_topic().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn user_ask_shown_as_the_turn_ends_closes_before_its_end() {
+    hub_card_shown_as_the_turn_ends_closes_before_its_end("user_ask", question()).await;
+}
+
+#[tokio::test]
+async fn user_ask_asked_as_the_turn_ends_is_refused() {
+    hub_card_asked_as_the_turn_ends_is_refused("user_ask", question()).await;
+}
+
+#[tokio::test]
+async fn user_secret_shown_as_the_turn_ends_closes_before_its_end() {
+    hub_card_shown_as_the_turn_ends_closes_before_its_end("user_secret", secret()).await;
+}
+
+#[tokio::test]
+async fn user_secret_asked_as_the_turn_ends_is_refused() {
+    hub_card_asked_as_the_turn_ends_is_refused("user_secret", secret()).await;
 }

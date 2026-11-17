@@ -6,6 +6,7 @@ use fronde_agent::threads::{ChildEnd, ChildTask, Delegation, ThreadId, Threads};
 use fronde_hub::threads::{
     Child, NewChild, ProviderModels, ReadThread, Started, ThreadControl, ThreadError, Waited,
 };
+use fronde_requests::{Ask, Waiter};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -165,5 +166,9 @@ impl ThreadControl for ThreadBridge {
             ChildEnd::TimedOut => Waited::TimedOut,
             ChildEnd::GaveUp => Waited::GaveUp,
         })
+    }
+
+    async fn ask(&self, caller: ThreadId, ask: Ask) -> Result<Option<Waiter>, ThreadError> {
+        self.0.ask_during(caller, ask).await.map_err(hub_error)
     }
 }

@@ -16,7 +16,7 @@ use crate::tools::{CallContext, ToolOutput, typed_tool_with_context};
 use async_trait::async_trait;
 use fronde_protocol::text::readable as visible;
 use fronde_protocol::{Entry, Event, ThreadId, ThreadStatus, TurnOutcome};
-use fronde_requests::Caller;
+use fronde_requests::{Ask, Caller, Waiter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -210,6 +210,10 @@ pub trait ThreadControl: Send + Sync {
         timeout: Duration,
         cancelled: CancellationToken,
     ) -> Result<Waited, ThreadError>;
+    /// Opens `ask`, a request of `caller`'s turn [`Ask::turn`] (a `user_*` card), and shows
+    /// its card while that turn still runs, so that the turn's end cancels it before its own end
+    /// is logged: `None`, with nothing asked, once that turn is over or ending.
+    async fn ask(&self, caller: ThreadId, ask: Ask) -> Result<Option<Waiter>, ThreadError>;
 }
 
 #[derive(Deserialize, JsonSchema)]

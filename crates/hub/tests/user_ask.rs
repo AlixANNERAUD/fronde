@@ -53,7 +53,7 @@ async fn bench() -> Bench {
     let (send, shown) = mpsc::unbounded_channel();
     let requests = Requests::open(db, Arc::new(Shown(send))).await.unwrap();
     let registry = Arc::new(Registry::new());
-    let tools: Vec<Tool> = user_tools(requests.clone());
+    let tools: Vec<Tool> = user_tools(requests.clone(), None);
     assert_eq!(registry.replace_source("hub", tools), 1);
     Bench {
         registry,

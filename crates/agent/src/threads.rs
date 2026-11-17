@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_entity::{stream_entries, streams, threads};
 use fronde_protocol::{Card, Outcome, RequestId, ThreadSummary};
-use fronde_requests::{Caller, Journal, Requests, User};
+use fronde_requests::{Ask, Caller, Journal, Requests, User, Waiter};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
@@ -652,6 +652,17 @@ impl Threads {
             topic: assistant.topic().to_owned(),
             turn: assistant.current_turn().await,
         })
+    }
+
+    /// Opens `ask`, a request thread `thread`'s agent makes through the hub during its turn
+    /// [`Ask::turn`]: see [`Assistant::ask_during`]. `None`, with nothing asked, when that turn
+    /// is over or ending, or the thread is not open (its agent runs no turn).
+    pub async fn ask_during(&self, thread: ThreadId, ask: Ask) -> anyhow::Result<Option<Waiter>> {
+        let assistant = self.open.lock().await.get(&thread).cloned();
+        match assistant {
+            Some(assistant) => assistant.ask_during(ask).await,
+            None => Ok(None),
+        }
     }
 
     /// The live hub tokens of the threads' agent processes.

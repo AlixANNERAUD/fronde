@@ -73,7 +73,7 @@ impl Hub {
             )
         });
         if let Some(requests) = requests {
-            own.extend(user::user_tools(requests));
+            own.extend(user::user_tools(requests, threads.clone()));
         }
         if let Some(threads) = &threads {
             own.extend(threads::thread_tools(threads.clone()));

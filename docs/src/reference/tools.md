@@ -96,7 +96,8 @@ private-use or unassigned code point); only `preview` may hold line breaks and t
 names the character as `U+XXXX`. Never use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
 than the question's: Codex, for instance, gives up after `tool_timeout_sec` (60 s by default).
 A call the client cancels closes its card as cancelled, and so does the end of the agent's
-turn, or *Stop*, for the questions that turn asked.
+turn, or *Stop*, for the questions that turn asked. A call from one of Fronde's agents that comes
+as its turn ends, or after, gets an error and shows no card: no card outlives its turn.
 See [Requests and cards](../explanation/requests.md).
 
 ### `user_secret`
@@ -145,7 +146,8 @@ The user picks how long the secret is kept:
   the card says so to the owner.
 
 The value never reaches the agent, the conversation, the request's row, a log or any file but the
-sealed row. Declined, expired and cancelled calls return as `user_ask`'s do. `user_secret` is
+sealed row. Declined, expired and cancelled calls return as `user_ask`'s do, and so does a call
+that comes as its turn ends. `user_secret` is
 served only while the chat runs, beside `user_ask`. See
 [Requests and cards](../explanation/requests.md#secret-cards).
 

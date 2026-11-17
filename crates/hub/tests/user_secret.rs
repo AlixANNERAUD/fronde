@@ -67,7 +67,7 @@ async fn bench() -> Bench {
         .unwrap();
     let registry = Arc::new(Registry::new());
     assert_eq!(
-        registry.replace_source("hub", user_tools(requests.clone())),
+        registry.replace_source("hub", user_tools(requests.clone(), None)),
         2
     );
     Bench {
@@ -452,7 +452,7 @@ async fn user_secret_needs_a_store() {
     let db = fronde_db::open(dir.path()).await.unwrap();
     let (send, _shown) = mpsc::unbounded_channel();
     let requests = Requests::open(db, Arc::new(Shown(send))).await.unwrap();
-    let names: Vec<String> = user_tools(requests)
+    let names: Vec<String> = user_tools(requests, None)
         .into_iter()
         .map(|(def, _)| def.name)
         .collect();

@@ -3,6 +3,7 @@
 use crate::config::is_valid_name;
 use crate::origin::Origin;
 use crate::source::Tool;
+use crate::threads::{ThreadControl, ThreadError};
 use crate::tools::{CallContext, ToolOutput, typed_tool_with_context};
 // Card texts stay short enough for a phone, and a card small enough for the chat's messages:
 // the caps the requests enforce on every card.
@@ -106,25 +107,77 @@ struct RememberArg {
     origin: String,
 }
 
+/// Where the `user_*` tools ask: the requests, and the threads that show a thread's card during
+/// its turn.
+#[derive(Clone)]
+struct Asking {
+    requests: Arc<Requests>,
+    threads: Option<Arc<dyn ThreadControl>>,
+}
+
+/// Why a card was not shown.
+enum NotShown {
+    /// The `client_request_id` names another request still pending.
+    Reused(anyhow::Error),
+    /// The calling thread's turn ended, or is ending: a card shown now would outlive it.
+    TurnOver,
+    /// Something broke; logged here.
+    Failed,
+}
+
+impl Asking {
+    /// Opens `ask` and shows its card. A thread's card tied to its turn goes through `threads`,
+    /// which show it while that turn still runs, so that the turn's end cancels it before its own
+    /// end is logged; the turn the call came in may have ended since. Any other card (an outside
+    /// client's, or one without threads to end a turn) is asked directly.
+    async fn open(&self, what: &str, context: &CallContext, ask: Ask) -> Result<Waiter, NotShown> {
+        let asked = match (&context.caller, context.turn, &self.threads) {
+            (Caller::Thread(thread), Some(_), Some(threads)) => {
+                match threads.ask(*thread, ask).await {
+                    Ok(Some(waiter)) => Ok(waiter),
+                    Ok(None) => return Err(NotShown::TurnOver),
+                    Err(ThreadError::Failed(error)) => Err(error),
+                    Err(ThreadError::NoSuchThread) => {
+                        Err(anyhow::anyhow!("the calling thread is unknown"))
+                    }
+                    Err(ThreadError::Refused(message)) => Err(anyhow::anyhow!(message)),
+                }
+            }
+            _ => self.requests.ask(ask).await,
+        };
+        asked.map_err(|error| {
+            if error.is::<Reused>() {
+                NotShown::Reused(error)
+            } else {
+                tracing::error!("{what} cannot open its request: {error:#}");
+                NotShown::Failed
+            }
+        })
+    }
+}
+
 /// The `user_*` tools, asking through `requests`; `user_secret` only when `requests` keeps
-/// secrets.
-pub fn user_tools(requests: Arc<Requests>) -> Vec<Tool> {
+/// secrets. With `threads`, a thread's card is shown while the turn it was asked in runs, and
+/// refused once that turn is over.
+pub fn user_tools(requests: Arc<Requests>, threads: Option<Arc<dyn ThreadControl>>) -> Vec<Tool> {
+    let secrets = requests.secrets().is_some();
+    let asking = Asking { requests, threads };
     let ask = typed_tool_with_context("user_ask", DESCRIPTION, false, {
-        let requests = requests.clone();
+        let asking = asking.clone();
         move |context: CallContext, args: AskArgs| {
-            let requests = requests.clone();
-            async move { user_ask(&requests, context, args).await }
+            let asking = asking.clone();
+            async move { user_ask(&asking, context, args).await }
         }
     });
     let mut tools = vec![ask];
-    if requests.secrets().is_some() {
+    if secrets {
         tools.push(typed_tool_with_context(
             "user_secret",
             SECRET_DESCRIPTION,
             false,
             move |context: CallContext, args: SecretArgs| {
-                let requests = requests.clone();
-                async move { user_secret(&requests, context, args).await }
+                let asking = asking.clone();
+                async move { user_secret(&asking, context, args).await }
             },
         ));
     }
@@ -146,7 +199,8 @@ async fn wait(requests: &Requests, context: &CallContext, waiter: Waiter) -> Res
     }
 }
 
-async fn user_secret(requests: &Requests, context: CallContext, args: SecretArgs) -> ToolOutput {
+async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) -> ToolOutput {
+    let requests = &asking.requests;
     if let Err(message) = check_asker(&context.caller) {
         return ToolOutput::error(message);
     }
@@ -190,15 +244,19 @@ async fn user_secret(requests: &Requests, context: CallContext, args: SecretArgs
         // A question or secret outlives the call: B6 brings its late answer to the assistant.
         tied: false,
     };
-    let waiter = match requests.ask(ask).await {
+    let waiter = match asking.open("user_secret", &context, ask).await {
         Ok(waiter) => waiter,
-        Err(error) if error.is::<Reused>() => {
+        Err(NotShown::Reused(error)) => {
             return ToolOutput::error(format!(
                 "{error}; give a new client_request_id for a new secret, or retry with exactly the same arguments"
             ));
         }
-        Err(error) => {
-            tracing::error!("user_secret cannot open its request: {error:#}");
+        Err(NotShown::TurnOver) => {
+            return ToolOutput::error(
+                "the card was not shown: your turn ended before it could be; if you still need this secret, ask for it again with user_secret in a later turn, never in chat",
+            );
+        }
+        Err(NotShown::Failed) => {
             return ToolOutput::error(
                 "the card could not be shown to the user; say in your reply that you need this secret, and never ask for it in chat",
             );
@@ -356,7 +414,8 @@ fn check_client_request_id(id: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> ToolOutput {
+async fn user_ask(asking: &Asking, context: CallContext, args: AskArgs) -> ToolOutput {
+    let requests = &asking.requests;
     if let Err(message) = check_asker(&context.caller) {
         return ToolOutput::error(message);
     }
@@ -377,15 +436,19 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
         // A question or secret outlives the call: B6 brings its late answer to the assistant.
         tied: false,
     };
-    let waiter = match requests.ask(ask).await {
+    let waiter = match asking.open("user_ask", &context, ask).await {
         Ok(waiter) => waiter,
-        Err(error) if error.is::<Reused>() => {
+        Err(NotShown::Reused(error)) => {
             return ToolOutput::error(format!(
                 "{error}; give a new client_request_id for a new question, or retry with exactly the same questions"
             ));
         }
-        Err(error) => {
-            tracing::error!("user_ask cannot open its request: {error:#}");
+        Err(NotShown::TurnOver) => {
+            return ToolOutput::error(
+                "the question was not shown: your turn ended before it could be; ask it again in a later turn if you still need the answer",
+            );
+        }
+        Err(NotShown::Failed) => {
             return ToolOutput::error(
                 "the question could not be shown to the user; ask it in your reply instead",
             );
