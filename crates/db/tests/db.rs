@@ -241,3 +241,48 @@ async fn opens_a_path_with_url_characters() {
     assert!(dir.join("fronde.db").is_file());
     assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
 }
+
+#[tokio::test]
+async fn failed_migration_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("fronde.db");
+    let url = format!("sqlite://{}?mode=rwc", file.display());
+    // A table in the way of the last migration's second table.
+    let raw = sea_orm::Database::connect(&url).await.unwrap();
+    raw.execute_unprepared("CREATE TABLE stream_entries (x)")
+        .await
+        .unwrap();
+    raw.close().await.unwrap();
+
+    assert!(fronde_db::open(dir.path()).await.is_err());
+    let raw = sea_orm::Database::connect(&url).await.unwrap();
+    let tables = |raw: sea_orm::DatabaseConnection| async move {
+        let rows = raw
+            .query_all_raw(Statement::from_string(
+                raw.get_database_backend(),
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+            ))
+            .await
+            .unwrap();
+        raw.close().await.unwrap();
+        rows.iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+    };
+    // Every migration rolled back, the earlier ones too.
+    assert_eq!(tables(raw).await, ["stream_entries"]);
+
+    let raw = sea_orm::Database::connect(&url).await.unwrap();
+    raw.execute_unprepared("DROP TABLE stream_entries")
+        .await
+        .unwrap();
+    raw.close().await.unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    assert!(
+        Migrator::get_pending_migrations(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    kv::set(&db, "s", "k", vec![1], None).await.unwrap();
+}

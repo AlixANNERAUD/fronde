@@ -83,13 +83,22 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<DatabaseConnection> {
              Fronde can write, and that no other Fronde is using it"
         )
     })?;
-    Migrator::up(&db, None).await.with_context(|| {
+    migrate(&db).await.with_context(|| {
         format!(
             "cannot update the database {shown} to this version of Fronde; if a newer Fronde \
              used it, run that version again or restore a backup of the data directory"
         )
     })?;
     Ok(db)
+}
+
+/// Applies the pending migrations in one transaction. sea-orm-migration runs a SQLite migration
+/// outside any transaction unless it asks for one, so a failure between a migration's change and
+/// its record would leave a schema that every later start fails to migrate again.
+async fn migrate(db: &DatabaseConnection) -> Result<(), DbErr> {
+    let transaction = begin_write(db).await?;
+    Migrator::up(&transaction, None).await?;
+    transaction.commit().await
 }
 
 /// `file` as a `sqlite://` URL. sqlx percent-decodes the path, so a `?`, `#` or `%` in a

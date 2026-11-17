@@ -1,11 +1,13 @@
 //! Fronde's conversation: one agent session, its turns recorded in the conversation log.
 
 use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
+use crate::legacy;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
+use fronde_db::DatabaseConnection;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -22,23 +24,14 @@ const SIGNED_OUT: &str =
     "L'agent n'est pas connecté à Claude : voir le README (claude setup-token).";
 const FAILED: &str = "L'agent a rencontré une erreur.";
 const INTERRUPTED: &str = "La réponse précédente a été interrompue.";
-/// The conversation log and the agent's session id, in the data directory.
-pub const LOG_FILE: &str = "conversation.jsonl";
-pub const SESSION_FILE: &str = "agent.session";
+/// The conversation's stream in the database.
+pub const TOPIC: &str = "conversation";
+/// The agent's session id in the database's key-value table: scope, key.
+pub const SESSION: (&str, &str) = ("agent", "session");
 /// How long the agent gets to start and open its session.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the agent gets to end a cancelled turn before it is stopped.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
-
-/// Renames `legacy` to `name` in `dir` when only the legacy file exists.
-fn migrate(dir: &Path, legacy: &str, name: &str) -> anyhow::Result<()> {
-    let (legacy, name) = (dir.join(legacy), dir.join(name));
-    if !name.exists() && legacy.exists() {
-        std::fs::rename(&legacy, &name)
-            .with_context(|| format!("renaming {} to {}", legacy.display(), name.display()))?;
-    }
-    Ok(())
-}
 
 /// Opens an agent session: `AgentClient::spawn` in production, a fake agent in tests.
 pub type Connector = Arc<
@@ -63,13 +56,13 @@ pub struct Assistant {
     spec: AgentSpec,
     connector: Connector,
     log: ConversationLog,
-    session_file: PathBuf,
+    db: DatabaseConnection,
     session: Mutex<Option<Session>>,
     /// Permission requests shown in the log and not answered yet, by their id in the log: the
     /// client that asked and its own id for the request.
     pending: Mutex<HashMap<u64, (Weak<AgentClient>, u64)>>,
     /// Cancels the running turn; `None` when idle.
-    turn: Mutex<Option<CancellationToken>>,
+    turn: tokio::sync::Mutex<Option<CancellationToken>>,
 }
 
 /// A connected agent and the task recording its events.
@@ -90,24 +83,24 @@ impl Session {
 }
 
 impl Assistant {
-    /// Opens the conversation stored in `data_dir`; the agent is started on the first message.
-    pub fn open(
+    /// Opens the conversation stored in `db`, first importing the files that held it in
+    /// `data_dir` before the database; the agent is started on the first message.
+    pub async fn open(
         spec: AgentSpec,
         data_dir: &Path,
+        db: DatabaseConnection,
         connector: Connector,
     ) -> anyhow::Result<Arc<Self>> {
-        // Files from before the rename to Fronde keep their conversation.
-        migrate(data_dir, "jarvis.jsonl", LOG_FILE)?;
-        migrate(data_dir, "jarvis.session", SESSION_FILE)?;
-        let log = ConversationLog::open(&data_dir.join(LOG_FILE))?;
+        legacy::import(&db, data_dir, TOPIC, SESSION).await?;
+        let log = ConversationLog::open(&db, TOPIC).await?;
         let assistant = Arc::new(Self {
             spec,
             connector,
             log,
-            session_file: data_dir.join(SESSION_FILE),
+            db,
             session: Mutex::new(None),
             pending: Mutex::default(),
-            turn: Mutex::new(None),
+            turn: tokio::sync::Mutex::new(None),
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
         let last_turn =
@@ -122,12 +115,16 @@ impl Assistant {
                     _ => None,
                 });
         if last_turn == Some(true) {
-            assistant.append(Event::Notice {
-                text: INTERRUPTED.into(),
-            });
-            assistant.append(Event::TurnEnded {
-                outcome: TurnOutcome::Error,
-            });
+            assistant
+                .append(Event::Notice {
+                    text: INTERRUPTED.into(),
+                })
+                .await;
+            assistant
+                .append(Event::TurnEnded {
+                    outcome: TurnOutcome::Error,
+                })
+                .await;
         }
         Ok(assistant)
     }
@@ -142,12 +139,12 @@ impl Assistant {
         // logged: a message sent on seeing `TurnEnded` finds the turn over. Locks are always
         // taken turn first, then log.
         let cancel = {
-            let mut turn = lock(&self.turn);
+            let mut turn = self.turn.lock().await;
             if turn.is_some() {
-                self.append(Event::Notice { text: BUSY.into() });
+                self.append(Event::Notice { text: BUSY.into() }).await;
                 return;
             }
-            self.append(Event::User { text: text.clone() });
+            self.append(Event::User { text: text.clone() }).await;
             turn.insert(CancellationToken::new()).clone()
         };
         let assistant = self.clone();
@@ -156,38 +153,42 @@ impl Assistant {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::warn!("the turn failed: {error:#}");
-                    assistant.append(Event::Notice {
-                        text: notice_for(&error).into(),
-                    });
+                    assistant
+                        .append(Event::Notice {
+                            text: notice_for(&error).into(),
+                        })
+                        .await;
                     TurnOutcome::Error
                 }
             };
-            let mut turn = lock(&assistant.turn);
-            assistant.append(Event::TurnEnded { outcome });
+            let mut turn = assistant.turn.lock().await;
+            assistant.append(Event::TurnEnded { outcome }).await;
             *turn = None;
         });
     }
 
     /// Stops the running turn, if any.
-    pub fn cancel(&self) {
-        if let Some(cancel) = lock(&self.turn).as_ref() {
+    pub async fn cancel(&self) {
+        if let Some(cancel) = self.turn.lock().await.as_ref() {
             cancel.cancel();
         }
     }
 
     /// Answers the permission request `id` shown in the log.
-    pub fn answer(&self, id: u64, allow: bool) {
+    pub async fn answer(&self, id: u64, allow: bool) {
         let asked = lock(&self.pending).remove(&id);
         let Some((client, request)) =
             asked.and_then(|(client, request)| Some((client.upgrade()?, request)))
         else {
             self.append(Event::Notice {
                 text: NOT_ACTIVE.into(),
-            });
+            })
+            .await;
             return;
         };
         // Logged first so the answer precedes whatever the agent does next.
-        self.append(Event::PermissionAnswered { id, allowed: allow });
+        self.append(Event::PermissionAnswered { id, allowed: allow })
+            .await;
         if let Err(error) = client.answer_permission(request, allow) {
             tracing::warn!("the answer came too late: {error:#}");
         }
@@ -248,7 +249,7 @@ impl Assistant {
         if let Some(session) = self.session_slot().clone() {
             return Ok(session);
         }
-        let saved = self.saved_session_id();
+        let saved = self.saved_session_id().await;
         let (events, agent_events) = mpsc::unbounded_channel();
         let client = (self.connector)(&self.spec, saved.clone(), events).await?;
         let id = client.session_id();
@@ -256,9 +257,10 @@ impl Assistant {
             if saved.is_some() {
                 self.append(Event::Notice {
                     text: NEW_CONVERSATION.into(),
-                });
+                })
+                .await;
             }
-            if let Err(error) = self.save_session_id(id) {
+            if let Err(error) = self.save_session_id(id).await {
                 tracing::warn!("cannot save the agent session id: {error:#}");
             }
         }
@@ -275,27 +277,24 @@ impl Assistant {
         Ok(session)
     }
 
-    fn saved_session_id(&self) -> Option<String> {
-        match std::fs::read_to_string(&self.session_file) {
-            Ok(id) => Some(id.trim().to_owned()).filter(|id| !id.is_empty()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    async fn saved_session_id(&self) -> Option<String> {
+        let (scope, key) = SESSION;
+        match fronde_db::kv::get(&self.db, scope, key).await {
+            Ok(id) => id.and_then(|id| String::from_utf8(id).ok()),
             Err(error) => {
-                tracing::warn!(
-                    "cannot read {}, starting a new session: {error}",
-                    self.session_file.display()
-                );
+                tracing::warn!("cannot read the agent session id, starting a new session: {error}");
                 None
             }
         }
     }
 
-    /// Replaced atomically and synced, so a crash never leaves half an id or none behind.
-    fn save_session_id(&self, id: &str) -> anyhow::Result<()> {
-        fronde_fs::write_atomic(&self.session_file, id)
-            .with_context(|| format!("replacing {}", self.session_file.display()))
+    async fn save_session_id(&self, id: &str) -> anyhow::Result<()> {
+        let (scope, key) = SESSION;
+        fronde_db::kv::set(&self.db, scope, key, id.into(), None).await?;
+        Ok(())
     }
 
-    fn record(&self, event: AgentEvent, recorder: &mut Recorder) {
+    async fn record(&self, event: AgentEvent, recorder: &mut Recorder) {
         let event = match event {
             AgentEvent::Text(text) => Event::Assistant { text },
             AgentEvent::ToolStarted { id, title } => {
@@ -320,10 +319,13 @@ impl Assistant {
                 // entry's seq. It is pending before the entry is broadcast, so an answer to it
                 // finds it. Lock order: log, then pending.
                 let client = recorder.client.clone();
-                let asked = self.log.append_with(|id| {
-                    lock(&self.pending).insert(id, (client, request));
-                    Event::Permission { id, title }
-                });
+                let asked = self
+                    .log
+                    .append_with(|id| {
+                        lock(&self.pending).insert(id, (client, request));
+                        Event::Permission { id, title }
+                    })
+                    .await;
                 match asked {
                     Ok(entry) => {
                         recorder.permissions.insert(request, entry.seq);
@@ -345,11 +347,11 @@ impl Assistant {
                 Event::PermissionAnswered { id, allowed: false }
             }
         };
-        self.append(event);
+        self.append(event).await;
     }
 
-    fn append(&self, event: Event) {
-        if let Err(error) = self.log.append(event) {
+    async fn append(&self, event: Event) {
+        if let Err(error) = self.log.append(event).await {
             tracing::error!("cannot write the conversation log: {error:#}");
         }
     }
@@ -392,7 +394,7 @@ async fn record_events(
                 let (Some(event), Some(owner)) = (event, assistant.upgrade()) else {
                     break;
                 };
-                owner.record(event, &mut recorder);
+                owner.record(event, &mut recorder).await;
             }
             Some(done) = flush_requests.recv() => {
                 let _ = done.send(());

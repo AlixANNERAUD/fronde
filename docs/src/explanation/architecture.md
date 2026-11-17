@@ -45,8 +45,10 @@ loopback with the same token, and a short system prompt. The session id is saved
 resumes the same conversation.
 
 Each turn streams back as events: text, tool calls, permission requests, the end of the turn.
-Fronde appends them to `conversation.jsonl`, numbered, and broadcasts them to every open page.
-A page that reconnects says which entry it saw last and gets only what it missed.
+Fronde numbers them and saves each one in the database, committed to disk, before it broadcasts
+it to every open page: a page never shows an entry a crash could lose. A page that reconnects
+says which entry it saw last and gets only what it missed. The conversation is one stream of the
+database, the topic `conversation`; the session id is saved there too.
 
 ## The web interface
 

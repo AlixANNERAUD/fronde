@@ -78,8 +78,8 @@ async fn chat(mut socket: WebSocket, assistant: Arc<Assistant>) {
                         }
                     }
                     Ok(ClientMsg::Send { text }) => assistant.send(text).await,
-                    Ok(ClientMsg::Cancel) => assistant.cancel(),
-                    Ok(ClientMsg::Answer { id, allow }) => assistant.answer(id, allow),
+                    Ok(ClientMsg::Cancel) => assistant.cancel().await,
+                    Ok(ClientMsg::Answer { id, allow }) => assistant.answer(id, allow).await,
                     Err(error) => tracing::debug!("ignoring a bad chat message: {error}"),
                 }
             }

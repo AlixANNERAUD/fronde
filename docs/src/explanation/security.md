@@ -30,7 +30,7 @@ whole address space. Disable core dumps where Fronde runs (`ulimit -c 0`, or `Li
 ## Personal data on disk
 
 Fronde creates its data directory and every directory inside it with mode 0700, and every file it
-writes (memory, conversation log, session id, the database `fronde.db` and its
+writes (memory, the database `fronde.db`, which holds the conversation and the session id, its
 `-wal` and `-shm` files, temporary files) with mode 0600,
 whatever the umask. At start, a data directory that group or others could enter is tightened to
 0700 and a warning is logged. Other users on the same machine cannot read your memory or

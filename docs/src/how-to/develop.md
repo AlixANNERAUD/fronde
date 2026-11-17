@@ -52,7 +52,10 @@ migration in `crates/migration`, named `mYYYYMMDD_NNNNNN_purpose` and appended t
 `Migrator::migrations`; a migration that was pushed is never edited, since databases that applied
 it would never see the change. Then run `mise run entities`, which applies the migrations to a
 throwaway database under `target/` and regenerates `crates/entity` with `sea-orm-cli`. The
-entities are generated, never edited by hand. Fronde applies pending migrations at each start.
+entities are generated, never edited by hand. Fronde applies pending migrations at each start,
+all in one transaction. sea-orm-migration runs a SQLite migration outside any transaction unless
+it asks for one, so a migration of several statements also returns `Some(true)` from
+`use_transaction`: it then applies whole or not at all wherever it runs.
 
 ## Tests
 

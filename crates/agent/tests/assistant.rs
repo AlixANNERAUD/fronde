@@ -3,13 +3,13 @@ use agent_client_protocol::v1::schema::{
     ToolCallUpdate, ToolCallUpdateFields,
 };
 use fronde_agent::acp::{AgentClient, AgentSpec};
-use fronde_agent::assistant::{Assistant, Connector, LOG_FILE, SESSION_FILE, process_connector};
+use fronde_agent::assistant::{Assistant, Connector, SESSION, TOPIC, process_connector};
 use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::{Event, ToolState, TurnOutcome};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
@@ -69,10 +69,24 @@ fn fake_connector(script: FakeScript, gate: Option<Arc<Notify>>) -> (Connector, 
     (connector, fakes)
 }
 
-fn open(dir: &Path, script: FakeScript) -> (Arc<Assistant>, Arc<Fakes>) {
+async fn open(dir: &Path, script: FakeScript) -> (Arc<Assistant>, Arc<Fakes>) {
     let (connector, fakes) = fake_connector(script, None);
-    let assistant = Assistant::open(spec(), dir, connector).expect("open");
+    let assistant = open_with(dir, spec(), connector).await;
     (assistant, fakes)
+}
+
+async fn open_with(dir: &Path, spec: AgentSpec, connector: Connector) -> Arc<Assistant> {
+    let db = fronde_db::open(dir).await.expect("database");
+    Assistant::open(spec, dir, db, connector)
+        .await
+        .expect("open")
+}
+
+/// The agent session id saved in the database.
+async fn saved_session(dir: &Path) -> Option<String> {
+    let db = fronde_db::open(dir).await.unwrap();
+    let id = fronde_db::kv::get(&db, SESSION.0, SESSION.1).await.unwrap();
+    id.map(|id| String::from_utf8(id).unwrap())
 }
 
 fn events(assistant: &Assistant) -> Vec<Event> {
@@ -176,7 +190,7 @@ async fn turn_is_logged_in_order() {
         ],
         ..FakeScript::default()
     };
-    let (assistant, _fakes) = open(dir.path(), script);
+    let (assistant, _fakes) = open(dir.path(), script).await;
 
     assistant.send("Salut".into()).await;
 
@@ -206,19 +220,18 @@ async fn turn_is_logged_in_order() {
             ended(TurnOutcome::Done),
         ]
     );
-    let saved = std::fs::read_to_string(dir.path().join(SESSION_FILE)).unwrap();
-    assert_eq!(saved, FAKE_SESSION_ID);
+    assert_eq!(saved_session(dir.path()).await.unwrap(), FAKE_SESSION_ID);
 }
 
 #[tokio::test]
 async fn second_prompt_during_turn_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, fakes) = open(dir.path(), asking());
+    let (assistant, fakes) = open(dir.path(), asking()).await;
 
     assistant.send("Mon agenda ?".into()).await;
     assistant.send("Et demain ?".into()).await;
     let id = wait_for_permission(&assistant).await;
-    assistant.answer(id, true);
+    assistant.answer(id, true).await;
     let events = wait_for_turns(&assistant, 1).await;
 
     assert!(events.contains(&notice(BUSY)), "{events:?}");
@@ -228,7 +241,7 @@ async fn second_prompt_during_turn_is_refused() {
     // Once the turn is over, the next message goes through.
     assistant.send("Et demain ?".into()).await;
     let id = wait_for_permission_after(&assistant, id).await;
-    assistant.answer(id, false);
+    assistant.answer(id, false).await;
     let events = wait_for_turns(&assistant, 2).await;
     assert!(events.contains(&user("Et demain ?")), "{events:?}");
 }
@@ -237,7 +250,7 @@ async fn second_prompt_during_turn_is_refused() {
 async fn send_right_after_turn_ended_is_accepted() {
     const TURNS: usize = 200;
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, _fakes) = open(dir.path(), FakeScript::default());
+    let (assistant, _fakes) = open(dir.path(), FakeScript::default()).await;
     let mut live = assistant.log().subscribe();
     let runtime = tokio::runtime::Handle::current();
     // A client that sends its next message the moment it sees the previous turn end.
@@ -297,7 +310,7 @@ async fn prompt_error_becomes_error_event() {
         fail_prompt: true,
         ..FakeScript::default()
     };
-    let (assistant, fakes) = open(dir.path(), script);
+    let (assistant, fakes) = open(dir.path(), script).await;
 
     assistant.send("Salut".into()).await;
     let events = wait_for_turns(&assistant, 1).await;
@@ -319,7 +332,7 @@ async fn connect_error_becomes_error_event() {
     let connector: Connector = Arc::new(|_: &AgentSpec, _, _| {
         Box::pin(async { Err(anyhow::anyhow!("cannot start the agent (claude-agent-acp)")) })
     });
-    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
+    let assistant = open_with(dir.path(), spec(), connector).await;
 
     assistant.send("Salut".into()).await;
 
@@ -336,7 +349,7 @@ async fn missing_agent_says_how_to_install_it() {
         command: vec!["/nonexistent/claude-agent-acp".into()],
         ..spec()
     };
-    let assistant = Assistant::open(spec, dir.path(), process_connector()).expect("open");
+    let assistant = open_with(dir.path(), spec, process_connector()).await;
 
     assistant.send("Salut".into()).await;
 
@@ -357,7 +370,7 @@ async fn signed_out_agent_points_to_the_readme() {
         signed_out: true,
         ..FakeScript::default()
     };
-    let (assistant, _fakes) = open(dir.path(), script);
+    let (assistant, _fakes) = open(dir.path(), script).await;
 
     assistant.send("Salut".into()).await;
 
@@ -376,11 +389,11 @@ async fn restart_resumes_or_starts_fresh() {
 
     // The saved session is resumed after a restart.
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, _fakes) = open(dir.path(), resumable.clone());
+    let (assistant, _fakes) = open(dir.path(), resumable.clone()).await;
     assistant.send("Salut".into()).await;
     wait_for_turns(&assistant, 1).await;
     drop(assistant);
-    let (assistant, fakes) = open(dir.path(), resumable.clone());
+    let (assistant, fakes) = open(dir.path(), resumable.clone()).await;
     assistant.send("Re".into()).await;
     let events = wait_for_turns(&assistant, 2).await;
     let record = fakes.handles()[0].record();
@@ -396,12 +409,17 @@ async fn restart_resumes_or_starts_fresh() {
 
     // An agent that cannot resume it starts a new conversation, and says so.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(SESSION_FILE), "earlier-session").unwrap();
+    {
+        let db = fronde_db::open(dir.path()).await.unwrap();
+        fronde_db::kv::set(&db, SESSION.0, SESSION.1, b"earlier-session".to_vec(), None)
+            .await
+            .unwrap();
+    }
     let refusing = FakeScript {
         refuse_resume: true,
         ..resumable
     };
-    let (assistant, fakes) = open(dir.path(), refusing);
+    let (assistant, fakes) = open(dir.path(), refusing).await;
     assistant.send("Salut".into()).await;
     let events = wait_for_turns(&assistant, 1).await;
     assert_eq!(
@@ -412,20 +430,19 @@ async fn restart_resumes_or_starts_fresh() {
         events,
         vec![user("Salut"), notice(FRESH), ended(TurnOutcome::Done)]
     );
-    let saved = std::fs::read_to_string(dir.path().join(SESSION_FILE)).unwrap();
-    assert_eq!(saved, FAKE_SESSION_ID);
+    assert_eq!(saved_session(dir.path()).await.unwrap(), FAKE_SESSION_ID);
 }
 
 #[tokio::test]
 async fn permission_answer_is_logged() {
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, fakes) = open(dir.path(), asking());
+    let (assistant, fakes) = open(dir.path(), asking()).await;
 
     assistant.send("Mon agenda ?".into()).await;
     let id = wait_for_permission(&assistant).await;
-    assistant.answer(id, true);
+    assistant.answer(id, true).await;
     wait_for_turns(&assistant, 1).await;
-    assistant.answer(id, true);
+    assistant.answer(id, true).await;
 
     assert_eq!(
         events(&assistant),
@@ -448,20 +465,20 @@ async fn permission_answer_is_logged() {
 #[tokio::test]
 async fn permission_ids_stay_unique_across_connections() {
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, _fakes) = open(dir.path(), asking());
+    let (assistant, _fakes) = open(dir.path(), asking()).await;
     assistant.send("Mon agenda ?".into()).await;
     let first = wait_for_permission(&assistant).await;
-    assistant.answer(first, true);
+    assistant.answer(first, true).await;
     wait_for_turns(&assistant, 1).await;
     drop(assistant);
 
     // After a restart the agent numbers its requests from 1 again; the log's ids go on.
-    let (assistant, fakes) = open(dir.path(), asking());
+    let (assistant, fakes) = open(dir.path(), asking()).await;
     assistant.send("Et demain ?".into()).await;
     let second = wait_for_permission_after(&assistant, first).await;
     assert!(second > first, "{second} after {first}");
-    assistant.answer(first, true);
-    assistant.answer(second, false);
+    assistant.answer(first, true).await;
+    assistant.answer(second, false).await;
     let events = wait_for_turns(&assistant, 2).await;
 
     assert_eq!(events.iter().filter(|e| **e == notice(GONE)).count(), 1);
@@ -477,14 +494,14 @@ async fn permission_ids_stay_unique_across_connections() {
 #[tokio::test]
 async fn cancel_ends_the_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, fakes) = open(dir.path(), asking());
+    let (assistant, fakes) = open(dir.path(), asking()).await;
 
     assistant.send("Mon agenda ?".into()).await;
     wait_for_permission(&assistant).await;
-    assistant.cancel();
+    assistant.cancel().await;
     wait_for_turns(&assistant, 1).await;
     // Idle: nothing to cancel.
-    assistant.cancel();
+    assistant.cancel().await;
 
     assert_eq!(
         events(&assistant),
@@ -498,7 +515,7 @@ async fn cancel_ends_the_turn() {
     assert_eq!(fakes.handles()[0].record().cancels, 1);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn stop_frees_a_turn_the_agent_never_ends() {
     let dir = tempfile::tempdir().unwrap();
     let script = FakeScript {
@@ -506,22 +523,31 @@ async fn stop_frees_a_turn_the_agent_never_ends() {
         ignore_cancel: true,
         ..FakeScript::default()
     };
-    let (assistant, fakes) = open(dir.path(), script);
+    let (assistant, fakes) = open(dir.path(), script).await;
     let searching = Event::Assistant {
         text: "Je cherche".into(),
     };
 
     assistant.send("Salut".into()).await;
     wait_until(&assistant, |events| events.contains(&searching)).await;
-    assistant.cancel();
+    // The clock is paused only while nothing is written: a paused clock jumps to the next timer
+    // whenever the runtime waits, and the database is written by a thread of its own.
+    tokio::time::pause();
+    assistant.cancel().await;
     // The agent gets a grace period to end the turn itself.
     tokio::time::sleep(Duration::from_secs(9)).await;
     assert_eq!(events(&assistant), vec![user("Salut"), searching.clone()]);
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    let resumed = Instant::now();
 
     assert_eq!(
-        events(&assistant),
+        wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), searching, ended(TurnOutcome::Cancelled)]
+    );
+    assert!(
+        resumed.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        resumed.elapsed()
     );
     let record = fakes.handles()[0].record();
     assert_eq!(record.cancels, 1);
@@ -550,10 +576,10 @@ async fn cancel_while_connecting_skips_the_prompt() {
         ..FakeScript::default()
     };
     let (connector, _fakes) = fake_connector(script, Some(gate.clone()));
-    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
+    let assistant = open_with(dir.path(), spec(), connector).await;
 
     assistant.send("Salut".into()).await;
-    assistant.cancel();
+    assistant.cancel().await;
     gate.notify_one();
 
     assert_eq!(
@@ -569,11 +595,11 @@ async fn stale_permission_is_closed_in_the_log() {
         leave_permission_pending: true,
         ..asking()
     };
-    let (assistant, _fakes) = open(dir.path(), script);
+    let (assistant, _fakes) = open(dir.path(), script).await;
 
     assistant.send("Mon agenda ?".into()).await;
     wait_for_turns(&assistant, 1).await;
-    assistant.answer(2, true);
+    assistant.answer(2, true).await;
 
     assert_eq!(
         events(&assistant),
@@ -623,7 +649,7 @@ fn hanging_connector() -> (Connector, Arc<Hanging>) {
 async fn cancel_interrupts_a_hanging_connect() {
     let dir = tempfile::tempdir().unwrap();
     let (connector, hanging) = hanging_connector();
-    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
+    let assistant = open_with(dir.path(), spec(), connector).await;
 
     assistant.send("Salut".into()).await;
     timeout(WAIT, async {
@@ -633,7 +659,7 @@ async fn cancel_interrupts_a_hanging_connect() {
     })
     .await
     .expect("the connect never started");
-    assistant.cancel();
+    assistant.cancel().await;
 
     assert_eq!(
         wait_for_turns(&assistant, 1).await,
@@ -643,26 +669,41 @@ async fn cancel_interrupts_a_hanging_connect() {
 
     // Fronde is free again.
     assistant.send("Encore".into()).await;
-    assistant.cancel();
+    assistant.cancel().await;
     let events = wait_for_turns(&assistant, 2).await;
     assert!(!events.contains(&notice(BUSY)), "{events:?}");
     assert!(events.contains(&user("Encore")), "{events:?}");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn connect_timeout_ends_the_turn() {
     let dir = tempfile::tempdir().unwrap();
     let (connector, hanging) = hanging_connector();
-    let assistant = Assistant::open(spec(), dir.path(), connector).expect("open");
+    let assistant = open_with(dir.path(), spec(), connector).await;
 
     assistant.send("Salut".into()).await;
+    timeout(WAIT, async {
+        while hanging.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the connect never started");
+    // Paused only while nothing is written, as in `stop_frees_a_turn_the_agent_never_ends`.
+    tokio::time::pause();
     tokio::time::sleep(Duration::from_secs(59)).await;
     assert_eq!(events(&assistant), vec![user("Salut")]);
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    let resumed = Instant::now();
 
     assert_eq!(
-        events(&assistant),
+        wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), notice(NO_START), ended(TurnOutcome::Error)]
+    );
+    assert!(
+        resumed.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        resumed.elapsed()
     );
     assert_eq!(hanging.dropped.load(Ordering::SeqCst), 1);
 }
@@ -672,16 +713,20 @@ async fn open_closes_a_turn_left_open() {
     let dir = tempfile::tempdir().unwrap();
     // The server stopped in the middle of a turn: its user message has no `turn_ended`.
     {
-        let log = fronde_agent::log::ConversationLog::open(&dir.path().join(LOG_FILE)).unwrap();
-        log.append(user("Un")).unwrap();
-        log.append(ended(TurnOutcome::Done)).unwrap();
-        log.append(user("Deux")).unwrap();
+        let db = fronde_db::open(dir.path()).await.unwrap();
+        let log = fronde_agent::log::ConversationLog::open(&db, TOPIC)
+            .await
+            .unwrap();
+        log.append(user("Un")).await.unwrap();
+        log.append(ended(TurnOutcome::Done)).await.unwrap();
+        log.append(user("Deux")).await.unwrap();
         log.append(Event::Assistant {
             text: "Je regarde".into(),
         })
+        .await
         .unwrap();
     }
-    let (assistant, _) = open(dir.path(), FakeScript::default());
+    let (assistant, _) = open(dir.path(), FakeScript::default()).await;
     let closed = [
         user("Un"),
         ended(TurnOutcome::Done),
@@ -696,29 +741,38 @@ async fn open_closes_a_turn_left_open() {
     drop(assistant);
 
     // A log whose last turn ended is left alone.
-    let (assistant, _) = open(dir.path(), FakeScript::default());
+    let (assistant, _) = open(dir.path(), FakeScript::default()).await;
     assert_eq!(events(&assistant), closed);
 }
 
 #[tokio::test]
-async fn open_renames_the_files_from_before_fronde() {
+async fn open_imports_the_files_from_before_fronde() {
     let dir = tempfile::tempdir().unwrap();
-    {
-        let log =
-            fronde_agent::log::ConversationLog::open(&dir.path().join("jarvis.jsonl")).unwrap();
-        log.append(user("Un")).unwrap();
-        log.append(ended(TurnOutcome::Done)).unwrap();
-    }
+    std::fs::write(
+        dir.path().join("jarvis.jsonl"),
+        concat!(
+            "{\"log_id\":\"jarvis-log\"}\n",
+            "{\"seq\":1,\"at\":\"2026-11-16T10:00:00Z\",\"event\":{\"type\":\"user\",\"text\":\"Un\"}}\n",
+            "{\"seq\":2,\"at\":\"2026-11-16T10:00:01Z\",\"event\":{\"type\":\"turn_ended\",\"outcome\":\"done\"}}\n",
+        ),
+    )
+    .unwrap();
     std::fs::write(dir.path().join("jarvis.session"), "earlier-session").unwrap();
 
-    let (assistant, _) = open(dir.path(), FakeScript::default());
+    let (assistant, _) = open(dir.path(), FakeScript::default()).await;
 
     assert_eq!(
         events(&assistant),
         vec![user("Un"), ended(TurnOutcome::Done)]
     );
-    let saved = std::fs::read_to_string(dir.path().join(SESSION_FILE)).unwrap();
-    assert_eq!(saved, "earlier-session");
+    assert_eq!(assistant.log().log_id(), "jarvis-log");
+    drop(assistant);
+    assert_eq!(
+        saved_session(dir.path()).await.as_deref(),
+        Some("earlier-session")
+    );
     assert!(!dir.path().join("jarvis.jsonl").exists());
     assert!(!dir.path().join("jarvis.session").exists());
+    assert!(dir.path().join("jarvis.jsonl.imported").exists());
+    assert!(dir.path().join("jarvis.session.imported").exists());
 }

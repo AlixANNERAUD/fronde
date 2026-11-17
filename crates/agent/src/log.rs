@@ -1,241 +1,251 @@
-//! Conversation log: an append-only JSONL file, mirrored in memory, with live broadcast.
+//! Conversation log: a stream of numbered entries in the database, mirrored in memory, with live
+//! broadcast.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::Context;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use fronde_db::DatabaseConnection;
+use fronde_entity::{stream_entries, streams};
+use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use tokio::sync::broadcast;
 
 pub use fronde_protocol::{Entry, Event, ToolState, TurnOutcome};
 
 const BROADCAST_CAPACITY: usize = 1024;
 
-/// The log file's first line.
-#[derive(Serialize, Deserialize)]
-struct Header {
-    log_id: String,
-}
-
-struct State {
-    entries: Vec<Entry>,
-    file: File,
-    /// The file may end in a torn line: terminate it before the next entry.
-    torn: bool,
-}
-
 pub struct ConversationLog {
+    db: DatabaseConnection,
+    topic: String,
     log_id: String,
-    state: Mutex<State>,
+    /// Held while an entry is numbered and saved, so seqs are unique and saved in order.
+    writer: Arc<tokio::sync::Mutex<()>>,
+    mirror: Arc<Mirror>,
+}
+
+/// The saved entries, and the channel announcing each new one.
+struct Mirror {
+    entries: Mutex<Vec<Entry>>,
     live: broadcast::Sender<Entry>,
 }
 
+impl Mirror {
+    fn entries(&self) -> MutexGuard<'_, Vec<Entry>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn publish(&self, entry: Entry) {
+        let mut entries = self.entries();
+        entries.push(entry.clone());
+        // No subscriber is not an error.
+        let _ = self.live.send(entry);
+    }
+}
+
 impl ConversationLog {
-    /// Reads the JSONL file (creating it if missing); unreadable lines are skipped and logged.
-    /// The first line names the log with a random id, written when the file is created.
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let mut entries = Vec::new();
-        let mut log_id = None;
-        match File::open(path) {
-            Ok(file) => {
-                for (index, line) in BufReader::new(file).lines().enumerate() {
-                    let line = line.with_context(|| format!("reading {}", path.display()))?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if index == 0
-                        && let Ok(header) = serde_json::from_str::<Header>(&line)
-                    {
-                        log_id = Some(header.log_id);
-                        continue;
-                    }
-                    match serde_json::from_str::<Entry>(&line) {
-                        Ok(entry) => entries.push(entry),
-                        Err(error) => {
-                            tracing::warn!(line = index + 1, %error, "skipping unreadable log line");
-                        }
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("opening {}", path.display()));
-            }
-        }
-        let log_id = match log_id {
-            Some(id) => id,
-            None => write_header(path)?,
-        };
-        let mut file = fronde_fs::private_options()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        fronde_fs::restrict_file(path)
-            .with_context(|| format!("restricting {}", path.display()))?;
-        let length = file.metadata()?.len();
-        let torn = length > 0 && {
-            let mut last = [0u8; 1];
-            file.seek(SeekFrom::Start(length - 1))?;
-            file.read_exact(&mut last)?;
-            last[0] != b'\n'
-        };
+    /// Loads the stream `topic`, creating it with a new random log id when it does not exist.
+    pub async fn open(db: &DatabaseConnection, topic: &str) -> anyhow::Result<Self> {
+        let log_id = stream_log_id(db, topic)
+            .await
+            .context("cannot open the conversation in the database")?;
+        let rows = stream_entries::Entity::find()
+            .filter(stream_entries::Column::Topic.eq(topic))
+            .order_by_asc(stream_entries::Column::Seq)
+            .all(db)
+            .await
+            .context("cannot read the conversation from the database")?;
+        let entries = rows
+            .into_iter()
+            .map(|row| {
+                let event = serde_json::from_value(row.event).with_context(|| {
+                    format!(
+                        "entry {} of the conversation is not readable by this version of \
+                         Fronde; run the version that wrote it, or restore a backup",
+                        row.seq
+                    )
+                })?;
+                Ok(Entry {
+                    seq: u64::try_from(row.seq).context("negative seq in the conversation")?,
+                    at: row.at,
+                    event,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let (live, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
+            db: db.clone(),
+            topic: topic.to_owned(),
             log_id,
-            state: Mutex::new(State {
-                entries,
-                file,
-                torn,
+            writer: Arc::default(),
+            mirror: Arc::new(Mirror {
+                entries: Mutex::new(entries),
+                live,
             }),
-            live,
         })
     }
 
-    /// The random id of this log, new each time the log file is created.
+    /// The random id of this log, new each time its stream is created.
     pub fn log_id(&self) -> &str {
         &self.log_id
     }
 
-    /// Numbers the event, appends it as one line, then broadcasts it.
-    pub fn append(&self, event: Event) -> anyhow::Result<Entry> {
-        self.append_with(|_| event)
+    /// Numbers the event, saves it, then broadcasts it.
+    pub async fn append(&self, event: Event) -> anyhow::Result<Entry> {
+        self.append_with(|_| event).await
     }
 
     /// [`append`](Self::append) for an event made from its seq, such as an id that must be
     /// unique for the life of the log. `event` runs under the log's lock.
-    pub fn append_with(&self, event: impl FnOnce(u64) -> Event) -> anyhow::Result<Entry> {
-        // The lock is held throughout so seqs are unique and file order matches seq order.
-        let mut state = self.lock();
-        let seq = state.entries.last().map_or(0, |entry| entry.seq) + 1;
+    pub async fn append_with(&self, event: impl FnOnce(u64) -> Event) -> anyhow::Result<Entry> {
+        let writer = self.writer.clone().lock_owned().await;
+        let seq = self.last_seq() + 1;
         let entry = Entry {
             seq,
             at: Utc::now(),
             event: event(seq),
         };
-        let mut line = String::new();
-        if state.torn {
-            line.push('\n');
-        }
-        line.push_str(&serde_json::to_string(&entry)?);
-        line.push('\n');
-        // A failed write may leave partial bytes behind.
-        state.torn = true;
-        state.file.write_all(line.as_bytes())?;
-        state.file.sync_data()?;
-        state.torn = false;
-        state.entries.push(entry.clone());
-        // No subscriber is not an error.
-        let _ = self.live.send(entry.clone());
-        Ok(entry)
+        let (db, topic, mirror) = (self.db.clone(), self.topic.clone(), self.mirror.clone());
+        // Saved and published by a task of its own: a caller that stops waiting cannot leave an
+        // entry saved but missing from the mirror, whose last seq numbers the next entry.
+        tokio::spawn(async move {
+            let _writer = writer;
+            save(&db, &topic, &entry)
+                .await
+                .context("cannot save the conversation entry in the database")?;
+            // Sent only once committed: a page never shows an entry a crash could lose.
+            mirror.publish(entry.clone());
+            Ok(entry)
+        })
+        .await
+        .context("saving the conversation entry stopped")?
     }
 
     /// Entries with a seq greater than the given one.
     pub fn since(&self, seq: u64) -> Vec<Entry> {
-        let state = self.lock();
-        let start = state.entries.partition_point(|entry| entry.seq <= seq);
-        state.entries[start..].to_vec()
+        let entries = self.mirror.entries();
+        let start = entries.partition_point(|entry| entry.seq <= seq);
+        entries[start..].to_vec()
     }
 
     /// The seq of the newest entry, 0 when the log is empty.
     pub fn last_seq(&self) -> u64 {
-        self.lock().entries.last().map_or(0, |entry| entry.seq)
+        self.mirror.entries().last().map_or(0, |entry| entry.seq)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Entry> {
-        self.live.subscribe()
-    }
-
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.mirror.live.subscribe()
     }
 }
 
-/// Names the log at `path` with a new random id, written as its first line, and returns the id.
-/// Entries already there (a log from before ids) are kept; the file is replaced atomically.
-fn write_header(path: &Path) -> anyhow::Result<String> {
-    let log_id = uuid::Uuid::new_v4().simple().to_string();
-    let mut text = serde_json::to_string(&Header {
-        log_id: log_id.clone(),
-    })?;
-    text.push('\n');
-    let mut old = Vec::new();
-    match File::open(path) {
-        Ok(mut file) => {
-            file.read_to_end(&mut old)
-                .with_context(|| format!("reading {}", path.display()))?;
+/// The log id of the stream `topic`, which is created when missing.
+async fn stream_log_id(db: &DatabaseConnection, topic: &str) -> Result<String, sea_orm::DbErr> {
+    let transaction = fronde_db::begin_write(db).await?;
+    let log_id = match streams::Entity::find_by_id(topic).one(&transaction).await? {
+        Some(stream) => stream.log_id,
+        None => {
+            let log_id = new_log_id();
+            streams::Entity::insert(new_stream(topic, &log_id))
+                .exec(&transaction)
+                .await?;
+            log_id
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
-    }
-    let mut bytes = text.into_bytes();
-    bytes.extend(old);
-    fronde_fs::write_atomic(path, &bytes)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    };
+    transaction.commit().await?;
     Ok(log_id)
+}
+
+/// A new random log id.
+pub(crate) fn new_log_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+pub(crate) fn new_stream(topic: &str, log_id: &str) -> streams::ActiveModel {
+    streams::ActiveModel {
+        topic: Set(topic.to_owned()),
+        log_id: Set(log_id.to_owned()),
+        created_at: Set(Utc::now()),
+    }
+}
+
+pub(crate) fn entry_row(topic: &str, entry: &Entry) -> anyhow::Result<stream_entries::ActiveModel> {
+    Ok(stream_entries::ActiveModel {
+        topic: Set(topic.to_owned()),
+        seq: Set(i64::try_from(entry.seq).context("seq too large")?),
+        at: Set(entry.at),
+        event: Set(serde_json::to_value(&entry.event)?),
+    })
+}
+
+/// Commits the entry; with `synchronous = FULL`, it is on disk when this returns.
+async fn save(db: &DatabaseConnection, topic: &str, entry: &Entry) -> anyhow::Result<()> {
+    let row = entry_row(topic, entry)?;
+    let transaction = fronde_db::begin_write(db).await?;
+    stream_entries::Entity::insert(row)
+        .exec(&transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::ConnectionTrait;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    const TOPIC: &str = "conversation";
 
     fn user(text: &str) -> Event {
         Event::User { text: text.into() }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn log_file_is_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("log.jsonl");
-        std::fs::write(&path, "").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let log = ConversationLog::open(&path).unwrap();
-        log.append(user("a")).unwrap();
-        let fresh = dir.path().join("new.jsonl");
-        ConversationLog::open(&fresh).unwrap();
-        for p in [&path, &fresh] {
-            assert_eq!(
-                std::fs::metadata(p).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
+    async fn db(dir: &Path) -> DatabaseConnection {
+        fronde_db::open(dir).await.unwrap()
     }
 
-    #[test]
-    fn append_assigns_increasing_seq() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = ConversationLog::open(&dir.path().join("log.jsonl")).unwrap();
-        assert_eq!(log.append(user("a")).unwrap().seq, 1);
-        assert_eq!(log.append(user("b")).unwrap().seq, 2);
+    async fn open(dir: &Path) -> ConversationLog {
+        ConversationLog::open(&db(dir).await, TOPIC).await.unwrap()
     }
 
-    #[test]
-    fn reopen_keeps_entries_and_seq() {
+    async fn saved_seqs(db: &DatabaseConnection) -> Vec<i64> {
+        stream_entries::Entity::find()
+            .filter(stream_entries::Column::Topic.eq(TOPIC))
+            .order_by_asc(stream_entries::Column::Seq)
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.seq)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn append_assigns_increasing_seq() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("log.jsonl");
-        let log = ConversationLog::open(&path).unwrap();
-        log.append(user("a")).unwrap();
-        log.append(user("b")).unwrap();
+        let log = open(dir.path()).await;
+        assert_eq!(log.append(user("a")).await.unwrap().seq, 1);
+        assert_eq!(log.append(user("b")).await.unwrap().seq, 2);
+    }
+
+    #[tokio::test]
+    async fn reopen_keeps_entries_and_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open(dir.path()).await;
+        log.append(user("a")).await.unwrap();
+        log.append(user("b")).await.unwrap();
         drop(log);
-        let log = ConversationLog::open(&path).unwrap();
+        let log = open(dir.path()).await;
         assert_eq!(log.since(0).len(), 2);
-        assert_eq!(log.append(user("c")).unwrap().seq, 3);
+        assert_eq!(log.append(user("c")).await.unwrap().seq, 3);
     }
 
-    #[test]
-    fn since_returns_only_newer() {
+    #[tokio::test]
+    async fn since_returns_only_newer() {
         let dir = tempfile::tempdir().unwrap();
-        let log = ConversationLog::open(&dir.path().join("log.jsonl")).unwrap();
+        let log = open(dir.path()).await;
         for t in ["a", "b", "c"] {
-            log.append(user(t)).unwrap();
+            log.append(user(t)).await.unwrap();
         }
         let seqs: Vec<u64> = log.since(1).iter().map(|e| e.seq).collect();
         assert_eq!(seqs, [2, 3]);
@@ -243,102 +253,49 @@ mod tests {
         assert_eq!(log.last_seq(), 3);
     }
 
-    #[test]
-    fn empty_log_last_seq_is_zero() {
+    #[tokio::test]
+    async fn empty_log_last_seq_is_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let log = ConversationLog::open(&dir.path().join("log.jsonl")).unwrap();
+        let log = open(dir.path()).await;
         assert_eq!(log.last_seq(), 0);
     }
 
-    #[test]
-    fn corrupt_line_is_skipped() {
+    #[tokio::test]
+    async fn log_id_is_kept_until_the_log_is_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("log.jsonl");
-        let log = ConversationLog::open(&path).unwrap();
-        log.append(user("a")).unwrap();
-        drop(log);
-        let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str("not json\n");
-        std::fs::write(&path, text).unwrap();
-        let log = ConversationLog::open(&path).unwrap();
-        assert_eq!(log.since(0).len(), 1);
-        assert_eq!(log.append(user("b")).unwrap().seq, 2);
-        drop(log);
-        assert_eq!(ConversationLog::open(&path).unwrap().since(0).len(), 2);
-    }
-
-    #[test]
-    fn torn_trailing_line_does_not_swallow_next_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("log.jsonl");
-        let log = ConversationLog::open(&path).unwrap();
-        log.append(user("a")).unwrap();
-        drop(log);
-        let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str(r#"{"seq":2,"at":"2026"#);
-        std::fs::write(&path, text).unwrap();
-        let log = ConversationLog::open(&path).unwrap();
-        assert_eq!(log.append(user("b")).unwrap().seq, 2);
-        drop(log);
-        let seqs: Vec<u64> = ConversationLog::open(&path)
-            .unwrap()
-            .since(0)
-            .iter()
-            .map(|e| e.seq)
-            .collect();
-        assert_eq!(seqs, [1, 2]);
-    }
-
-    #[test]
-    fn log_id_is_kept_until_the_log_is_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("log.jsonl");
-        let log = ConversationLog::open(&path).unwrap();
+        let db = db(dir.path()).await;
+        let log = ConversationLog::open(&db, TOPIC).await.unwrap();
         let id = log.log_id().to_owned();
         assert!(id.len() >= 16, "{id}");
-        log.append(user("a")).unwrap();
+        log.append(user("a")).await.unwrap();
         drop(log);
 
-        let log = ConversationLog::open(&path).unwrap();
+        let log = ConversationLog::open(&db, TOPIC).await.unwrap();
         assert_eq!(log.log_id(), id);
         assert_eq!(log.since(0).len(), 1);
         drop(log);
 
-        std::fs::remove_file(&path).unwrap();
-        let log = ConversationLog::open(&path).unwrap();
+        // Starting a new conversation: Fronde stopped, the database deleted.
+        db.close().await.unwrap();
+        for name in ["fronde.db", "fronde.db-wal", "fronde.db-shm"] {
+            let _ = std::fs::remove_file(dir.path().join(name));
+        }
+        let log = open(dir.path()).await;
         assert_ne!(log.log_id(), id);
         assert_eq!(log.last_seq(), 0);
     }
 
-    #[test]
-    fn log_without_an_id_gets_one_and_keeps_its_entries() {
+    #[tokio::test]
+    async fn append_with_gives_the_event_its_seq() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("log.jsonl");
-        let entry = r#"{"seq":1,"at":"2026-11-16T10:00:00Z","event":{"type":"user","text":"a"}}"#;
-        std::fs::write(&path, format!("{entry}\n")).unwrap();
-
-        let log = ConversationLog::open(&path).unwrap();
-        let id = log.log_id().to_owned();
-        assert_eq!(log.since(0).len(), 1);
-        assert_eq!(log.append(user("b")).unwrap().seq, 2);
-        drop(log);
-
-        let log = ConversationLog::open(&path).unwrap();
-        assert_eq!(log.log_id(), id);
-        let seqs: Vec<u64> = log.since(0).iter().map(|e| e.seq).collect();
-        assert_eq!(seqs, [1, 2]);
-    }
-
-    #[test]
-    fn append_with_gives_the_event_its_seq() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = ConversationLog::open(&dir.path().join("log.jsonl")).unwrap();
-        log.append(user("a")).unwrap();
+        let log = open(dir.path()).await;
+        log.append(user("a")).await.unwrap();
         let entry = log
             .append_with(|seq| Event::Permission {
                 id: seq,
                 title: "t".into(),
             })
+            .await
             .unwrap();
         assert_eq!(entry.seq, 2);
         assert_eq!(
@@ -353,10 +310,10 @@ mod tests {
     #[tokio::test]
     async fn replay_after_reconnect_has_no_duplicates() {
         let dir = tempfile::tempdir().unwrap();
-        let log = ConversationLog::open(&dir.path().join("log.jsonl")).unwrap();
+        let log = open(dir.path()).await;
         let mut live = log.subscribe();
         for t in ["a", "b", "c"] {
-            log.append(user(t)).unwrap();
+            log.append(user(t)).await.unwrap();
         }
         let mut seen: Vec<u64> = log.since(1).iter().map(|e| e.seq).collect();
         while let Ok(entry) = live.try_recv() {
@@ -365,5 +322,133 @@ mod tests {
             }
         }
         assert_eq!(seen, [2, 3]);
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_log_id_and_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db(dir.path()).await;
+        let log = ConversationLog::open(&db, TOPIC).await.unwrap();
+        log.append(user("a")).await.unwrap();
+        log.append_with(|id| Event::Permission {
+            id,
+            title: "t".into(),
+        })
+        .await
+        .unwrap();
+        log.append(Event::TurnEnded {
+            outcome: TurnOutcome::Done,
+        })
+        .await
+        .unwrap();
+        let (id, entries) = (log.log_id().to_owned(), log.since(0));
+        drop(log);
+        db.close().await.unwrap();
+
+        let log = open(dir.path()).await;
+        assert_eq!(log.log_id(), id);
+        // Timestamps included, to the nanosecond.
+        assert_eq!(log.since(0), entries);
+        assert_eq!(log.append(user("b")).await.unwrap().seq, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_keep_seq_order() {
+        const TASKS: u64 = 8;
+        const EACH: u64 = 25;
+        const TOTAL: u64 = TASKS * EACH;
+        let dir = tempfile::tempdir().unwrap();
+        let db = db(dir.path()).await;
+        let log = Arc::new(ConversationLog::open(&db, TOPIC).await.unwrap());
+
+        // A page connecting while the agent writes: subscribe, replay, then follow.
+        let reader = tokio::spawn({
+            let log = log.clone();
+            async move {
+                tokio::task::yield_now().await;
+                let mut live = log.subscribe();
+                let mut seen: Vec<u64> = log.since(0).iter().map(|e| e.seq).collect();
+                while seen.last().copied().unwrap_or(0) < TOTAL {
+                    let entry = live.recv().await.unwrap();
+                    if entry.seq > seen.last().copied().unwrap_or(0) {
+                        seen.push(entry.seq);
+                    }
+                }
+                seen
+            }
+        });
+        let writers: Vec<_> = (0..TASKS)
+            .map(|task| {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut seqs = Vec::new();
+                    for n in 0..EACH {
+                        let entry = log.append(user(&format!("{task}-{n}"))).await.unwrap();
+                        seqs.push(entry.seq);
+                    }
+                    seqs
+                })
+            })
+            .collect();
+        let mut all = BTreeSet::new();
+        for writer in writers {
+            let seqs = writer.await.unwrap();
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+            all.extend(seqs);
+        }
+
+        let expected: Vec<u64> = (1..=TOTAL).collect();
+        assert_eq!(all.into_iter().collect::<Vec<_>>(), expected);
+        assert_eq!(reader.await.unwrap(), expected);
+        let in_memory: Vec<u64> = log.since(0).iter().map(|e| e.seq).collect();
+        assert_eq!(in_memory, expected);
+        let saved: Vec<u64> = saved_seqs(&db)
+            .await
+            .into_iter()
+            .map(|s| s as u64)
+            .collect();
+        assert_eq!(saved, expected);
+        let reopened = ConversationLog::open(&db, TOPIC).await.unwrap();
+        assert_eq!(reopened.since(0), log.since(0));
+    }
+
+    #[tokio::test]
+    async fn entry_is_saved_before_it_is_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db(dir.path()).await;
+        let log = Arc::new(ConversationLog::open(&db, TOPIC).await.unwrap());
+        let mut live = log.subscribe();
+        let appended = tokio::spawn({
+            let log = log.clone();
+            async move { log.append(user("a")).await.unwrap() }
+        });
+        let entry = live.recv().await.unwrap();
+        // Read on another connection the moment the entry is announced.
+        assert_eq!(saved_seqs(&db).await, [entry.seq as i64]);
+        assert_eq!(appended.await.unwrap(), entry);
+    }
+
+    #[tokio::test]
+    async fn failed_save_is_neither_kept_nor_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db(dir.path()).await;
+        let log = ConversationLog::open(&db, TOPIC).await.unwrap();
+        log.append(user("a")).await.unwrap();
+        let mut live = log.subscribe();
+        db.execute_unprepared(
+            "CREATE TRIGGER refuse BEFORE INSERT ON stream_entries \
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+        )
+        .await
+        .unwrap();
+
+        let error = format!("{:#}", log.append(user("b")).await.unwrap_err());
+        assert!(error.contains("disk full"), "{error}");
+        assert!(live.try_recv().is_err());
+        assert_eq!(log.last_seq(), 1);
+
+        db.execute_unprepared("DROP TRIGGER refuse").await.unwrap();
+        assert_eq!(log.append(user("c")).await.unwrap().seq, 2);
+        assert_eq!(saved_seqs(&db).await, [1, 2]);
     }
 }

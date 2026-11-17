@@ -10,6 +10,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20261117_000001_kv;
 mod m20261117_000002_memory_fts;
+mod m20261117_000003_streams;
 
 /// Every migration of Fronde, in the order they apply.
 pub struct Migrator;
@@ -20,6 +21,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20261117_000001_kv::Migration),
             Box::new(m20261117_000002_memory_fts::Migration),
+            Box::new(m20261117_000003_streams::Migration),
         ]
     }
 }

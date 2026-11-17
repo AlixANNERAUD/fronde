@@ -175,7 +175,7 @@ pub async fn start_with(
     let components = component_sources(&config)?;
     fronde_hub::private::prepare_data_dir(&data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
-    let hub = Arc::new(Hub::start(config, db, components).await?);
+    let hub = Arc::new(Hub::start(config, db.clone(), components).await?);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot listen on {listen}"))?;
@@ -194,7 +194,7 @@ pub async fn start_with(
             system_prompt: system_prompt(&user),
             builtin_tools: agent.builtin_tools,
         };
-        let assistant = Assistant::open(spec, &data_dir, connector)?;
+        let assistant = Assistant::open(spec, &data_dir, db, connector).await?;
         app = app.merge(web::router(
             web::Web {
                 assistant,

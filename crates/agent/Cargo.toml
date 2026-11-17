@@ -15,7 +15,9 @@ agent-client-protocol.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
-fronde-fs = { path = "../fs" }
+sea-orm.workspace = true
+fronde-db = { path = "../db" }
+fronde-entity = { path = "../entity" }
 fronde-protocol = { path = "../protocol" }
 secrecy.workspace = true
 serde.workspace = true
