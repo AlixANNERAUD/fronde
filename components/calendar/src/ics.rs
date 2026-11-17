@@ -1257,6 +1257,14 @@ END:VCALENDAR\r\n";
     }
 
     #[test]
+    fn edit_keeps_a_data_uri_parameter() {
+        // calcard 0.3.15 rebuilt it as base64 and lost the charset.
+        let note = "X-NOTE;ALTREP=\"data:text/plain;charset=iso-8859-1,caf%E9\":Café";
+        let out = edit_rich_with(note);
+        assert_eq!(raw_line(&out, "X-NOTE", &[]), [note], "{out}");
+    }
+
+    #[test]
     fn edit_survives_deeply_nested_components() {
         let depth = 5000;
         let nested = "BEGIN:VALARM\r\n".repeat(depth) + &"END:VALARM\r\n".repeat(depth);
