@@ -2828,17 +2828,23 @@ async fn a_wake_turn_asks_no_secret_and_names_its_sub_agent() {
     let main_assistant = bench.assistant(ThreadId::MAIN).await;
     timeout(WAIT, async {
         loop {
-            bench.gate.notify_waiters();
             let events = events_of(&main_assistant);
             let woken = events
                 .iter()
                 .position(|event| matches!(event, Event::Woken { .. }));
-            if woken.is_some_and(|woken| {
-                events[woken..]
+            if let Some(woken) = woken {
+                // Once the wake turn started, the gate is left alone: notifying it would end
+                // the very turn the test needs open. Its first chunk shown, the agent waits
+                // at the gate.
+                if events[woken..]
                     .iter()
                     .any(|event| matches!(event, Event::Assistant { .. }))
-            }) {
-                return;
+                {
+                    return;
+                }
+            } else {
+                // Only the owner's turn is held so far: release it.
+                bench.gate.notify_waiters();
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
