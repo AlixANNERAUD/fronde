@@ -509,6 +509,15 @@ fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
         }
         match source {
             SourceConfig::Mcp(m) => {
+                let prefix = format!("{name}_");
+                if let Some(reserved) = RESERVED_TOOL_PREFIXES
+                    .iter()
+                    .find(|r| prefix.starts_with(**r) || r.starts_with(&prefix))
+                {
+                    bail!(
+                        "source name {name:?} is reserved for the hub's own tools ({reserved}…); pick another name"
+                    );
+                }
                 if m.url.is_some() == m.command.is_some() {
                     bail!("source {name:?}: set exactly one of url or command");
                 }

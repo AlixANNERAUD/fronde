@@ -76,7 +76,7 @@ An upstream MCP server. See [Add upstream MCP servers](../how-to/add-upstream-mc
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | Required. Prefixes the server's tools. |
+| `name` | string | Required. Prefixes the server's tools, so it cannot overlap the hub's reserved prefixes (`hub_`, `memory_`, `search_`, `use_`). |
 | `url` | URL | Streamable HTTP address of the server. |
 | `command` | array of strings | Program and arguments to run, talking MCP over standard input and output. |
 | `token` | secret | Optional, with `url` only: sent as `Authorization: Bearer <token>`. |

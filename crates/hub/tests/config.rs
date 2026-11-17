@@ -153,8 +153,30 @@ fn missing_secret_explains() {
 
 #[test]
 fn rejects_reserved_and_duplicate_upstream_names() {
-    let s = format!("{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"hub\"\nurl = \"http://x/mcp\"\n");
-    assert!(format!("{:#}", load_str(&s).unwrap_err()).contains("reserved"));
+    for name in [
+        "hub",
+        "hub_extra",
+        "memory",
+        "memory_extra",
+        "search",
+        "use",
+    ] {
+        let s = format!(
+            "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = {name:?}\nurl = \"http://x/mcp\"\n"
+        );
+        let err = format!("{:#}", load_str(&s).unwrap_err());
+        assert!(
+            err.contains("reserved") && err.contains("pick another name"),
+            "{name}: {err}"
+        );
+    }
+    // Non-overlapping names starting like a reserved prefix stay allowed.
+    for name in ["mem", "memory2", "hub2"] {
+        let s = format!(
+            "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = {name:?}\nurl = \"http://x/mcp\"\n"
+        );
+        load_str(&s).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+    }
     // Names are unique across kinds.
     let s = format!(
         "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"a\"\nurl = \"http://x/mcp\"\n[[sources]]\nkind = \"component\"\nname = \"a\"\npath = \"a.wasm\"\n"

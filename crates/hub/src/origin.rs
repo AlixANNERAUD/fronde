@@ -223,17 +223,20 @@ pub fn is_loopback(ip: IpAddr) -> bool {
 
 /// An address of the host itself or of its networks: loopback, unspecified (which reaches the
 /// host), private (10/8, 172.16/12, 192.168/16, fc00::/7), shared (100.64/10), link-local (where
-/// most metadata services are) and other metadata addresses. IPv4 carried in IPv6 counts as
-/// itself.
+/// most metadata services are), IETF protocol assignments (192.0.0/24), benchmarking
+/// (198.18/15), NAT64 local-use (64:ff9b:1::/48) and other metadata addresses. IPv4 carried in
+/// IPv6 counts as itself.
 pub fn is_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || a == 0
                 || (a == 100 && (64..128).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (18..=19).contains(&b))
                 || METADATA.contains(&ip)
         }
         IpAddr::V6(v6) => match embedded_ipv4(v6) {
@@ -243,6 +246,7 @@ pub fn is_local(ip: IpAddr) -> bool {
                     || v6.is_unspecified()
                     || v6.is_unicast_link_local()
                     || v6.is_unique_local()
+                    || matches!(v6.segments(), [0x64, 0xff9b, 1, ..])
                     || METADATA.contains(&ip)
             }
         },
@@ -261,14 +265,14 @@ pub fn is_never_allowed(ip: IpAddr) -> bool {
     }
 }
 
-/// The IPv4 address an IPv6 one stands for: mapped (`::ffff:a.b.c.d`), compatible
-/// (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`).
+/// The IPv4 address an IPv6 one stands for: mapped (`::ffff:a.b.c.d`), translated
+/// (`::ffff:0:a.b.c.d`), compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`).
 fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let o = v6.octets();
     match v6.segments() {
-        [0, 0, 0, 0, 0, 0xffff | 0, _, _] | [0x64, 0xff9b, 0, 0, 0, 0, _, _] => {
-            Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
-        }
+        [0, 0, 0, 0, 0, 0xffff | 0, _, _]
+        | [0, 0, 0, 0, 0xffff, 0, _, _]
+        | [0x64, 0xff9b, 0, 0, 0, 0, _, _] => Some(Ipv4Addr::new(o[12], o[13], o[14], o[15])),
         [0x2002, ..] => Some(Ipv4Addr::new(o[2], o[3], o[4], o[5])),
         _ => None,
     }
@@ -469,7 +473,11 @@ mod tests {
             "10.0.0.2",
             "172.16.0.1",
             "172.31.255.255",
+            "192.0.0.0",
+            "192.0.0.255",
             "192.168.1.10",
+            "198.18.0.0",
+            "198.19.255.255",
             "100.64.0.1",
             "100.127.255.254",
             "169.254.169.254",
@@ -485,10 +493,18 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "::ffff:100.64.0.1",
+            "::ffff:0:0.0.0.0",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "::ffff:0:192.0.0.0",
+            "::ffff:0:198.19.255.255",
             "::127.0.0.1",
             "::10.0.0.1",
             "64:ff9b::7f00:1",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::",
+            "64:ff9b:1::808:808",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
             "2002:7f00:1::",
             "2002:c0a8:101::1",
         ] {
@@ -498,12 +514,23 @@ mod tests {
             "8.8.8.8",
             "172.32.0.1",
             "172.15.255.255",
+            "191.255.255.255",
+            "192.0.1.0",
+            "198.17.255.255",
+            "198.20.0.0",
             "100.128.0.1",
             "100.63.255.255",
             "2001:db8::1",
             "2606:4700::1111",
             "::ffff:8.8.8.8",
+            "::fffe:ffff:ffff:ffff",
+            "::ffff:0:8.8.8.8",
+            "::ffff:0:255.255.255.255",
+            "::ffff:1:0:0",
+            "::ffff:1:127.0.0.1",
             "64:ff9b::808:808",
+            "64:ff9b:0:ffff:ffff:ffff:ffff:ffff",
+            "64:ff9b:2::",
             "2002:808:808::1",
         ] {
             assert!(!is_local(remote.parse().unwrap()), "{remote}");
@@ -517,6 +544,7 @@ mod tests {
             "169.254.169.254",
             "fe80::1",
             "::ffff:169.254.169.254",
+            "::ffff:0:169.254.169.254",
             "100.100.100.200",
             "168.63.129.16",
             "fd00:ec2::254",

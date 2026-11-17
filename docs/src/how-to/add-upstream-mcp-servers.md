@@ -32,8 +32,9 @@ Fronde's rights and environment, so only run programs you trust.
 ## Names
 
 `name` must match `^[a-z][a-z0-9_]{0,63}$`, must be unique among all sources, and may not be
-`hub`, which is reserved for Fronde's own tools. Each upstream tool becomes `<name>_<tool>`, lowercased, with any
-character outside `a-z`, `0-9` and `_` turned into `_`, cut at 64 characters.
+`hub` or overlap the hub's reserved tool prefixes (`hub_`, `memory_`, `search_`, `use_`). Each
+upstream tool becomes `<name>_<tool>`, lowercased, with any character outside `a-z`, `0-9` and `_`
+turned into `_`, cut at 64 characters.
 
 ## How the agent finds them
 
