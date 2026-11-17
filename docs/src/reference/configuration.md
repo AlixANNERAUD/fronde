@@ -283,7 +283,12 @@ only the hub: `/health` and `/mcp`.
 ## `[agent]`
 
 Optional. The agent Fronde runs for the chat, over ACP on standard input and output. It is
-started on the first message, and only when `[web]` is set.
+started on the first message, and only when `[web]` is set. These are the settings of Claude, the
+only provider so far; another provider will come with a table of its own, `[providers.<id>]`
+(**planned**, see [Why subscriptions and ACP](../explanation/subscriptions.md#other-providers)).
+Until then a `[providers]` table is refused, and so will be a thread asked to run on `codex` or
+`gemini` (`threads_start`, planned): "only claude is configured; Codex and Gemini/Antigravity are
+planned".
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -293,6 +298,10 @@ started on the first message, and only when `[web]` is set.
 | `read` | array of paths | `[]` | More directories the confined agent may read and run programs from, besides the system's, its `PATH` and the adapter's install. A relative path is read from the configuration file's directory. One that equals or contains the data directory, the configuration's directory, a secret file or systemd's credentials is an error. Use it for a Claude Code installed elsewhere (`CLAUDE_CODE_EXECUTABLE`) or a Node.js outside the `PATH`. |
 | `oauth_token` | secret | none | The agent's Claude sign-in: the token `claude setup-token` prints, as `{ file = "…" }`, `{ env = "…" }` or `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`). Fronde reads it at each start of the agent and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through its environment only. `[agent] env` may not set `CLAUDE_CODE_OAUTH_TOKEN` as well. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
 | `builtin_tools` | array of strings | `["WebSearch", "WebFetch"]` | Claude Code's own tools the agent may use besides the hub's. Only `WebSearch` and `WebFetch` are allowed; `[]` for none. `AskUserQuestion` is always on, never allowed up front: it asks you through a card. |
+
+There is no setting for the model: each thread runs on the agent's default unless it was given
+one, which Fronde chooses through the session's config options (see
+[How Fronde works](../explanation/architecture.md#providers-and-models)).
 
 ```toml
 [agent]

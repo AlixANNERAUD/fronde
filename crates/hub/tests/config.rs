@@ -1033,3 +1033,26 @@ fn agent_limits_refuse_bad_values() {
         assert!(e.contains(expected), "{table}: {e}");
     }
 }
+
+/// `[agent]` is Claude's settings and Claude the only provider; the planned ones are named as
+/// such, and `[providers.<id>]` is not read yet.
+#[test]
+fn only_claude_is_a_configured_provider() {
+    use fronde_hub::config::{PROVIDERS, check_provider};
+    assert_eq!(PROVIDERS, ["claude"]);
+    check_provider("claude").unwrap();
+    for planned in ["codex", "gemini", "antigravity", "Gemini"] {
+        let e = check_provider(planned).unwrap_err().to_string();
+        assert_eq!(
+            e, "only claude is configured; Codex and Gemini/Antigravity are planned",
+            "{planned}"
+        );
+    }
+    let e = check_provider("mistral").unwrap_err().to_string();
+    assert!(e.contains("unknown provider \"mistral\""), "{e}");
+    assert!(e.contains("only claude is configured"), "{e}");
+    let e = refused(&format!(
+        "{MIN}\n[providers.codex]\ncommand = [\"codex-acp\"]\n"
+    ));
+    assert!(e.contains("unknown field"), "{e}");
+}

@@ -87,6 +87,7 @@ impl Setup {
     fn spec_with_hub(&self, command: &[&str], env: &[(&str, &str)], hub_port: u16) -> AgentSpec {
         AgentSpec {
             thread: ThreadId::MAIN,
+            provider: &fronde_agent::provider::Provider::CLAUDE,
             command: command.iter().map(|s| s.to_string()).collect(),
             env: env
                 .iter()

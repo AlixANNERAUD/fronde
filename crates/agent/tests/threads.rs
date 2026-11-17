@@ -1,6 +1,8 @@
 use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::{Assistant, Connector, TOPIC};
-use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
+use fronde_agent::fake::{
+    FAKE_MODEL_OPTION, FAKE_MODELS, FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk,
+};
 use fronde_agent::log::{ConversationLog, Event, TurnOutcome};
 use fronde_agent::threads::{Budget, StartedBy, ThreadId, Threads};
 use fronde_protocol::{Card, ChoiceOption, Field, Outcome};
@@ -22,6 +24,7 @@ const WAITING: &str = "En attente : d'autres conversations utilisent l'agent.";
 fn spec() -> AgentSpec {
     AgentSpec {
         thread: fronde_protocol::ThreadId::MAIN,
+        provider: &fronde_agent::provider::Provider::CLAUDE,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: "/srv/fronde/agent".into(),
@@ -838,4 +841,130 @@ async fn a_new_thread_never_inherits_an_earlier_threads_files() {
         .await
         .unwrap();
     assert_eq!(next.id, ThreadId(3));
+}
+
+/// The thread's model is chosen through the session's config options after each open or
+/// resume, since a resumed session may come back on the agent's default; the models seen are
+/// kept for choosing one before an agent runs.
+#[tokio::test]
+async fn model_is_applied_again_after_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = FakeScript {
+        resume: true,
+        models: true,
+        ..FakeScript::default()
+    };
+    let (connector, started) = fake_connector(script);
+    let threads = open(dir.path(), connector).await;
+    assert!(threads.models("claude").await.unwrap().is_empty());
+    threads
+        .set_model(ThreadId::MAIN, Some("fake-large"))
+        .await
+        .unwrap();
+    assert_eq!(
+        threads
+            .get(ThreadId::MAIN)
+            .await
+            .unwrap()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("fake-large")
+    );
+    let main = threads.main();
+    main.send("Un".into()).await;
+    wait_for_turns(&main, 1).await;
+    assert!(main.stop_agent().await);
+    main.send("Deux".into()).await;
+    wait_for_turns(&main, 2).await;
+
+    let handles = started.lock().unwrap().clone();
+    assert_eq!(handles.len(), 2);
+    let chosen = [(FAKE_MODEL_OPTION.to_owned(), "fake-large".to_owned())];
+    let first = handles[0].record();
+    assert_eq!(first.new_sessions.len(), 1);
+    assert_eq!(first.config_sets, chosen);
+    let second = handles[1].record();
+    assert!(second.new_sessions.is_empty(), "{second:?}");
+    assert_eq!(second.resumes.len(), 1);
+    assert_eq!(second.config_sets, chosen);
+    let models: Vec<String> = threads
+        .models("claude")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|model| model.id)
+        .collect();
+    assert_eq!(models, FAKE_MODELS);
+
+    // Back to the agent's default: nothing is asked of the next session.
+    threads.set_model(ThreadId::MAIN, None).await.unwrap();
+    assert!(main.stop_agent().await);
+    main.send("Trois".into()).await;
+    wait_for_turns(&main, 3).await;
+    let third = started.lock().unwrap()[2].record();
+    assert!(third.config_sets.is_empty(), "{third:?}");
+}
+
+/// A model the agent does not offer fails the turn's start before any prompt reaches it.
+#[tokio::test]
+async fn unknown_thread_model_fails_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = FakeScript {
+        models: true,
+        ..FakeScript::default()
+    };
+    let (connector, handles) = fake_connector(script);
+    let threads = open(dir.path(), connector).await;
+    threads
+        .set_model(ThreadId::MAIN, Some("fake-huge"))
+        .await
+        .unwrap();
+    let main = threads.main();
+    main.send("Un".into()).await;
+    let shown = wait_for_turns(&main, 1).await;
+    assert!(
+        shown.contains(&Event::Notice {
+            text: "L'agent a rencontré une erreur.".into()
+        }),
+        "{shown:?}"
+    );
+    let record = handles.lock().unwrap()[0].record();
+    assert!(record.config_sets.is_empty(), "{record:?}");
+    assert!(!main.agent_running());
+}
+
+/// A thread stored for a provider that is not configured does not open.
+#[tokio::test]
+async fn a_thread_of_another_provider_does_not_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector(FakeScript::default());
+    let threads = open(dir.path(), connector).await;
+    let row = threads
+        .create("alix", StartedBy::User, None, "Ailleurs")
+        .await
+        .unwrap();
+    assert_eq!(row.provider, "claude");
+    use sea_orm::QueryFilter;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    fronde_entity::threads::Entity::update_many()
+        .col_expr(
+            fronde_entity::threads::Column::Provider,
+            sea_orm::sea_query::Expr::value("codex"),
+        )
+        .filter(sea_orm::ColumnTrait::eq(
+            &fronde_entity::threads::Column::Id,
+            row.id.0,
+        ))
+        .exec(&db)
+        .await
+        .unwrap();
+    let Err(error) = threads.assistant(row.id).await else {
+        panic!("the thread opened");
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("\"codex\", which is not configured"),
+        "{error}"
+    );
 }

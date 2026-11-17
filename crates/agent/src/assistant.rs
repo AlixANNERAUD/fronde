@@ -428,7 +428,8 @@ impl Assistant {
             reply.send(permission::denial(&options));
             return;
         };
-        let Some(card) = permission::card(&tool_call, &options, owner.admin) else {
+        let rules = &self.spec.provider.permissions;
+        let Some(card) = permission::card(rules, &tool_call, &options, owner.admin) else {
             tracing::warn!("a permission request offered nothing the card can show: refused");
             reply.send(permission::denial(&options));
             return;
@@ -652,6 +653,8 @@ impl Assistant {
                 tracing::warn!("cannot save the agent session id: {error:#}");
             }
         }
+        // After each open or resume: a resumed session may come back on the agent's default.
+        self.choose_model(&client).await?;
         let client = Arc::new(client);
         let (flushes, flush_requests) = mpsc::unbounded_channel();
         let recorder = record_events(
@@ -718,6 +721,29 @@ impl Assistant {
             tracing::info!("the agent of thread {} stopped", self.thread);
             *slot = None;
         }
+    }
+
+    /// Applies the thread's model to the session just opened or resumed, and remembers the
+    /// models the agent offered. A model the agent does not offer fails the start, saying which
+    /// it does.
+    async fn choose_model(&self, client: &AgentClient) -> anyhow::Result<()> {
+        let provider = self.spec.provider.id;
+        let models = client.models();
+        if !models.is_empty()
+            && let Err(error) = threads::cache_models(&self.db, provider, &models).await
+        {
+            tracing::warn!("cannot remember the models of {provider}: {error:#}");
+        }
+        let model = threads::model(&self.db, self.thread)
+            .await
+            .context("cannot read the thread's model")?;
+        if let Some(model) = model {
+            client
+                .set_model(&model)
+                .await
+                .with_context(|| format!("cannot run thread {} on {model}", self.thread))?;
+        }
+        Ok(())
     }
 
     async fn saved_session_id(&self) -> Option<String> {

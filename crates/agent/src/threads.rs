@@ -34,7 +34,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 pub use fronde_protocol::ThreadId;
 
-use crate::acp::AgentSpec;
+use crate::acp::{AgentSpec, Model};
 use crate::assistant::{self, Assistant, Connector, Shared, TOPIC};
 use crate::legacy;
 use crate::log::{Event, new_log_id, new_stream};
@@ -45,8 +45,6 @@ use crate::tokens::Tokens;
 const LEGACY_SESSION: (&str, &str) = ("agent", "session");
 /// The main thread's title.
 const MAIN_TITLE: &str = "Fronde";
-/// The only provider so far.
-const PROVIDER: &str = "claude";
 /// Stream entries read at a time when looking for a turn a stop left open.
 const SCAN_PAGE: u64 = 64;
 
@@ -378,7 +376,7 @@ impl Threads {
         budget: Budget,
     ) -> anyhow::Result<Arc<Self>> {
         legacy::import(&db, data_dir, TOPIC, LEGACY_SESSION).await?;
-        ensure_main(&db, &owner.name)
+        ensure_main(&db, &owner.name, spec.provider.id)
             .await
             .context("cannot make the main thread in the database")?;
         let spec = AgentSpec {
@@ -461,6 +459,15 @@ impl Threads {
         let Some(row) = self.get(id).await? else {
             return Ok(None);
         };
+        // Every thread's agent starts from the one configured provider's spec: a thread stored
+        // for another would get its permission rules and sign-in, so it does not open.
+        if row.provider != self.spec.provider.id {
+            bail!(
+                "thread {id} uses the provider {:?}, which is not configured; only {} is",
+                row.provider,
+                self.spec.provider.id
+            );
+        }
         let shared = Shared {
             db: self.db.clone(),
             connector: self.connector.clone(),
@@ -576,7 +583,7 @@ impl Threads {
             depth: Set(depth),
             owner: Set(owner.into()),
             started_by: Set(started_by.stored()),
-            provider: Set(PROVIDER.into()),
+            provider: Set(self.spec.provider.id.into()),
             model: Set(None),
             session_id: Set(None),
             client_request_id: Set(None),
@@ -589,6 +596,24 @@ impl Threads {
             .await?;
         transaction.commit().await?;
         ThreadRow::from_model(row)
+    }
+
+    /// Sets the model thread `id`'s agent runs, `None` for the agent's default. It applies from
+    /// the agent's next start, after its session opens or resumes; a model the agent does not
+    /// offer then fails that start, saying which it offers.
+    pub async fn set_model(&self, id: ThreadId, model: Option<&str>) -> anyhow::Result<()> {
+        self.update(
+            id,
+            threads::Column::Model,
+            Expr::value(model.map(str::to_owned)),
+        )
+        .await
+    }
+
+    /// The models the agent of `provider` offered when it last started, for choosing one; empty
+    /// when none was seen yet.
+    pub async fn models(&self, provider: &str) -> anyhow::Result<Vec<Model>> {
+        cached_models(&self.db, provider).await
     }
 
     /// Thread `id`, if there is one.
@@ -693,7 +718,7 @@ fn move_aside_leftover(data_dir: &Path, id: ThreadId) -> anyhow::Result<()> {
 /// Makes the main thread's stream and row when missing, and moves the agent's session id from
 /// the key-value table to the row, in one transaction: the row is then the only place it is
 /// kept.
-async fn ensure_main(db: &DatabaseConnection, owner: &str) -> anyhow::Result<()> {
+async fn ensure_main(db: &DatabaseConnection, owner: &str, provider: &str) -> anyhow::Result<()> {
     let transaction = fronde_db::begin_write(db).await?;
     if streams::Entity::find_by_id(TOPIC)
         .one(&transaction)
@@ -718,7 +743,7 @@ async fn ensure_main(db: &DatabaseConnection, owner: &str) -> anyhow::Result<()>
             depth: Set(0),
             owner: Set(owner.into()),
             started_by: Set(StartedBy::User.stored()),
-            provider: Set(PROVIDER.into()),
+            provider: Set(provider.into()),
             model: Set(None),
             session_id: Set(None),
             client_request_id: Set(None),
@@ -739,6 +764,44 @@ async fn ensure_main(db: &DatabaseConnection, owner: &str) -> anyhow::Result<()>
     }
     transaction.commit().await?;
     Ok(())
+}
+
+/// Thread `id`'s model, `None` for the agent's default.
+pub(crate) async fn model(db: &DatabaseConnection, id: ThreadId) -> anyhow::Result<Option<String>> {
+    Ok(threads::Entity::find_by_id(id.0)
+        .one(db)
+        .await?
+        .with_context(|| format!("no thread {id}"))?
+        .model)
+}
+
+/// Where the models an agent offered are kept, for choosing one before it starts: the key-value
+/// table's scope `provider/<id>`, key `models`.
+fn models_key(provider: &str) -> (String, &'static str) {
+    (format!("provider/{provider}"), "models")
+}
+
+/// Remembers the models the agent of `provider` offered at its last start.
+pub(crate) async fn cache_models(
+    db: &DatabaseConnection,
+    provider: &str,
+    models: &[Model],
+) -> anyhow::Result<()> {
+    let (scope, key) = models_key(provider);
+    fronde_db::kv::set(db, &scope, key, serde_json::to_vec(models)?, None).await?;
+    Ok(())
+}
+
+/// The models the agent of `provider` offered at its last start; empty when none was seen.
+pub(crate) async fn cached_models(
+    db: &DatabaseConnection,
+    provider: &str,
+) -> anyhow::Result<Vec<Model>> {
+    let (scope, key) = models_key(provider);
+    match fronde_db::kv::get(db, &scope, key).await? {
+        Some(value) => Ok(serde_json::from_slice(&value)?),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Thread `id`'s agent session id.

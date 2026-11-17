@@ -519,6 +519,7 @@ async fn every_threads_token_never_appears() {
     let main = thread_dirs(&data, ThreadId::MAIN);
     let spec = AgentSpec {
         thread: ThreadId::MAIN,
+        provider: &fronde_agent::provider::Provider::CLAUDE,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: main.work,

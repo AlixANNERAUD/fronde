@@ -397,6 +397,24 @@ fn tasks_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D:
 /// The origin a stored `[agent] oauth_token` is stored for: Claude's API, which it opens.
 pub const CLAUDE_ORIGIN: &str = "https://api.anthropic.com";
 
+/// The providers a thread may run on: `[agent]` holds Claude's settings, the only provider so
+/// far. Another one comes with its own `[providers.<id>]` table.
+pub const PROVIDERS: [&str; 1] = ["claude"];
+
+/// Providers named in the plans but not built: refused with a word saying so.
+const PLANNED_PROVIDERS: [&str; 4] = ["codex", "gemini", "antigravity", "agy"];
+
+/// Checks that a thread may run on `provider`: one of [`PROVIDERS`].
+pub fn check_provider(provider: &str) -> anyhow::Result<()> {
+    if PROVIDERS.contains(&provider) {
+        return Ok(());
+    }
+    if PLANNED_PROVIDERS.contains(&provider.to_ascii_lowercase().as_str()) {
+        bail!("only claude is configured; Codex and Gemini/Antigravity are planned");
+    }
+    bail!("unknown provider {provider:?}; only claude is configured");
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {

@@ -133,6 +133,9 @@ Options are offered as follows:
 - On a tool call that switches the session's mode (leaving plan mode, entering it), only
   *Yes, manually approve edits* and *No*: every other option there may switch to a mode that asks
   less (auto mode, accepting every edit), which must never be one tap away.
+- These lists belong to the agent's provider (see
+  [How Fronde works](architecture.md#providers-and-models)). A provider whose options Fronde has
+  not read gets no lasting option at all, and no option on a mode switch, which is then refused.
 - An option id the agent gives with two different kinds is left out.
 
 The server refuses any option the card does not offer, and the agent only ever gets one the card

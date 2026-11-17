@@ -62,6 +62,29 @@ fronde serve
 only the environment it needs, confines itself with Landlock and seccomp, and becomes the
 adapter. See [Where the agent runs](security.md#where-the-agent-runs).
 
+### Providers and models
+
+What sets Claude apart from another agent speaking ACP is gathered in one **provider profile**
+(`crates/agent/src/provider.rs`), data rather than code: the session's `_meta` (Claude Code's
+tools, the allowed ones, no settings of the owner's, `AskUserQuestion`), the mode a session is
+put in once open (`default`, since the adapter starts in `auto`), the variable its sign-in token
+goes in (`CLAUDE_CODE_OAUTH_TOKEN`), how the session's MCP header carries the hub's token
+(`Bearer ${FRONDE_HUB_TOKEN}`, which Claude Code expands from its environment), which permission
+options a card may offer (the lasting ones Fronde knows and those allowed on a mode switch, see
+[Permission cards](requests.md#permission-cards)), and what the sandbox grants for the program to
+run (the adapter's `node_modules`). Claude is the only provider; `[agent]` holds its settings.
+Codex and Antigravity are planned (see [Why subscriptions and ACP](subscriptions.md#other-providers)).
+
+A thread may run on a chosen **model**, kept in its row; without one, the agent's default. Fronde
+chooses it through the session's config options, stable in ACP v1: the agent lists them when the
+session opens or resumes, and the values of the option of category `model` are the models it
+offers (the Claude adapter's option `model`). After each open or resume, Fronde sends
+`session/set_config_option` with the thread's model, since a resumed session may come back on
+the default. A model the agent does not list fails the start, and the log says which it lists;
+an agent with no model option refuses any model. The models an agent listed are kept in the
+key-value table (`provider/<id>`, `models`) for choosing one before an agent runs. Nothing sets a
+thread's model from the chat yet: that comes with `threads_start` (**planned**).
+
 Each turn streams back as events: text, tool calls, permission requests, the end of the turn.
 Fronde numbers them and saves each one in the database, committed to disk, before it broadcasts
 it to every open page: a page never shows an entry a crash could lose. A page that reconnects
@@ -152,4 +175,6 @@ These are designed but **not built yet**:
   outgoing WebSocket over TLS (`wss://`) to the main instance, which reaches the node's tools over
   MCP inside that socket. TLS is mandatory between instances, with a self-signed certificate
   generated at first start and trusted by pinning its SHA-256 fingerprint, exchanged when pairing.
-- **More agents.** Codex and Gemini through their own ACP adapters, on their own subscriptions.
+- **More agents.** Codex through `@agentclientprotocol/codex-acp` and Antigravity through
+  `agy acp`, on their own subscriptions, each with a provider profile of its own (see
+  [Why subscriptions and ACP](subscriptions.md#other-providers)).

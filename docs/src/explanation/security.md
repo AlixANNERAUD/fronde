@@ -391,7 +391,8 @@ The agent may:
 
 - read and run files under the system's directories (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`,
   `/lib64`, `/etc`, `/proc`, `/sys`), each directory on its `PATH`, the adapter's install
-  (the topmost `node_modules` above the program, or else its directory), and `[agent] read`;
+  (for Claude's npm adapter, the topmost `node_modules` above the program, or else its directory;
+  for a native program, its directory), and `[agent] read`;
 - read `/dev/zero`, `/dev/random` and `/dev/urandom`, and write `/dev/null` and `/dev/full`: no
   other device, so no terminal (`/dev/tty`, `/dev/pts`) and no shared memory (`/dev/shm`);
 - read, write, create and remove files in its thread's two directories, and no other thread's:

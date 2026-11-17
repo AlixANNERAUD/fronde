@@ -660,6 +660,8 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
         system: &system,
         path: path.as_deref(),
         program,
+        // `[agent]` is Claude's, the only provider so far.
+        install: fronde_agent::provider::Provider::CLAUDE.install,
         extra: &config.agent.read,
         write,
         protected: &protected,
@@ -829,6 +831,7 @@ pub async fn start_with(
             // in that process's environment: the hub tells a thread's calls by it.
             let spec = AgentSpec {
                 thread: ThreadId::MAIN,
+                provider: &fronde_agent::provider::Provider::CLAUDE,
                 command: agent.command,
                 env: agent.env.into_iter().collect(),
                 cwd: main.work,

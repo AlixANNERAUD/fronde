@@ -311,6 +311,7 @@ fn no_secret_in_debug() {
     let bearer = Credential::Bearer(bearer_canary.into());
     let agent_spec = AgentSpec {
         thread: fronde_agent::threads::ThreadId::MAIN,
+        provider: &fronde_agent::provider::Provider::CLAUDE,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: dir.path().to_path_buf(),

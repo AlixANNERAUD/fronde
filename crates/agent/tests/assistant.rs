@@ -31,6 +31,7 @@ const FAILED: &str = "L'agent a rencontré une erreur.";
 fn spec() -> AgentSpec {
     AgentSpec {
         thread: fronde_protocol::ThreadId::MAIN,
+        provider: &fronde_agent::provider::Provider::CLAUDE,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: "/srv/fronde/agent".into(),

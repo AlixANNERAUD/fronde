@@ -5,11 +5,14 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::schema::{
     CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationContentValue,
+    SessionConfigKind,
 };
 use fronde_agent::acp::{
     AgentClient, AgentEvent, AgentSpec, ElicitationAsk, Failure, PermissionAsk, TurnEnd,
 };
-use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
+use fronde_agent::fake::{
+    FAKE_MODEL_OPTION, FAKE_MODELS, FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +25,7 @@ const WAIT: Duration = Duration::from_secs(10);
 fn spec() -> AgentSpec {
     AgentSpec {
         thread: fronde_protocol::ThreadId::MAIN,
+        provider: &fronde_agent::provider::Provider::CLAUDE,
         command: vec!["claude-agent-acp".into()],
         env: Vec::new(),
         cwd: "/srv/fronde/agent".into(),
@@ -804,4 +808,101 @@ async fn a_form_for_another_session_is_cancelled() {
             .iter()
             .any(|event| matches!(event, AgentEvent::Elicitation(_)))
     );
+}
+
+fn with_models() -> FakeScript {
+    FakeScript {
+        models: true,
+        ..FakeScript::default()
+    }
+}
+
+/// The models are the values of the agent's config option of category `model`, and choosing one
+/// is a `session/set_config_option` on that option.
+#[tokio::test]
+async fn model_is_set_through_config_options() {
+    let (client, handle, _rx) = connect(with_models(), None).await;
+    let ids: Vec<String> = client.models().into_iter().map(|model| model.id).collect();
+    assert_eq!(ids, FAKE_MODELS);
+    assert_eq!(client.config_options().len(), 1);
+
+    timeout(WAIT, client.set_model("fake-large"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        handle.record().config_sets,
+        [(FAKE_MODEL_OPTION.to_owned(), "fake-large".to_owned())]
+    );
+    // The options as the agent answered them: the new model is current.
+    let [option] = client.config_options().try_into().unwrap();
+    let SessionConfigKind::Select(select) = option.kind else {
+        panic!("not a select: {option:?}");
+    };
+    assert_eq!(&*select.current_value.0, "fake-large");
+    // The session's mode is still set as before, once.
+    assert_eq!(handle.record().modes, ["default"]);
+}
+
+#[tokio::test]
+async fn unknown_model_is_refused_with_the_choices() {
+    let (client, handle, _rx) = connect(with_models(), None).await;
+    let error = timeout(WAIT, client.set_model("fake-huge"))
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "unknown model \"fake-huge\"; choose one of: fake-small, fake-large"
+    );
+    // Refused before the agent is asked.
+    assert!(handle.record().config_sets.is_empty());
+}
+
+#[tokio::test]
+async fn agent_without_model_option_refuses_a_model() {
+    let (client, handle, _rx) = connect(FakeScript::default(), None).await;
+    assert!(client.models().is_empty());
+    assert!(client.config_options().is_empty());
+    let error = timeout(WAIT, client.set_model("fake-small"))
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "this agent offers no choice of model");
+    assert!(handle.record().config_sets.is_empty());
+}
+
+/// A resumed session's config options are kept as `session/resume` gives them.
+#[tokio::test]
+async fn resumed_session_keeps_its_config_options() {
+    let script = FakeScript {
+        resume: true,
+        ..with_models()
+    };
+    let (client, handle, _rx) = connect(script, Some("earlier-session")).await;
+    assert_eq!(handle.record().resumes.len(), 1);
+    assert_eq!(client.models().len(), 2);
+    timeout(WAIT, client.set_model("fake-small"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        handle.record().config_sets,
+        [(FAKE_MODEL_OPTION.to_owned(), "fake-small".to_owned())]
+    );
+}
+
+/// With a shared counter, each agent playing the script gives its new session its own id.
+#[tokio::test]
+async fn counted_sessions_get_distinct_ids() {
+    let script = FakeScript {
+        counted_sessions: Some(Arc::default()),
+        ..FakeScript::default()
+    };
+    let (first, ..) = connect(script.clone(), None).await;
+    let (second, ..) = connect(script, None).await;
+    assert_eq!(first.session_id(), "fake-session-1");
+    assert_eq!(second.session_id(), "fake-session-2");
 }

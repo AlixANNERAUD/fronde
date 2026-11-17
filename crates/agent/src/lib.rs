@@ -9,6 +9,7 @@ pub mod fake;
 pub mod legacy;
 pub mod log;
 pub mod permission;
+pub mod provider;
 pub mod scope;
 pub mod threads;
 pub mod tokens;

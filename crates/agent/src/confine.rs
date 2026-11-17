@@ -6,6 +6,7 @@
 //! Fronde's own.
 
 use crate::acp::AgentSpec;
+use crate::provider::Install;
 use crate::scope::{MANAGER_ENV, Scope, Unavailable};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -447,6 +448,8 @@ pub struct GrantRequest<'a> {
     pub path: Option<&'a OsStr>,
     /// The agent's program, as `[agent] command` names it.
     pub program: &'a str,
+    /// How its provider's program is installed: what is granted for it to run.
+    pub install: Install,
     /// `[agent] read`.
     pub extra: &'a [PathBuf],
     /// Directories the agent writes besides its thread's, which [`Confine::command_with`] adds
@@ -524,7 +527,7 @@ pub fn grants(request: &GrantRequest<'_>) -> anyhow::Result<Grants> {
             }
         }
     }
-    if let Some(install) = install_dir(request.program, request.path) {
+    if let Some(install) = install_grant(request.install, request.program, request.path) {
         if let Some(p) = covering_home(&install) {
             bail!(
                 "the agent's program {} is installed in {}, which holds {}: install the adapter \
@@ -610,9 +613,16 @@ fn canonical(path: &Path) -> PathBuf {
     }
 }
 
-/// Where the agent's program is installed: the topmost `node_modules` above its canonical path,
-/// so that the adapter can load its own Claude Code, or else its directory.
-fn install_dir(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+/// What the sandbox grants for the agent's program to run, as its provider installs it.
+fn install_grant(install: Install, program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    match install {
+        Install::NodeModules => install_dir(program, path),
+        Install::Directory => program_path(program, path)?.parent().map(Path::to_path_buf),
+    }
+}
+
+/// The canonical path of the agent's program, looked up on `path` when it has no directory.
+fn program_path(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     let program = Path::new(program);
     let found = if program.components().count() > 1 {
         program.to_path_buf()
@@ -621,7 +631,13 @@ fn install_dir(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
             .map(|dir| dir.join(program))
             .find(|candidate| candidate.is_file())?
     };
-    let canonical = found.canonicalize().ok()?;
+    found.canonicalize().ok()
+}
+
+/// Where an npm adapter is installed: the topmost `node_modules` above its program's canonical
+/// path, so that the adapter can load its own CLI (Claude Code), or else its directory.
+fn install_dir(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let canonical = program_path(program, path)?;
     canonical
         .ancestors()
         .filter(|dir| dir.file_name() == Some(OsStr::new("node_modules")))
@@ -958,6 +974,7 @@ mod tests {
     fn spec(data: &tempfile::TempDir, env: Vec<(String, String)>) -> AgentSpec {
         AgentSpec {
             thread: ThreadId::MAIN,
+            provider: &crate::provider::Provider::CLAUDE,
             command: vec!["claude-agent-acp".into(), "--flag".into()],
             env,
             cwd: data.path().join("agent"),
@@ -1345,6 +1362,7 @@ mod tests {
             system,
             path,
             program: "/nonexistent/agent",
+            install: Install::NodeModules,
             extra,
             write,
             protected,
@@ -1495,5 +1513,32 @@ mod tests {
             install_dir(plain.join("agent").to_str().unwrap(), None),
             Some(plain.canonicalize().unwrap())
         );
+    }
+
+    /// Only an npm adapter's profile grants its whole `node_modules`; a native binary's grants
+    /// its directory alone, wherever it is.
+    #[test]
+    fn the_install_grant_follows_the_provider() {
+        let (root, ..) = tree();
+        let modules = root.path().join("agent/node_modules");
+        let package = modules.join("@scope/adapter/dist");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(modules.join(".bin")).unwrap();
+        let script = package.join("index.js");
+        std::fs::write(&script, "").unwrap();
+        let link = modules.join(".bin/claude-agent-acp");
+        std::os::unix::fs::symlink(&script, &link).unwrap();
+        let path = std::env::join_paths([modules.join(".bin")]).unwrap();
+        let claude = crate::provider::Provider::CLAUDE.install;
+        assert_eq!(
+            install_grant(claude, "claude-agent-acp", Some(&path)),
+            Some(modules.canonicalize().unwrap())
+        );
+        let native = crate::provider::Provider::bare("antigravity").install;
+        assert_eq!(
+            install_grant(native, "claude-agent-acp", Some(&path)),
+            Some(package.canonicalize().unwrap())
+        );
+        assert_eq!(install_grant(native, "absent-agent", Some(&path)), None);
     }
 }

@@ -1,6 +1,7 @@
 //! ACP client: starts the agent, opens Fronde's session and runs prompt turns.
 
 use crate::confine::Confine;
+use crate::provider::Provider;
 use crate::scope::ScopeStop;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
@@ -10,15 +11,15 @@ use agent_client_protocol::v1::schema::{
     ElicitationFormCapabilities, ElicitationMode, ElicitationScope, HttpHeader, Implementation,
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SessionCapabilities, SessionId, SessionNotification, SessionUpdate,
-    SetSessionModeRequest, StopReason, SystemPrompt, SystemPromptMode, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields,
+    ResumeSessionRequest, SessionCapabilities, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, SystemPrompt,
+    SystemPromptMode, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ErrorCode};
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use fronde_protocol::ThreadId;
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::json;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -28,13 +29,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
-/// The variable that carries the hub's token to an agent Fronde starts, and that Claude Code
-/// expands in the session's MCP header: the header itself then holds no secret, since the
-/// adapter passes it to Claude Code on a command line, which every user can read.
-pub const HUB_TOKEN_VAR: &str = "FRONDE_HUB_TOKEN";
+pub use crate::provider::ASK_USER_QUESTION;
 
-/// The variable Claude Code reads its sign-in token from.
-pub const OAUTH_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+/// The variable that carries the hub's token to an agent Fronde starts, and that the session's
+/// MCP header names as its provider's [`HubHeader`](crate::provider::HubHeader) says: the header
+/// itself then holds no secret, since the Claude adapter passes it to Claude Code on a command
+/// line, which every user can read.
+pub const HUB_TOKEN_VAR: &str = "FRONDE_HUB_TOKEN";
 
 /// The agent's Claude sign-in token, `[agent] oauth_token`: read again at each start, so that a
 /// token changed in its file or store applies at the next one.
@@ -56,6 +57,9 @@ where
 pub struct AgentSpec {
     /// The thread the agent works for: its scope unit names it.
     pub thread: ThreadId,
+    /// What sets the agent's provider apart: its session's `_meta`, mode, sign-in variable and
+    /// permission rules.
+    pub provider: &'static Provider,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
     /// The agent's working directory, which its sandbox lets it write.
@@ -66,7 +70,8 @@ pub struct AgentSpec {
     /// The agent process's own hub token: a [`Threads`](crate::threads::Threads) thread's agent
     /// gets a fresh one at each start, which dies with the process.
     pub hub_token: SecretString,
-    /// Given to the agent as `CLAUDE_CODE_OAUTH_TOKEN` when set.
+    /// Given to the agent in its provider's sign-in variable (`CLAUDE_CODE_OAUTH_TOKEN`) when
+    /// set.
     pub oauth_token: Option<OauthToken>,
     pub system_prompt: String,
     /// Claude Code's own tools the session gets besides the hub's, such as `WebSearch`.
@@ -77,6 +82,7 @@ impl fmt::Debug for AgentSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentSpec")
             .field("thread", &self.thread)
+            .field("provider", &self.provider.id)
             .field("command", &self.command)
             .field("env", &self.env)
             .field("cwd", &self.cwd)
@@ -309,6 +315,8 @@ pub struct AgentClient {
     connection: ConnectionTo<Agent>,
     session_id: SessionId,
     permissions: Arc<Permissions>,
+    /// The session's config options, as the agent last gave them.
+    config: Arc<Mutex<Vec<SessionConfigOption>>>,
     // The connection task runs until this sender is dropped.
     _stop: oneshot::Sender<()>,
     // Then the agent's scope, if it has one, is stopped.
@@ -359,8 +367,14 @@ impl AgentClient {
             spec.hub_token.expose_secret().to_owned(),
         )];
         if let Some(read) = &spec.oauth_token {
+            let var = spec.provider.sign_in_env.with_context(|| {
+                format!(
+                    "[agent] oauth_token: the provider {} takes no sign-in token",
+                    spec.provider.id
+                )
+            })?;
             let token = read().await.context("[agent] oauth_token")?;
-            secrets.push((OAUTH_TOKEN_VAR.to_owned(), token.expose_secret().to_owned()));
+            secrets.push((var.to_owned(), token.expose_secret().to_owned()));
         }
         let mut scope = None;
         let config = match confine {
@@ -389,7 +403,7 @@ impl AgentClient {
         let connection = Connection::start(AcpAgent::new(config), events)
             .await
             .with_context(|| format!("cannot start the agent ({command})"))?;
-        let header = format!("Bearer ${{{HUB_TOKEN_VAR}}}");
+        let header = spec.provider.hub_header.value(HUB_TOKEN_VAR);
         let mut client = connection.open_session(spec, header, resume).await?;
         client._scope = scope;
         Ok(client)
@@ -412,6 +426,40 @@ impl AgentClient {
 
     pub fn session_id(&self) -> &str {
         &self.session_id.0
+    }
+
+    /// The session's config options (ACP v1), as the agent gave them when the session opened or
+    /// last changed them.
+    pub fn config_options(&self) -> Vec<SessionConfigOption> {
+        lock(&self.config).clone()
+    }
+
+    /// The models the agent offers: the values of its config option of category `model`. Empty
+    /// when it offers no choice.
+    pub fn models(&self) -> Vec<Model> {
+        model_option(&lock(&self.config))
+            .map(|(_, models)| models)
+            .unwrap_or_default()
+    }
+
+    /// Chooses the session's model with `session/set_config_option`. A model the agent does not
+    /// offer is refused here, with the ones it does; so is any model when it offers no choice.
+    pub async fn set_model(&self, model: &str) -> anyhow::Result<()> {
+        let (option, models) =
+            model_option(&lock(&self.config)).context("this agent offers no choice of model")?;
+        if !models.iter().any(|known| known.id == model) {
+            let ids: Vec<&str> = models.iter().map(|known| known.id.as_str()).collect();
+            bail!("unknown model {model:?}; choose one of: {}", ids.join(", "));
+        }
+        let request = SetSessionConfigOptionRequest::new(self.session_id.clone(), option, model);
+        let response = self
+            .connection
+            .send_request(request)
+            .block_task()
+            .await
+            .with_context(|| format!("the agent refused the model {model:?}"))?;
+        *lock(&self.config) = response.config_options;
+        Ok(())
     }
 
     /// Run one turn; events stream to the sender given at connection until it returns.
@@ -600,6 +648,7 @@ struct Connection {
     connection: ConnectionTo<Agent>,
     capabilities: SessionCapabilities,
     permissions: Arc<Permissions>,
+    config: Arc<Mutex<Vec<SessionConfigOption>>>,
     stop: oneshot::Sender<()>,
 }
 
@@ -609,13 +658,18 @@ impl Connection {
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> anyhow::Result<Self> {
         let permissions = Arc::new(Permissions::new());
+        let config = Arc::new(Mutex::new(Vec::new()));
         let builder = Client
             .v1()
             .on_receive_notification(
                 {
                     let (permissions, events) = (permissions.clone(), events.clone());
+                    let config = config.clone();
                     async move |notification: SessionNotification, _cx| {
                         permissions.track(&notification.update);
+                        if let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
+                            *lock(&config) = update.config_options.clone();
+                        }
                         for event in events_from(notification.update) {
                             // A closed receiver only means nobody is listening any more.
                             let _ = events.send(event);
@@ -737,6 +791,7 @@ impl Connection {
             connection,
             capabilities: response.agent_capabilities.session_capabilities,
             permissions,
+            config,
             stop,
         })
     }
@@ -752,6 +807,7 @@ impl Connection {
             connection,
             capabilities,
             permissions,
+            config,
             stop,
         } = self;
         let hub = McpServer::Http(
@@ -764,14 +820,18 @@ impl Connection {
                     .mode(SystemPromptMode::Append)
             });
 
+        let meta = spec.provider.session_meta.build(&spec.builtin_tools);
         let mut resumed = None;
         if let Some(id) = resume.filter(|_| capabilities.resume.is_some()) {
             let request = ResumeSessionRequest::new(id.clone(), spec.cwd.clone())
                 .mcp_servers(vec![hub.clone()])
                 .system_prompt(system_prompt.clone())
-                .meta(session_meta(&spec.builtin_tools));
+                .meta(meta.clone());
             match connection.send_request(request).block_task().await {
-                Ok(_) => resumed = Some(SessionId::from(id)),
+                Ok(response) => {
+                    *lock(&config) = response.config_options.unwrap_or_default();
+                    resumed = Some(SessionId::from(id));
+                }
                 Err(error) => {
                     tracing::warn!("cannot resume agent session {id}, starting a new one: {error}");
                 }
@@ -783,20 +843,24 @@ impl Connection {
                 let request = NewSessionRequest::new(spec.cwd.clone())
                     .mcp_servers(vec![hub])
                     .system_prompt(system_prompt)
-                    .meta(session_meta(&spec.builtin_tools));
-                connection
+                    .meta(meta);
+                let response = connection
                     .send_request(request)
                     .block_task()
                     .await
-                    .context("the agent refused to open a session")?
-                    .session_id
+                    .context("the agent refused to open a session")?;
+                *lock(&config) = response.config_options.unwrap_or_default();
+                response.session_id
             }
         };
 
-        // The Claude Code adapter starts sessions in `auto`; `default` asks before acting.
-        let mode = SetSessionModeRequest::new(session_id.clone(), "default");
-        if let Err(error) = connection.send_request(mode).block_task().await {
-            tracing::debug!("the agent has no default mode: {error}");
+        // Claude's: the Claude Code adapter starts sessions in `auto`; `default` asks before
+        // acting.
+        if let Some(mode) = spec.provider.mode_after_open {
+            let request = SetSessionModeRequest::new(session_id.clone(), mode);
+            if let Err(error) = connection.send_request(request).block_task().await {
+                tracing::debug!("the agent has no {mode} mode: {error}");
+            }
         }
 
         permissions.state().session = Some(session_id.clone());
@@ -804,6 +868,7 @@ impl Connection {
             connection,
             session_id,
             permissions,
+            config,
             _stop: stop,
             _scope: None,
         })
@@ -819,41 +884,43 @@ fn client_capabilities() -> ClientCapabilities {
         .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
 }
 
-/// Claude Code's own tool that asks the user questions: the adapter turns it into a form
-/// elicitation, which becomes a card. Enabled, never allowed up front, so that every use goes
-/// through the adapter's permission check, which is where it asks.
-pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
+/// A model an agent offers, as its config option of category `model` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Model {
+    /// The value `set_model` takes.
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
 
-/// Fronde's agent gets the hub's tools and the listed built-in ones, all allowed up front, and
-/// [`ASK_USER_QUESTION`]. The Claude Code adapter loads the user's, project's and local settings
-/// unless told otherwise, and with them the owner's plugins, MCP servers, hooks and allow rules:
-/// none of them apply. The sign-in is not a setting and still works.
-fn session_meta(builtin_tools: &[String]) -> serde_json::Map<String, serde_json::Value> {
-    let allowed: Vec<&str> = std::iter::once("mcp__fronde")
-        .chain(builtin_tools.iter().map(String::as_str))
-        .filter(|tool| *tool != ASK_USER_QUESTION)
-        .collect();
-    let tools: Vec<&str> = builtin_tools
-        .iter()
-        .map(String::as_str)
-        .filter(|tool| *tool != ASK_USER_QUESTION)
-        .chain([ASK_USER_QUESTION])
-        .collect();
-    // The adapter prefers `tools` over `disableBuiltInTools`; the flag stays so that an adapter
-    // ignoring `tools` falls back to no built-in tool rather than all of them.
-    let serde_json::Value::Object(meta) = json!({
-        "disableBuiltInTools": true,
-        "claudeCode": {"options": {
-            "tools": tools,
-            "allowedTools": allowed,
-            "settingSources": [],
-            "strictMcpConfig": true,
-            "allowDangerouslySkipPermissions": false,
-        }},
-    }) else {
-        unreachable!("the literal is an object")
-    };
-    meta
+/// The id of the config option of category `model`, a select, and its values; `None` when the
+/// agent has none.
+fn model_option(options: &[SessionConfigOption]) -> Option<(String, Vec<Model>)> {
+    options.iter().find_map(|option| {
+        if option.category != Some(SessionConfigOptionCategory::Model) {
+            return None;
+        }
+        let SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        let values: Vec<_> = match &select.options {
+            SessionConfigSelectOptions::Ungrouped(values) => values.iter().collect(),
+            SessionConfigSelectOptions::Grouped(groups) => {
+                groups.iter().flat_map(|group| &group.options).collect()
+            }
+            _ => Vec::new(),
+        };
+        let models = values
+            .into_iter()
+            .map(|value| Model {
+                id: value.value.0.to_string(),
+                name: value.name.clone(),
+                description: value.description.clone(),
+            })
+            .collect();
+        Some((option.id.0.to_string(), models))
+    })
 }
 
 fn connection_end_error(
