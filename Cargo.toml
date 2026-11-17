@@ -75,7 +75,8 @@ webpki-roots = "1"
 web-sys = "0.3"
 # Only what a host of tool components uses: no GC, threads, cache or debugging support.
 wasmtime = { version = "50.0.1", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"] }
-wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2"] }
+# p1 runs CPython for WASI (crates/wasm/src/python.rs), a wasm32-wasip1 core module.
+wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p1", "p2"] }
 # Without its default sender: the gate sends requests itself (crates/wasm/src/dial.rs).
 wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2"] }
 url = { version = "2", features = ["serde"] }
@@ -89,6 +90,22 @@ all = { level = "warn", priority = -1 }
 # Dependencies without debug information keep test binaries small and quick to link.
 [profile.dev.package."*"]
 debug = false
+
+# Unoptimised, Cranelift takes about 10 s to compile CPython for WASI in each test that loads it.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

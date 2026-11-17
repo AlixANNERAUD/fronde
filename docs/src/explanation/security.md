@@ -159,6 +159,43 @@ A component's tools start with the prefixes its manifest declares, which no othe
 use: a component cannot shadow the hub's tools or another source's. See
 [Configuration](../reference/configuration.md#kind--component).
 
+## Python sandbox
+
+Agents run Python for calculations in CPython 3.15 built for WASI preview 1, inside the same
+wasmtime engine as components but with a linker of its own that holds WASI preview 1 and nothing
+else. A module that imports anything more, sockets or HTTP among them, cannot be instantiated.
+Each run gets a fresh instance, so nothing carries over from one run to the next: no globals, no
+imported modules, no files.
+
+What a run is granted:
+
+- its arguments, which are fixed: the interpreter in isolated mode and Fronde's own runner;
+- standard input, which carries the code, the data and the user's time zone as JSON;
+- standard output, to a buffer in memory of at most 64 KiB, which carries the reply;
+- standard error, to Fronde's log as warnings under `python`, at most 100 lines a run;
+- the clocks and random numbers;
+- one directory, the standard library, read-only at `/lib`.
+
+It gets no environment variables, no other directory, no network and no way to start a process
+or a thread. There is no `/tmp`: nothing a calculation needs is worth a writable directory, which
+would be one more thing to clean up and to bound. Prints are captured in memory by the runner.
+
+Each run has its limits, which end that run with an error that says what to change and leave the
+hub and the next run untouched:
+
+| Limit | Value | Why |
+| --- | --- | --- |
+| Memory | 256 MiB | CPython reserves 40 MiB at start; loading and grouping 100 000 rows of JSON needs about 56 MiB in all. Only the pages touched are used. |
+| CPU | about 10 s of running time | Counted as for components; time spent waiting is free. Python under WASI is about four times slower than native. |
+| Wall clock | 30 s | A run cannot hold a tool call open longer, even while sleeping. |
+| Output | 64 KiB | Results and prints go back to the agent's context: aggregates, not rows. Prints keep their first 16 KiB. |
+
+Fronde runs only the CPython build it pins: the SHA-256 of `python.wasm` is written in Fronde's
+source, and the file is hashed and compiled from the same bytes, at start. Any other file is
+refused with its hash. The standard library is not hashed. It only ever runs inside the sandbox,
+so changing it gains nothing the code sent to the tool could not already do, and changing it
+needs write access to the installation, which would also allow replacing the `fronde` binary.
+
 ## What is out of scope
 
 - Several users: there is one password and one conversation.
