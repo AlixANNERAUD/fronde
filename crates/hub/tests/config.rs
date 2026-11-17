@@ -480,6 +480,31 @@ fn the_calendar_migration_marks_local_servers() {
     assert!(!entry.contains("Serve CalDAV over https"), "{entry}");
 }
 
+/// A host the URL standard accepts may hold characters TOML must escape: the entry still reads
+/// back with the same origin.
+#[test]
+fn the_calendar_migration_escapes_origins() {
+    let entry = calendar_replacement(
+        "events_url = 'https://we\"ird.example/c/'\n\
+         reminders_url = 'http://lo\"cal:5232/r/'\nusername = \"a\"\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(&path, format!("{MIN}\n{entry}")).unwrap();
+    let config = fronde_hub::config::load(&path).expect(&entry);
+    let [fronde_hub::config::SourceConfig::Component(c)] = &config.sources[..] else {
+        panic!("{:?}", config.sources)
+    };
+    let allowed: Vec<String> = c.allow.iter().map(|a| a.origin.to_string()).collect();
+    assert_eq!(
+        allowed,
+        ["https://we\"ird.example", "http://lo\"cal:5232"],
+        "{entry}"
+    );
+    let credited: Vec<String> = c.credentials.iter().map(|c| c.origin.to_string()).collect();
+    assert_eq!(credited, allowed, "{entry}");
+}
+
 #[test]
 fn old_sections_point_to_sources() {
     let e = refused(&format!(

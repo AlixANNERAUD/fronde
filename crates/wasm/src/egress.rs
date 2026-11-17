@@ -160,9 +160,17 @@ impl WasiHttpHooks for Egress {
         // a new request, checked again here.
         let deadline = Instant::now() + self.request_timeout;
         let local = grant.local;
+        let credential = grant.authorization.is_some();
         let component = self.component.clone();
         Box::new(async move {
-            let send = dial::send(request, &origin, CONNECT_TIMEOUT, local, &component);
+            let send = dial::send(
+                request,
+                &origin,
+                CONNECT_TIMEOUT,
+                local,
+                credential,
+                &component,
+            );
             let (response, io) = tokio::time::timeout_at(deadline, send)
                 .await
                 .map_err(|_| Error::HttpResponseTimeout)??;
@@ -311,7 +319,11 @@ mod tests {
     #[test]
     fn credentials_need_https_unless_loopback() {
         let cred = || Credential::Bearer("t".into());
-        for origin in ["http://cal.example", "http://10.0.0.2:8080"] {
+        for origin in [
+            "http://cal.example",
+            "http://10.0.0.2:8080",
+            "http://localhost.:8080",
+        ] {
             let o: Origin = origin.parse().unwrap();
             let e = Grants::new(&[allowed_origin(&o)], &[(o.clone(), cred())])
                 .err()

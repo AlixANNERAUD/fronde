@@ -1,10 +1,12 @@
 //! Sends a request the gate allowed. The host name is resolved here and the connection goes to an
 //! address checked after that lookup, so a second lookup cannot swap in another address. Local
 //! addresses (the host, its private networks, cloud metadata) are refused unless the origin is
-//! allowed as local. TLS trusts the webpki roots, as wasmtime's own sender does.
+//! allowed as local. A credential over plain http goes only to loopback addresses. TLS trusts the
+//! webpki roots, as wasmtime's own sender does.
 
-use fronde_hub::origin::{Origin, is_local, is_never_allowed};
-use http::{Request, Response, Uri};
+use fronde_hub::origin::{Origin, is_local, is_loopback, is_never_allowed};
+use http::header::HOST;
+use http::{HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use std::future::poll_fn;
@@ -29,14 +31,16 @@ type Sent = (
     Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
 );
 
-/// Connect to `origin`, the request's as the gate parsed it, and send the request. Returns the response and the connection's
-/// remaining work, which ends with the response body. `connect_timeout` covers the lookup, the
-/// connection, TLS and the HTTP handshake together.
+/// Connect to `origin`, the request's as the gate parsed it, and send the request. Returns the
+/// response and the connection's remaining work, which ends with the response body.
+/// `connect_timeout` covers the lookup, the connection, TLS and the HTTP handshake together.
+/// `credential` says whether the request carries one the host added.
 pub(crate) async fn send(
     mut request: Request<WasiBody>,
     origin: &Origin,
     connect_timeout: Duration,
     local: bool,
+    credential: bool,
     component: &str,
 ) -> Result<Sent, Error> {
     let deadline = Instant::now() + connect_timeout;
@@ -60,6 +64,15 @@ pub(crate) async fn send(
         tracing::warn!(
             "{component}: {origin} resolves to a link-local or metadata address, which is \
              refused even for an origin allowed as local"
+        );
+        return Err(Error::DestinationIpProhibited);
+    }
+    // The configuration lets a credential over plain http only to a loopback origin, but a name
+    // can still resolve elsewhere: every address must stay on this machine.
+    if credential && !origin.is_https() && !addresses.iter().all(|a| is_loopback(a.ip())) {
+        tracing::warn!(
+            "{component}: {origin} resolves to an address off this machine, where its credential \
+             would travel unencrypted; use https"
         );
         return Err(Error::DestinationIpProhibited);
     }
@@ -101,6 +114,10 @@ pub(crate) async fn send(
         .path_and_query(path)
         .build()
         .map_err(|_| Error::HttpRequestUriInvalid)?;
+    // wasmtime sets Host from the guest's spelling of the authority: name the host connected to.
+    let authority =
+        HeaderValue::from_str(&origin.authority()).map_err(|_| Error::HttpRequestUriInvalid)?;
+    request.headers_mut().insert(HOST, authority);
 
     // Drive the connection while waiting for the response; what remains of it is returned.
     let mut response = pin!(sender.send_request(request));
@@ -179,7 +196,7 @@ pub(crate) mod tests {
         String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
     }
 
-    fn refusal(uri: &str, local: bool) -> (bool, String) {
+    fn refusal(uri: &str, local: bool, credential: bool) -> (bool, String) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -195,7 +212,14 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             let origin = Origin::of_request(request.uri()).unwrap();
-            let sent = send(request, &origin, Duration::from_secs(2), local, "calendar");
+            let sent = send(
+                request,
+                &origin,
+                Duration::from_secs(2),
+                local,
+                credential,
+                "calendar",
+            );
             refused = matches!(runtime.block_on(sent), Err(Error::DestinationIpProhibited));
         });
         (refused, log)
@@ -203,7 +227,7 @@ pub(crate) mod tests {
 
     #[test]
     fn local_refusal_names_the_fix() {
-        let (refused, log) = refusal("http://127.0.0.1:5232/dav?secret=1", false);
+        let (refused, log) = refusal("http://127.0.0.1:5232/dav?secret=1", false, false);
         assert!(refused);
         assert!(log.contains("WARN"), "{log}");
         assert!(
@@ -218,7 +242,7 @@ pub(crate) mod tests {
 
     #[test]
     fn link_local_is_refused_even_as_local() {
-        let (refused, log) = refusal("http://169.254.169.254/latest", true);
+        let (refused, log) = refusal("http://169.254.169.254/latest", true, false);
         assert!(refused);
         assert!(
             log.contains("calendar: http://169.254.169.254 resolves"),
@@ -226,5 +250,31 @@ pub(crate) mod tests {
         );
         assert!(log.contains("link-local or metadata"), "{log}");
         assert!(!log.contains("/latest"), "{log}");
+    }
+
+    #[test]
+    fn credential_over_plain_http_needs_loopback_addresses() {
+        // Allowed as local, so only the credential stops them: a name such as "localhost" that
+        // the resolver points at the network is refused the same way.
+        for (uri, origin) in [
+            ("http://10.0.0.2:5232/dav?secret=1", "http://10.0.0.2:5232"),
+            ("http://[::127.0.0.1]:9/?secret=1", "http://[::7f00:1]:9"),
+        ] {
+            let (refused, log) = refusal(uri, true, true);
+            assert!(refused, "{uri}");
+            assert!(log.contains("WARN"), "{log}");
+            assert!(
+                log.contains(&format!(
+                    "calendar: {origin} resolves to an address off this machine, where its \
+                     credential would travel unencrypted; use https"
+                )),
+                "{log}"
+            );
+            assert!(!log.contains("secret"), "{log}");
+        }
+        // A loopback address passes this check and goes on to connect.
+        let (refused, log) = refusal("http://127.0.0.1:9/", true, true);
+        assert!(!refused, "{log}");
+        assert!(!log.contains("off this machine"), "{log}");
     }
 }

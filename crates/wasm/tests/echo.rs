@@ -342,6 +342,42 @@ async fn local_addresses_need_a_local_origin() {
     assert_eq!(out.value["body"], "local");
 }
 
+/// Another spelling of an allowed address is the same origin, and the server sees the host the
+/// gate matched, not the guest's spelling of it.
+#[tokio::test]
+async fn another_spelling_reaches_the_allowed_host() {
+    let server = MockServer::start().await;
+    let port = server.address().port();
+    Mock::given(method("GET"))
+        .and(path("/page"))
+        .and(header("host", format!("127.0.0.1:{port}").as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut spec = spec();
+    spec.allow = vec![Allowed {
+        origin: format!("http://127.0.0.1:{port}").parse().unwrap(),
+        local: true,
+    }];
+    let echo = load(spec).await;
+    let out = echo
+        .call(
+            "echo_fetch",
+            &json!({ "url": format!("http://0x7f.1:{port}/page") }),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.to_text());
+    assert_eq!(out.value["status"], 200, "{}", out.to_text());
+    assert_eq!(out.value["body"], "hello");
+    let received = server.received_requests().await.unwrap();
+    let hosts: Vec<_> = received
+        .iter()
+        .flat_map(|r| r.headers.get_all("host"))
+        .collect();
+    assert_eq!(hosts, [format!("127.0.0.1:{port}").as_str()]);
+}
+
 #[tokio::test]
 async fn guest_cannot_set_authorization() {
     let server = MockServer::start().await;

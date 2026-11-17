@@ -76,8 +76,17 @@ impl Origin {
         if authority.as_str().contains('@') {
             return None;
         }
-        let host = Host::parse(authority.host()).ok()?;
-        let port = authority.port_u16().unwrap_or(default_port(https));
+        let host = authority.host();
+        // A port that is not a u16 is no port at all, not the scheme's default one.
+        let port = match &authority.as_str()[host.len()..] {
+            "" => default_port(https),
+            rest => rest
+                .strip_prefix(':')
+                .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))?
+                .parse()
+                .ok()?,
+        };
+        let host = Host::parse(host).ok()?;
         Some(Self { https, host, port })
     }
 
@@ -123,14 +132,25 @@ impl Origin {
         }
     }
 
+    /// `host[:port]`, as the `Host` header names it: the port only when it is not the scheme's
+    /// default.
+    pub fn authority(&self) -> String {
+        if self.port == default_port(self.https) {
+            self.host.to_string()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
     pub fn locality(&self) -> Locality {
         match &self.host {
+            // Only the exact name: glibc does not match "localhost." against /etc/hosts, so that
+            // name may go to DNS, which can answer with any address.
+            Host::Domain(d) if d == "localhost" => Locality::Loopback,
             Host::Domain(d) => {
-                // A fully qualified name ("localhost.") is the same host.
+                // A fully qualified name ("nas.lan.") is the same host.
                 let d = d.strip_suffix('.').unwrap_or(d);
-                if d == "localhost" {
-                    Locality::Loopback
-                } else if !d.contains('.') || d.ends_with(".local") || d.ends_with(".lan") {
+                if !d.contains('.') || d.ends_with(".local") || d.ends_with(".lan") {
                     Locality::Local
                 } else {
                     Locality::Public
@@ -180,11 +200,7 @@ impl<'de> Deserialize<'de> for Origin {
 /// As the configuration writes it: the port only when it is not the scheme's default.
 impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}://{}", self.scheme(), self.host)?;
-        if self.port != default_port(self.https) {
-            write!(f, ":{}", self.port)?;
-        }
-        Ok(())
+        write!(f, "{}://{}", self.scheme(), self.authority())
     }
 }
 
@@ -354,6 +370,34 @@ mod tests {
     }
 
     #[test]
+    fn requests_with_a_bad_port_have_no_origin() {
+        for uri in [
+            "http://cal.example:65536/",
+            "http://cal.example:99999/",
+            "http://cal.example:/",
+            "http://[::1]:70000/",
+        ] {
+            assert_eq!(request(uri), None, "{uri}");
+        }
+        assert_eq!(
+            request("http://[::1]:65535/"),
+            Some(origin("http://[::1]:65535"))
+        );
+    }
+
+    #[test]
+    fn authority_as_the_host_header_names_it() {
+        for (o, authority) in [
+            ("http://0x7f.1:8080", "127.0.0.1:8080"),
+            ("https://Cal.Example:443", "cal.example"),
+            ("http://[0:0:0:0:0:0:0:1]:9", "[::1]:9"),
+            ("https://cal.example:80", "cal.example:80"),
+        ] {
+            assert_eq!(origin(o).authority(), authority, "{o}");
+        }
+    }
+
+    #[test]
     fn credentials_need_https_unless_loopback() {
         for o in [
             "https://cal.example",
@@ -372,6 +416,15 @@ mod tests {
             "http://192.168.1.10:5232",
             "http://100.64.0.1",
             "http://cal.local",
+            // Not in /etc/hosts as glibc reads it: the name may go to DNS.
+            "http://localhost.",
+            "http://localhost.:5232",
+            // Unspecified, not loopback: a socket bound there may be reached from the network.
+            "http://0.0.0.0",
+            "http://[::]",
+            "http://[::ffff:0.0.0.0]",
+            // IPv4-compatible, deprecated: not a loopback address.
+            "http://[::127.0.0.1]",
             // An IPv4 loopback inside NAT64 or 6to4 goes through a relay.
             "http://[64:ff9b::7f00:1]",
             "http://[2002:7f00:1::]",
@@ -384,7 +437,8 @@ mod tests {
     fn locality_of_hosts() {
         for (o, locality) in [
             ("http://localhost:5232", Locality::Loopback),
-            ("http://localhost.:5232", Locality::Loopback),
+            ("http://localhost.:5232", Locality::Local),
+            ("http://nas.lan.", Locality::Local),
             ("http://127.0.0.1", Locality::Loopback),
             ("http://[::1]", Locality::Loopback),
             ("http://[::ffff:127.0.0.1]", Locality::Loopback),

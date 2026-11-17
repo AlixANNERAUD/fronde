@@ -435,9 +435,9 @@ fn calendar_source(old: &toml::Value) -> String {
     let allow: Vec<String> = origins
         .iter()
         .map(|o| match o.locality() {
-            Locality::Public => format!("\"{o}\""),
+            Locality::Public => quoted(&o.to_string()),
             Locality::Loopback | Locality::Local => {
-                format!("{{ origin = \"{o}\", local = true }}")
+                format!("{{ origin = {}, local = true }}", quoted(&o.to_string()))
             }
         })
         .collect();
@@ -468,9 +468,9 @@ fn calendar_source(old: &toml::Value) -> String {
         }
         entry.push_str(&format!(
             "[[sources.credentials]]\n\
-             origin = \"{}\"\n\
+             origin = {}\n\
              basic = {{ username = {}, password = {password} }}\n",
-            origin,
+            quoted(&origin.to_string()),
             quoted(&username),
         ));
     }

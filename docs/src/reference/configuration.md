@@ -134,9 +134,10 @@ one of:
 | `bearer` | secret | Sent as `Authorization: Bearer …`. |
 
 The manifest must ask for a credential of that kind for that origin. A credential travels only
-over https, or plain http to this machine (`localhost`, `127.0.0.1`, `::1`, `::ffff:127.0.0.1`): a server on the
-local network needs https. In Docker, this machine is the container: a server on the Docker host
-(`host.docker.internal`) needs https too.
+over https, or plain http to this machine (`localhost`, `127.0.0.1`, `::1`, `::ffff:127.0.0.1`;
+not `localhost.` nor `0.0.0.0`), and only when the name resolves to loopback addresses alone: a
+server on the local network needs https. In Docker, this machine is the container: a server on
+the Docker host (`host.docker.internal`) needs https too.
 
 ```toml
 [[sources]]

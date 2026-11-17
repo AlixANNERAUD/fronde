@@ -8,7 +8,7 @@ use fronde_wasm::{
     Allowed, Approval, Checks, ComponentHost, ComponentSource, ComponentSpec, Hashes,
     LoadedComponent, prepare, shipped,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,8 +29,9 @@ fn calendar_wasm() -> PathBuf {
 }
 
 /// The calendar shipped with this build, under an entry without hashes, as the `[calendar]`
-/// migration writes it: approved as shipped, loaded and listing its tools. Their contract is
-/// pinned by the component's own tests (components/calendar/tests/schemas.rs).
+/// migration writes it: approved as shipped, loaded and listing its tools with the contract the
+/// component's own tests pin (components/calendar/tests/schemas.rs). A `components/dist` older
+/// than the component's source fails here.
 #[tokio::test]
 async fn shipped_calendar_is_approved_loads_and_lists_its_tools() {
     let config: ComponentConfig = toml::from_str(&format!(
@@ -60,12 +61,9 @@ async fn shipped_calendar_is_approved_loads_and_lists_its_tools() {
     let calendar = LoadedComponent::load(&ComponentHost::new().unwrap(), prepared)
         .await
         .unwrap();
-    let mut names: Vec<&str> = calendar
-        .list_tools()
-        .iter()
-        .map(|d| d.name.as_str())
-        .collect();
-    names.sort_unstable();
+    let mut tools: Vec<_> = calendar.list_tools().iter().collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
         [
@@ -79,11 +77,34 @@ async fn shipped_calendar_is_approved_loads_and_lists_its_tools() {
             "reminders_list",
         ]
     );
-    for tool in calendar.list_tools() {
-        assert!(!tool.description.is_empty(), "{}", tool.name);
-        assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
+    for tool in &tools {
         assert_eq!(tool.source, "calendar");
     }
+    // The host already read each schema from the JSON text the component sent, as the
+    // component's test does before comparing.
+    let contract: Value = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "deferred": t.deferred,
+                "input_schema": t.input_schema,
+            })
+        })
+        .collect();
+    let snapshot: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../components/calendar/tests/snapshots/calendar-tools.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        contract, snapshot,
+        "the shipped calendar.wasm differs from the pinned contract: run `mise run components`"
+    );
 }
 
 #[tokio::test]
