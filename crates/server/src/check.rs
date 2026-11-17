@@ -59,6 +59,17 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
             }
         }
     }
+    if config.web.is_some() {
+        let helper = std::env::current_exe()?;
+        let confine = crate::agent_confine(config, &helper)?;
+        let (line, starts) = crate::sandbox_line(&confine, config.server.listen.port());
+        let warning = if starts {
+            ""
+        } else {
+            "; the agent cannot start"
+        };
+        writeln!(out, "agent sandbox: {line}{warning}")?;
+    }
     if let Some(python) = &config.python {
         let host = fronde_wasm::ComponentHost::new()?;
         fronde_wasm::Python::load(&host, &python.dir)

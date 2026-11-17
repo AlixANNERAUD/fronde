@@ -1,11 +1,11 @@
 //! `fronde __confine`: the helper Fronde starts instead of its agent. It keeps only the
-//! environment variables its policy names, lowers its own priority, raises its OOM score and then
-//! `exec`s the agent, which inherits all of it.
+//! environment variables its policy names, lowers its own priority, raises its OOM score, confines
+//! itself with Landlock and then `exec`s the agent, which inherits all of it and cannot undo any.
 //! It runs in a fresh, single-threaded process, so nothing runs between `fork` and `exec` in
 //! Fronde's own.
 
 use crate::acp::AgentSpec;
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
@@ -38,6 +38,14 @@ pub const KEEP_ENV: [&str; 18] = [
     "TMPDIR",
 ];
 
+/// What the system lets every confined agent read and run.
+pub const SYSTEM_READ: [&str; 10] = [
+    "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/proc", "/sys", "/dev",
+];
+
+/// TCP ports the agent may connect to besides the hub's and a proxy's: https and DNS over TCP.
+pub const CONNECT_PORTS: [u16; 2] = [443, 53];
+
 /// What the helper does before it starts the agent. It holds names and paths only, never a value:
 /// it travels on the command line, which every user can read.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +57,21 @@ pub struct Policy {
     pub keep_env: Vec<String>,
     /// Exact names dropped even when `keep_env` matches them: Fronde's `{ env }` secrets.
     pub drop_env: Vec<String>,
+    /// The Landlock sandbox; `None` (`[agent] sandbox = false`) runs the agent unconfined.
+    pub sandbox: Option<Sandbox>,
+}
+
+/// What the confined agent may reach. Everything else on the filesystem is out of its reach, and
+/// so are other TCP ports, signals to processes outside it and abstract Unix sockets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sandbox {
+    /// Read and run, canonical paths.
+    pub read: Vec<PathBuf>,
+    /// Read, run, write, create and remove, canonical paths.
+    pub write: Vec<PathBuf>,
+    /// TCP ports it may connect to; it may bind none.
+    pub connect_ports: Vec<u16>,
 }
 
 impl Policy {
@@ -81,7 +104,7 @@ pub struct Confine {
     pub helper: PathBuf,
     /// The agent's own home, `<data>/home`; its `tmp` is the agent's `TMPDIR`.
     pub home: PathBuf,
-    /// Everything but what the spec gives: its directory and its variables.
+    /// Everything but what the spec gives: its directory, its variables and the hub's port.
     pub policy: Policy,
 }
 
@@ -123,6 +146,13 @@ impl Confine {
         policy
             .drop_env
             .retain(|name| !spec.env.iter().any(|(set, _)| set == name));
+        if let Some(sandbox) = &mut policy.sandbox {
+            let port = url_port(&spec.hub_url)
+                .with_context(|| format!("no port in the hub's URL {}", spec.hub_url))?;
+            if !sandbox.connect_ports.contains(&port) {
+                sandbox.connect_ports.push(port);
+            }
+        }
         let mut helper_args = vec![
             SUBCOMMAND.to_owned(),
             "--policy".to_owned(),
@@ -146,6 +176,286 @@ fn path_string(path: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
+/// The port of an `http`, `https` or `socks` URL, given or implied by its scheme.
+pub fn url_port(url: &str) -> Option<u16> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    match host.rsplit_once(':') {
+        Some((before, port)) if !before.ends_with(':') && !port.ends_with(']') => port.parse().ok(),
+        _ => match scheme.to_ascii_lowercase().as_str() {
+            "http" => Some(80),
+            "https" => Some(443),
+            "socks" | "socks5" | "socks5h" => Some(1080),
+            _ => None,
+        },
+    }
+}
+
+/// What the kernel's Landlock can do for the agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Support {
+    /// The kernel's Landlock ABI, as far as Fronde tells them apart (7 and 8 read as 6): 0 when
+    /// Landlock is missing or turned off.
+    pub abi: u8,
+}
+
+/// The lowest Landlock ABI the agent runs under: ABI 1 forbids every rename across directories,
+/// which Claude Code's atomic writes need.
+pub const MIN_ABI: u8 = 2;
+
+impl Support {
+    /// Asks the running kernel, without restricting anything.
+    pub fn probe() -> Self {
+        Self { abi: probe_abi() }
+    }
+
+    pub fn files(self) -> bool {
+        self.abi >= MIN_ABI
+    }
+
+    pub fn tcp_ports(self) -> bool {
+        self.abi >= 4
+    }
+
+    /// Signals to processes outside the sandbox and abstract Unix sockets.
+    pub fn scopes(self) -> bool {
+        self.abi >= 6
+    }
+
+    /// Unix sockets reached by path.
+    pub fn unix_paths(self) -> bool {
+        self.abi >= 9
+    }
+
+    /// An error saying why the agent cannot be confined here, if it cannot.
+    pub fn require(self) -> anyhow::Result<()> {
+        if self.files() {
+            return Ok(());
+        }
+        let found = match self.abi {
+            0 => {
+                "no Landlock (check that `cat /sys/kernel/security/lsm` lists landlock)".to_owned()
+            }
+            abi => format!("Landlock ABI {abi}"),
+        };
+        bail!(
+            "the agent's sandbox needs Landlock ABI {MIN_ABI} (Linux 5.19) or later, and this \
+             kernel has {found}; upgrade the kernel, or set [agent] sandbox = false to run the \
+             agent unconfined, with access to everything your user can read and write"
+        )
+    }
+
+    /// What the sandbox covers on this kernel, and what it misses, for `fronde check` and the log.
+    pub fn describe(self, ports: &[u16]) -> String {
+        if !self.files() {
+            return format!(
+                "unavailable ({})",
+                self.require()
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
+            );
+        }
+        let ports: Vec<String> = ports.iter().map(u16::to_string).collect();
+        let mut covered = vec!["files".to_owned()];
+        let mut missing = Vec::new();
+        if self.tcp_ports() {
+            covered.push(format!("TCP ports {}", ports.join(" ")));
+        } else {
+            missing.push("TCP ports (Linux 6.7)");
+        }
+        if self.scopes() {
+            covered.push("signals and abstract sockets".to_owned());
+        } else {
+            missing.push("signals and abstract sockets (Linux 6.12)");
+        }
+        if self.unix_paths() {
+            covered.push("Unix socket paths".to_owned());
+        } else {
+            missing.push("Unix socket paths (Linux 7.1)");
+        }
+        let mut text = format!("Landlock ABI {} ({})", self.abi, covered.join(", "));
+        if !missing.is_empty() {
+            text.push_str(&format!("; not confined: {}", missing.join(", ")));
+        }
+        text
+    }
+}
+
+/// What the confined agent may read and write, built from what it needs and checked against
+/// what it must never reach.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Grants {
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
+    /// `PATH` entries left out, each with why: to log as warnings.
+    pub skipped: Vec<String>,
+}
+
+/// What [`grants`] starts from.
+#[derive(Debug)]
+pub struct GrantRequest<'a> {
+    /// [`SYSTEM_READ`], or another list in tests.
+    pub system: &'a [PathBuf],
+    /// The agent's `PATH`.
+    pub path: Option<&'a OsStr>,
+    /// The agent's program, as `[agent] command` names it.
+    pub program: &'a str,
+    /// `[agent] read`.
+    pub extra: &'a [PathBuf],
+    /// The agent's directories: `<data>/agent` and `<data>/home`.
+    pub write: &'a [PathBuf],
+    /// What no grant may equal or contain: the data directory, the configuration's directory,
+    /// the master key, secret files, the memory.
+    pub protected: &'a [PathBuf],
+}
+
+/// The read and write grants of the agent's sandbox. Every path is canonical, so a symbolic link
+/// cannot hide what it points to, and a missing one is left out. A grant that equals or contains
+/// a protected path is an error, except for a `PATH` entry, which is skipped with a warning.
+pub fn grants(request: &GrantRequest<'_>) -> anyhow::Result<Grants> {
+    let protected: Vec<PathBuf> = request.protected.iter().map(|p| canonical(p)).collect();
+    let covering = |grant: &Path| protected.iter().find(|p| p.starts_with(grant)).cloned();
+    let mut grants = Grants::default();
+
+    for dir in request.system {
+        let Ok(dir) = dir.canonicalize() else {
+            continue;
+        };
+        if let Some(p) = covering(&dir) {
+            bail!(
+                "the agent's sandbox lets it read {}, which holds {}: keep Fronde's data and \
+                 configuration out of the system directories",
+                dir.display(),
+                p.display()
+            );
+        }
+        push(&mut grants.read, dir);
+    }
+    // A resolver configuration managed elsewhere (systemd-resolved) is a link out of /etc.
+    if let Ok(resolv) = Path::new("/etc/resolv.conf").canonicalize()
+        && covering(&resolv).is_none()
+    {
+        push(&mut grants.read, resolv);
+    }
+    if let Some(path) = request.path {
+        for dir in std::env::split_paths(path) {
+            if dir.is_relative() {
+                grants.skipped.push(format!(
+                    "{}: a relative PATH entry is not granted to the confined agent",
+                    dir.display()
+                ));
+                continue;
+            }
+            let Ok(dir) = dir.canonicalize() else {
+                continue;
+            };
+            match covering(&dir) {
+                Some(p) => grants.skipped.push(format!(
+                    "{}: this PATH entry holds {}, so the confined agent does not get it",
+                    dir.display(),
+                    p.display()
+                )),
+                None => push(&mut grants.read, dir),
+            }
+        }
+    }
+    if let Some(install) = install_dir(request.program, request.path) {
+        if let Some(p) = covering(&install) {
+            bail!(
+                "the agent's program {} is installed in {}, which holds {}: install the adapter \
+                 elsewhere, or move Fronde's data and configuration out of it",
+                request.program,
+                install.display(),
+                p.display()
+            );
+        }
+        push(&mut grants.read, install);
+    }
+    for dir in request.extra {
+        let Ok(dir) = dir.canonicalize() else {
+            continue;
+        };
+        if let Some(p) = covering(&dir) {
+            bail!(
+                "[agent] read: {} holds {}, which the agent must not read; grant a directory \
+                 inside it instead",
+                dir.display(),
+                p.display()
+            );
+        }
+        push(&mut grants.read, dir);
+    }
+    for dir in request
+        .write
+        .iter()
+        .map(PathBuf::as_path)
+        .chain([Path::new("/dev/null")])
+    {
+        let canonical = dir
+            .canonicalize()
+            .with_context(|| format!("cannot find the agent's directory {}", dir.display()))?;
+        if let Some(p) = covering(&canonical) {
+            bail!(
+                "the agent may write {}, which holds {}: keep Fronde's configuration and secrets \
+                 out of the data directory's agent/ and home/",
+                canonical.display(),
+                p.display()
+            );
+        }
+        push(&mut grants.write, canonical);
+    }
+    Ok(grants)
+}
+
+fn push(list: &mut Vec<PathBuf>, path: PathBuf) {
+    if !list.contains(&path) {
+        list.push(path);
+    }
+}
+
+/// `path` with its links resolved; for a path that does not exist yet, its nearest existing
+/// ancestor's, followed by the rest as written.
+fn canonical(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(found) = current.canonicalize() {
+            return rest.iter().rev().fold(found, |acc, part| acc.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Where the agent's program is installed: the topmost `node_modules` above its canonical path,
+/// so that the adapter can load its own Claude Code, or else its directory.
+fn install_dir(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    let program = Path::new(program);
+    let found = if program.components().count() > 1 {
+        program.to_path_buf()
+    } else {
+        std::env::split_paths(path?)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())?
+    };
+    let canonical = found.canonicalize().ok()?;
+    canonical
+        .ancestors()
+        .filter(|dir| dir.file_name() == Some(OsStr::new("node_modules")))
+        .last()
+        .or_else(|| canonical.parent())
+        .map(Path::to_path_buf)
+}
+
 /// The helper itself: never returns but with an error, which the binary prints before exiting
 /// with 127, and which reaches Fronde through the agent's standard error.
 pub fn run_helper(
@@ -153,9 +463,22 @@ pub fn run_helper(
     program: &OsStr,
     args: &[OsString],
 ) -> anyhow::Result<Infallible> {
+    run_helper_with(policy, Support::probe(), program, args)
+}
+
+fn run_helper_with(
+    policy: &Policy,
+    support: Support,
+    program: &OsStr,
+    args: &[OsString],
+) -> anyhow::Result<Infallible> {
     use std::os::unix::process::CommandExt;
-    let mut command = command_for(policy, program, args);
+    let mut command = command_for(policy, support, program, args)?;
     yield_to_fronde();
+    if let Some(sandbox) = &policy.sandbox {
+        // From here on, this process and every one it starts are confined.
+        landlock_rules::apply(sandbox)?;
+    }
     let error = command.exec();
     Err(anyhow::Error::new(error).context(format!(
         "cannot start the agent {}",
@@ -163,8 +486,17 @@ pub fn run_helper(
     )))
 }
 
-/// The agent's command, with only the variables the policy keeps.
-fn command_for(policy: &Policy, program: &OsStr, args: &[OsString]) -> std::process::Command {
+/// The agent's command, with only the variables the policy keeps; an error first when the policy
+/// asks for a sandbox this kernel cannot give.
+fn command_for(
+    policy: &Policy,
+    support: Support,
+    program: &OsStr,
+    args: &[OsString],
+) -> anyhow::Result<std::process::Command> {
+    if policy.sandbox.is_some() {
+        support.require()?;
+    }
     let mut command = std::process::Command::new(program);
     command.args(args).env_clear().current_dir(&policy.cwd);
     for (name, value) in std::env::vars_os() {
@@ -172,7 +504,7 @@ fn command_for(policy: &Policy, program: &OsStr, args: &[OsString]) -> std::proc
             command.env(name, value);
         }
     }
-    command
+    Ok(command)
 }
 
 /// The kernel kills the agent first when memory runs out, and Fronde comes first for the CPU.
@@ -186,6 +518,98 @@ fn yield_to_fronde() {
         if let Err(error) = rustix::process::setpriority_process(None, 10) {
             eprintln!("fronde __confine: cannot lower the agent's priority: {error}");
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_abi() -> u8 {
+    landlock_rules::probe_abi()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_abi() -> u8 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+mod landlock_rules {
+    use super::Sandbox;
+    use ::landlock::{
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
+    };
+    use anyhow::{Context, bail};
+
+    /// The newest ABI this build knows; the kernel's own may be older, and what it lacks is left
+    /// out (best effort), but [`super::Support::require`] has checked the minimum first.
+    const ABI: ABI = ABI::V9;
+
+    /// The highest ABI whose distinctive right the kernel accepts, asked without creating or
+    /// enforcing anything.
+    pub(super) fn probe_abi() -> u8 {
+        let fs = |access: AccessFs| {
+            Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(access)
+                .is_ok()
+        };
+        let checks: [(u8, bool); 7] = [
+            (9, fs(AccessFs::ResolveUnix)),
+            (
+                6,
+                Ruleset::default()
+                    .set_compatibility(CompatLevel::HardRequirement)
+                    .scope(Scope::Signal)
+                    .is_ok(),
+            ),
+            (5, fs(AccessFs::IoctlDev)),
+            (
+                4,
+                Ruleset::default()
+                    .set_compatibility(CompatLevel::HardRequirement)
+                    .handle_access(AccessNet::ConnectTcp)
+                    .is_ok(),
+            ),
+            (3, fs(AccessFs::Truncate)),
+            (2, fs(AccessFs::Refer)),
+            (1, fs(AccessFs::Execute)),
+        ];
+        checks
+            .into_iter()
+            .find(|(_, supported)| *supported)
+            .map_or(0, |(abi, _)| abi)
+    }
+
+    pub(super) fn apply(sandbox: &Sandbox) -> anyhow::Result<()> {
+        let mut ruleset = Ruleset::default()
+            .handle_access(AccessFs::from_all(ABI))?
+            .handle_access(AccessNet::from_all(ABI))?
+            .scope(Scope::from_all(ABI))?
+            .create()?
+            .add_rules(path_beneath_rules(&sandbox.read, AccessFs::from_read(ABI)))?
+            .add_rules(path_beneath_rules(&sandbox.write, AccessFs::from_all(ABI)))?;
+        for port in &sandbox.connect_ports {
+            ruleset = ruleset.add_rule(NetPort::new(*port, AccessNet::ConnectTcp))?;
+        }
+        let status = ruleset
+            .restrict_self()
+            .context("cannot confine the agent")?;
+        if status.ruleset == RulesetStatus::NotEnforced {
+            bail!(
+                "the kernel did not enforce the agent's sandbox; set [agent] sandbox = false to \
+                 run the agent unconfined"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod landlock_rules {
+    pub(super) fn apply(_: &super::Sandbox) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "the agent's sandbox needs Linux; set [agent] sandbox = false to run it unconfined"
+        )
     }
 }
 
@@ -206,7 +630,7 @@ mod tests {
         }
     }
 
-    fn confine() -> Confine {
+    fn confine(sandbox: bool) -> Confine {
         Confine {
             helper: PathBuf::from("/usr/bin/fronde"),
             home: PathBuf::from("/data/home"),
@@ -214,6 +638,11 @@ mod tests {
                 cwd: PathBuf::new(),
                 keep_env: KEEP_ENV.map(str::to_owned).to_vec(),
                 drop_env: vec!["SERVER_TOKEN".into(), "SHARED".into()],
+                sandbox: sandbox.then(|| Sandbox {
+                    read: vec!["/usr".into()],
+                    write: vec!["/data/agent".into()],
+                    connect_ports: CONNECT_PORTS.to_vec(),
+                }),
             },
         }
     }
@@ -225,7 +654,7 @@ mod tests {
             ("FOO".into(), value.into()),
             ("CLAUDE_CODE_OAUTH_TOKEN".into(), value.into()),
         ]);
-        let command = confine().command(&spec).unwrap();
+        let command = confine(true).command(&spec).unwrap();
         let line = command.args.join(" ");
         assert!(!line.contains(value), "{line}");
         assert!(!line.contains("token-value-never"), "{line}");
@@ -245,7 +674,7 @@ mod tests {
 
     #[test]
     fn helper_command_runs_the_agent_through_the_helper() {
-        let command = confine()
+        let command = confine(true)
             .command(&spec(vec![("SHARED".into(), "set".into())]))
             .unwrap();
         assert_eq!(command.program, PathBuf::from("/usr/bin/fronde"));
@@ -255,6 +684,11 @@ mod tests {
         assert_eq!(&args[3..], ["--", "claude-agent-acp", "--flag"]);
         let policy = Policy::from_arg(args[2]).unwrap();
         assert_eq!(policy.cwd, PathBuf::from("/data/agent"));
+        assert_eq!(
+            policy.sandbox.as_ref().unwrap().connect_ports,
+            [443, 53, 8484],
+            "the hub's port is added"
+        );
         // `[agent] env` sets SHARED itself, so its value is the configuration's, and kept.
         assert_eq!(policy.drop_env, ["SERVER_TOKEN"]);
         assert!(policy.keeps("SHARED"));
@@ -269,7 +703,7 @@ mod tests {
 
     #[test]
     fn keep_env_is_an_allow_list() {
-        let policy = confine().policy;
+        let policy = confine(false).policy;
         for kept in [
             "PATH",
             "LANG",
@@ -303,6 +737,183 @@ mod tests {
 
     #[test]
     fn policy_refuses_unknown_fields() {
-        assert!(Policy::from_arg(r#"{"cwd":"/","keep_env":[],"drop_env":[],"x":1}"#).is_err());
+        assert!(
+            Policy::from_arg(r#"{"cwd":"/","keep_env":[],"drop_env":[],"sandbox":null,"x":1}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn url_ports() {
+        assert_eq!(url_port("http://127.0.0.1:8484/mcp"), Some(8484));
+        assert_eq!(url_port("http://[::1]:9000/mcp"), Some(9000));
+        assert_eq!(url_port("http://[::1]/mcp"), Some(80));
+        assert_eq!(url_port("https://proxy.example"), Some(443));
+        assert_eq!(url_port("http://user:pw@proxy:3128"), Some(3128));
+        assert_eq!(url_port("socks5://proxy"), Some(1080));
+        assert_eq!(url_port("proxy:3128"), None);
+    }
+
+    #[test]
+    fn sandbox_unavailable_stops_the_agent() {
+        let missing = OsStr::new("/nonexistent/fronde-test-agent");
+        for abi in [0, 1] {
+            let error = command_for(&confine(true).policy, Support { abi }, missing, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("[agent] sandbox = false"), "{error}");
+            assert!(error.contains("Landlock ABI 2"), "{error}");
+            let found = if abi == 0 {
+                "no Landlock"
+            } else {
+                "Landlock ABI 1"
+            };
+            assert!(error.contains(found), "{error}");
+        }
+        // Without the sandbox, the same kernel runs the agent with the explicit environment.
+        let mut policy = confine(false).policy;
+        policy.cwd = PathBuf::from("/");
+        let command = command_for(&policy, Support { abi: 0 }, missing, &[]).unwrap();
+        assert!(
+            command
+                .get_envs()
+                .all(|(name, _)| policy.keeps(name.to_str().unwrap()))
+        );
+    }
+
+    #[test]
+    fn support_says_what_is_missing() {
+        assert_eq!(
+            Support { abi: 9 }.describe(&[443, 53]),
+            "Landlock ABI 9 (files, TCP ports 443 53, signals and abstract sockets, Unix socket paths)"
+        );
+        let text = Support { abi: 3 }.describe(&[443]);
+        assert!(
+            text.contains("not confined: TCP ports (Linux 6.7)"),
+            "{text}"
+        );
+        assert!(Support { abi: 1 }.describe(&[]).starts_with("unavailable"));
+    }
+
+    fn tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let config = root.path().join("config");
+        for dir in [data.join("agent"), data.join("home"), config.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        (root, data, config)
+    }
+
+    fn request<'a>(
+        system: &'a [PathBuf],
+        path: Option<&'a OsStr>,
+        extra: &'a [PathBuf],
+        write: &'a [PathBuf],
+        protected: &'a [PathBuf],
+    ) -> GrantRequest<'a> {
+        GrantRequest {
+            system,
+            path,
+            program: "/nonexistent/agent",
+            extra,
+            write,
+            protected,
+        }
+    }
+
+    #[test]
+    fn policy_refuses_grants_over_protected_paths() {
+        let (root, data, config) = tree();
+        let protected = vec![data.clone(), config.join("master.key"), config.clone()];
+        let write = vec![data.join("agent"), data.join("home")];
+
+        // `[agent] read` naming the data directory, or a link to it.
+        let error = grants(&request(
+            &[],
+            None,
+            std::slice::from_ref(&data),
+            &write,
+            &protected,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("[agent] read"), "{error}");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        assert!(grants(&request(&[], None, &[link], &write, &protected)).is_err());
+
+        // A PATH entry holding the data directory is skipped with a warning, not granted.
+        let path = std::env::join_paths([root.path(), Path::new("/usr/bin")]).unwrap();
+        let granted = grants(&request(&[], Some(&path), &[], &write, &protected)).unwrap();
+        let root_canonical = root.path().canonicalize().unwrap();
+        assert!(!granted.read.contains(&root_canonical));
+        assert_eq!(granted.skipped.len(), 1, "{:?}", granted.skipped);
+        assert!(granted.read.contains(&PathBuf::from("/usr/bin")));
+
+        // A configuration under a granted system directory.
+        let system = vec![root.path().to_path_buf()];
+        let error = grants(&request(&system, None, &[], &write, &protected))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("system directories"), "{error}");
+
+        // A configuration kept in the agent's own directory.
+        let protected = vec![data.join("home/fronde.toml")];
+        assert!(grants(&request(&[], None, &[], &write, &protected)).is_err());
+    }
+
+    #[test]
+    fn grants_are_canonical_and_complete() {
+        let (root, data, config) = tree();
+        let protected = vec![data.clone(), config.clone()];
+        let write = vec![data.join("agent"), data.join("home")];
+        let tools = root.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        let system = vec![PathBuf::from("/usr"), PathBuf::from("/nonexistent")];
+        let granted = grants(&request(
+            &system,
+            None,
+            std::slice::from_ref(&tools),
+            &write,
+            &protected,
+        ))
+        .unwrap();
+        assert!(granted.read.contains(&PathBuf::from("/usr")));
+        assert!(!granted.read.contains(&PathBuf::from("/nonexistent")));
+        assert!(granted.read.contains(&tools.canonicalize().unwrap()));
+        assert_eq!(
+            granted.write,
+            [
+                data.join("agent").canonicalize().unwrap(),
+                data.join("home").canonicalize().unwrap(),
+                PathBuf::from("/dev/null"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_adapter_is_granted_from_its_topmost_node_modules() {
+        let (root, ..) = tree();
+        let modules = root.path().join("agent/node_modules");
+        let package = modules.join("@scope/adapter/node_modules/inner/dist");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(modules.join(".bin")).unwrap();
+        let script = package.join("index.js");
+        std::fs::write(&script, "").unwrap();
+        let link = modules.join(".bin/claude-agent-acp");
+        std::os::unix::fs::symlink(&script, &link).unwrap();
+        let path = std::env::join_paths([modules.join(".bin")]).unwrap();
+        assert_eq!(
+            install_dir("claude-agent-acp", Some(&path)),
+            Some(modules.canonicalize().unwrap())
+        );
+        let plain = root.path().join("bin");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("agent"), "").unwrap();
+        assert_eq!(
+            install_dir(plain.join("agent").to_str().unwrap(), None),
+            Some(plain.canonicalize().unwrap())
+        );
     }
 }

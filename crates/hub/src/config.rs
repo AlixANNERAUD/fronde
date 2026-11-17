@@ -29,9 +29,17 @@ pub struct Config {
     /// Where the master key of the stored secrets is kept.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// The file this configuration was read from, absolute; [`load`] sets it.
+    #[serde(skip)]
+    path: Option<PathBuf>,
 }
 
 impl Config {
+    /// The file this configuration was read from, when [`load`] read it.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// Every `{ env = "…" }` secret's variable: Fronde reads them from its own environment, and
     /// the agent's never holds them.
     pub fn secret_env_names(&self) -> Vec<String> {
@@ -41,6 +49,19 @@ impl Config {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every `{ file = "…" }` secret's file, the master key file included.
+    pub fn secret_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self
+            .secrets()
+            .filter_map(|secret| match secret {
+                Secret::File { file } => Some(file.clone()),
+                _ => None,
+            })
+            .collect();
+        files.extend(self.secrets.master_key_file.clone());
+        files
     }
 
     fn secrets(&self) -> impl Iterator<Item = &Secret> {
@@ -133,6 +154,11 @@ impl SecretsConfig {
         self.credentials_dir = dir;
     }
 
+    /// `$CREDENTIALS_DIRECTORY`, when systemd set it.
+    pub fn credentials_dir(&self) -> Option<&Path> {
+        self.credentials_dir.as_deref()
+    }
+
     /// Use `keychain` instead of the platform's.
     pub fn set_keychain(&mut self, keychain: fronde_db::master_key::Keychain) {
         self.keychain = Some(keychain);
@@ -181,6 +207,11 @@ pub struct AgentConfig {
     pub env: BTreeMap<String, String>,
     /// Claude Code's own tools the agent gets besides the hub's; empty for none.
     pub builtin_tools: Vec<String>,
+    /// Confine the agent with Landlock; it does not start where the kernel cannot. `false` runs
+    /// it unconfined, with a warning at each start.
+    pub sandbox: bool,
+    /// More directories the confined agent may read and run programs from.
+    pub read: Vec<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -189,6 +220,8 @@ impl Default for AgentConfig {
             command: vec!["claude-agent-acp".to_string()],
             env: BTreeMap::new(),
             builtin_tools: SAFE_BUILTIN_TOOLS.map(str::to_string).to_vec(),
+            sandbox: true,
+            read: Vec::new(),
         }
     }
 }
@@ -593,6 +626,10 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
             );
         }
     }
+    for dir in &mut config.agent.read {
+        *dir = base.join(&*dir).components().collect();
+    }
+    config.path = Some(base.join(abs.file_name().unwrap_or_default()));
     for tool in &config.agent.builtin_tools {
         if !SAFE_BUILTIN_TOOLS.contains(&tool.as_str()) {
             bail!(

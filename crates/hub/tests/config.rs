@@ -821,6 +821,23 @@ fn master_key_needs_a_loaded_configuration() {
 }
 
 #[test]
+fn the_agent_is_confined_by_default() {
+    let c = load_str(MIN).unwrap();
+    assert!(c.agent.sandbox);
+    assert!(c.agent.read.is_empty());
+    let c = load_str(&format!(
+        "{MIN}[agent]\nsandbox = false\nread = [\"tools\", \"/opt/x\"]\n"
+    ))
+    .unwrap();
+    assert!(!c.agent.sandbox);
+    let base = c.path().unwrap().parent().unwrap();
+    assert_eq!(
+        c.agent.read,
+        [base.join("tools"), std::path::PathBuf::from("/opt/x")]
+    );
+}
+
+#[test]
 fn agent_env_cannot_point_the_agent_at_the_session() {
     for name in [
         "HOME",
@@ -847,4 +864,6 @@ fn secret_variables_are_listed() {
     ))
     .unwrap();
     assert_eq!(c.secret_env_names(), ["T", "UP_TOKEN"]);
+    let base = c.path().unwrap().parent().unwrap();
+    assert_eq!(c.secret_files(), [base.join("pw"), base.join("master.key")]);
 }

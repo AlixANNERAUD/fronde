@@ -62,7 +62,13 @@ database: it
 opens it read-only, and a database an older Fronde left without the approvals or secrets table
 has no stored approval or secret, which is what `serve` would find after updating it. With
 `[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
-`python: approved (CPython 3.15.2)`. It also checks that `[data] dir` can be created and written:
+`python: approved (CPython 3.15.2)`. With `[web]`, it prints what the agent's sandbox covers on
+this kernel, such as `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, signals and
+abstract sockets); not confined: Unix socket paths (Linux 7.1)`, followed by `the agent cannot
+start` on a kernel without Landlock, and refuses a grant over Fronde's data or configuration
+(see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the
+agent's `agent/` and `home/` in the data directory for that. It also checks that `[data] dir` can
+be created and written:
 it creates the directory (mode 0700), writes a probe file and removes it, and otherwise names the
 path and the fix (set `[data] dir` to a directory you own, such as `~/.local/share/fronde`). A
 `[server] listen` that is not an address is reported by the parse. When `[web]` is set and the

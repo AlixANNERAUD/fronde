@@ -32,7 +32,12 @@ under `[agent]`:
 ```toml
 [agent]
 env = { CLAUDE_CODE_EXECUTABLE = "/home/alex/.local/bin/claude" }
+read = ["/home/alex/.local/share/claude"]
 ```
+
+The confined agent may run only programs from the system's directories, its `PATH` and the
+adapter's install, so `read` grants the directory the installed Claude Code lives in
+(`~/.local/bin/claude` is a link into `~/.local/share/claude`).
 
 ## Docker, with a token (recommended)
 

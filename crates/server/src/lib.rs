@@ -18,7 +18,10 @@ use axum::response::Response;
 use axum::routing::get;
 use fronde_agent::acp::AgentSpec;
 use fronde_agent::assistant::{Assistant, Connector, confined_connector, process_connector};
-use fronde_agent::confine::{Confine, KEEP_ENV, Policy};
+use fronde_agent::confine::{
+    CONNECT_PORTS, Confine, GrantRequest, KEEP_ENV, Policy, SYSTEM_READ, Sandbox, Support, grants,
+    url_port,
+};
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::{HubServer, McpCaller};
@@ -267,7 +270,14 @@ pub async fn start_with_helper(
     helper: &Path,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let connector = match &config.web {
-        Some(_) => confined_connector(agent_confine(&config, helper)?),
+        Some(_) => {
+            let confine = agent_confine(&config, helper)?;
+            match sandbox_line(&confine, config.server.listen.port()) {
+                (line, true) => tracing::info!("agent sandbox: {line}"),
+                (line, false) => tracing::error!("agent sandbox: {line}; the agent cannot start"),
+            }
+            confined_connector(confine)
+        }
         None => process_connector(),
     };
     start_with(config, connector, &site_root()).await
@@ -275,7 +285,8 @@ pub async fn start_with_helper(
 
 /// How the agent is started through `helper`, the `fronde` binary: in `<data>/agent`, with its
 /// own home `<data>/home` (and `TMPDIR` in it), created here, and only the variables it needs
-/// from Fronde's environment, never a `{ env }` secret's.
+/// from Fronde's environment, never a `{ env }` secret's. With `[agent] sandbox`, Landlock keeps
+/// it to the system's directories, its program's and its own two, and to the TCP ports it needs.
 pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> {
     let data = &config.data.dir;
     fronde_hub::private::prepare_data_dir(data)?;
@@ -284,6 +295,15 @@ pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> 
         fronde_hub::private::create_dir_all(&dir)
             .with_context(|| format!("cannot create the agent's directory {}", dir.display()))?;
     }
+    let sandbox = if config.agent.sandbox {
+        Some(agent_sandbox(config, &[data.join("agent"), home.clone()])?)
+    } else {
+        tracing::warn!(
+            "[agent] sandbox = false: the agent runs unconfined, with access to every file your \
+             user can read and write, Fronde's data and configuration included"
+        );
+        None
+    };
     Ok(Confine {
         helper: helper.to_path_buf(),
         home,
@@ -291,8 +311,87 @@ pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> 
             cwd: data.join("agent"),
             keep_env: KEEP_ENV.map(str::to_owned).to_vec(),
             drop_env: config.secret_env_names(),
+            sandbox,
         },
     })
+}
+
+/// A variable of the agent's environment: `[agent] env`'s, else Fronde's.
+fn agent_variable(config: &Config, name: &str) -> Option<std::ffi::OsString> {
+    match config.agent.env.get(name) {
+        Some(value) => Some(value.into()),
+        None => std::env::var_os(name),
+    }
+}
+
+/// What no grant of the agent's sandbox may equal or contain: the data directory (the memory and
+/// the database among it), the configuration's directory, every secret file and the master key,
+/// and where systemd keeps credentials.
+fn protected_paths(config: &Config) -> Vec<PathBuf> {
+    let data = &config.data.dir;
+    let mut protected = vec![data.clone(), data.join("memory"), fronde_db::path(data)];
+    if let Some(file) = config.path() {
+        protected.push(file.to_path_buf());
+        protected.extend(file.parent().map(Path::to_path_buf));
+    }
+    protected.extend(config.secret_files());
+    protected.extend(config.secrets.credentials_dir().map(Path::to_path_buf));
+    protected.push(PathBuf::from("/run/credentials"));
+    #[cfg(target_os = "linux")]
+    protected.push(PathBuf::from(format!(
+        "/run/user/{}/credentials",
+        rustix::process::getuid().as_raw()
+    )));
+    protected
+}
+
+fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> {
+    let system = SYSTEM_READ.map(PathBuf::from);
+    let path = agent_variable(config, "PATH");
+    let program = config.agent.command.first().map_or("", String::as_str);
+    let protected = protected_paths(config);
+    let granted = grants(&GrantRequest {
+        system: &system,
+        path: path.as_deref(),
+        program,
+        extra: &config.agent.read,
+        write,
+        protected: &protected,
+    })?;
+    for skipped in &granted.skipped {
+        tracing::warn!("agent sandbox: {skipped}");
+    }
+    let mut connect_ports = CONNECT_PORTS.to_vec();
+    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        let port = agent_variable(config, name)
+            .and_then(|url| url.into_string().ok())
+            .and_then(|url| url_port(&url));
+        if let Some(port) = port
+            && !connect_ports.contains(&port)
+        {
+            connect_ports.push(port);
+        }
+    }
+    Ok(Sandbox {
+        read: granted.read,
+        write: granted.write,
+        connect_ports,
+    })
+}
+
+/// What the agent's sandbox covers on this kernel, for the start log and `fronde check`: the
+/// line, and whether the agent can start at all.
+pub fn sandbox_line(confine: &Confine, hub_port: u16) -> (String, bool) {
+    let Some(sandbox) = &confine.policy.sandbox else {
+        return (
+            "off ([agent] sandbox = false): the agent runs unconfined".to_owned(),
+            true,
+        );
+    };
+    let support = Support::probe();
+    let mut ports = sandbox.connect_ports.clone();
+    ports.push(hub_port);
+    (support.describe(&ports), support.files())
 }
 
 /// [`start`], with Fronde reaching its agent through `connector` and the web interface's files in

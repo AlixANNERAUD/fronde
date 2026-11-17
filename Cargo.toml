@@ -38,6 +38,8 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 iana-time-zone = "0.1"
+# The agent's sandbox (crates/agent/src/confine.rs), Linux only.
+landlock = "0.4.7"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

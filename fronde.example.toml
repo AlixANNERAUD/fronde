@@ -90,3 +90,7 @@ env = {}
 # Claude Code's own tools Fronde may use besides the hub's. Only the web ones are allowed; [] for
 # none.
 builtin_tools = ["WebSearch", "WebFetch"]
+# Confine the agent with Landlock: it reads only system directories, its PATH, the adapter and
+# `read`, and writes only <data>/agent and <data>/home. false runs it unconfined, with a warning.
+sandbox = true
+read = []

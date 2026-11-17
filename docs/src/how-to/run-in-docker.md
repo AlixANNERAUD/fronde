@@ -64,6 +64,23 @@ The `fronde-data` volume keeps the memory, the conversation and the agent's home
 keeps its settings. Back it up as a whole. It never holds the master key of
 [stored secrets](#stored-secrets), which is kept apart.
 
+## The agent's sandbox
+
+Fronde confines its agent with Landlock (see
+[Where the agent runs](../explanation/security.md#where-the-agent-runs)), which the host's kernel
+provides: a container cannot bring its own. Docker's default seccomp profile allows it. Check that
+the host enables it:
+
+```sh
+cat /sys/kernel/security/lsm   # the list must include landlock
+```
+
+Debian 12 and later, Ubuntu 22.04 and later, Fedora and Arch enable it. `docker logs fronde`
+shows an `agent sandbox:` line at start that says what the kernel enforces. Without Landlock, the
+agent does not start; set `[agent] sandbox = false` only if you accept an unconfined agent. In the
+container, the agent's home is `/data/home` and no host socket (D-Bus, the user manager, the
+Docker socket) is there unless you mount it: do not mount one.
+
 ## 4. Check it
 
 ```sh
