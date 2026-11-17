@@ -1,5 +1,5 @@
 //! How much of the owner's subscription windows is used, read from what a provider's agent sends
-//! during turns ([`UsageSource`]).
+//! during turns ([`UsageSource`]), and kept per provider in the [`UsageBook`].
 //!
 //! The Claude adapter (`@agentclientprotocol/claude-agent-acp` 0.107.0) sends a reading only
 //! after the Claude Code CLI emits a `rate_limit_event`, which it does when the limits change:
@@ -9,9 +9,17 @@
 //! missing, of the wrong type or out of range is left out (logged at debug level, by name, never
 //! the whole `_meta`), and never fails a turn.
 
-use chrono::{DateTime, Utc};
+mod book;
+
+pub use book::UsageBook;
+
+use crate::acp::AgentSpec;
+use agent_client_protocol::v1::schema::UsageUpdate;
+use chrono::{DateTime, Local, TimeZone, Utc};
 use fronde_protocol::usage::{LimitStatus, Window, WindowKind};
 use serde_json::{Map, Value};
+use std::fmt;
+use std::sync::Arc;
 
 /// The key of the Claude adapter's `_meta` that holds the CLI's latest `rate_limit_info`.
 pub const CLAUDE_RATE_LIMIT: &str = "_claude/rateLimit";
@@ -266,6 +274,122 @@ fn reset_time(kind: WindowKind, value: &Value, as_of: DateTime<Utc>) -> Option<D
         tracing::debug!(window = %kind, "ignored a reset time that is not Unix seconds near now");
     }
     at
+}
+
+/// A turn the agent refused because a usage limit is reached: what the turn's failure says.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateLimited {
+    pub provider: &'static str,
+    pub resumes_at: Option<DateTime<Utc>>,
+}
+
+impl RateLimited {
+    /// The notice the turn ends with, its time in the server's time zone.
+    pub fn notice(&self) -> String {
+        rate_limit_notice(self.resumes_at, Utc::now(), &Local)
+    }
+}
+
+impl fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the {} subscription's usage limit is reached",
+            self.provider
+        )?;
+        match self.resumes_at {
+            Some(at) => write!(f, "; turns run again from {}", at.to_rfc3339()),
+            None => f.write_str("; the agent gave no reset time"),
+        }
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// « Limite d'usage atteinte, reprise vers 16:40. », the day added when the reset is a day or
+/// more away; without a reset time, only that the limit is reached.
+pub fn rate_limit_notice<Tz: TimeZone>(
+    resumes_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    zone: &Tz,
+) -> String
+where
+    Tz::Offset: fmt::Display,
+{
+    let Some(at) = resumes_at else {
+        return "Limite d'usage atteinte : réessaie plus tard.".into();
+    };
+    let local = at.with_timezone(zone);
+    if at - now < chrono::Duration::hours(24) {
+        format!(
+            "Limite d'usage atteinte, reprise vers {}.",
+            local.format("%H:%M")
+        )
+    } else {
+        format!(
+            "Limite d'usage atteinte, reprise vers {} le {}.",
+            local.format("%H:%M"),
+            local.format("%d/%m")
+        )
+    }
+}
+
+/// What one agent connection does with the readings it receives: read them with its provider's
+/// [`UsageSource`] and record them in the book, if it has one.
+#[derive(Clone)]
+pub(crate) struct Capture {
+    provider: &'static str,
+    source: UsageSource,
+    book: Option<Arc<UsageBook>>,
+}
+
+impl Capture {
+    pub(crate) fn of(spec: &AgentSpec) -> Self {
+        Self {
+            provider: spec.provider.id,
+            source: spec.provider.usage,
+            book: spec.usage.clone(),
+        }
+    }
+
+    /// Records the reading a `usage_update` carries, if any. Context tokens and cost are not
+    /// kept.
+    pub(crate) fn update(&self, update: &UsageUpdate) {
+        if let Some(windows) = self.source.read(update.meta.as_ref(), Utc::now()) {
+            self.record(windows);
+        }
+    }
+
+    /// The limit a prompt error says the turn hit, its windows recorded; `None` for any other
+    /// error.
+    pub(crate) fn error(&self, error: &agent_client_protocol::Error) -> Option<RateLimited> {
+        let limit = self.source.read_error(error.data.as_ref(), Utc::now())?;
+        if !limit.windows.is_empty() {
+            self.record(limit.windows);
+        }
+        Some(RateLimited {
+            provider: self.provider,
+            resumes_at: limit.resumes_at,
+        })
+    }
+
+    fn record(&self, windows: Vec<Window>) {
+        let kinds: Vec<String> = windows
+            .iter()
+            .map(|window| window.kind.to_string())
+            .collect();
+        match &self.book {
+            Some(book) => {
+                let changed = book.record(self.provider, windows);
+                tracing::debug!(provider = self.provider, ?kinds, changed, "usage reading");
+            }
+            None => tracing::debug!(
+                provider = self.provider,
+                ?kinds,
+                "usage reading not kept: no book"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -655,5 +779,27 @@ mod tests {
         let data = json!({"errorKind": "rate_limit", "rateLimit": info});
         assert_eq!(bare.usage.read_error(Some(&data), as_of()), None);
         assert_eq!(Provider::CLAUDE.usage, UsageSource::ClaudeRateLimitMeta);
+    }
+
+    #[test]
+    fn rate_limit_notice_says_when() {
+        let now = as_of();
+        assert_eq!(
+            rate_limit_notice(at(1_794_931_200), now, &Utc),
+            "Limite d'usage atteinte, reprise vers 16:00."
+        );
+        let paris = chrono::FixedOffset::east_opt(3600).unwrap();
+        assert_eq!(
+            rate_limit_notice(at(1_794_931_200), now, &paris),
+            "Limite d'usage atteinte, reprise vers 17:00."
+        );
+        assert_eq!(
+            rate_limit_notice(at(1_795_424_400), now, &Utc),
+            "Limite d'usage atteinte, reprise vers 09:00 le 23/11."
+        );
+        assert_eq!(
+            rate_limit_notice(None, now, &Utc),
+            "Limite d'usage atteinte : réessaie plus tard."
+        );
     }
 }

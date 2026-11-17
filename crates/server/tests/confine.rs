@@ -100,6 +100,7 @@ impl Setup {
             oauth_token: None,
             system_prompt: String::new(),
             builtin_tools: Vec::new(),
+            usage: None,
         }
     }
 

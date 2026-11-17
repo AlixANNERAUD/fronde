@@ -41,6 +41,7 @@ fn spec() -> AgentSpec {
         oauth_token: None,
         system_prompt: "You are Fronde.".into(),
         builtin_tools: vec!["WebSearch".into(), "WebFetch".into()],
+        usage: None,
     }
 }
 

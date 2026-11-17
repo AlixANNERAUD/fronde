@@ -58,8 +58,9 @@ a mode switch: a new provider never inherits Claude's lists.
 ## Usage and quotas
 
 A subscription has two usage windows: one of 5 hours and one of a week. Fronde reads how much
-of each is used from what the Claude adapter already sends during a turn. It makes no request of
-its own for it: no call to an Anthropic endpoint, no `/usage` turn.
+of each is used from what the Claude adapter already sends during a turn, and keeps the latest
+reading per provider. It makes no request of its own for it: no call to an Anthropic endpoint, no
+`/usage` turn.
 
 What the adapter sends:
 
@@ -75,7 +76,9 @@ What the adapter sends:
   it is there and falls back on the documented window.
 - **Paid extra usage in use** (`isUsingOverage`), kept as an extra window marked as a warning.
 - **A turn refused for a limit**: the prompt fails with `errorKind: "rate_limit"` and the latest
-  reading, whose reset time says when turns run again.
+  reading, whose reset time says when turns run again. The turn ends with
+  « Limite d'usage atteinte, reprise vers 16:40. » (the day added when it is a day or more away)
+  and the reading is kept.
 
 What it does not send, and Fronde does not make up:
 
@@ -92,9 +95,8 @@ reading that does not parse never fails a turn. The log names the fields it left
 whole `_meta`. Once a window's reset time has passed, it reads as reset since the reading. Codex
 and Antigravity send no reading Fronde reads yet.
 
-Capturing the readings during turns and keeping them across restarts, showing them in the chat
-and in `fronde check`, and keeping a share of each window for your own turns by pausing
-background work, are **planned**.
+Keeping the readings across restarts, showing them in the chat and in `fronde check`, and
+keeping a share of each window for your own turns by pausing background work, are **planned**.
 
 ## Why MCP for the tools
 

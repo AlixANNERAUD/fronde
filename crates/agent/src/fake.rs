@@ -9,7 +9,7 @@ use agent_client_protocol::v1::schema::{
     SessionConfigSelectOption, SessionNotification, SessionResumeCapabilities,
     SessionSystemPromptCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallUpdate, ToolCallUpdateFields,
+    TextContent, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Channel, Client, ConnectTo, Error};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +45,9 @@ pub struct FakeScript {
     pub leave_permission_pending: bool,
     /// Answer each prompt with an error, after the updates.
     pub fail_prompt: bool,
+    /// Answer each prompt with an internal error carrying this `data`, after the updates, as the
+    /// Claude adapter fails a turn ([`rate_limit_error`] for one refused for a limit).
+    pub fail_prompt_data: Option<serde_json::Value>,
     /// Answer each prompt with ACP's `auth_required` error, as a signed-out Claude does.
     pub signed_out: bool,
     /// Never answer a prompt, even once it is cancelled, after the updates: a wedged agent.
@@ -82,6 +85,7 @@ impl Default for FakeScript {
             wait_for_cancel: false,
             leave_permission_pending: false,
             fail_prompt: false,
+            fail_prompt_data: None,
             signed_out: false,
             ignore_cancel: false,
             pause: None,
@@ -100,6 +104,24 @@ pub fn text_chunk(text: &str) -> SessionUpdate {
     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
         text,
     ))))
+}
+
+/// A `usage_update` carrying `rate_limit` (a CLI `rate_limit_info`) as the Claude adapter sends
+/// it after a `rate_limit_event`: in `_meta["_claude/rateLimit"]`, beside the model.
+pub fn usage_update(rate_limit: serde_json::Value) -> SessionUpdate {
+    let serde_json::Value::Object(meta) = serde_json::json!({
+        "_claude/rateLimit": rate_limit,
+        "_claude/model": "claude-opus-4-5",
+    }) else {
+        unreachable!("the literal is an object")
+    };
+    SessionUpdate::UsageUpdate(UsageUpdate::new(53_000, 200_000).meta(meta))
+}
+
+/// The `data` of the Claude adapter's error for a turn refused for a limit (`turnErrorData`):
+/// its kind and the turn's latest `rate_limit_info`.
+pub fn rate_limit_error(rate_limit: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"errorKind": "rate_limit", "rateLimit": rate_limit})
 }
 
 /// Everything the client sent to the fake agent.
@@ -335,6 +357,10 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
                         }
                         if script.fail_prompt {
                             return responder.respond_with_error(Error::internal_error());
+                        }
+                        if let Some(data) = &script.fail_prompt_data {
+                            return responder
+                                .respond_with_error(Error::internal_error().data(data.clone()));
                         }
                         if script.signed_out {
                             return responder.respond_with_error(Error::auth_required());

@@ -78,6 +78,16 @@ Stop in a sub-agent's own thread stops that sub-agent; its parent is told it end
 *(interrompu)*. A sub-agent's turn that runs longer than 30 minutes is stopped the same way, with
 *Délai dépassé* in its thread.
 
+## When the subscription's limit is reached
+
+When your subscription's 5-hour or weekly window is used up, Claude refuses the turn, and the
+thread says when it can run again, in the server's time:
+
+> Limite d'usage atteinte, reprise vers 16:40.
+
+The turn ends as failed. Send your message again after that time. Fronde keeps the reading the
+refusal carried (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)).
+
 ## Change the limits on sub-agents
 
 Sub-agents spend your subscription's quota in the background. When an agent says it hit a limit,

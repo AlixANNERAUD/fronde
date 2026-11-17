@@ -852,7 +852,7 @@ impl Assistant {
                 Err(error) => {
                     tracing::warn!("the turn failed: {error:#}");
                     self.append(Event::Notice {
-                        text: notice_for(&error).into(),
+                        text: notice_for(&error),
                     })
                     .await;
                     TurnOutcome::Error
@@ -1814,15 +1814,20 @@ fn duration_text(duration: Duration) -> String {
     }
 }
 
-fn notice_for(error: &anyhow::Error) -> &'static str {
+fn notice_for(error: &anyhow::Error) -> String {
     if error.is::<StartTimeout>() {
-        return NO_START;
+        return NO_START.into();
+    }
+    // A limit says when turns run again.
+    if let Some(limited) = error.downcast_ref::<crate::usage::RateLimited>() {
+        return limited.notice();
     }
     match Failure::of(error) {
         Failure::NotInstalled => NOT_INSTALLED,
         Failure::SignedOut => SIGNED_OUT,
         Failure::Other => FAILED,
     }
+    .into()
 }
 
 /// How the last turn of `entries` ended, if one did and none started since.

@@ -3,6 +3,7 @@
 use crate::confine::Confine;
 use crate::provider::Provider;
 use crate::scope::ScopeStop;
+use crate::usage::{Capture, UsageBook};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
@@ -76,6 +77,9 @@ pub struct AgentSpec {
     pub system_prompt: String,
     /// Claude Code's own tools the session gets besides the hub's, such as `WebSearch`.
     pub builtin_tools: Vec<String>,
+    /// Where the usage readings the agent sends go, read with its provider's
+    /// [`UsageSource`](crate::usage::UsageSource): the server's one book. `None` drops them.
+    pub usage: Option<Arc<UsageBook>>,
 }
 
 impl fmt::Debug for AgentSpec {
@@ -95,6 +99,7 @@ impl fmt::Debug for AgentSpec {
             )
             .field("system_prompt", &self.system_prompt)
             .field("builtin_tools", &self.builtin_tools)
+            .field("usage", &self.usage)
             .finish()
     }
 }
@@ -317,6 +322,8 @@ pub struct AgentClient {
     permissions: Arc<Permissions>,
     /// The session's config options, as the agent last gave them.
     config: Arc<Mutex<Vec<SessionConfigOption>>>,
+    /// Where the usage a refused prompt reports goes.
+    usage: Capture,
     // The connection task runs until this sender is dropped.
     _stop: oneshot::Sender<()>,
     // Then the agent's scope, if it has one, is stopped.
@@ -400,7 +407,7 @@ impl AgentClient {
                     .envs(helper.env)
             }
         };
-        let connection = Connection::start(AcpAgent::new(config), events)
+        let connection = Connection::start(AcpAgent::new(config), events, Capture::of(spec))
             .await
             .with_context(|| format!("cannot start the agent ({command})"))?;
         let header = spec.provider.hub_header.value(HUB_TOKEN_VAR);
@@ -418,7 +425,7 @@ impl AgentClient {
     ) -> anyhow::Result<Self> {
         // In this process: the header may hold the token itself.
         let header = format!("Bearer {}", spec.hub_token.expose_secret());
-        Connection::start(transport, events)
+        Connection::start(transport, events, Capture::of(spec))
             .await?
             .open_session(spec, header, resume)
             .await
@@ -462,14 +469,23 @@ impl AgentClient {
         Ok(())
     }
 
-    /// Run one turn; events stream to the sender given at connection until it returns.
+    /// Run one turn; events stream to the sender given at connection until it returns. A turn
+    /// the agent refuses for a usage limit fails with [`RateLimited`](crate::usage::RateLimited),
+    /// the reading it carries recorded.
     pub async fn prompt(&self, text: &str) -> anyhow::Result<TurnEnd> {
         let request = PromptRequest::new(self.session_id.clone(), vec![ContentBlock::from(text)]);
         // A cancel that came after the previous turn ended is not about this one.
         self.permissions.end_turn();
         let response = self.connection.send_request(request).block_task().await;
         self.permissions.end_turn();
-        let response = response.context("the agent failed the turn")?;
+        let response = match response {
+            Ok(response) => response,
+            // Not chained to the agent's error, whose data holds the whole reading.
+            Err(error) => match self.usage.error(&error) {
+                Some(limited) => return Err(limited.into()),
+                None => return Err(anyhow::Error::from(error).context("the agent failed the turn")),
+            },
+        };
         Ok(match response.stop_reason {
             StopReason::Cancelled => TurnEnd::Cancelled,
             StopReason::Refusal => TurnEnd::Refused,
@@ -649,6 +665,7 @@ struct Connection {
     capabilities: SessionCapabilities,
     permissions: Arc<Permissions>,
     config: Arc<Mutex<Vec<SessionConfigOption>>>,
+    usage: Capture,
     stop: oneshot::Sender<()>,
 }
 
@@ -656,6 +673,7 @@ impl Connection {
     async fn start(
         transport: impl ConnectTo<Client> + 'static,
         events: mpsc::UnboundedSender<AgentEvent>,
+        usage: Capture,
     ) -> anyhow::Result<Self> {
         let permissions = Arc::new(Permissions::new());
         let config = Arc::new(Mutex::new(Vec::new()));
@@ -664,11 +682,17 @@ impl Connection {
             .on_receive_notification(
                 {
                     let (permissions, events) = (permissions.clone(), events.clone());
-                    let config = config.clone();
+                    let (config, usage) = (config.clone(), usage.clone());
                     async move |notification: SessionNotification, _cx| {
                         permissions.track(&notification.update);
-                        if let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
-                            *lock(&config) = update.config_options.clone();
+                        match &notification.update {
+                            SessionUpdate::ConfigOptionUpdate(update) => {
+                                *lock(&config) = update.config_options.clone();
+                            }
+                            // Recorded here, in order: the book only takes a lock to compare,
+                            // its writes run on a task of their own.
+                            SessionUpdate::UsageUpdate(update) => usage.update(update),
+                            _ => {}
                         }
                         for event in events_from(notification.update) {
                             // A closed receiver only means nobody is listening any more.
@@ -792,6 +816,7 @@ impl Connection {
             capabilities: response.agent_capabilities.session_capabilities,
             permissions,
             config,
+            usage,
             stop,
         })
     }
@@ -808,6 +833,7 @@ impl Connection {
             capabilities,
             permissions,
             config,
+            usage,
             stop,
         } = self;
         let hub = McpServer::Http(
@@ -869,6 +895,7 @@ impl Connection {
             session_id,
             permissions,
             config,
+            usage,
             _stop: stop,
             _scope: None,
         })

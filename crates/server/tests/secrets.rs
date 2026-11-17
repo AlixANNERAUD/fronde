@@ -321,6 +321,7 @@ fn no_secret_in_debug() {
         oauth_token: None,
         system_prompt: "You are Fronde.".into(),
         builtin_tools: Vec::new(),
+        usage: None,
     };
 
     let all_canaries = [

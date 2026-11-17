@@ -94,6 +94,12 @@ Fronde numbers them and saves each one in the database, committed to disk, befor
 it to every open page: a page never shows an entry a crash could lose. A page that reconnects
 says which entry it saw last and gets only what it missed.
 
+The usage readings a turn brings (`usage_update`s with a rate limit, and a prompt refused for a
+limit) go to the **usage book** instead (`crates/agent/src/usage`): one per server, shared by
+every agent process, it keeps the latest window of each kind per provider, a window replacing
+another only when its reset is later, or the same and it came later, so that readings from
+several processes end on the newest.
+
 ## Threads
 
 Each conversation is a **thread**: a row of the `threads` table and a stream of its own in the
