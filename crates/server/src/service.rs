@@ -117,6 +117,8 @@ fn quote_systemd_arg(arg: &str) -> String {
     for c in arg.chars() {
         match c {
             '%' => out.push_str("%%"),
+            // systemd expands $NAME and ${NAME} in ExecStart.
+            '$' => out.push_str("$$"),
             '\\' if needs_quotes => out.push_str("\\\\"),
             '"' if needs_quotes => out.push_str("\\\""),
             '\n' if needs_quotes => out.push_str("\\n"),
@@ -479,6 +481,16 @@ WantedBy=default.target
                 "ExecStart=\"/opt/my bin/100%%/fronde\" serve --config \"/home/alix/fronde 50%%/fronde.toml\""
             ),
             "{unit}"
+        );
+        // systemd would expand $HOME: a literal dollar is doubled.
+        let unit_dollar = render_unit(
+            Path::new("/opt/$HOME/fronde"),
+            Path::new("/home/alix/fronde.toml"),
+        )
+        .unwrap();
+        assert!(
+            unit_dollar.contains("ExecStart=/opt/$$HOME/fronde serve"),
+            "{unit_dollar}"
         );
         // Unquoted path containing % still escapes %.
         let unit_percent_only = render_unit(
