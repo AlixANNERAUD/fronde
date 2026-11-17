@@ -7,11 +7,11 @@ use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use fronde_db::DatabaseConnection;
 use fronde_protocol::{Card, Outcome, RequestId};
-use fronde_requests::Journal;
+use fronde_requests::{Journal, Requests};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -66,6 +66,9 @@ pub struct Assistant {
     pending: Mutex<HashMap<u64, (Weak<AgentClient>, u64)>>,
     /// The running turn; `None` when idle.
     turn: tokio::sync::Mutex<Option<Turn>>,
+    /// The requests a turn may ask, cancelled when it ends or is stopped. Weak: they hold the
+    /// assistant as their journal.
+    requests: OnceLock<Weak<Requests>>,
 }
 
 struct Turn {
@@ -110,6 +113,7 @@ impl Assistant {
             session: Mutex::new(None),
             pending: Mutex::default(),
             turn: tokio::sync::Mutex::new(None),
+            requests: OnceLock::new(),
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
         let last_turn =
@@ -142,12 +146,20 @@ impl Assistant {
         &self.log
     }
 
+    /// The requests the assistant's turns ask through: a turn that ends or is stopped cancels
+    /// those still pending. Set once.
+    pub fn set_requests(&self, requests: &Arc<Requests>) {
+        if self.requests.set(Arc::downgrade(requests)).is_err() {
+            tracing::warn!("the assistant's requests were already set");
+        }
+    }
+
     /// Logs the message and runs the turn in the background; refused while a turn runs.
     pub async fn send(self: &Arc<Self>, text: String) {
         // The turn is locked while its start or refusal is logged, as it is while its end is
         // logged: a message sent on seeing `TurnEnded` finds the turn over. Locks are always
         // taken turn first, then log.
-        let cancel = {
+        let (cancel, seq) = {
             let mut turn = self.turn.lock().await;
             if turn.is_some() {
                 self.append(Event::Notice { text: BUSY.into() }).await;
@@ -165,7 +177,7 @@ impl Assistant {
                 cancel: cancel.clone(),
                 seq,
             });
-            cancel
+            (cancel, seq)
         };
         let assistant = self.clone();
         tokio::spawn(async move {
@@ -181,16 +193,34 @@ impl Assistant {
                     TurnOutcome::Error
                 }
             };
+            // Nobody waits for the answers any more, and their cards close before the turn.
+            assistant.cancel_requests(seq).await;
             let mut turn = assistant.turn.lock().await;
             assistant.append(Event::TurnEnded { outcome }).await;
             *turn = None;
         });
     }
 
-    /// Stops the running turn, if any.
+    /// Stops the running turn, if any, and cancels the requests it asked: the agent may wait
+    /// on one, and its cancel may never reach the tool call.
     pub async fn cancel(&self) {
-        if let Some(turn) = self.turn.lock().await.as_ref() {
-            turn.cancel.cancel();
+        let seq = match self.turn.lock().await.as_ref() {
+            Some(turn) => {
+                turn.cancel.cancel();
+                turn.seq
+            }
+            None => return,
+        };
+        self.cancel_requests(seq).await;
+    }
+
+    /// Cancels the pending requests of the turn whose user message is `seq`.
+    async fn cancel_requests(&self, seq: Option<u64>) {
+        let requests = self.requests.get().and_then(Weak::upgrade);
+        if let (Some(seq), Some(requests)) = (seq, requests)
+            && let Err(error) = requests.cancel_turn(TOPIC, seq).await
+        {
+            tracing::error!("cannot cancel the requests of the turn: {error:#}");
         }
     }
 

@@ -15,6 +15,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -75,7 +76,7 @@ impl ToolOutput {
 
 /// Who calls a tool, and on whose behalf: a tool that asks the user puts its card in `topic`,
 /// for `user`, tied to `turn`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CallContext {
     pub caller: Caller,
     /// The user the caller acts for.
@@ -84,6 +85,9 @@ pub struct CallContext {
     pub topic: String,
     /// The seq of the user message of the turn calling, for Fronde's assistant.
     pub turn: Option<u64>,
+    /// Cancelled when the caller gives the call up (MCP `notifications/cancelled`): rmcp does not
+    /// stop the handler, so a tool that waits must watch it.
+    pub cancelled: CancellationToken,
 }
 
 #[async_trait]

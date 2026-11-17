@@ -67,6 +67,7 @@ fn context() -> CallContext {
         user: "alix".into(),
         topic: "conversation".into(),
         turn: Some(3),
+        cancelled: tokio_util::sync::CancellationToken::new(),
     }
 }
 

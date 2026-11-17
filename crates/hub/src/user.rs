@@ -104,7 +104,18 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
             );
         }
     };
-    match waiter.wait().await {
+    let id = waiter.id();
+    let resolution = tokio::select! {
+        resolution = waiter.wait() => resolution,
+        // The caller gave up: the card must not stay open for an answer nobody reads.
+        () = context.cancelled.cancelled() => {
+            if let Err(error) = requests.cancel(id).await {
+                tracing::error!("cannot cancel request {id}: {error:#}");
+            }
+            Resolution::Cancelled
+        }
+    };
+    match resolution {
         Resolution::Answered(Response::Form { values }) => {
             let answers: Vec<Value> = questions
                 .iter()

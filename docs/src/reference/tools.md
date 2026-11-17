@@ -85,6 +85,8 @@ A question from Fronde's own assistant is headed *Question de Fronde*; one from 
 is headed with the name the client gave (`clientInfo.name`), such as *Question de Codex*. Never
 use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
 than the question's: Codex, for instance, gives up after `tool_timeout_sec` (60 s by default).
+A call the client cancels closes its card as cancelled, and so does the end of the assistant's
+turn, or *Stop*, for the questions that turn asked.
 See [Requests and cards](../explanation/requests.md).
 
 ## Calendar

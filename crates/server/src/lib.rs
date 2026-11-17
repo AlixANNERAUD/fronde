@@ -329,6 +329,7 @@ pub async fn start_with(
             };
             let assistant = Assistant::open(spec, &data_dir, db.clone(), connector).await?;
             let requests = Requests::open(db.clone(), assistant.clone()).await?;
+            assistant.set_requests(&requests);
             Some((
                 assistant,
                 assistant_token,

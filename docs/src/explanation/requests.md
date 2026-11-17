@@ -22,7 +22,7 @@ A request ends in one of four ways:
 | `answered` | You sent an answer | *Réponse : …* |
 | `declined` | You pressed *Refuser* | *Refusée* |
 | `expired` | Its time ran out | *Expirée* |
-| `cancelled` | The asker gave up, or the request could not be shown | *Annulée* |
+| `cancelled` | The asker gave up (its tool call was cancelled), the assistant's turn that asked ended or was stopped, or the request could not be shown | *Annulée* |
 
 The row is closed before the one who asked is told, and a closed request never reopens. Every
 request expires: no answer means no. The row keeps who answered, when, and a short summary of the

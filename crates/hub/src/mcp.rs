@@ -65,6 +65,7 @@ impl HubServer {
             user: self.hub.config.data.user.clone(),
             topic: TOPIC.to_owned(),
             turn,
+            cancelled: context.ct.clone(),
         }
     }
 }
@@ -337,6 +338,79 @@ mod tests {
                 "turn": null,
             })
         );
+    }
+
+    /// Records each request's end.
+    #[derive(Default)]
+    struct Closes(std::sync::Mutex<Vec<(u64, fronde_protocol::Outcome)>>);
+
+    #[async_trait::async_trait]
+    impl fronde_requests::Journal for Closes {
+        async fn announce(
+            &self,
+            _topic: &str,
+            id: u64,
+            _card: &fronde_protocol::Card,
+            _from: Option<&str>,
+        ) -> anyhow::Result<u64> {
+            Ok(id)
+        }
+
+        async fn close(
+            &self,
+            _topic: &str,
+            id: u64,
+            outcome: &fronde_protocol::Outcome,
+            _by: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push((id, outcome.clone()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_closes_its_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let toml = format!(
+            "[server]\ntoken = {{ env = \"UNUSED\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"alix\"\n[memory]\ngit = false\n",
+            data.display().to_string()
+        );
+        let config: crate::config::Config = toml::from_str(&toml).unwrap();
+        crate::private::prepare_data_dir(&data).unwrap();
+        let db = fronde_db::open(&data).await.unwrap();
+        let closes = Arc::new(Closes::default());
+        let requests = fronde_requests::Requests::open(db.clone(), closes.clone())
+            .await
+            .unwrap();
+        let hub = Arc::new(Hub::start(config, db, vec![], Some(requests)).await.unwrap());
+        let client = connect(hub).await;
+        let args = serde_json::json!({"questions": [{
+            "question": "Laquelle ?",
+            "header": "Appli",
+            "options": [
+                {"label": "Mealie", "description": "Recettes"},
+                {"label": "Seerr", "description": "Films"},
+            ],
+        }]});
+        let call = client.peer().call_tool_once(
+            CallToolRequestParams::new("user_ask")
+                .with_arguments(args.as_object().unwrap().clone()),
+        );
+        // The client gives up: dropping the call sends `notifications/cancelled`.
+        let given_up = tokio::time::timeout(std::time::Duration::from_millis(300), call).await;
+        assert!(given_up.is_err(), "the call should still be waiting");
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(closed) = closes.0.lock().unwrap().first().cloned() {
+                    return closed;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the card stayed open");
+        assert_eq!(closed.1, fronde_protocol::Outcome::Cancelled);
     }
 
     #[tokio::test]

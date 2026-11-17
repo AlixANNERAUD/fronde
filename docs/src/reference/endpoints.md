@@ -62,7 +62,7 @@ From the page:
 | --- | --- | --- |
 | `hello` | `last_seq`, optional `log_id` | Start streaming: the entries after `last_seq`, then live ones. A different `log_id` gets the whole log. |
 | `send` | `text` | A message to Fronde. Refused with a notice while a turn runs. |
-| `cancel` | | Stop the running turn. |
+| `cancel` | | Stop the running turn, and cancel the requests it asked that are still open. |
 | `answer` | `id`, `response` | Answer the request `id`. `response` is tagged by `type`: `form` with `values` (each question's key to `{ "selected": [labels], "other"?, "note"? }`), `decline`, or `permission` with `choice` (`allow_once` or `reject_once`) for a permission request of the agent. The first answer wins. |
 
 From the server:

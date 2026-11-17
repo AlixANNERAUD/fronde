@@ -898,3 +898,115 @@ async fn requests_are_shown_in_the_conversation() {
     );
     assert_eq!(assistant.current_turn().await, None);
 }
+
+/// A one-question card for the assistant's requests tests.
+fn question_card() -> fronde_protocol::Card {
+    use fronde_protocol::{Card, ChoiceOption, Field};
+    let option = |label: &str| ChoiceOption {
+        label: label.into(),
+        description: None,
+        preview: None,
+        recommended: false,
+    };
+    Card::Form {
+        message: String::new(),
+        fields: vec![Field::Choice {
+            key: "q1".into(),
+            header: None,
+            question: "Quel agenda ?".into(),
+            options: vec![option("Perso"), option("Travail")],
+            multi: false,
+            other: true,
+            required: true,
+        }],
+        submit: None,
+    }
+}
+
+/// The assistant with its requests, asking one question during a turn that waits on a
+/// permission; returns the waiter.
+async fn ask_during_a_turn(
+    dir: &Path,
+) -> (
+    Arc<Assistant>,
+    Arc<fronde_requests::Requests>,
+    fronde_requests::Waiter,
+    u64,
+) {
+    use fronde_requests::{Ask, Caller, Requests};
+    let (assistant, _fakes) = open(dir, asking()).await;
+    let db = fronde_db::open(dir).await.unwrap();
+    let requests = Requests::open(db, assistant.clone()).await.unwrap();
+    assistant.set_requests(&requests);
+    assistant.send("Mon agenda ?".into()).await;
+    let permission = wait_for_permission(&assistant).await;
+    let waiter = requests
+        .ask(Ask {
+            topic: TOPIC.into(),
+            turn: assistant.current_turn().await,
+            caller: Caller::Assistant,
+            client_request_id: None,
+            card: question_card(),
+            for_user: "alix".into(),
+            admin_only: false,
+            timeout: Duration::from_secs(600),
+        })
+        .await
+        .unwrap();
+    (assistant, requests, waiter, permission)
+}
+
+#[tokio::test]
+async fn stop_cancels_the_turns_open_requests() {
+    use fronde_protocol::Outcome;
+    use fronde_requests::Resolution;
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, _requests, waiter, _) = ask_during_a_turn(dir.path()).await;
+    let id = waiter.id();
+    assistant.cancel().await;
+    assert_eq!(
+        timeout(WAIT, waiter.wait()).await.unwrap(),
+        Resolution::Cancelled
+    );
+    let events = wait_for_turns(&assistant, 1).await;
+    let closed = Event::RequestClosed {
+        id,
+        outcome: Outcome::Cancelled,
+        by: None,
+    };
+    let at = events.iter().position(|event| *event == closed);
+    assert!(at.is_some(), "{events:?}");
+    assert_eq!(events.last(), Some(&ended(TurnOutcome::Cancelled)));
+}
+
+#[tokio::test]
+async fn turn_end_cancels_the_requests_left_open() {
+    use fronde_protocol::Outcome;
+    use fronde_requests::Resolution;
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, _requests, waiter, permission) = ask_during_a_turn(dir.path()).await;
+    let id = waiter.id();
+    // The agent goes on without the answer and ends its turn.
+    assistant.answer(permission, true).await;
+    assert_eq!(
+        timeout(WAIT, waiter.wait()).await.unwrap(),
+        Resolution::Cancelled
+    );
+    let events = wait_for_turns(&assistant, 1).await;
+    let closed = events
+        .iter()
+        .position(|event| {
+            *event
+                == Event::RequestClosed {
+                    id,
+                    outcome: Outcome::Cancelled,
+                    by: None,
+                }
+        })
+        .expect("closed");
+    let ended_at = events
+        .iter()
+        .position(|event| matches!(event, Event::TurnEnded { .. }))
+        .unwrap();
+    assert!(closed < ended_at, "{events:?}");
+}
