@@ -63,8 +63,8 @@ opens it read-only, and a database an older Fronde left without the approvals or
 has no stored approval or secret, which is what `serve` would find after updating it. With
 `[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
 `python: approved (CPython 3.15.2)`. With `[web]`, it prints what the agent's sandbox covers on
-this kernel, such as `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, signals and
-abstract sockets); seccomp: no Unix sockets but connected pairs, only IPv4, IPv6 and netlink route
+this kernel, such as `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, device ioctls,
+signals and abstract sockets); seccomp: no Unix sockets but connected pairs, only IPv4, IPv6 and netlink route
 sockets, no io_uring`, followed by `the agent cannot start` on a kernel without Landlock or
 seccomp, and refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the

@@ -75,9 +75,12 @@ that the host enables Landlock:
 cat /sys/kernel/security/lsm   # the list must include landlock
 ```
 
-Debian 12 and later, Ubuntu 22.04 and later, Fedora and Arch enable it. `docker logs fronde`
-shows an `agent sandbox:` line at start that says what the kernel enforces. Without Landlock, the
-agent does not start; set `[agent] sandbox = false` only if you accept an unconfined agent. In the
+Debian 12 and later, Ubuntu 22.04 and later, Fedora and Arch enable it. Fronde also needs Linux
+6.2 or later (Landlock ABI 3), which Debian 12's own kernel (6.1) is not: on such a host, install
+a newer kernel (`bookworm-backports` has one), or set `[agent] sandbox = false`. Ubuntu 22.04
+needs its HWE kernel for the same reason. `docker logs fronde` shows an `agent sandbox:` line at
+start that says what the kernel enforces. Without it, the agent does not start; set
+`[agent] sandbox = false` only if you accept an unconfined agent. In the
 container, the agent's home is `/data/home` and no host socket (D-Bus, the user manager, the
 Docker socket) is there unless you mount it: do not mount one.
 

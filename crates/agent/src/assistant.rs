@@ -48,7 +48,8 @@ pub type Connector = Arc<
         + Sync,
 >;
 
-/// Starts the agent process with `AgentClient::spawn`.
+/// Starts the agent process with `AgentClient::spawn`, unconfined: for tests.
+#[cfg(feature = "testing")]
 pub fn process_connector() -> Connector {
     Arc::new(|spec: &AgentSpec, resume, events| {
         let spec = spec.clone();

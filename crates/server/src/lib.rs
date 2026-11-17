@@ -17,7 +17,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use fronde_agent::acp::AgentSpec;
-use fronde_agent::assistant::{Assistant, Connector, confined_connector, process_connector};
+use fronde_agent::assistant::{Assistant, Connector, confined_connector};
 use fronde_agent::confine::{
     CONNECT_PORTS, Confine, GrantRequest, KEEP_ENV, Policy, SYSTEM_READ, Sandbox, Support, grants,
     url_port,
@@ -345,7 +345,12 @@ pub async fn start_with_helper(
             }
             confined_connector(confine)
         }
-        None => process_connector(),
+        // Without `[web]` there is no chat, so no agent to start.
+        None => Arc::new(|_: &AgentSpec, _, _| {
+            let refused: std::pin::Pin<Box<dyn Future<Output = _> + Send>> =
+                Box::pin(async { anyhow::bail!("the agent runs only with [web]") });
+            refused
+        }),
     };
     start_with(config, connector, &site_root()).await
 }
@@ -418,6 +423,7 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
     let path = agent_variable(config, "PATH");
     let program = config.agent.command.first().map_or("", String::as_str);
     let protected = protected_paths(config);
+    let home = std::env::home_dir();
     let granted = grants(&GrantRequest {
         system: &system,
         path: path.as_deref(),
@@ -425,9 +431,16 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
         extra: &config.agent.read,
         write,
         protected: &protected,
+        home: home.as_deref(),
     })?;
     for skipped in &granted.skipped {
         tracing::warn!("agent sandbox: {skipped}");
+    }
+    for dir in &granted.under_home {
+        tracing::warn!(
+            "agent sandbox: the agent may read {}, inside your home; keep secrets out of it",
+            dir.display()
+        );
     }
     let mut connect_ports = CONNECT_PORTS.to_vec();
     for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {

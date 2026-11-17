@@ -279,10 +279,12 @@ in Docker.
 The agent may:
 
 - read and run files under the system's directories (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`,
-  `/lib64`, `/etc`, `/proc`, `/sys`, `/dev`), each directory on its `PATH`, the adapter's install
+  `/lib64`, `/etc`, `/proc`, `/sys`), each directory on its `PATH`, the adapter's install
   (the topmost `node_modules` above the program, or else its directory), and `[agent] read`;
+- read `/dev/zero`, `/dev/random` and `/dev/urandom`, and write `/dev/null` and `/dev/full`: no
+  other device, so no terminal (`/dev/tty`, `/dev/pts`) and no shared memory (`/dev/shm`);
 - read, write, create and remove files in `<data>/agent`, its working directory, and
-  `<data>/home`, its home, and write `/dev/null`;
+  `<data>/home`, its home;
 - connect over TCP to ports 443 (https, Claude's API and `WebFetch`), 53 (DNS over TCP), the
   hub's own port, for `/mcp`, and the port of an `HTTPS_PROXY` or `HTTP_PROXY` it is given. It may
   not listen on any TCP port;
@@ -295,13 +297,34 @@ Everything else on disk is out of its reach. It cannot read or write `fronde.db`
 and `-shm`), the memory files, anything else in the data directory, the configuration's directory
 (`fronde.toml`, `master.key`, a systemd `.cred` file), any `{ file = "…" }` secret, systemd's
 credentials (`$CREDENTIALS_DIRECTORY`, `/run/credentials`, `/run/user/<uid>/credentials`), or
-your own files (`~/.ssh`, `~/.claude` and the rest of your home). Every path is resolved before
-it is granted, so a link cannot smuggle one in. Before it starts the agent, Fronde refuses any
-grant that equals or contains one of these: `[agent] read` naming the data directory is an
-error, a configuration under `/etc` is an error, and a `PATH` entry that holds the data directory
-is left out with a warning. The agent cannot ptrace Fronde or read its `/proc/<pid>/environ` and
-`mem`, and it cannot send Fronde a signal. Landlock only adds limits: the agent still runs as your
-user, under the usual file permissions.
+your own files (`~/.ssh`, `~/.claude` and the rest of your home) outside what the grants above
+name. Every path is resolved before it is granted, so a symbolic link cannot smuggle one in; a
+bind mount or a hard link can, since neither is told apart from the place it shows: do not give
+the agent's directories either. Before it starts the agent, Fronde refuses any grant that equals
+or contains one of these: `[agent] read` naming the data directory is an error, a configuration
+under `/etc` is an error, and a `PATH` entry that holds the data directory is left out with a
+warning.
+
+Your home is guarded the same way for the `PATH` and the adapter's install: a `PATH` entry that
+equals or holds your home is left out with a warning, and an adapter installed in a directory
+that holds it is an error. A directory inside your home can still be granted: an entry of the
+`PATH` such as `~/.local/bin`, the adapter's `node_modules` in a checkout, or `[agent] read`.
+Fronde then logs a warning at every start that names it, since the agent can read everything in
+it: keep secrets out of those directories.
+
+The agent cannot ptrace Fronde or read its `/proc/<pid>/environ` and `mem`, and, from ABI 6, it
+cannot send Fronde a signal. It cannot gain privileges either: the helper sets `no_new_privs`, so
+a set-user-ID program runs without its privileges, and the agent does not start if the kernel
+refused it. Landlock only adds limits: the agent still runs as your user, under the usual file
+permissions.
+
+Fronde sets every variable of its environment the agent does not get to an empty value before it
+starts the helper, so a `{ env = "…" }` secret's value never reaches it, and the helper makes
+itself non-dumpable before it reads its environment, so that other processes of your user cannot
+read it either. The agent's standard streams are pipes; when Fronde runs in a terminal, the agent
+still has it as its controlling terminal, but cannot open it (`/dev/tty` is not granted) and holds
+no descriptor to it, and the seccomp filter refuses `TIOCSTI` and `TIOCLINUX`, the `ioctl`s that
+would type into it.
 
 ### No Unix sockets
 
@@ -330,17 +353,27 @@ at its first system call instead.
 
 ### What the kernel enforces
 
-What the kernel can enforce depends on its Landlock version (its ABI). Fronde needs ABI 2
-(Linux 5.19) for files, and seccomp filters, which every kernel since Linux 3.17 has. TCP ports need ABI 4
-(Linux 6.7), and signals and abstract Unix sockets ABI 6 (Linux 6.12); on an older kernel the
-agent runs without those parts (seccomp still refuses abstract sockets). `fronde check` and the
-log at start say which apply, for example `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53
-8484, signals and abstract sockets); seccomp: no Unix sockets but connected pairs, only IPv4,
-IPv6 and netlink route sockets, no io_uring`.
+What the kernel can enforce depends on its Landlock version (its ABI). Fronde needs ABI 3
+(Linux 6.2) for files: before it, Landlock cannot stop `truncate`, and the agent could empty
+`fronde.db` or `fronde.toml` without opening them. It also needs seccomp filters, which every
+kernel since Linux 3.17 has. The rest is applied when the kernel has it, and missing otherwise:
+
+- TCP ports need ABI 4 (Linux 6.7): without it, the agent may connect to any TCP port;
+- device `ioctl`s need ABI 5 (Linux 6.10): without it, the agent may send any `ioctl` to the
+  devices it may open;
+- signals and abstract Unix sockets need ABI 6 (Linux 6.12): without it, the agent may send
+  Fronde a signal, and kill it (seccomp still refuses abstract sockets).
+
+`fronde check` and the log at start say which apply and which are missing, for example
+`agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, device ioctls, signals and abstract
+sockets); seccomp: no Unix sockets but connected pairs, only IPv4, IPv6 and netlink route sockets,
+no io_uring`.
 
 With `[agent] sandbox = true`, the default, the agent does not start on a kernel without Landlock,
-with ABI 1, or where the seccomp filter cannot be installed: the chat answers *L'agent a
-rencontré une erreur*, and the log says why and how to fix it.
+with ABI 1 or 2, or where the seccomp filter cannot be installed: the chat answers *L'agent a
+rencontré une erreur*, and the log says why and how to fix it. Debian 12's kernel (6.1) has ABI 2,
+so there the agent needs a newer kernel, such as the one from `bookworm-backports`, or
+`[agent] sandbox = false`.
 `[agent] sandbox = false` runs the agent unconfined, with the explicit environment only, and
 Fronde logs a warning at every start. There is no silent fallback.
 

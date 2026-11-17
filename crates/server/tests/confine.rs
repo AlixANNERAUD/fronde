@@ -110,10 +110,16 @@ impl Setup {
 }
 
 /// Whether this kernel can confine the agent. When it cannot, every confined run must instead
-/// fail with the sandbox's error, which [`refused_without_landlock`] checks.
+/// fail with the sandbox's error, which [`refused_without_landlock`] checks; with
+/// `FRONDE_REQUIRE_LANDLOCK=1` (CI on a kernel that has it), it is a failure instead.
 fn landlock() -> bool {
     let support = Support::probe();
     if !support.ready() {
+        assert!(
+            std::env::var_os("FRONDE_REQUIRE_LANDLOCK").is_none(),
+            "FRONDE_REQUIRE_LANDLOCK is set, but this kernel cannot confine the agent \
+             ({support:?})"
+        );
         eprintln!("this kernel cannot confine the agent ({support:?}): checking the refusal");
     }
     support.ready()
@@ -415,6 +421,34 @@ fn probe_child() {
     let mut report = Report::new();
     report.insert("inherited sockets".to_owned(), inherited_sockets());
     probe_sockets(&mut report, &plan);
+    report.insert(
+        "device open /dev/tty".to_owned(),
+        outcome(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty"),
+        ),
+    );
+    report.insert(
+        "device list /dev/shm".to_owned(),
+        outcome(std::fs::read_dir("/dev/shm")),
+    );
+    report.insert(
+        "device create in /dev/shm".to_owned(),
+        outcome(std::fs::write("/dev/shm/fronde-probe", b"probe")),
+    );
+    report.insert(
+        "device read /dev/urandom".to_owned(),
+        outcome(std::fs::File::open("/dev/urandom").and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut [0; 8])
+        })),
+    );
+    report.insert(
+        "device write /dev/null".to_owned(),
+        outcome(std::fs::write("/dev/null", b"probe")),
+    );
     for file in &plan.protected_files {
         probe_file(&mut report, file);
     }
@@ -865,4 +899,21 @@ fn real_adapter_starts_confined() {
     assert!(
         setup.data.join("home/.claude").exists() || setup.data.join("home/.claude.json").exists()
     );
+}
+
+#[test]
+fn agent_cannot_reach_terminals_or_shared_memory() {
+    let probe = probe_setup();
+    let Some(report) = probe.run() else { return };
+    for attempt in [
+        "device open /dev/tty",
+        "device list /dev/shm",
+        "device create in /dev/shm",
+    ] {
+        assert_eq!(report[attempt], "denied", "{attempt}: {report:#?}");
+    }
+    assert!(!Path::new("/dev/shm/fronde-probe").exists());
+    for attempt in ["device read /dev/urandom", "device write /dev/null"] {
+        assert_eq!(report[attempt], "ok", "{attempt}: {report:#?}");
+    }
 }

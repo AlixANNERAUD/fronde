@@ -101,6 +101,14 @@ FRONDE_LIVE_AGENT=$PWD/agent/node_modules/.bin/claude-agent-acp \
 The path must be absolute: tests run from their crate's directory. `FRONDE_LIVE_CLAUDE` optionally
 names the Claude Code to run instead of the adapter's own.
 
+The confinement tests (`crates/server/tests/confine.rs`) run the agent through the real sandbox.
+On a kernel that cannot confine it (no Landlock, ABI 1 or 2, or no seccomp), they check that the
+agent refuses to start instead. On a CI runner whose kernel has Landlock, set
+`FRONDE_REQUIRE_LANDLOCK=1`: they then fail rather than fall back to that check, so a runner that
+lost Landlock does not pass silently. `real_adapter_starts_confined`, in the same file, runs the
+real adapter under the sandbox; it is ignored, and runs with `FRONDE_LIVE_AGENT` set as above and
+`--test confine`.
+
 Tests and development runs never reach your keychain either: `mise.toml` sets
 `FRONDE_KEYCHAIN=off`, which makes Fronde act as if the machine had none, so a master key made by
 a test or by `mise run dev` goes to a file. Run Cargo through `mise exec` or a mise task to get

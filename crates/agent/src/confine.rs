@@ -39,10 +39,25 @@ pub const KEEP_ENV: [&str; 18] = [
     "TMPDIR",
 ];
 
-/// What the system lets every confined agent read and run.
-pub const SYSTEM_READ: [&str; 10] = [
-    "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/proc", "/sys", "/dev",
+/// What the system lets every confined agent read and run. Of `/dev`, only the devices every
+/// program may use: no terminal, no shared memory, no other device.
+pub const SYSTEM_READ: [&str; 12] = [
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
 ];
+
+/// The devices the confined agent may write to, besides reading them.
+pub const DEVICES_WRITE: [&str; 2] = ["/dev/null", "/dev/full"];
 
 /// TCP ports the agent may connect to besides the hub's and a proxy's: https and DNS over TCP.
 pub const CONNECT_PORTS: [u16; 2] = [443, 53];
@@ -148,6 +163,18 @@ impl Confine {
         policy
             .drop_env
             .retain(|name| !spec.env.iter().any(|(set, _)| set == name));
+        // The helper is started with Fronde's environment, which the ACP crate cannot clear:
+        // every variable the agent does not get is set empty, so that its value, a `{ env }`
+        // secret's among them, never reaches the helper.
+        let mut env = env;
+        for (name, _) in std::env::vars_os() {
+            if let Some(name) = name.to_str()
+                && !policy.keeps(name)
+                && !env.iter().any(|(set, _)| set == name)
+            {
+                env.push((name.to_owned(), String::new()));
+            }
+        }
         if let Some(sandbox) = &mut policy.sandbox {
             let port = url_port(&spec.hub_url)
                 .with_context(|| format!("no port in the hub's URL {}", spec.hub_url))?;
@@ -212,8 +239,9 @@ pub const SOCKETS: &str = "seccomp: no Unix sockets but connected pairs, only IP
                            netlink route sockets, no io_uring";
 
 /// The lowest Landlock ABI the agent runs under: ABI 1 forbids every rename across directories,
-/// which Claude Code's atomic writes need.
-pub const MIN_ABI: u8 = 2;
+/// which Claude Code's atomic writes need, and ABI 2 cannot stop `truncate`, which would empty
+/// `fronde.db` or the configuration.
+pub const MIN_ABI: u8 = 3;
 
 impl Support {
     /// Asks the running kernel, without restricting anything.
@@ -235,6 +263,11 @@ impl Support {
 
     pub fn tcp_ports(self) -> bool {
         self.abi >= 4
+    }
+
+    /// `ioctl` on the devices the agent may open.
+    pub fn device_ioctls(self) -> bool {
+        self.abi >= 5
     }
 
     /// Signals to processes outside the sandbox and abstract Unix sockets.
@@ -267,7 +300,7 @@ impl Support {
             abi => format!("Landlock ABI {abi}"),
         };
         bail!(
-            "the agent's sandbox needs Landlock ABI {MIN_ABI} (Linux 5.19) or later, and this \
+            "the agent's sandbox needs Landlock ABI {MIN_ABI} (Linux 6.2) or later, and this \
              kernel has {found}; upgrade the kernel, or set [agent] sandbox = false to run the \
              agent unconfined, with access to everything your user can read and write"
         )
@@ -292,10 +325,15 @@ impl Support {
         } else {
             missing.push("TCP ports (Linux 6.7)");
         }
+        if self.device_ioctls() {
+            covered.push("device ioctls".to_owned());
+        } else {
+            missing.push("device ioctls (Linux 6.10)");
+        }
         if self.scopes() {
             covered.push("signals and abstract sockets".to_owned());
         } else {
-            missing.push("signals and abstract sockets (Linux 6.12)");
+            missing.push("signals to Fronde and abstract sockets (Linux 6.12)");
         }
         // Below ABI 9, the seccomp filter alone keeps the agent from Unix sockets.
         if self.unix_paths() {
@@ -321,10 +359,12 @@ pub struct Grants {
     pub write: Vec<PathBuf>,
     /// `PATH` entries left out, each with why: to log as warnings.
     pub skipped: Vec<String>,
+    /// Grants under the owner's home, which the agent can read: to log as warnings.
+    pub under_home: Vec<PathBuf>,
 }
 
 /// What [`grants`] starts from.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GrantRequest<'a> {
     /// [`SYSTEM_READ`], or another list in tests.
     pub system: &'a [PathBuf],
@@ -339,6 +379,8 @@ pub struct GrantRequest<'a> {
     /// What no grant may equal or contain: the data directory, the configuration's directory,
     /// the master key, secret files, the memory.
     pub protected: &'a [PathBuf],
+    /// The owner's home, which no `PATH` entry or install may equal or contain either.
+    pub home: Option<&'a Path>,
 }
 
 /// The read and write grants of the agent's sandbox. Every path is canonical, so a symbolic link
@@ -347,6 +389,18 @@ pub struct GrantRequest<'a> {
 pub fn grants(request: &GrantRequest<'_>) -> anyhow::Result<Grants> {
     let protected: Vec<PathBuf> = request.protected.iter().map(|p| canonical(p)).collect();
     let covering = |grant: &Path| protected.iter().find(|p| p.starts_with(grant)).cloned();
+    let home = request.home.map(canonical);
+    // A `PATH` entry or an install must not hold the whole home either: `~/.ssh` is in it.
+    let covering_home = |grant: &Path| {
+        covering(grant).or_else(|| home.clone().filter(|home| home.starts_with(grant)))
+    };
+    let note_home = |grants: &mut Grants, grant: &Path| {
+        if home.as_ref().is_some_and(|home| grant.starts_with(home))
+            && !grants.under_home.iter().any(|g| g == grant)
+        {
+            grants.under_home.push(grant.to_path_buf());
+        }
+    };
     let mut grants = Grants::default();
 
     for dir in request.system {
@@ -381,18 +435,21 @@ pub fn grants(request: &GrantRequest<'_>) -> anyhow::Result<Grants> {
             let Ok(dir) = dir.canonicalize() else {
                 continue;
             };
-            match covering(&dir) {
+            match covering_home(&dir) {
                 Some(p) => grants.skipped.push(format!(
                     "{}: this PATH entry holds {}, so the confined agent does not get it",
                     dir.display(),
                     p.display()
                 )),
-                None => push(&mut grants.read, dir),
+                None => {
+                    note_home(&mut grants, &dir);
+                    push(&mut grants.read, dir);
+                }
             }
         }
     }
     if let Some(install) = install_dir(request.program, request.path) {
-        if let Some(p) = covering(&install) {
+        if let Some(p) = covering_home(&install) {
             bail!(
                 "the agent's program {} is installed in {}, which holds {}: install the adapter \
                  elsewhere, or move Fronde's data and configuration out of it",
@@ -401,6 +458,7 @@ pub fn grants(request: &GrantRequest<'_>) -> anyhow::Result<Grants> {
                 p.display()
             );
         }
+        note_home(&mut grants, &install);
         push(&mut grants.read, install);
     }
     for dir in request.extra {
@@ -415,13 +473,14 @@ pub fn grants(request: &GrantRequest<'_>) -> anyhow::Result<Grants> {
                 p.display()
             );
         }
+        note_home(&mut grants, &dir);
         push(&mut grants.read, dir);
     }
     for dir in request
         .write
         .iter()
         .map(PathBuf::as_path)
-        .chain([Path::new("/dev/null")])
+        .chain(DEVICES_WRITE.map(Path::new))
     {
         let canonical = dir
             .canonicalize()
@@ -501,8 +560,17 @@ fn run_helper_with(
     args: &[OsString],
 ) -> anyhow::Result<Infallible> {
     use std::os::unix::process::CommandExt;
-    let mut command = command_for(policy, support, program, args)?;
+    // First, while `/proc/self` is still the user's to write.
     yield_to_fronde();
+    // Then other processes of the user cannot read the helper's environment or memory; `exec`
+    // makes the agent dumpable again.
+    #[cfg(target_os = "linux")]
+    if let Err(error) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        eprintln!("fronde __confine: cannot make the helper non-dumpable: {error}");
+    }
+    let mut command = command_for(policy, support, program, args)?;
     if let Some(sandbox) = &policy.sandbox {
         // From here on, this process and every one it starts are confined.
         landlock_rules::apply(sandbox)?;
@@ -629,6 +697,13 @@ mod landlock_rules {
                  run the agent unconfined"
             );
         }
+        // Without it, a set-user-ID program would run outside the sandbox.
+        if !status.no_new_privs {
+            bail!(
+                "the agent's sandbox could not forbid new privileges; set [agent] sandbox = \
+                 false to run the agent unconfined"
+            );
+        }
         Ok(())
     }
 }
@@ -650,7 +725,8 @@ mod landlock_rules {
 /// connected pair of stream or sequenced Unix sockets, which reaches nothing but itself and is how
 /// Node gives its child processes their standard streams. A datagram pair is refused: it could
 /// still send to any datagram socket by path. io_uring is refused too, since it creates sockets
-/// without the `socket` system call. Any other process architecture (32-bit x86, whose
+/// without the `socket` system call, and so are the `ioctl`s that type into a terminal or drive
+/// the Linux console. Any other process architecture (32-bit x86, whose
 /// `socketcall` this filter does not inspect) is killed at its first system call.
 #[cfg(target_os = "linux")]
 mod seccomp_rules {
@@ -684,6 +760,16 @@ mod seccomp_rules {
         )?)
     }
 
+    /// An `ioctl` request, an `unsigned int` for the kernel.
+    fn request(value: libc::Ioctl) -> anyhow::Result<SeccompRule> {
+        Ok(SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            u64::from(value as u32),
+        )?])?)
+    }
+
     pub(super) fn program() -> anyhow::Result<BpfProgram> {
         use SeccompCmpOp::{Eq, MaskedEq, Ne};
         let arch = std::env::consts::ARCH;
@@ -707,9 +793,12 @@ mod seccomp_rules {
             SeccompRule::new(vec![arg(1, MaskedEq(SOCK_TYPE_MASK), libc::SOCK_DGRAM)?])?,
             SeccompRule::new(vec![arg(1, MaskedEq(SOCK_TYPE_MASK), libc::SOCK_RAW)?])?,
         ];
+        // Typing into a terminal, should the agent ever hold one: Landlock grants none.
+        let ioctl = vec![request(libc::TIOCSTI)?, request(libc::TIOCLINUX)?];
         let rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::from([
             (libc::SYS_socket, socket),
             (libc::SYS_socketpair, socketpair),
+            (libc::SYS_ioctl, ioctl),
             (libc::SYS_io_uring_setup, Vec::new()),
             (libc::SYS_io_uring_enter, Vec::new()),
             (libc::SYS_io_uring_register, Vec::new()),
@@ -899,19 +988,19 @@ mod tests {
     #[test]
     fn sandbox_unavailable_stops_the_agent() {
         let missing = OsStr::new("/nonexistent/fronde-test-agent");
-        for abi in [0, 1] {
+        for abi in [0, 1, 2] {
             let support = Support { abi, seccomp: true };
             let error = command_for(&confine(true).policy, support, missing, &[])
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("[agent] sandbox = false"), "{error}");
-            assert!(error.contains("Landlock ABI 2"), "{error}");
+            assert!(error.contains("Landlock ABI 3"), "{error}");
             let found = if abi == 0 {
-                "no Landlock"
+                "no Landlock".to_owned()
             } else {
-                "Landlock ABI 1"
+                format!("Landlock ABI {abi}")
             };
-            assert!(error.contains(found), "{error}");
+            assert!(error.contains(&found), "{error}");
         }
         // Landlock without seccomp is refused too.
         let support = Support {
@@ -945,16 +1034,20 @@ mod tests {
         assert_eq!(
             support(9).describe(&[443, 53]),
             format!(
-                "Landlock ABI 9 (files, TCP ports 443 53, signals and abstract sockets, Unix \
-                 socket paths); {SOCKETS}"
+                "Landlock ABI 9 (files, TCP ports 443 53, device ioctls, signals and abstract \
+                 sockets, Unix socket paths); {SOCKETS}"
             )
         );
         let text = support(3).describe(&[443]);
         assert!(
-            text.contains("not confined: TCP ports (Linux 6.7)"),
+            text.contains(
+                "not confined: TCP ports (Linux 6.7), device ioctls (Linux 6.10), signals to \
+                 Fronde and abstract sockets (Linux 6.12)"
+            ),
             "{text}"
         );
         // Below ABI 9, seccomp keeps the agent from Unix sockets on its own.
+        assert!(support(2).describe(&[]).starts_with("unavailable"));
         let text = support(6).describe(&[443]);
         assert!(text.ends_with(SOCKETS), "{text}");
         assert!(!text.contains("not confined"), "{text}");
@@ -985,6 +1078,7 @@ mod tests {
             extra,
             write,
             protected,
+            home: None,
         }
     }
 
@@ -1054,8 +1148,57 @@ mod tests {
                 data.join("agent").canonicalize().unwrap(),
                 data.join("home").canonicalize().unwrap(),
                 PathBuf::from("/dev/null"),
+                PathBuf::from("/dev/full"),
             ]
         );
+    }
+
+    #[test]
+    fn the_owners_home_is_never_granted_whole() {
+        let (root, data, _) = tree();
+        let home = root.path().join("owner");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let write = vec![data.join("agent"), data.join("home")];
+        let path = std::env::join_paths([root.path(), &home, &bin]).unwrap();
+        let mut request = request(&[], Some(&path), &[], &write, &[]);
+        request.home = Some(&home);
+        let granted = grants(&request).unwrap();
+        // Neither the home nor what holds it, through PATH.
+        assert!(!granted.read.contains(&home.canonicalize().unwrap()));
+        assert!(!granted.read.contains(&root.path().canonicalize().unwrap()));
+        assert_eq!(granted.skipped.len(), 2, "{:?}", granted.skipped);
+        // A directory inside it is granted, and reported.
+        let bin = bin.canonicalize().unwrap();
+        assert!(granted.read.contains(&bin));
+        assert_eq!(granted.under_home, [bin]);
+        // An install that holds the home is refused.
+        let program = home.join("agent");
+        std::fs::write(&program, "").unwrap();
+        let program = program.to_str().unwrap().to_owned();
+        let mut refused = request.clone();
+        refused.path = None;
+        refused.program = &program;
+        let error = grants(&refused).unwrap_err().to_string();
+        assert!(error.contains("install the adapter elsewhere"), "{error}");
+    }
+
+    #[test]
+    fn helper_command_blanks_what_the_agent_does_not_keep() {
+        let command = confine(true).command(&spec(Vec::new())).unwrap();
+        let mut blanked = 0;
+        for (name, _) in std::env::vars_os() {
+            let Some(name) = name.to_str() else { continue };
+            let set = command.env.iter().find(|(n, _)| n == name);
+            if command.policy.keeps(name) {
+                assert!(set.is_none_or(|(_, value)| !value.is_empty()), "{name}");
+            } else {
+                assert_eq!(set.map(|(_, value)| value.as_str()), Some(""), "{name}");
+                blanked += 1;
+            }
+        }
+        // The test runner sets variables the agent does not keep, such as `CARGO_*`.
+        assert!(blanked > 0);
     }
 
     #[test]

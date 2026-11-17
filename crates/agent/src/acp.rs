@@ -157,7 +157,8 @@ pub struct AgentClient {
 
 impl AgentClient {
     /// Start the agent process, inheriting Fronde's environment, and open a session (resumed
-    /// when possible).
+    /// when possible). Unconfined: for tests.
+    #[cfg(feature = "testing")]
     pub async fn spawn(
         spec: &AgentSpec,
         resume: Option<String>,
