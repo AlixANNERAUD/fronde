@@ -1,5 +1,5 @@
 //! Usage readings: captured from the agent's `usage_update`s and refused prompts, kept per
-//! provider in the book.
+//! provider in the book, and in `fronde.db` across restarts.
 
 use agent_client_protocol::v1::schema::{SessionUpdate, UsageUpdate};
 use chrono::{DateTime, Local, Utc};
@@ -9,7 +9,7 @@ use fronde_agent::fake::{FakeScript, fake_agent, rate_limit_error, text_chunk, u
 use fronde_agent::log::{Event, TurnOutcome};
 use fronde_agent::provider::Provider;
 use fronde_agent::threads::Threads;
-use fronde_agent::usage::{RateLimited, UsageBook};
+use fronde_agent::usage::{RateLimited, UsageBook, read_usage};
 use fronde_protocol::usage::{LimitStatus, ProviderUsage, Window, WindowKind};
 use fronde_requests::User;
 use serde_json::{Value, json};
@@ -321,7 +321,7 @@ async fn other_prompt_errors_unchanged() {
     assert_eq!(book.get("claude"), None);
 }
 
-// Through the threads: what the owner sees.
+// Through the threads: what the owner sees, and what is kept.
 
 fn alix() -> User {
     User {
@@ -340,10 +340,10 @@ fn connector(script: FakeScript) -> Connector {
     })
 }
 
-/// The threads of `dir`, with a book, as the server opens them.
+/// The threads of `dir`, with the book stored there, as the server opens them.
 async fn open(dir: &Path, script: FakeScript) -> (Arc<Threads>, Arc<UsageBook>) {
     let db = fronde_db::open(dir).await.unwrap();
-    let book = UsageBook::in_memory();
+    let book = UsageBook::load(db.clone()).await;
     let threads = Threads::open(db, dir, spec(Some(book.clone())), connector(script), alix())
         .await
         .unwrap();
@@ -411,4 +411,164 @@ async fn rate_limited_turn_says_when() {
         usage.window(&WindowKind::Session).unwrap().status,
         Some(LimitStatus::Rejected)
     );
+    book.flush().await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    assert_eq!(read_usage(&db, "claude").await.unwrap(), Some(usage));
+}
+
+#[tokio::test]
+async fn usage_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (session_reset, weekly_reset) = (hence(3), hence(100));
+    let script = FakeScript {
+        updates: vec![
+            usage_update(rate_limit(0.42, "allowed", session_reset, weekly_reset)),
+            text_chunk("Bonjour"),
+        ],
+        ..FakeScript::default()
+    };
+    let (threads, book) = open(dir.path(), script.clone()).await;
+    turn(&threads.main(), 1).await;
+    let recorded = book.get("claude").expect("no reading");
+    book.flush().await;
+    drop(threads);
+    drop(book);
+
+    // A fresh start reads the same book, before any turn.
+    let (threads, book) = open(dir.path(), FakeScript::default()).await;
+    assert_eq!(book.get("claude"), Some(recorded.clone()));
+    assert_eq!(book.all(), std::slice::from_ref(&recorded));
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    assert_eq!(
+        read_usage(&db, "claude").await.unwrap(),
+        Some(recorded.clone())
+    );
+    assert_eq!(read_usage(&db, "codex").await.unwrap(), None);
+
+    // A later reading of the same window replaces it, and is kept in turn.
+    drop(threads);
+    let script = FakeScript {
+        updates: vec![usage_update(rate_limit(
+            0.6,
+            "allowed",
+            session_reset,
+            weekly_reset,
+        ))],
+        ..FakeScript::default()
+    };
+    let (threads, book) = open(dir.path(), script).await;
+    turn(&threads.main(), 2).await;
+    let later = book.get("claude").unwrap();
+    assert_eq!(used(&later, WindowKind::Session), Some(0.6));
+    assert!(later.known_since > recorded.known_since);
+    book.flush().await;
+    assert_eq!(read_usage(&db, "claude").await.unwrap(), Some(later));
+}
+
+fn window(kind: WindowKind, used: f64, resets_at: i64, as_of: DateTime<Utc>) -> Window {
+    Window {
+        kind,
+        used: Some(used),
+        status: Some(LimitStatus::Allowed),
+        resets_at: Some(time(resets_at)),
+        as_of,
+        reset_since_reading: false,
+    }
+}
+
+/// Two agent processes report, the older window arriving last: the newest window stays, in
+/// memory and stored.
+#[tokio::test]
+async fn newest_window_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let book = UsageBook::load(db.clone()).await;
+    let (old_reset, new_reset) = (hence(1), hence(6));
+    let now = Utc::now();
+    // The second agent saw the new window first.
+    assert!(book.record(
+        "claude",
+        vec![window(WindowKind::Session, 0.1, new_reset, now)]
+    ));
+    // The first agent's held reading of the window before arrives later.
+    let late = now + chrono::Duration::seconds(5);
+    assert!(!book.record(
+        "claude",
+        vec![window(WindowKind::Session, 0.95, old_reset, late)]
+    ));
+    assert!(book.record(
+        "claude",
+        vec![
+            window(WindowKind::Session, 0.95, old_reset, late),
+            window(WindowKind::Weekly, 0.3, hence(100), late),
+        ]
+    ));
+    book.flush().await;
+    let expected = book.get("claude").unwrap();
+    assert_eq!(used(&expected, WindowKind::Session), Some(0.1));
+    assert_eq!(used(&expected, WindowKind::Weekly), Some(0.3));
+    assert_eq!(expected.known_since, late);
+    drop(book);
+    let book = UsageBook::load(db.clone()).await;
+    assert_eq!(book.get("claude"), Some(expected));
+}
+
+#[tokio::test]
+async fn unchanged_reading_moves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let book = UsageBook::load(db.clone()).await;
+    let mut changes = book.changes();
+    let reset = hence(3);
+    let first = Utc::now();
+    assert!(book.record(
+        "claude",
+        vec![window(WindowKind::Session, 0.4, reset, first)]
+    ));
+    assert!(changes.has_changed().unwrap());
+    changes.mark_unchanged();
+    book.flush().await;
+    // Removed behind the book's back: a write would put it back.
+    assert!(
+        fronde_db::kv::delete(&db, "provider/claude", "usage")
+            .await
+            .unwrap()
+    );
+
+    let again = first + chrono::Duration::minutes(5);
+    assert!(!book.record(
+        "claude",
+        vec![window(WindowKind::Session, 0.4, reset, again)]
+    ));
+    book.flush().await;
+    assert!(!changes.has_changed().unwrap());
+    assert_eq!(read_usage(&db, "claude").await.unwrap(), None);
+    // Still known since the first reading.
+    let usage = book.get("claude").unwrap();
+    assert_eq!(usage.known_since, first);
+    assert_eq!(usage.windows[0].as_of, first);
+}
+
+#[tokio::test]
+async fn bad_usage_row_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    for bad in [
+        b"not json".to_vec(),
+        br#"{"provider": "claude", "windows": "none"}"#.to_vec(),
+        br#"{"provider": "claude", "known_since": "2026-11-17T12:00:00Z", "windows": [{"kind": "hourly", "as_of": "2026-11-17T12:00:00Z"}]}"#.to_vec(),
+        // A row naming another provider is not this one's.
+        br#"{"provider": "codex", "known_since": "2026-11-17T12:00:00Z", "windows": []}"#.to_vec(),
+    ] {
+        fronde_db::kv::set(&db, "provider/claude", "usage", bad.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(read_usage(&db, "claude").await.unwrap(), None);
+        let book = UsageBook::load(db.clone()).await;
+        assert_eq!(book.get("claude"), None);
+        // The book still records, and replaces the bad row.
+        assert!(book.record("claude", vec![window(WindowKind::Session, 0.2, hence(3), Utc::now())]));
+        book.flush().await;
+        assert_eq!(read_usage(&db, "claude").await.unwrap(), book.get("claude"));
+    }
 }

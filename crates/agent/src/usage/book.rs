@@ -1,38 +1,85 @@
-//! The latest usage reading per provider, in memory.
+//! The latest usage reading per provider, kept in `fronde.db`'s `kv` table (scope
+//! `provider/<id>`, key `usage`, the JSON of a [`ProviderUsage`], no expiry), beside the models
+//! cache.
 
+use crate::provider::Provider;
 use chrono::{DateTime, Utc};
 use fronde_protocol::usage::{ProviderUsage, Window};
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
+
+const KEY: &str = "usage";
+
+fn scope(provider: &str) -> String {
+    format!("provider/{provider}")
+}
 
 /// The latest windows read for each provider, from every agent process: a window replaces the
-/// one of its kind only when it is newer (see [`UsageBook::record`]).
+/// one of its kind only when it is newer (see [`UsageBook::record`]). Each change is written to
+/// the database by a task of the book's own, so that a slow write never holds an agent's
+/// messages; a failed write is logged, and the reading stays in memory.
 pub struct UsageBook {
     readings: Mutex<HashMap<String, ProviderUsage>>,
     changes: watch::Sender<u64>,
+    /// To the task that writes the readings; `None` for a book kept in memory only.
+    saves: Option<mpsc::UnboundedSender<Save>>,
+}
+
+enum Save {
+    Usage(ProviderUsage),
+    /// Answered once every reading sent before it is written.
+    Flush(oneshot::Sender<()>),
 }
 
 impl fmt::Debug for UsageBook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UsageBook")
             .field("providers", &lock(&self.readings).len())
+            .field("saved", &self.saves.is_some())
             .finish()
     }
 }
 
 impl UsageBook {
+    /// The book of `db`: the readings stored for each configured provider, and a task, on the
+    /// current Tokio runtime, that writes the changes back. A reading that cannot be read is
+    /// logged and left out: the book then starts without it.
+    pub async fn load(db: DatabaseConnection) -> Arc<Self> {
+        let mut readings = HashMap::new();
+        for provider in Provider::ALL {
+            match read_usage(&db, provider.id).await {
+                Ok(Some(usage)) => {
+                    readings.insert(provider.id.to_owned(), usage);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!("cannot read the usage of {}: {error:#}", provider.id);
+                }
+            }
+        }
+        let (saves, receiver) = mpsc::unbounded_channel();
+        tokio::spawn(save_loop(db, receiver));
+        Arc::new(Self {
+            readings: Mutex::new(readings),
+            changes: watch::Sender::new(0),
+            saves: Some(saves),
+        })
+    }
+
     /// A book that keeps its readings in memory only.
     pub fn in_memory() -> Arc<Self> {
         Arc::new(Self {
             readings: Mutex::default(),
             changes: watch::Sender::new(0),
+            saves: None,
         })
     }
 
-    /// Records the windows of one reading of `provider`; true when it changed the book, which
-    /// then moves [`UsageBook::changes`].
+    /// Records the windows of one reading of `provider`; true when it changed the book, which is
+    /// then saved and moves [`UsageBook::changes`].
     ///
     /// Per kind, a window replaces the one known when its `resets_at` is later, or the same and
     /// it was received later; one without `resets_at` replaces only one without. So readings
@@ -40,7 +87,7 @@ impl UsageBook {
     /// that says the same as the one known (its use, status and reset) changes nothing, and
     /// keeps the time it was first read.
     pub fn record(&self, provider: &str, windows: Vec<Window>) -> bool {
-        {
+        let saved = {
             let mut readings = lock(&self.readings);
             let mut changed = false;
             let mut latest: Option<DateTime<Utc>> = None;
@@ -68,9 +115,15 @@ impl UsageBook {
             if !changed {
                 return false;
             }
-        }
+            usage.clone()
+        };
         self.changes
             .send_modify(|count| *count = count.wrapping_add(1));
+        if let Some(saves) = &self.saves
+            && saves.send(Save::Usage(saved)).is_err()
+        {
+            tracing::warn!("cannot save the usage of {provider}: its writer has stopped");
+        }
         true
     }
 
@@ -91,6 +144,17 @@ impl UsageBook {
     pub fn changes(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
     }
+
+    /// Waits until every change recorded so far is written (or failed to be).
+    pub async fn flush(&self) {
+        let Some(saves) = &self.saves else {
+            return;
+        };
+        let (done, written) = oneshot::channel();
+        if saves.send(Save::Flush(done)).is_ok() {
+            let _ = written.await;
+        }
+    }
 }
 
 /// Puts `window` in `windows` when it is new or newer than the one of its kind; true if it was.
@@ -110,6 +174,61 @@ fn merge(windows: &mut Vec<Window>, window: Window) -> bool {
     }
     *known = window;
     true
+}
+
+/// The reading stored for `provider` in `db`; `None` when there is none, or when it does not
+/// read (logged). `fronde check` reads it from a read-only connection.
+pub async fn read_usage<C: ConnectionTrait>(
+    db: &C,
+    provider: &str,
+) -> anyhow::Result<Option<ProviderUsage>> {
+    let Some(value) = fronde_db::kv::get(db, &scope(provider), KEY).await? else {
+        return Ok(None);
+    };
+    match serde_json::from_slice::<ProviderUsage>(&value) {
+        Ok(usage) if usage.provider == provider => Ok(Some(usage)),
+        Ok(_) => {
+            tracing::warn!("ignored the stored usage of {provider}: it names another provider");
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::warn!("ignored the stored usage of {provider}: {error}");
+            Ok(None)
+        }
+    }
+}
+
+/// Writes the readings sent, the latest of each provider when several wait, until the book is
+/// dropped.
+async fn save_loop(db: DatabaseConnection, mut saves: mpsc::UnboundedReceiver<Save>) {
+    while let Some(first) = saves.recv().await {
+        let mut latest: HashMap<String, ProviderUsage> = HashMap::new();
+        let mut flushes = Vec::new();
+        let mut take = |save| match save {
+            Save::Usage(usage) => {
+                latest.insert(usage.provider.clone(), usage);
+            }
+            Save::Flush(done) => flushes.push(done),
+        };
+        take(first);
+        while let Ok(save) = saves.try_recv() {
+            take(save);
+        }
+        for usage in latest.into_values() {
+            if let Err(error) = save(&db, &usage).await {
+                tracing::warn!("cannot save the usage of {}: {error:#}", usage.provider);
+            }
+        }
+        for done in flushes {
+            let _ = done.send(());
+        }
+    }
+}
+
+async fn save(db: &DatabaseConnection, usage: &ProviderUsage) -> anyhow::Result<()> {
+    let value = serde_json::to_vec(usage)?;
+    fronde_db::kv::set(db, &scope(&usage.provider), KEY, value, None).await?;
+    Ok(())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

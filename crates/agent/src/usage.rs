@@ -11,7 +11,7 @@
 
 mod book;
 
-pub use book::UsageBook;
+pub use book::{UsageBook, read_usage};
 
 use crate::acp::AgentSpec;
 use agent_client_protocol::v1::schema::UsageUpdate;

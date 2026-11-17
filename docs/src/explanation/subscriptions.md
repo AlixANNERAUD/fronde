@@ -59,8 +59,8 @@ a mode switch: a new provider never inherits Claude's lists.
 
 A subscription has two usage windows: one of 5 hours and one of a week. Fronde reads how much
 of each is used from what the Claude adapter already sends during a turn, and keeps the latest
-reading per provider. It makes no request of its own for it: no call to an Anthropic endpoint, no
-`/usage` turn.
+reading per provider in `fronde.db`, so that it survives a restart. It makes no request of its
+own for it: no call to an Anthropic endpoint, no `/usage` turn.
 
 What the adapter sends:
 
@@ -95,8 +95,8 @@ reading that does not parse never fails a turn. The log names the fields it left
 whole `_meta`. Once a window's reset time has passed, it reads as reset since the reading. Codex
 and Antigravity send no reading Fronde reads yet.
 
-Keeping the readings across restarts, showing them in the chat and in `fronde check`, and
-keeping a share of each window for your own turns by pausing background work, are **planned**.
+Showing the windows in the chat and in `fronde check`, and keeping a share of each window for
+your own turns by pausing background work, are **planned**.
 
 ## Why MCP for the tools
 

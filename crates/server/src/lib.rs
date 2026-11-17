@@ -901,7 +901,7 @@ pub async fn start_with(
                 system_prompt: system_prompt(&user),
                 builtin_tools: agent.builtin_tools,
                 // The latest usage reading per provider, from every agent process.
-                usage: Some(fronde_agent::usage::UsageBook::in_memory()),
+                usage: Some(fronde_agent::usage::UsageBook::load(db.clone()).await),
             };
             // The one user so far is the owner, an admin.
             let owner = fronde_requests::User {

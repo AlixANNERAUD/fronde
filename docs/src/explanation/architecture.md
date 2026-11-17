@@ -98,7 +98,9 @@ The usage readings a turn brings (`usage_update`s with a rate limit, and a promp
 limit) go to the **usage book** instead (`crates/agent/src/usage`): one per server, shared by
 every agent process, it keeps the latest window of each kind per provider, a window replacing
 another only when its reset is later, or the same and it came later, so that readings from
-several processes end on the newest.
+several processes end on the newest. A change is written to the key-value table
+(`provider/<id>`, `usage`) by a task of the book's own, so that no write holds the agent's
+messages, and loaded at start.
 
 ## Threads
 
