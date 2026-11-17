@@ -35,6 +35,12 @@ fn loads_example() {
         std::path::Path::new("/keys/master.key")
     );
     assert!(c.web.is_some());
+    let accounts = c.accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(
+        (accounts[0].name.as_str(), accounts[0].owner.as_str()),
+        ("alix", "alix")
+    );
     assert_eq!(
         c.python.unwrap().dir,
         std::path::PathBuf::from("/app/python")
@@ -1223,6 +1229,267 @@ fn stored_upstream_token_is_for_url_servers_only() {
     let e = refused(&stdio);
     assert!(
         e.contains("a command has none") && e.contains("use { file = \"…\" }"),
+        "{e}"
+    );
+}
+
+/// `[accounts.<name>]`: a provider, an owner and a token, each token anchored and listed with
+/// the other secrets, so that its file is checked private and its variable kept from the agent.
+#[test]
+fn accounts_parse() {
+    use fronde_hub::config::AccountForm;
+    let c = load_str(&format!(
+        "{MIN}user = \"alix\"\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ stored = \"claude_alix\" }}\n"
+    ))
+    .unwrap();
+    let accounts = c.accounts();
+    assert_eq!(accounts.len(), 1);
+    let alix = &accounts[0];
+    assert_eq!(
+        (
+            alix.name.as_str(),
+            alix.provider.as_str(),
+            alix.owner.as_str()
+        ),
+        ("alix", "claude", "alix")
+    );
+    assert!(matches!(&alix.token, Some(Secret::Stored { stored }) if stored == "claude_alix"));
+    assert_eq!(alix.form, AccountForm::Declared);
+
+    let c = load_str(&format!(
+        "{MIN}user = \"alix\"\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ file = \"alix.token\" }}\n"
+    ))
+    .unwrap();
+    let base = c.path().unwrap().parent().unwrap().to_path_buf();
+    assert!(
+        matches!(&c.accounts()[0].token, Some(Secret::File { file }) if file == &base.join("alix.token"))
+    );
+    assert!(c.secret_files().contains(&base.join("alix.token")));
+    let c = load_str(&format!(
+        "{MIN}user = \"alix\"\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ env = \"ALIX_TOKEN\" }}\n"
+    ))
+    .unwrap();
+    assert!(c.secret_env_names().contains(&"ALIX_TOKEN".to_owned()));
+    // Never the token itself, a stored name checked, and no key but these.
+    for bad in [
+        "oauth_token = \"sk-ant-oat\"",
+        "oauth_token = { stored = \"no spaces\" }",
+        "oauth_token = { file = \"t\" }\nshared_with = [\"marie\"]",
+    ] {
+        let text = format!(
+            "{MIN}user = \"alix\"\n[accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n{bad}\n"
+        );
+        assert!(load_str(&text).is_err(), "{bad}");
+    }
+    let e = refused(&format!(
+        "{MIN}user = \"alix\"\n[accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n\
+         oauth_token = {{ file = \"t\" }}\nshared_with = [\"marie\"]\n"
+    ));
+    assert!(e.contains("shared_with"), "{e}");
+}
+
+/// An account's name is a plain identifier, as a tool's prefix is.
+#[test]
+fn account_name_is_checked() {
+    let e = refused(&format!(
+        "{MIN}[accounts.\"Alix\"]\nprovider = \"claude\"\nowner = \"me\"\noauth_token = {{ file = \"t\" }}\n"
+    ));
+    assert!(
+        e.contains("[accounts.\"Alix\"]") && e.contains("^[a-z][a-z0-9_]{0,63}$"),
+        "{e}"
+    );
+}
+
+/// Without `[accounts]`, `[agent] oauth_token` is the owner's one account, named `claude`.
+#[test]
+fn legacy_agent_token_is_the_owner_account() {
+    use fronde_hub::config::{AccountForm, LEGACY_ACCOUNT};
+    let mut c = load_str(&format!(
+        "{MIN}user = \"alix\"\n[agent]\noauth_token = {{ stored = \"claude\" }}\n"
+    ))
+    .unwrap();
+    // The file's token wins over an inherited variable.
+    c.set_inherited_sign_in(true);
+    let accounts = c.accounts();
+    assert_eq!(accounts.len(), 1);
+    let account = &accounts[0];
+    assert_eq!(LEGACY_ACCOUNT, "claude");
+    assert_eq!(
+        (
+            account.name.as_str(),
+            account.provider.as_str(),
+            account.owner.as_str()
+        ),
+        ("claude", "claude", "alix")
+    );
+    assert!(matches!(&account.token, Some(Secret::Stored { stored }) if stored == "claude"));
+    assert_eq!(account.form, AccountForm::AgentToken);
+
+    // With neither a token nor the variable, the owner's agent starts unsigned, as before.
+    let mut c = load_str(&format!("{MIN}user = \"alix\"\n")).unwrap();
+    c.set_inherited_sign_in(false);
+    let accounts = c.accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].owner, "alix");
+    assert!(accounts[0].token.is_none());
+    assert_eq!(accounts[0].form, AccountForm::Unsigned);
+}
+
+/// Without `[accounts]` nor `[agent] oauth_token`, `CLAUDE_CODE_OAUTH_TOKEN` in Fronde's
+/// environment (the Docker how-to) is the owner's account's token; it is not listed as a secret
+/// of the file, so the agent's environment is what it was.
+#[test]
+fn legacy_env_token_is_the_owner_account() {
+    use fronde_hub::config::AccountForm;
+    let mut c = load_str(&format!("{MIN}user = \"alix\"\n")).unwrap();
+    c.set_inherited_sign_in(true);
+    let accounts = c.accounts();
+    assert_eq!(accounts.len(), 1);
+    let account = &accounts[0];
+    assert_eq!(
+        (account.name.as_str(), account.owner.as_str()),
+        ("claude", "alix")
+    );
+    assert!(
+        matches!(&account.token, Some(Secret::Env { env }) if env == "CLAUDE_CODE_OAUTH_TOKEN")
+    );
+    assert_eq!(account.form, AccountForm::Inherited);
+    assert!(
+        !c.secret_env_names()
+            .contains(&"CLAUDE_CODE_OAUTH_TOKEN".to_owned())
+    );
+}
+
+#[test]
+fn agent_token_and_accounts_are_refused_together() {
+    let e = refused(&format!(
+        "{MIN}user = \"alix\"\n[agent]\noauth_token = {{ file = \"a\" }}\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ file = \"b\" }}\n"
+    ));
+    assert!(
+        e.contains("[agent] oauth_token and [accounts] are both set")
+            && e.contains("[accounts.<name>] oauth_token"),
+        "{e}"
+    );
+}
+
+#[test]
+fn unknown_provider_refused() {
+    let account = |provider: &str| {
+        refused(&format!(
+            "{MIN}[accounts.me]\nprovider = {provider:?}\nowner = \"me\"\noauth_token = {{ file = \"t\" }}\n"
+        ))
+    };
+    let e = account("mistral");
+    assert!(
+        e.contains("[accounts.me] provider = \"mistral\"") && e.contains("unknown provider"),
+        "{e}"
+    );
+    let e = account("codex");
+    assert!(
+        e.contains("Codex and Gemini/Antigravity are planned"),
+        "{e}"
+    );
+}
+
+#[test]
+fn owner_must_be_a_user() {
+    let e = refused(&format!(
+        "{MIN}user = \"alix\"\n\
+         [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\noauth_token = {{ file = \"t\" }}\n"
+    ));
+    assert!(
+        e.contains("[accounts.marie] owner = \"marie\" is not a user") && e.contains("alix"),
+        "{e}"
+    );
+}
+
+#[test]
+fn one_account_per_owner_and_provider() {
+    let e = refused(&format!(
+        "{MIN}user = \"alix\"\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ file = \"a\" }}\n\
+         [accounts.alix_pro]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ file = \"b\" }}\n"
+    ));
+    assert!(
+        e.contains("[accounts.alix] and [accounts.alix_pro] both belong to alix on claude")
+            && e.contains("one account per provider"),
+        "{e}"
+    );
+}
+
+/// Two accounts reading one token would sign two people in with it: refused, whether the
+/// token is stored, in a file (however its path is written) or in a variable.
+#[test]
+fn two_accounts_cannot_name_one_secret() {
+    for (a, b, place) in [
+        (
+            "{ stored = \"claude\" }",
+            "{ stored = \"claude\" }",
+            "the stored secret claude",
+        ),
+        (
+            "{ file = \"token\" }",
+            "{ file = \"./token\" }",
+            "the file ",
+        ),
+        (
+            "{ env = \"CLAUDE\" }",
+            "{ env = \"CLAUDE\" }",
+            "the environment variable CLAUDE",
+        ),
+    ] {
+        // The token is checked before the owner: the same refusal once two people exist.
+        let e = refused(&format!(
+            "{MIN}user = \"alix\"\n\
+             [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {a}\n\
+             [accounts.other]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {b}\n"
+        ));
+        assert!(
+            e.contains("[accounts.alix] and [accounts.other] both read their token from")
+                && e.contains(place)
+                && e.contains("never share one"),
+            "{e}"
+        );
+    }
+}
+
+/// `[agent] env` never sets a variable an agent signs in with, accounts or not.
+#[test]
+fn agent_env_cannot_set_a_sign_in_variable() {
+    for name in [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ] {
+        for rest in ["", "oauth_token = { file = \"t\" }\n"] {
+            let e = refused(&format!("{MIN}[agent]\n{rest}env = {{ {name} = \"x\" }}\n"));
+            assert!(
+                e.contains(&format!("[agent] env sets {name}"))
+                    && e.contains("oauth_token")
+                    && e.contains(&format!("remove {name} from env")),
+                "{e}"
+            );
+        }
+        let e = refused(&format!(
+            "{MIN}[agent]\nenv = {{ {name} = \"x\" }}\n\
+             [accounts.me]\nprovider = \"claude\"\nowner = \"me\"\noauth_token = {{ file = \"t\" }}\n"
+        ));
+        assert!(e.contains(&format!("[agent] env sets {name}")), "{e}");
+    }
+}
+
+/// Only the legacy form's account may lack a token.
+#[test]
+fn declared_account_needs_a_token() {
+    let e = refused(&format!(
+        "{MIN}[accounts.me]\nprovider = \"claude\"\nowner = \"me\"\n"
+    ));
+    assert!(
+        e.contains("[accounts.me] has no oauth_token") && e.contains("claude setup-token"),
         "{e}"
     );
 }

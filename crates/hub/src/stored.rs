@@ -37,6 +37,11 @@ impl StoredSecrets {
         self.key.as_ref().map(|key| key.backend())
     }
 
+    /// Whether a secret named `name` is stored, for any origin.
+    pub fn is_stored(&self, name: &str) -> bool {
+        self.sealed.iter().any(|s| s.name == name)
+    }
+
     /// The value of the secret `name`, which must have been stored for `origin`. A secret not
     /// stored yet, or stored for another origin, is [`Waiting`]: `fronde secret set` fixes it
     /// while Fronde runs.

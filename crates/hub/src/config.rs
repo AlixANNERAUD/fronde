@@ -32,9 +32,17 @@ pub struct Config {
     /// Where the master key of the stored secrets is kept.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// The provider accounts agents sign in with, by name. Left out, the legacy form stands for
+    /// one account: see [`Config::accounts`].
+    #[serde(default)]
+    pub accounts: BTreeMap<String, AccountConfig>,
     /// The file this configuration was read from, absolute; [`load`] sets it.
     #[serde(skip)]
     path: Option<PathBuf>,
+    /// Whether Fronde's environment held `CLAUDE_CODE_OAUTH_TOKEN` when [`load`] read the file:
+    /// the legacy form's owner account then reads it.
+    #[serde(skip)]
+    inherited_sign_in: bool,
 }
 
 impl Config {
@@ -85,11 +93,61 @@ impl Config {
                     .collect(),
             }
         });
+        // The legacy form's inherited variable is not listed: the file does not name it, and the
+        // agent's environment keeps it from Fronde's.
+        let accounts = self
+            .accounts
+            .values()
+            .filter_map(|account| account.oauth_token.as_ref());
         std::iter::once(&self.server.token)
             .chain(self.web.as_ref().map(|web| &web.password))
             .chain(self.secrets.master_key.as_ref())
             .chain(self.agent.oauth_token.as_ref())
+            .chain(accounts)
             .chain(sources)
+    }
+
+    /// The names of the people who sign in: `[data] user`, the one user so far.
+    pub fn user_names(&self) -> Vec<String> {
+        vec![self.data.user.clone()]
+    }
+
+    /// The provider accounts agents sign in with: the `[accounts]` declared, or else the one
+    /// account the legacy form stands for, named [`LEGACY_ACCOUNT`], on Claude, owned by
+    /// `[data] user` and reading `[agent] oauth_token`, else `CLAUDE_CODE_OAUTH_TOKEN` when
+    /// Fronde's environment held it at load, else no token (the agent starts unsigned). Only
+    /// that implicit account may lack a token. The file is never rewritten.
+    pub fn accounts(&self) -> Vec<Account> {
+        if !self.accounts.is_empty() {
+            return self
+                .accounts
+                .iter()
+                .map(|(name, account)| Account {
+                    name: name.clone(),
+                    provider: account.provider.clone(),
+                    owner: account.owner.clone(),
+                    token: account.oauth_token.clone(),
+                    form: AccountForm::Declared,
+                })
+                .collect();
+        }
+        let (token, form) = match &self.agent.oauth_token {
+            Some(token) => (Some(token.clone()), AccountForm::AgentToken),
+            None if self.inherited_sign_in => (
+                Some(Secret::Env {
+                    env: INHERITED_SIGN_IN.to_owned(),
+                }),
+                AccountForm::Inherited,
+            ),
+            None => (None, AccountForm::Unsigned),
+        };
+        vec![Account {
+            name: LEGACY_ACCOUNT.to_owned(),
+            provider: "claude".to_owned(),
+            owner: self.data.user.clone(),
+            token,
+            form,
+        }]
     }
 
     /// The master key file, which [`load`] always sets: `[secrets] master_key`, or `master.key`
@@ -126,6 +184,74 @@ impl Config {
             self.secrets.credentials_dir.clone(),
             keychain,
         ))
+    }
+}
+
+/// Test hooks, behind the `testing` feature that only dev-dependencies enable.
+#[cfg(feature = "testing")]
+impl Config {
+    /// Read the legacy form as if Fronde's environment held `CLAUDE_CODE_OAUTH_TOKEN`, or not.
+    pub fn set_inherited_sign_in(&mut self, inherited: bool) {
+        self.inherited_sign_in = inherited;
+    }
+}
+
+/// `[accounts.<name>]`: a subscription of one provider, whose owner's agents sign in with it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfig {
+    /// One of [`PROVIDERS`].
+    pub provider: String,
+    /// The user whose threads run on it.
+    pub owner: String,
+    /// The token `claude setup-token` printed; a stored one is stored for [`CLAUDE_ORIGIN`].
+    /// Required: an `Option` only so that its absence is refused with how to fix it.
+    pub oauth_token: Option<Secret>,
+}
+
+/// The name of the one account the legacy form stands for.
+pub const LEGACY_ACCOUNT: &str = "claude";
+
+/// The variable the legacy form's account reads when Fronde inherits it (the Docker how-to).
+pub const INHERITED_SIGN_IN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// A provider account, as [`Config::accounts`] reads it.
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub name: String,
+    pub provider: String,
+    /// The user it belongs to.
+    pub owner: String,
+    /// Where its token comes from; `None` only for the legacy form without a token.
+    pub token: Option<Secret>,
+    /// Which part of the file it was read from.
+    pub form: AccountForm,
+}
+
+/// Where an [`Account`] was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountForm {
+    /// An `[accounts.<name>]` section.
+    Declared,
+    /// The legacy form's `[agent] oauth_token`.
+    AgentToken,
+    /// The legacy form, with `CLAUDE_CODE_OAUTH_TOKEN` in Fronde's environment.
+    Inherited,
+    /// The legacy form without a token: the agent starts unsigned.
+    Unsigned,
+}
+
+/// The variables a provider's agent signs in with, which `[agent] env` never sets: only an
+/// account's token signs an agent in. `fronde_agent::provider::Provider::sign_in_vars` lists the
+/// same, which a test of the server pins.
+pub fn sign_in_vars(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "claude" => &[
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+        ],
+        _ => &[],
     }
 }
 
@@ -746,7 +872,7 @@ pub struct BasicCredential {
 }
 
 /// A secret is never written in the TOML: it points to a file, an environment variable, or, in a
-/// component's credentials, a URL upstream server's token and the agent's `oauth_token` only, a
+/// component's credentials, a URL upstream server's token and an account's `oauth_token` only, a
 /// secret stored encrypted in `fronde.db`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
@@ -998,6 +1124,17 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
     }
     check_sources(&config.sources)?;
     for name in config.agent.env.keys() {
+        if let Some(provider) = PROVIDERS
+            .into_iter()
+            .find(|provider| sign_in_vars(provider).contains(&name.as_str()))
+        {
+            bail!(
+                "[agent] env sets {name}, which signs {provider}'s agent in: Fronde gives each \
+                 agent its own account's token and nothing else; name the token in \
+                 [accounts.<name>] oauth_token (or the legacy [agent] oauth_token), never in \
+                 fronde.toml, and remove {name} from env"
+            );
+        }
         if reserved_agent_variable(name) {
             bail!(
                 "[agent] env: {name} cannot be set here: Fronde gives the agent its own HOME and \
@@ -1014,13 +1151,11 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
         if let Secret::Stored { stored } = token {
             fronde_db::secrets::check_name(stored).context("[agent] oauth_token")?;
         }
-        if config.agent.env.contains_key("CLAUDE_CODE_OAUTH_TOKEN") {
-            bail!(
-                "[agent] env sets CLAUDE_CODE_OAUTH_TOKEN and [agent] oauth_token gives it too; \
-                 keep oauth_token, and never write the token in fronde.toml"
-            );
-        }
     }
+    check_accounts(&mut config, base)?;
+    // Read once, here: `Config::accounts` stays pure.
+    config.inherited_sign_in =
+        std::env::var_os(INHERITED_SIGN_IN).is_some_and(|value| !value.is_empty());
     for tool in &config.agent.builtin_tools {
         if !SAFE_BUILTIN_TOOLS.contains(&tool.as_str()) {
             bail!(
@@ -1029,6 +1164,75 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
         }
     }
     Ok(config)
+}
+
+/// The rules of `[accounts]`, each refusal naming its key; anchors the tokens' files.
+fn check_accounts(config: &mut Config, base: &Path) -> anyhow::Result<()> {
+    if config.accounts.is_empty() {
+        return Ok(());
+    }
+    if config.agent.oauth_token.is_some() {
+        bail!(
+            "[agent] oauth_token and [accounts] are both set: move the token to the oauth_token \
+             of its owner's account, [accounts.<name>] oauth_token, and remove it from [agent]"
+        );
+    }
+    let users = config.user_names();
+    // (owner, provider) -> account, and each token's place -> account.
+    let mut owned: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    let mut tokens: BTreeMap<String, &str> = BTreeMap::new();
+    for account in config.accounts.values_mut() {
+        if let Some(token) = &mut account.oauth_token {
+            token.anchor(base);
+        }
+    }
+    for (name, account) in &config.accounts {
+        if !is_valid_name(name) {
+            bail!("[accounts.{name:?}]: an account's name must match ^[a-z][a-z0-9_]{{0,63}}$");
+        }
+        check_provider(&account.provider)
+            .with_context(|| format!("[accounts.{name}] provider = {:?}", account.provider))?;
+        let owner = &account.owner;
+        if !users.iter().any(|user| user == owner) {
+            bail!(
+                "[accounts.{name}] owner = {owner:?} is not a user; name one of: {}",
+                users.join(", ")
+            );
+        }
+        let Some(token) = &account.oauth_token else {
+            bail!(
+                "[accounts.{name}] has no oauth_token: set oauth_token = {{ stored = \"…\" }}, \
+                 {{ file = \"…\" }} or {{ env = \"…\" }}, the token `claude setup-token` prints"
+            );
+        };
+        let place = match token {
+            Secret::Stored { stored } => {
+                fronde_db::secrets::check_name(stored)
+                    .with_context(|| format!("[accounts.{name}] oauth_token"))?;
+                format!("the stored secret {stored}")
+            }
+            Secret::File { file } => format!(
+                "the file {}",
+                file.components().collect::<PathBuf>().display()
+            ),
+            Secret::Env { env } => format!("the environment variable {env}"),
+        };
+        if let Some(other) = tokens.insert(place.clone(), name) {
+            bail!(
+                "[accounts.{other}] and [accounts.{name}] both read their token from {place}: \
+                 one token would sign both in, so two accounts never share one; give each \
+                 account its own"
+            );
+        }
+        if let Some(other) = owned.insert((owner, &account.provider), name) {
+            bail!(
+                "[accounts.{other}] and [accounts.{name}] both belong to {owner} on {}: a person \
+                 has one account per provider; remove one",
+                account.provider
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `[calendar]` and `[[mcp]]` became `[[sources]]` entries: say how, rather than "unknown field".

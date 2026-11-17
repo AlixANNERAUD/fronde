@@ -33,6 +33,9 @@ pub struct Provider {
     pub mode_after_open: Option<&'static str>,
     /// The variable the provider reads its sign-in token from: where `[agent] oauth_token` goes.
     pub sign_in_env: Option<&'static str>,
+    /// Every variable its agent may sign in with, `sign_in_env` included: `[agent] env` never
+    /// sets them (`fronde_hub::config::sign_in_vars` lists the same).
+    pub sign_in_vars: &'static [&'static str],
     /// Which permission options a card may offer.
     pub permissions: PermissionRules,
     /// What the sandbox grants for the provider's program to run.
@@ -151,6 +154,11 @@ impl Provider {
         // The Claude Code adapter starts sessions in `auto`; `default` asks before acting.
         mode_after_open: Some("default"),
         sign_in_env: Some("CLAUDE_CODE_OAUTH_TOKEN"),
+        sign_in_vars: &[
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+        ],
         permissions: PermissionRules {
             mode_switch_prefix: Some(CLAUDE_EXIT_PLAN),
             mode_switch_options: CLAUDE_MODE_SWITCH_OPTIONS,
@@ -170,6 +178,7 @@ impl Provider {
             session_meta: SessionMeta::None,
             mode_after_open: None,
             sign_in_env: None,
+            sign_in_vars: &[],
             permissions: PermissionRules::NONE,
             install: Install::Directory,
             usage: UsageSource::None,

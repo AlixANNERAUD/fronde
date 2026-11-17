@@ -380,13 +380,24 @@ async fn the_agent_token_is_read_at_each_start() {
     fronde_hub::private::prepare_data_dir(&config.data.dir).unwrap();
     let db = fronde_db::open(&config.data.dir).await.unwrap();
     let backends = config.master_key_backends().unwrap();
-    let read = |secret: Secret| fronde::agent_oauth_token(secret, db.clone(), backends.clone());
+    let read =
+        |secret: Secret| fronde::account_token("alix".into(), secret, db.clone(), backends.clone());
 
     // Stored for Claude's API: opened with the master key, again at each start.
     let stored = read(Secret::Stored {
         stored: "claude".into(),
     });
-    let missing = stored().await.unwrap_err().to_string();
+    // Not stored yet: the account is not connected, an error of its own.
+    let missing = stored().await.unwrap_err();
+    assert_eq!(
+        missing.downcast_ref::<fronde_agent::acp::SignInMissing>(),
+        Some(&fronde_agent::acp::SignInMissing {
+            account: "alix".into(),
+            stored: "claude".into(),
+            origin: CLAUDE_ORIGIN.into(),
+        })
+    );
+    let missing = missing.to_string();
     assert!(
         missing.contains("fronde secret set claude --origin"),
         "{missing}"

@@ -94,16 +94,8 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         writeln!(out, "agents: {}", crate::pool_line(config, scope.as_ref()))?;
         writeln!(out, "sub-agents: {}", crate::children_line(config))?;
         writeln!(out, "usage: {}", usage_check_line(config).await)?;
-        // A stored token is opened at each start of the agent, with the master key.
-        match &config.agent.oauth_token {
-            Some(fronde_hub::config::Secret::Stored { stored }) => {
-                writeln!(out, "agent token: the stored secret {stored}")?
-            }
-            Some(token) => {
-                token.resolve().context("[agent] oauth_token")?;
-                writeln!(out, "agent token: [agent] oauth_token, read")?
-            }
-            None => {}
+        for account in config.accounts() {
+            writeln!(out, "{}", account_line(config, &account, &checks.secrets)?)?;
         }
     }
     if let Some(python) = &config.python {
@@ -118,6 +110,65 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         )?;
     }
     Ok(())
+}
+
+/// One account's line: its provider and owner, where its token comes from and whether it reads,
+/// never its value. A stored token is opened as an upstream server's is, for Claude's API. A
+/// token that does not read fails the check, but for a stored one not stored yet of an account
+/// that is not the owner's: a warning, since its owner's agents are not started yet.
+fn account_line(
+    config: &Config,
+    account: &fronde_hub::config::Account,
+    stored: &fronde_wasm::StoredSecrets,
+) -> anyhow::Result<String> {
+    use fronde_hub::config::{AccountForm, CLAUDE_ORIGIN};
+    let name = &account.name;
+    let head = format!(
+        "account {name} ({}, owner {})",
+        account.provider, account.owner
+    );
+    let place = || format!("account {name}: oauth_token");
+    let legacy = match account.form {
+        AccountForm::Declared => "",
+        AccountForm::AgentToken => " ([agent] oauth_token, legacy form)",
+        AccountForm::Inherited | AccountForm::Unsigned => " (legacy form)",
+    };
+    let token = match &account.token {
+        None => {
+            return Ok(format!(
+                "{head}: no token: the agent starts unsigned{legacy}"
+            ));
+        }
+        Some(token) => token,
+    };
+    let source = match token {
+        Secret::Stored { stored: secret } => {
+            let origin = fronde_hub::origin::Origin::parse(CLAUDE_ORIGIN)?;
+            match stored.open(secret, &origin) {
+                Ok(value) => {
+                    crate::one_line(value).with_context(place)?;
+                    return Ok(format!(
+                        "{head}: stored secret {secret} opens, for {CLAUDE_ORIGIN}{legacy}"
+                    ));
+                }
+                Err(_) if !stored.is_stored(secret) && account.owner != config.data.user => {
+                    return Ok(format!(
+                        "{head}: warning: stored secret {secret} not stored yet: store it with \
+                         `fronde secret set {secret} --origin {CLAUDE_ORIGIN} --config <your \
+                         fronde.toml>`, the token on standard input"
+                    ));
+                }
+                Err(error) => return Err(error.context(place())),
+            }
+        }
+        Secret::File { file } => format!("the file {}", file.display()),
+        Secret::Env { env } if account.form == AccountForm::Inherited => {
+            format!("Fronde's environment, {env}")
+        }
+        Secret::Env { env } => format!("the environment variable {env}"),
+    };
+    crate::one_line(token.resolve().with_context(place)?).with_context(place)?;
+    Ok(format!("{head}: token from {source}, read{legacy}"))
 }
 
 /// [`crate::usage_line`] from the owner's readings stored in the database, opened read-only:

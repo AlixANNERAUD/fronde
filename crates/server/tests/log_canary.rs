@@ -24,6 +24,7 @@ const MCP_CANARY: &str = "canary-mcp-token-0123456789abcdef0123456789";
 const WEB_CANARY: &str = "canary-web-secret-4a5b6c7d";
 const SETUP_CANARY: &str = "canary-setup-secret-3b9d1e";
 const CONFIG_CANARY: &str = "canary-config-line-5e2f81";
+const ACCOUNT_CANARY: &str = "canary-account-token-8c1d4e";
 
 fn dist(file: &str) -> PathBuf {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -309,7 +310,8 @@ async fn log_canary_never_appears() {
 }
 
 /// The assistant's own `/mcp` token, made at each start and kept in memory, is never logged:
-/// not at start, not when the agent gets it, not when the assistant calls the hub with it.
+/// not at start, not when the agent gets it, not when the assistant calls the hub with it. Nor
+/// is the owner's account token, read at the agent's start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assistant_token_never_appears() {
     use fronde_agent::acp::{AgentClient, AgentSpec};
@@ -323,7 +325,9 @@ async fn assistant_token_never_appears() {
     let _serial = SERIAL.lock().await;
     let scanner = capture();
     *scanner.0.lock().unwrap() = Scan {
-        secrets: [MCP_CANARY, WEB_CANARY].map(String::from).to_vec(),
+        secrets: [MCP_CANARY, WEB_CANARY, ACCOUNT_CANARY]
+            .map(String::from)
+            .to_vec(),
         wanted: vec!["memory_search".to_string(), "user_ask".to_string()],
         keep: true,
         ..Scan::default()
@@ -332,18 +336,22 @@ async fn assistant_token_never_appears() {
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("mcp_token");
     let web_file = dir.path().join("web_pass");
+    let account_file = dir.path().join("account_token");
     fronde_hub::private::write(&token_file, MCP_CANARY).unwrap();
     fronde_hub::private::write(&web_file, WEB_CANARY).unwrap();
+    fronde_hub::private::write(&account_file, ACCOUNT_CANARY).unwrap();
     let config: Config = toml::from_str(&format!(
         "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n\
          [data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
          [memory]\ngit = false\n\
          [secrets]\nmaster_key = {{ file = {:?} }}\n\
-         [web]\npassword = {{ file = {:?} }}\n",
+         [web]\npassword = {{ file = {:?} }}\n\
+         [accounts.me]\nprovider = \"claude\"\nowner = \"me\"\noauth_token = {{ file = {:?} }}\n",
         token_file.display().to_string(),
         dir.path().join("data").display().to_string(),
         dir.path().join("master.key").display().to_string(),
         web_file.display().to_string(),
+        account_file.display().to_string(),
     ))
     .unwrap();
     // The fake agent holds its turn open, so the assistant's calls belong to it.
@@ -354,12 +362,22 @@ async fn assistant_token_never_appears() {
         ..FakeScript::default()
     };
     let seen: Arc<Mutex<Option<AgentSpec>>> = Arc::default();
+    let account_token: Arc<Mutex<Option<String>>> = Arc::default();
     let connector: Connector = Arc::new({
-        let seen = seen.clone();
+        let (seen, account_token) = (seen.clone(), account_token.clone());
         move |spec: &AgentSpec, resume, events| {
             *seen.lock().unwrap() = Some(spec.clone());
             let (spec, script) = (spec.clone(), script.clone());
+            let account_token = account_token.clone();
             Box::pin(async move {
+                // The account's token is read as a real start reads it.
+                let read = spec
+                    .oauth_token
+                    .as_ref()
+                    .expect("the owner's account token");
+                let token = read().await?;
+                *account_token.lock().unwrap() =
+                    Some(secrecy::ExposeSecret::expose_secret(&token).to_owned());
                 let (transport, _handle) = fake_agent(script);
                 AgentClient::connect(transport, &spec, resume, events).await
             })
@@ -456,6 +474,11 @@ async fn assistant_token_never_appears() {
     drop(client);
     server.abort();
 
+    assert_eq!(
+        account_token.lock().unwrap().as_deref(),
+        Some(ACCOUNT_CANARY),
+        "the agent's start read the owner's account token"
+    );
     let scan = std::mem::take(&mut *scanner.0.lock().unwrap());
     assert!(scan.lines > 0, "nothing was captured");
     assert!(scan.leaked.is_empty(), "{:#?}", scan.leaked);

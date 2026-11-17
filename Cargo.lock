@@ -2578,6 +2578,7 @@ dependencies = [
  "etcetera",
  "fronde-db",
  "fronde-fs",
+ "fronde-hub",
  "fronde-protocol",
  "fronde-requests",
  "http",

@@ -847,19 +847,22 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
     })
 }
 
-/// `[agent] oauth_token`, read at each start of the agent: a file or a variable as any secret,
-/// or a secret stored for Claude's API, opened with the master key.
-pub fn agent_oauth_token(
+/// The token of the account `account`, read at each start of the agent: a file or a variable as
+/// any secret, or a secret stored for Claude's API, opened with the master key. A stored one
+/// that is not stored yet fails with [`fronde_agent::acp::SignInMissing`].
+pub fn account_token(
+    account: String,
     token: fronde_hub::config::Secret,
     db: fronde_db::DatabaseConnection,
     backends: fronde_db::master_key::Backends,
 ) -> fronde_agent::acp::OauthToken {
     fronde_agent::acp::oauth_token(move || {
-        let (token, db, backends) = (token.clone(), db.clone(), backends.clone());
+        let (account, token, db, backends) =
+            (account.clone(), token.clone(), db.clone(), backends.clone());
         async move {
             let token = match token {
                 fronde_hub::config::Secret::Stored { stored } => {
-                    open_claude_token(&stored, &db, &backends).await
+                    open_claude_token(&account, &stored, &db, &backends).await
                 }
                 token => token.resolve(),
             }?;
@@ -870,7 +873,7 @@ pub fn agent_oauth_token(
 
 /// A sign-in token is one word: a space or line break inside (a token pasted across the
 /// terminal's wrapped lines) would reach Claude's API as an invalid bearer token.
-fn one_line(token: SecretString) -> anyhow::Result<SecretString> {
+pub(crate) fn one_line(token: SecretString) -> anyhow::Result<SecretString> {
     let text = token.expose_secret();
     if text.is_empty() || text.chars().any(|c| c.is_whitespace() || c.is_control()) {
         anyhow::bail!(
@@ -882,6 +885,7 @@ fn one_line(token: SecretString) -> anyhow::Result<SecretString> {
 }
 
 async fn open_claude_token(
+    account: &str,
     name: &str,
     db: &fronde_db::DatabaseConnection,
     backends: &fronde_db::master_key::Backends,
@@ -893,7 +897,12 @@ async fn open_claude_token(
     );
     let sealed = fronde_db::secrets::load_sealed(db, fronde_db::secrets::SOURCES).await?;
     let Some(sealed) = sealed.into_iter().find(|s| s.name == name) else {
-        anyhow::bail!("no secret named {name} is stored; {set}");
+        return Err(fronde_agent::acp::SignInMissing {
+            account: account.to_owned(),
+            stored: name.to_owned(),
+            origin: CLAUDE_ORIGIN.to_owned(),
+        }
+        .into());
     };
     if sealed.origin != CLAUDE_ORIGIN {
         anyhow::bail!(
@@ -957,6 +966,16 @@ pub async fn start_signed_in_as(
     let user = config.data.user.clone();
     let timezone = config.data.timezone;
     let agent = config.agent.clone();
+    // The owner's Claude account signs the agents in, as the one token did: every thread is the
+    // owner's so far. The legacy form's inherited variable is left to the agent's environment,
+    // as before accounts. The configuration is read once per run: a future reload must restart
+    // the agents of every person whose account changed.
+    let owner_token = config
+        .accounts()
+        .into_iter()
+        .find(|account| account.owner == config.data.user && account.provider == "claude")
+        .filter(|account| account.form != fronde_hub::config::AccountForm::Inherited)
+        .and_then(|account| Some((account.name, account.token?)));
     let budget = budget(&config);
     warn_if_keychain_off();
     let backends = config.master_key_backends()?;
@@ -1023,9 +1042,9 @@ pub async fn start_signed_in_as(
                 home: main.home,
                 hub_url: format!("http://{}/mcp", reachable(addr)),
                 hub_token: SecretString::from(String::new()),
-                oauth_token: agent
-                    .oauth_token
-                    .map(|token| agent_oauth_token(token, db.clone(), backends.clone())),
+                oauth_token: owner_token.map(|(account, token)| {
+                    account_token(account, token, db.clone(), backends.clone())
+                }),
                 system_prompt: system_prompt(&user),
                 builtin_tools: agent.builtin_tools,
                 // The latest usage reading per account, from every agent process.
@@ -1140,6 +1159,22 @@ mod tests {
                 .to_string();
             assert!(e.contains("one line"), "{e}");
             assert!(!e.contains("abc") && !e.contains("bc\""), "{e}");
+        }
+    }
+
+    /// `[agent] env` refuses exactly the variables each provider signs its agent in with.
+    #[test]
+    fn sign_in_variables_agree() {
+        for provider in fronde_agent::provider::Provider::ALL {
+            assert_eq!(
+                fronde_hub::config::sign_in_vars(provider.id),
+                provider.sign_in_vars,
+                "{}",
+                provider.id
+            );
+            if let Some(var) = provider.sign_in_env {
+                assert!(provider.sign_in_vars.contains(&var), "{var}");
+            }
         }
     }
 

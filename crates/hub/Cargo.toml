@@ -7,8 +7,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-# Test hooks: a fake keychain and a credentials directory in `SecretsConfig`; only
-# dev-dependencies turn it on.
+# Test hooks: a fake keychain and a credentials directory in `SecretsConfig`, the inherited
+# sign-in variable in `Config`; only dev-dependencies turn it on.
 testing = []
 
 [dependencies]
@@ -41,6 +41,7 @@ etcetera.workspace = true
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
+fronde-hub = { path = ".", features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 # In-process servers that ask Fronde to fill a form.
 rmcp = { workspace = true, features = ["elicitation"] }

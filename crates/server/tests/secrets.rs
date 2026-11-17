@@ -256,6 +256,7 @@ fn no_secret_in_debug() {
     let caldav_canary = "canary-caldav-password-1e2f3a4b";
     let bearer_canary = "canary-bearer-token-7c8d9e0f";
     let agent_canary = "canary-agent-hub-token-3b4c5d6e";
+    let account_canary = "canary-account-token-6f7a8b9c";
 
     let token_file = dir.path().join("mcp_token");
     let web_file = dir.path().join("web_pass");
@@ -265,6 +266,8 @@ fn no_secret_in_debug() {
     fronde_hub::private::write(&web_file, web_canary).unwrap();
     fronde_hub::private::write(&upstream_file, upstream_canary).unwrap();
     fronde_hub::private::write(&caldav_file, caldav_canary).unwrap();
+    let account_file = dir.path().join("account_tok");
+    fronde_hub::private::write(&account_file, account_canary).unwrap();
 
     let wasm = dist("calendar.wasm");
     let manifest = dist("calendar.toml");
@@ -277,7 +280,8 @@ fn no_secret_in_debug() {
          allow = [\"https://cloud.example\"]\n\
          [sources.settings]\nevents_url = \"https://cloud.example/e/\"\nreminders_url = \"https://cloud.example/r/\"\n\
          [[sources.credentials]]\norigin = \"https://cloud.example\"\n\
-         basic = {{ username = \"alix\", password = {{ file = {:?} }} }}\n",
+         basic = {{ username = \"alix\", password = {{ file = {:?} }} }}\n\
+         [accounts.me]\nprovider = \"claude\"\nowner = \"me\"\noauth_token = {{ file = {:?} }}\n",
         token_file.display().to_string(),
         dir.path().join("data").display().to_string(),
         web_file.display().to_string(),
@@ -285,6 +289,7 @@ fn no_secret_in_debug() {
         wasm.display().to_string(),
         manifest.display().to_string(),
         caldav_file.display().to_string(),
+        account_file.display().to_string(),
     );
     let config_path = dir.path().join("fronde.toml");
     std::fs::write(&config_path, &toml).unwrap();
@@ -332,6 +337,7 @@ fn no_secret_in_debug() {
         caldav_canary,
         bearer_canary,
         agent_canary,
+        account_canary,
     ];
     let formatted = [
         ("Config compact", format!("{config:?}")),

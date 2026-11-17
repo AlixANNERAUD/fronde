@@ -21,11 +21,11 @@ A secret is never written in the file. It is one of:
 | --- | --- |
 | `{ file = "/run/secrets/name" }` | The file's content, without its trailing line breaks. A relative path is read from the directory of the configuration file, not from Fronde's working directory. |
 | `{ env = "NAME" }` | The value of the environment variable `NAME`. |
-| `{ stored = "name" }` | The secret stored under `name` by `fronde secret set`, encrypted in `fronde.db` (see [Store a secret](../how-to/store-a-secret.md)). Only in a component's `[[sources.credentials]]`, the `token` of a `kind = "mcp"` entry with a `url`, and `[agent] oauth_token`, and only for the origin it was stored for. |
+| `{ stored = "name" }` | The secret stored under `name` by `fronde secret set`, encrypted in `fronde.db` (see [Store a secret](../how-to/store-a-secret.md)). Only in a component's `[[sources.credentials]]`, the `token` of a `kind = "mcp"` entry with a `url`, an account's `oauth_token` (and the legacy `[agent] oauth_token`), and only for the origin it was stored for. |
 
 The settings below marked *secret* take one of these forms, except `{ stored = "…" }`, which only
-a component's credential, the `token` of an upstream server reached by `url` and `[agent]
-oauth_token` take: `server.token` and `web.password` refuse it, saying to use `{ file = "…" }` or
+a component's credential, the `token` of an upstream server reached by `url` and an account's
+`oauth_token` take: `server.token` and `web.password` refuse it, saying to use `{ file = "…" }` or
 `{ env = "…" }`, and so does the `token` of a server run as a `command`, which has no origin to
 bind it to.
 
@@ -282,6 +282,48 @@ only the hub: `/health` and `/mcp`.
 | `password` | secret | required | The chat's password. Must not be empty. |
 | `secure_cookie` | boolean | `false` | Mark the session cookie `Secure`. Set it to `true` when the page is served over https. |
 
+## `[accounts.<name>]`
+
+Optional. The provider subscriptions the agents sign in with, one section per account. An
+account belongs to one person, its `owner`, and is where that is written, once: the threads of
+its owner run on it (an account per person, and each thread signing in with its owner's, is
+**planned**; until then every thread is the owner's, and runs on the owner's account).
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `provider` | string | required | The provider the subscription is for: `"claude"`, the only one configured. Codex and Gemini/Antigravity are refused as planned. |
+| `owner` | string | required | The person it belongs to: `[data] user`, the one user so far. |
+| `oauth_token` | secret | required | The token `claude setup-token` prints, run in the owner's own home and signed in with the owner's own Claude account: `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`), `{ file = "…" }` or `{ env = "…" }`. Fronde reads it at each start of the owner's agents and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through their environment only. |
+
+The name matches `^[a-z][a-z0-9_]{0,63}$`. Fronde refuses, naming the keys:
+
+- an `owner` who is not a user, or two accounts of one owner on one provider: a person has one
+  account per provider;
+- two accounts reading one token: the same stored secret, the same file (however its path is
+  written) or the same variable, since one token would then sign both in;
+- an account without `oauth_token`;
+- `[agent] oauth_token` with `[accounts]`: move the token to the owner's account.
+
+```toml
+[data]
+user = "alix"
+
+[accounts.alix]
+provider = "claude"
+owner = "alix"
+oauth_token = { stored = "claude_alix" }
+```
+
+### The legacy form
+
+A file without `[accounts]` keeps working, and is never rewritten: Fronde reads it as one account,
+named `claude`, on Claude, owned by `[data] user`, whose token is `[agent] oauth_token`; without
+it, `CLAUDE_CODE_OAUTH_TOKEN` when Fronde's own environment holds it (the
+[Docker](../how-to/run-in-docker.md) set-up), left to the agent's environment as before; without
+either, the agent starts unsigned and uses the sign-in kept in its home. Only this account may
+lack a token. `fronde check` says which it read (see
+[Command line](command-line.md#fronde-check)).
+
 ## `[agent]`
 
 Optional. The agent Fronde runs for the chat, over ACP on standard input and output. It is
@@ -295,10 +337,10 @@ Codex and Gemini/Antigravity are planned".
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `command` | array of strings | `["claude-agent-acp"]` | Program and arguments. A bare name is looked up on the `PATH`, which does not include `agent/node_modules/.bin` outside `mise exec`: use the adapter's full path (`fronde init` writes it when it finds it). `fronde check` warns when the program is not found. |
-| `env` | table of strings | `{}` | Extra environment variables, in plain text: never a secret. The agent does not inherit Fronde's environment: it gets `PATH`, the locale (`LANG`, `LANGUAGE`, `LC_*`), `TZ`, `CLAUDE_*`, `ANTHROPIC_*`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in either case) and CA variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) when set, these, and `HOME` and `TMPDIR`, which Fronde sets to its own home (see [Data directory](data-directory.md)). Never a `{ env = "…" }` secret's variable, even one whose name matches. `HOME`, `TMPDIR`, `CREDENTIALS_DIRECTORY`, `XDG_*` and `DBUS_*` cannot be set here. |
+| `env` | table of strings | `{}` | Extra environment variables, in plain text: never a secret. The agent does not inherit Fronde's environment: it gets `PATH`, the locale (`LANG`, `LANGUAGE`, `LC_*`), `TZ`, `CLAUDE_*`, `ANTHROPIC_*`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in either case) and CA variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) when set, these, and `HOME` and `TMPDIR`, which Fronde sets to its own home (see [Data directory](data-directory.md)). Never a `{ env = "…" }` secret's variable, even one whose name matches. `HOME`, `TMPDIR`, `CREDENTIALS_DIRECTORY`, `XDG_*` and `DBUS_*` cannot be set here, nor the variables an agent signs in with (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`): only an account's `oauth_token` signs an agent in. |
 | `sandbox` | boolean | `true` | Confine the agent with Landlock and seccomp (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)). On a kernel that cannot (no Landlock, or ABI 1 or 2, before Linux 6.2), the agent does not start. `false` runs it unconfined, with access to everything your user can read and write, and Fronde logs a warning at every start. |
 | `read` | array of paths | `[]` | More directories the confined agent may read and run programs from, besides the system's, its `PATH` and the adapter's install. A relative path is read from the configuration file's directory. One that equals or contains the data directory, the configuration's directory, a secret file or systemd's credentials is an error. Use it for a Claude Code installed elsewhere (`CLAUDE_CODE_EXECUTABLE`) or a Node.js outside the `PATH`. |
-| `oauth_token` | secret | none | The agent's Claude sign-in: the token `claude setup-token` prints, as `{ file = "…" }`, `{ env = "…" }` or `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`). Fronde reads it at each start of the agent and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through its environment only. `[agent] env` may not set `CLAUDE_CODE_OAUTH_TOKEN` as well. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
+| `oauth_token` | secret | none | The legacy form of the owner's account (see [The legacy form](#the-legacy-form)): the token `claude setup-token` prints, as `{ file = "…" }`, `{ env = "…" }` or `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`). Fronde reads it at each start of the agent and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through its environment only. Refused with `[accounts]`. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
 | `builtin_tools` | array of strings | `["WebSearch", "WebFetch"]` | Claude Code's own tools the agent may use besides the hub's. Only `WebSearch` and `WebFetch` are allowed; `[]` for none. `AskUserQuestion` is always on, never allowed up front: it asks you through a card. |
 
 There is no setting for the model: each thread runs on the agent's default unless it was given
@@ -395,4 +437,4 @@ wakes_without_owner = 10
 | `FRONDE_SITE_ROOT` | Directory of the built web interface. Default `target/dx/fronde-web/release/web/public`, relative to the working directory. |
 | `RUST_LOG` | Log filter, such as `debug` or `fronde_hub=debug`. Default `info`. The WebSocket library's targets (`tungstenite`, `tokio_tungstenite`) stay off whatever it says: they would log the chat's messages, secrets typed in a card included. |
 | `FRONDE_KEYCHAIN` | `off` makes the platform's keychain absent, for tests and development (see [`[secrets]`](#secrets-1)); Fronde warns at start while it is set. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Read by the agent, not by Fronde: the token from `claude setup-token`, kept from Fronde's environment when `[agent] oauth_token` is not set. Prefer `oauth_token`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | The token from `claude setup-token`, kept from Fronde's environment for the agent when the file has neither `[accounts]` nor `[agent] oauth_token`: the legacy form's account (see [The legacy form](#the-legacy-form)). Prefer naming it, as `oauth_token = { env = "CLAUDE_CODE_OAUTH_TOKEN" }` in the owner's account. |

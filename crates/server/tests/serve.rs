@@ -1300,3 +1300,140 @@ async fn check_says_when_usage_cannot_be_read() {
     assert!(line.contains("does not read"), "{line}");
     assert_eq!(changed_files(&data, &before), Vec::<String>::new());
 }
+
+/// `fronde check` with `fronde.toml` holding `text`, Fronde's environment holding
+/// `CLAUDE_CODE_OAUTH_TOKEN = inherited` or not: its exit code and everything it printed.
+fn check_with(
+    path: &std::path::Path,
+    text: &str,
+    inherited: Option<&str>,
+) -> (Option<i32>, String) {
+    std::fs::write(path, text).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"));
+    command.args(["check", "--config"]).arg(path);
+    match inherited {
+        Some(value) => command.env("CLAUDE_CODE_OAUTH_TOKEN", value),
+        None => command.env_remove("CLAUDE_CODE_OAUTH_TOKEN"),
+    };
+    let out = command.output().unwrap();
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// `fronde check` prints one line per account: its provider and owner, where its token comes
+/// from and whether it reads; never the token. The legacy form is read as one account.
+#[tokio::test]
+async fn check_reports_each_account() {
+    const ALIX: &str = "token-of-alix";
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    let legacy = std::fs::read_to_string(&path).unwrap();
+
+    // The legacy form without a token, then with the Docker how-to's variable.
+    let (code, shown) = check_with(&path, &legacy, None);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(
+            "account claude (claude, owner me): no token: the agent starts unsigned (legacy form)"
+        ),
+        "{shown}"
+    );
+    let (code, shown) = check_with(&path, &legacy, Some(ALIX));
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(
+            "account claude (claude, owner me): token from Fronde's environment, \
+             CLAUDE_CODE_OAUTH_TOKEN, read (legacy form)"
+        ) && !shown.contains(ALIX),
+        "{shown}"
+    );
+
+    // The legacy `[agent] oauth_token`, a file.
+    let file = dir.path().join("claude-token");
+    fronde_hub::private::write(&file, format!("{ALIX}\n")).unwrap();
+    let (code, shown) = check_with(
+        &path,
+        &format!("{legacy}[agent]\noauth_token = {{ file = \"claude-token\" }}\n"),
+        Some("inherited-and-ignored"),
+    );
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(&format!(
+            "account claude (claude, owner me): token from the file {}, read ([agent] \
+             oauth_token, legacy form)",
+            file.display()
+        )) && !shown.contains(ALIX),
+        "{shown}"
+    );
+
+    // A declared account whose token is stored: missing, it fails the check, for the owner.
+    let declared = format!(
+        "{}[accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n\
+         oauth_token = {{ stored = \"claude_alix\" }}\n",
+        legacy.replace("[data]\n", "[data]\nuser = \"alix\"\n")
+    );
+    let (code, shown) = check_with(&path, &declared, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("account alix: oauth_token")
+            && shown.contains("no secret named claude_alix is stored")
+            && shown.contains("fronde secret set claude_alix --origin https://api.anthropic.com"),
+        "{shown}"
+    );
+    // Stored for another origin, it is refused.
+    let key = dir.path().join("master.key");
+    store_secret(&data, &key, "claude_alix", "https://other.example", ALIX).await;
+    let (code, shown) = check_with(&path, &declared, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("is for https://other.example, not https://api.anthropic.com")
+            && !shown.contains(ALIX),
+        "{shown}"
+    );
+    // Stored for Claude's API, it opens.
+    store_secret(
+        &data,
+        &key,
+        "claude_alix",
+        "https://api.anthropic.com",
+        ALIX,
+    )
+    .await;
+    let (code, shown) = check_with(&path, &declared, None);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(
+            "account alix (claude, owner alix): stored secret claude_alix opens, for \
+             https://api.anthropic.com"
+        ) && !shown.contains(ALIX),
+        "{shown}"
+    );
+    // A token that does not read as one line fails the check, without showing it.
+    let declared_file = declared.replace(
+        "{ stored = \"claude_alix\" }",
+        "{ file = \"claude-token\" }",
+    );
+    let (code, shown) = check_with(&path, &declared_file, None);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(&format!(
+            "account alix (claude, owner alix): token from the file {}, read",
+            file.display()
+        )),
+        "{shown}"
+    );
+    fronde_hub::private::write(&file, format!("{ALIX} {ALIX}\n")).unwrap();
+    let (code, shown) = check_with(&path, &declared_file, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("account alix: oauth_token") && shown.contains("one line"),
+        "{shown}"
+    );
+    assert!(!shown.contains(ALIX), "{shown}");
+}

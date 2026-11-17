@@ -38,8 +38,8 @@ pub use crate::provider::ASK_USER_QUESTION;
 /// line, which every user can read.
 pub const HUB_TOKEN_VAR: &str = "FRONDE_HUB_TOKEN";
 
-/// The agent's Claude sign-in token, `[agent] oauth_token`: read again at each start, so that a
-/// token changed in its file or store applies at the next one.
+/// The agent's Claude sign-in token, its account's `oauth_token`: read again at each start, so
+/// that a token changed in its file or store applies at the next one.
 pub type OauthToken = Arc<
     dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<SecretString>> + Send + Sync,
 >;
@@ -52,6 +52,37 @@ where
 {
     Arc::new(move || Box::pin(read()))
 }
+
+/// An account's token is a stored secret that is not stored yet: the account is not connected.
+/// An [`OauthToken`] fails with it, which the caller may tell apart from a token that does not
+/// read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInMissing {
+    /// The account whose token it is.
+    pub account: String,
+    /// The stored secret's name.
+    pub stored: String,
+    /// The origin it is to be stored for.
+    pub origin: String,
+}
+
+impl fmt::Display for SignInMissing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            account,
+            stored,
+            origin,
+        } = self;
+        write!(
+            f,
+            "the account {account} is not connected: no secret named {stored} is stored; store \
+             it with `claude setup-token`'s output on standard input: `fronde secret set \
+             {stored} --origin {origin} --config <your fronde.toml>`"
+        )
+    }
+}
+
+impl std::error::Error for SignInMissing {}
 
 /// How to start the agent and what its session gets.
 #[derive(Clone)]

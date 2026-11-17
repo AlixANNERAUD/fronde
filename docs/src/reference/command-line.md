@@ -82,9 +82,17 @@ passed; `background work paused
 until 16:40 (5-hour window past the reserve's line, 70%)` past `[threads] reserve`), or `usage:
 claude: no reading yet; background work bounded by the daily counts` before Fronde's first turn,
 or `usage: cannot read (…)` when the stored reading does not read, and the check goes on (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)); the start log prints
-the same line; then, with
-`[agent] oauth_token`, `agent token: [agent] oauth_token, read` once it read a
-file or variable token (a stored one is named, and opened when the agent starts), and refuses a grant over Fronde's data or configuration
+the same line; then one line per [account](configuration.md#accountsname), never with its
+token: `account alix (claude, owner alix): stored secret claude_alix opens, for
+https://api.anthropic.com` (opened as the agent's start opens it, from the database read-only),
+`account alix (claude, owner alix): token from the file /run/secrets/claude, read` or `… from the
+environment variable CLAUDE_TOKEN, read`; for the [legacy form](configuration.md#the-legacy-form),
+`account claude (claude, owner alix): token from the file …, read ([agent] oauth_token, legacy
+form)`, `… token from Fronde's environment, CLAUDE_CODE_OAUTH_TOKEN, read (legacy form)` or `…: no
+token: the agent starts unsigned (legacy form)`. A token that does not read, or holds spaces or
+line breaks, fails the check, and so does the owner's stored token not stored yet; another
+person's not stored yet is a warning, `warning: stored secret claude_marie not stored yet: store
+it with fronde secret set …`. It also refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the
 agent's `agent/` and `home/` in the data directory for that. It also checks that `[data] dir` can
 be created and written:
