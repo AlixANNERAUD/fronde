@@ -2,7 +2,8 @@
 
 Fronde can keep a secret, such as a CalDAV password, encrypted in its database, bound to the one
 origin it is for. You type it once, into `fronde secret set` or into a card in the chat; it never
-goes in the configuration file, and a component's credential names it with `{ stored = "…" }`.
+goes in the configuration file, and a component's credential, an upstream MCP server's token or
+the agent's sign-in token names it with `{ stored = "…" }`.
 
 ## Store it
 
@@ -120,8 +121,11 @@ which prints `source calendar: credential for https://cloud.example: stored secr
 stored for this origin`, never the value. It reports a secret that is not stored, one stored for
 another origin, and a master key that does not open the stored secrets, each with what to do.
 
-Only a component's credential takes `{ stored = "…" }`: the `/mcp` token, the chat password and
-an upstream server's token still name a file or an environment variable.
+A component's credential, the `token` of an upstream MCP server reached by `url` (see
+[Add upstream MCP servers](add-upstream-mcp-servers.md#keep-the-token-in-the-encrypted-store);
+`fronde check` prints `source up: token: stored secret … opens, stored for this origin`) and
+`[agent] oauth_token` take `{ stored = "…" }`. The `/mcp` token, the chat password and the token
+of a server run as a command still name a file or an environment variable.
 
 To move a password from a file into the store, store it from the file, replace
 `{ file = "…" }` by `{ stored = "caldav" }`, run `fronde check`, then delete the file:

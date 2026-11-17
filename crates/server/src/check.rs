@@ -6,7 +6,8 @@ use std::io::Write;
 
 /// Check the secrets and sources of a loaded configuration. For each component, write the hashes
 /// that approve its files to `out` first, so that a component not approved yet shows them, then
-/// what approved it, then each credential that names a stored secret: it exists, is for the
+/// what approved it, then each credential that names a stored secret (and each upstream server's
+/// stored token): it exists, is for the
 /// credential's origin and opens with the master key (its value is never shown). Approvals and
 /// secrets stored in the database count as when serving; a data directory without a database has
 /// none, and the database is never changed by this check. With `[python]`, check and compile the
@@ -28,9 +29,27 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         let name = source.name();
         match source {
             SourceConfig::Mcp(m) => {
-                if let Some(t) = &m.token {
-                    t.resolve()
-                        .with_context(|| format!("source {name}: token"))?;
+                match (&m.token, &m.url) {
+                    // A stored token is opened for the origin of the URL, as starting the server
+                    // opens it; the value is dropped, never shown.
+                    (Some(Secret::Stored { stored }), Some(url)) => {
+                        let origin = fronde_hub::origin::Origin::of_url(url)
+                            .with_context(|| format!("source {name}"))?;
+                        checks
+                            .secrets
+                            .open(stored, &origin)
+                            .with_context(|| format!("source {name}: token"))?;
+                        writeln!(
+                            out,
+                            "source {name}: token: stored secret {stored} opens, stored for \
+                             this origin"
+                        )?;
+                    }
+                    (Some(t), _) => {
+                        t.resolve()
+                            .with_context(|| format!("source {name}: token"))?;
+                    }
+                    (None, _) => {}
                 }
             }
             SourceConfig::Component(c) => {

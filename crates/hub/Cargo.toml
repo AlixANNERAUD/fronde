@@ -47,6 +47,7 @@ rmcp = { workspace = true, features = ["elicitation"] }
 fronde-db = { path = "../db", features = ["testing"] }
 axum.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

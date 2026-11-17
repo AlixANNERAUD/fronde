@@ -489,12 +489,6 @@ fn stored_secret_refused_outside_credentials() {
             format!("{MIN}\n[web]\npassword = {stored}\n"),
             "web.password",
         ),
-        (
-            format!(
-                "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"up\"\nurl = \"https://up.example/mcp\"\ntoken = {stored}\n"
-            ),
-            "source \"up\": token",
-        ),
     ];
     for (text, place) in cases {
         let e = refused(&text);
@@ -1116,4 +1110,32 @@ fn only_claude_is_a_configured_provider() {
         "{MIN}\n[providers.codex]\ncommand = [\"codex-acp\"]\n"
     ));
     assert!(e.contains("unknown field"), "{e}");
+}
+
+/// A URL server's token may be stored; a command has no origin to bind it to.
+#[test]
+fn stored_upstream_token_is_for_url_servers_only() {
+    let url = format!(
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"up\"\nurl = \"https://up.example/mcp\"\ntoken = {{ stored = \"tok\" }}\n"
+    );
+    let c = load_str(&url).unwrap();
+    let SourceConfig::Mcp(m) = &c.sources[0] else {
+        panic!("not an mcp source")
+    };
+    assert!(matches!(&m.token, Some(Secret::Stored { stored }) if stored == "tok"));
+
+    let e = refused(&url.replace("\"tok\"", "\"bad name\""));
+    assert!(
+        e.contains("source \"up\": token") && e.contains("is not allowed"),
+        "{e}"
+    );
+
+    let stdio = format!(
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"up\"\ncommand = [\"x\"]\ntoken = {{ stored = \"tok\" }}\n"
+    );
+    let e = refused(&stdio);
+    assert!(
+        e.contains("a command has none") && e.contains("use { file = \"…\" }"),
+        "{e}"
+    );
 }

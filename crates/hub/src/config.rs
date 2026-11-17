@@ -677,7 +677,8 @@ pub struct BasicCredential {
 }
 
 /// A secret is never written in the TOML: it points to a file, an environment variable, or, in a
-/// component's credentials only, a secret stored encrypted in `fronde.db`.
+/// component's credentials, a URL upstream server's token and the agent's `oauth_token` only, a
+/// secret stored encrypted in `fronde.db`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Secret {
@@ -687,9 +688,9 @@ pub enum Secret {
     Env {
         env: String,
     },
-    /// The secret `fronde secret set` stored under this name. Only the preparation of the
-    /// component whose credential names it opens it (`fronde_wasm::prepare`), so
-    /// [`Secret::resolve`] refuses it.
+    /// The secret `fronde secret set` stored under this name. Only what names it opens it, for
+    /// its origin (the preparation of a component, the start of an upstream server, the
+    /// agent's start), so [`Secret::resolve`] refuses it.
     Stored {
         stored: String,
     },
@@ -848,7 +849,18 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
             SourceConfig::Mcp(m) => {
                 if let Some(t) = &mut m.token {
                     t.anchor(base);
-                    t.not_stored(&format!("source {:?}: token", m.name))?;
+                    if let Secret::Stored { stored } = t {
+                        let name = &m.name;
+                        if m.url.is_none() {
+                            bail!(
+                                "source {name:?}: token = {{ stored = {stored:?} }}: a stored \
+                                 secret is bound to the origin of a URL, and a command has none; \
+                                 use {{ file = \"…\" }}"
+                            );
+                        }
+                        fronde_db::secrets::check_name(stored)
+                            .with_context(|| format!("source {name:?}: token"))?;
+                    }
                 }
             }
             SourceConfig::Component(c) => {

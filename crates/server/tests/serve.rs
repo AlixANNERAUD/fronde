@@ -996,3 +996,73 @@ fn check_reports_the_python_approval() {
         "{stderr}"
     );
 }
+
+#[tokio::test]
+async fn check_reports_stored_upstream_tokens() {
+    const VALUE: &str = "canary-stored-upstream-7a8b9c0d";
+    let dir = tempfile::tempdir().unwrap();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
+    let data = dir.path().join("data");
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+             [secrets]\nbackend = \"file\"\n\
+             [[sources]]\nkind = \"mcp\"\nname = \"up\"\nurl = \"https://up.example/mcp\"\n\
+             token = {{ stored = \"up\" }}\n",
+            data.display().to_string()
+        ),
+    )
+    .unwrap();
+    let output = |out: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    let out = run_check(&path);
+    let shown = output(&out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("source up: token")
+            && shown.contains("no secret named up is stored")
+            && shown.contains("`fronde secret set up --origin https://up.example --config"),
+        "{shown}"
+    );
+    assert!(!fronde_db::path(&data).exists(), "check made no database");
+
+    store_secret(
+        &data,
+        &dir.path().join("master.key"),
+        "up",
+        "https://other.example",
+        VALUE,
+    )
+    .await;
+    let shown = output(&run_check(&path));
+    assert!(
+        shown.contains("the stored secret up is for https://other.example, not https://up.example")
+            && !shown.contains(VALUE),
+        "{shown}"
+    );
+
+    store_secret(
+        &data,
+        &dir.path().join("master.key"),
+        "up",
+        "https://up.example",
+        VALUE,
+    )
+    .await;
+    let out = run_check(&path);
+    let shown = output(&out);
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(
+        shown.contains("source up: token: stored secret up opens, stored for this origin")
+            && !shown.contains(VALUE),
+        "{shown}"
+    );
+}

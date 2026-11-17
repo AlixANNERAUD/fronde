@@ -21,11 +21,13 @@ A secret is never written in the file. It is one of:
 | --- | --- |
 | `{ file = "/run/secrets/name" }` | The file's content, without its trailing line breaks. A relative path is read from the directory of the configuration file, not from Fronde's working directory. |
 | `{ env = "NAME" }` | The value of the environment variable `NAME`. |
-| `{ stored = "name" }` | The secret stored under `name` by `fronde secret set`, encrypted in `fronde.db` (see [Store a secret](../how-to/store-a-secret.md)). Only in a component's `[[sources.credentials]]`, and only for the origin it was stored for. |
+| `{ stored = "name" }` | The secret stored under `name` by `fronde secret set`, encrypted in `fronde.db` (see [Store a secret](../how-to/store-a-secret.md)). Only in a component's `[[sources.credentials]]`, the `token` of a `kind = "mcp"` entry with a `url`, and `[agent] oauth_token`, and only for the origin it was stored for. |
 
 The settings below marked *secret* take one of these forms, except `{ stored = "…" }`, which only
-a component's credential takes: `server.token`, `web.password` and an upstream server's `token`
-refuse it, saying to use `{ file = "…" }` or `{ env = "…" }`.
+a component's credential, the `token` of an upstream server reached by `url` and `[agent]
+oauth_token` take: `server.token` and `web.password` refuse it, saying to use `{ file = "…" }` or
+`{ env = "…" }`, and so does the `token` of a server run as a `command`, which has no origin to
+bind it to.
 
 When secrets are stored, Fronde checks the master key as it starts: a key that is not the one
 that sealed them, no key at all, or a keychain that is locked or out of reach, stops it with an
@@ -148,7 +150,7 @@ An upstream MCP server. See [Add upstream MCP servers](../how-to/add-upstream-mc
 | `name` | string | Required. Prefixes the server's tools, so it cannot overlap the hub's reserved prefixes (`code_`, `hub_`, `memory_`, `search_`, `threads_`, `use_`, `user_`). |
 | `url` | URL | Streamable HTTP address of the server. |
 | `command` | array of strings | Program and arguments to run, talking MCP over standard input and output. |
-| `token` | secret | Optional, with `url` only: sent as `Authorization: Bearer <token>`. |
+| `token` | secret | Optional, with `url` only: sent as `Authorization: Bearer <token>`. `{ stored = "name" }` is opened for the URL's origin each time Fronde connects: a name not stored yet, or stored for another origin, is waited for and tried again with backoff. |
 
 Each server sets exactly one of `url` or `command`.
 

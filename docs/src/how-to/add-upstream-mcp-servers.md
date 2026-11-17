@@ -15,7 +15,26 @@ token = { env = "MCPHUB_TOKEN" }
 ```
 
 `token` is optional. Fronde sends it as `Authorization: Bearer <token>`. Like every secret, it
-comes from a file or an environment variable.
+comes from a file, an environment variable or the encrypted store.
+
+### Keep the token in the encrypted store
+
+Store the token for the server's origin (scheme, host and port, no path), then name it:
+
+```sh
+fronde secret set mcphub --origin https://mcphub.example --config fronde.toml < mcphub-token
+```
+
+```toml
+token = { stored = "mcphub" }
+```
+
+Fronde opens it each time it connects, and only for that origin: a secret stored for another
+origin is refused, and the message gives the `fronde secret set` command to run. If the secret is
+not stored yet, the server waits, with the same backoff as a server that is down, and connects
+within a minute of `fronde secret set`, with no restart. `fronde check` says whether it opens,
+never showing it. A server run as a `command` has no origin: use `{ file = "…" }` there. See
+[Store a secret](store-a-secret.md).
 
 ## A server run as a command
 
@@ -77,4 +96,5 @@ anyway.
 Fronde connects in the background and keeps trying, waiting 2 seconds at first and up to one
 minute between attempts. A server that does not answer within 30 seconds counts as down. While it
 is down, its tools answer that it is unreachable. When it comes back, its tools are listed again.
+A stored token that is missing or stored for another origin is reported in the same way.
 Check `fronde serve`'s log for `connected`, `disconnected` and `cannot start` lines.

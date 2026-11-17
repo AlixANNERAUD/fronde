@@ -2592,6 +2592,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]

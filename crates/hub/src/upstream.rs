@@ -12,10 +12,14 @@
 //! the server cancels its request, or with the assistant's turn when the assistant alone is
 //! calling. Anything else is cancelled unseen, so that a server cannot fill the chat with cards.
 
-use crate::config::UpstreamConfig;
+use crate::config::{Secret, UpstreamConfig};
+use crate::origin::Origin;
 use crate::source::{Session, ToolSource, unreachable};
+use crate::stored::StoredSecrets;
 use crate::tools::{CallContext, ToolDef, ToolHandler, ToolOutput};
+use anyhow::Context;
 use async_trait::async_trait;
+use fronde_db::master_key::Backends;
 use fronde_protocol::text::{Notes, line};
 use fronde_protocol::{CallBy, Card, Response};
 use fronde_requests::elicitation::{DEFAULT_TIMEOUT, MAX_TIMEOUT, Refused, form};
@@ -28,7 +32,7 @@ use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, ErrorData, RoleClient, ServiceExt};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -459,10 +463,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Connect and list tools, giving up after `CONNECT_TIMEOUT` (a silent server must not block retries).
 async fn connect(
     cfg: &UpstreamConfig,
+    token: Option<SecretString>,
     handler: UpstreamClient,
 ) -> anyhow::Result<(Client, Vec<rmcp::model::Tool>)> {
     let attempt = async {
-        let client = open(cfg, handler).await?;
+        let client = open(cfg, token, handler).await?;
         let tools = client.list_all_tools().await?;
         anyhow::Ok((client, tools))
     };
@@ -471,11 +476,15 @@ async fn connect(
         .map_err(|_| anyhow::anyhow!("timed out after {}s", CONNECT_TIMEOUT.as_secs()))?
 }
 
-async fn open(cfg: &UpstreamConfig, handler: UpstreamClient) -> anyhow::Result<Client> {
+async fn open(
+    cfg: &UpstreamConfig,
+    token: Option<SecretString>,
+    handler: UpstreamClient,
+) -> anyhow::Result<Client> {
     if let Some(url) = &cfg.url {
         let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
-        if let Some(t) = &cfg.token {
-            config = config.auth_header(t.resolve()?.expose_secret());
+        if let Some(t) = &token {
+            config = config.auth_header(t.expose_secret());
         }
         Ok(handler
             .serve(StreamableHttpClientTransport::from_config(config))
@@ -493,17 +502,74 @@ async fn open(cfg: &UpstreamConfig, handler: UpstreamClient) -> anyhow::Result<C
 pub struct Upstream {
     cfg: UpstreamConfig,
     asking: Option<Asking>,
+    /// The database and the master key's backends, where a `{ stored }` token and the key are
+    /// read each time the server starts, so that a secret stored since applies.
+    store: Option<(fronde_db::DatabaseConnection, Backends)>,
 }
 
 impl Upstream {
     /// A server whose forms are cancelled: Fronde shows them nowhere.
     pub fn new(cfg: UpstreamConfig) -> Self {
-        Self { cfg, asking: None }
+        Self {
+            cfg,
+            asking: None,
+            store: None,
+        }
     }
 
     /// A server whose forms are shown as cards, as `asking` says.
     pub fn asking(cfg: UpstreamConfig, asking: Option<Asking>) -> Self {
-        Self { cfg, asking }
+        Self {
+            cfg,
+            asking,
+            store: None,
+        }
+    }
+
+    /// Read a `{ stored }` token from `db`, and the master key from `backends`, each time the
+    /// server starts.
+    pub fn reading_secrets_from(
+        mut self,
+        db: fronde_db::DatabaseConnection,
+        backends: Backends,
+    ) -> Self {
+        self.store = Some((db, backends));
+        self
+    }
+
+    /// The token to send: a file or environment secret read now, a stored one opened for the
+    /// origin of the URL. A stored token that is not set yet, or is stored for another origin,
+    /// is [`Waiting`](crate::source::Waiting): `fronde secret set` fixes it while Fronde runs.
+    async fn token(&self) -> anyhow::Result<Option<SecretString>> {
+        let name = &self.cfg.name;
+        match &self.cfg.token {
+            None => Ok(None),
+            Some(Secret::Stored { stored }) => {
+                let Some(url) = &self.cfg.url else {
+                    anyhow::bail!(
+                        "mcp {name:?}: token = {{ stored = {stored:?} }}: a command has no \
+                         origin to bind a stored secret to; use {{ file = \"…\" }}"
+                    );
+                };
+                let Some((db, backends)) = &self.store else {
+                    anyhow::bail!(
+                        "mcp {name:?}: the stored secret {stored} cannot be opened: this server \
+                         was not given the secret store"
+                    );
+                };
+                let origin = Origin::of_url(url).with_context(|| format!("mcp {name:?}"))?;
+                let secrets = StoredSecrets::load(db, backends).await?;
+                secrets
+                    .open(stored, &origin)
+                    .map(Some)
+                    .with_context(|| format!("mcp {name:?}: token"))
+            }
+            Some(secret) => Ok(Some(
+                secret
+                    .resolve()
+                    .with_context(|| format!("mcp {name:?}: token"))?,
+            )),
+        }
     }
 }
 
@@ -521,7 +587,8 @@ impl ToolSource for Upstream {
             asking: self.asking.clone(),
             calls: calls.clone(),
         };
-        let (client, tools) = connect(&self.cfg, handler).await?;
+        let token = self.token().await?;
+        let (client, tools) = connect(&self.cfg, token, handler).await?;
         let name = self.cfg.name.clone();
         let link = Arc::new(Link {
             name: name.clone(),
@@ -638,6 +705,32 @@ pub(crate) mod test_server {
         down
     }
 
+    /// Serve on `listener` like [`serve`], answering 401 unless the request carries
+    /// `Authorization: <expected>`.
+    pub fn serve_requiring(listener: tokio::net::TcpListener, expected: &'static str) {
+        let svc = StreamableHttpService::new(
+            || Ok(Echo),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let app = axum::Router::new()
+            .nest_service("/mcp", svc)
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    let ok = req
+                        .headers()
+                        .get("authorization")
+                        .is_some_and(|v| v.as_bytes() == expected.as_bytes());
+                    if ok {
+                        next.run(req).await
+                    } else {
+                        axum::http::StatusCode::UNAUTHORIZED.into_response()
+                    }
+                },
+            ));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+    }
+
     use axum::response::IntoResponse;
 }
 
@@ -646,6 +739,7 @@ mod tests {
     use super::*;
     use crate::source::Supervisor;
     use crate::tools::Registry;
+    use fronde_db::master_key::Backends;
     use serde_json::json;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -672,6 +766,139 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         false
+    }
+
+    /// A store with `value` sealed as `name` for `origin`, and the backends that open it.
+    async fn store(
+        dir: &std::path::Path,
+        name: &str,
+        origin: &str,
+        value: &str,
+    ) -> (fronde_db::DatabaseConnection, Backends) {
+        let db = fronde_db::open(dir).await.unwrap();
+        let backends = Backends::file(dir.join("master.key"));
+        put(&db, &backends, name, origin, value).await;
+        (db, backends)
+    }
+
+    async fn put(
+        db: &fronde_db::DatabaseConnection,
+        backends: &Backends,
+        name: &str,
+        origin: &str,
+        value: &str,
+    ) {
+        fronde_db::secrets::store(
+            db,
+            backends,
+            fronde_db::secrets::SOURCES,
+            name,
+            origin,
+            &value.to_owned().into(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn stored_cfg(url: &str, name: &str) -> UpstreamConfig {
+        UpstreamConfig {
+            name: "mcphub".into(),
+            url: Some(url.parse().unwrap()),
+            command: None,
+            token: Some(Secret::Stored {
+                stored: name.into(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_token_reaches_upstream() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The handshake is not MCP: the server only has to see the header.
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer stored-token"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1..)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, backends) = store(dir.path(), "up", &server.uri(), "stored-token").await;
+        let source = Upstream::new(stored_cfg(&format!("{}/mcp", server.uri()), "up"))
+            .reading_secrets_from(db, backends);
+        let e = source.start().await.err().expect("not an MCP server");
+        assert!(!format!("{e:#}").contains("stored-token"));
+        drop(server); // verifies the expectation
+    }
+
+    #[tokio::test]
+    async fn stored_token_for_stdio_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, backends) = store(dir.path(), "up", "https://up.example", "x").await;
+        let cfg = UpstreamConfig {
+            name: "mcphub".into(),
+            url: None,
+            command: Some(vec!["true".into()]),
+            token: Some(Secret::Stored {
+                stored: "up".into(),
+            }),
+        };
+        let e = Upstream::new(cfg)
+            .reading_secrets_from(db, backends)
+            .start()
+            .await
+            .err()
+            .expect("refused");
+        assert!(format!("{e:#}").contains("use { file = \"…\" }"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn stored_token_other_origin_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, backends) = store(dir.path(), "up", "https://other.example", "secret-x").await;
+        let source = Upstream::new(stored_cfg("https://up.example/mcp", "up"))
+            .reading_secrets_from(db, backends);
+        let e = source.start().await.err().expect("refused");
+        let shown = format!("{e:#}");
+        assert!(
+            shown.contains("is for https://other.example, not https://up.example")
+                && shown.contains("fronde secret set up --origin https://up.example")
+                && !shown.contains("secret-x"),
+            "{shown}"
+        );
+        assert!(e.downcast_ref::<crate::source::Waiting>().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_missing_stored_token_waits_then_starts_once_set() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        test_server::serve_requiring(listener, "Bearer later-token");
+        let dir = tempfile::tempdir().unwrap();
+        let db = fronde_db::open(dir.path()).await.unwrap();
+        let backends = Backends::file(dir.path().join("master.key"));
+        let source = Upstream::new(stored_cfg(&format!("http://{addr}/mcp"), "up"))
+            .reading_secrets_from(db.clone(), backends.clone());
+        let e = source.start().await.err().expect("not stored yet");
+        assert!(
+            e.downcast_ref::<crate::source::Waiting>().is_some(),
+            "{e:#}"
+        );
+        assert!(format!("{e:#}").contains("no secret named up is stored"));
+
+        let reg = Arc::new(Registry::new());
+        Supervisor::new(reg.clone()).spawn(Arc::new(source));
+        put(
+            &db,
+            &backends,
+            "up",
+            &format!("http://{addr}"),
+            "later-token",
+        )
+        .await;
+        // The supervisor's first retry waits about 2 s.
+        assert!(wait_for(&reg, "mcphub_echo", 15).await);
     }
 
     #[test]
@@ -727,7 +954,7 @@ mod tests {
             asking: None,
             calls: Arc::default(),
         };
-        let Err(e) = connect(&cfg(addr), handler).await else {
+        let Err(e) = connect(&cfg(addr), None, handler).await else {
             panic!("connected to a silent server");
         };
         assert!(format!("{e:#}").contains("timed out"), "{e:#}");

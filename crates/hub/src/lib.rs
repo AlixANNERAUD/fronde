@@ -8,6 +8,7 @@ pub mod origin;
 pub mod private;
 pub mod search;
 pub mod source;
+pub mod stored;
 pub mod threads;
 pub mod tools;
 pub mod upstream;
@@ -89,9 +90,26 @@ impl Hub {
                 Ok(()) => {}
             }
         }
+        // The master key's place is needed only by a server whose token is stored (a
+        // configuration not read by `config::load` has none).
+        let stored_token =
+            |m: &config::UpstreamConfig| matches!(m.token, Some(config::Secret::Stored { .. }));
+        let backends = if config
+            .sources
+            .iter()
+            .any(|s| matches!(s, SourceConfig::Mcp(m) if stored_token(m)))
+        {
+            Some(config.master_key_backends()?)
+        } else {
+            None
+        };
         for source in &config.sources {
             if let SourceConfig::Mcp(m) = source {
-                sources.spawn(Arc::new(Upstream::asking(m.clone(), asking.clone())));
+                let mut upstream = Upstream::asking(m.clone(), asking.clone());
+                if let Some(backends) = &backends {
+                    upstream = upstream.reading_secrets_from(db.clone(), backends.clone());
+                }
+                sources.spawn(Arc::new(upstream));
             }
         }
         Ok(Self {
