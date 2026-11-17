@@ -30,6 +30,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+use tower_sessions::ExpiredDeletion;
+use tower_sessions_sqlx_store::SqliteStore;
+
+/// How often expired web sessions and key-value entries are deleted.
+const PURGE_EVERY: Duration = Duration::from_secs(60 * 60);
 
 pub fn check_token(token: &SecretString) -> anyhow::Result<()> {
     if token.expose_secret().chars().count() < 32 {
@@ -156,6 +161,28 @@ fn component_sources(config: &Config) -> anyhow::Result<Vec<Arc<dyn ToolSource>>
         .collect())
 }
 
+/// Deletes expired web sessions and key-value entries. Reads already refuse them (the session
+/// store and `fronde_db::kv::get` check the expiry), so this only frees their rows: a failure is
+/// logged, never fatal.
+async fn purge_expired(db: &fronde_db::DatabaseConnection, sessions: &SqliteStore) {
+    if let Err(error) = sessions.delete_expired().await {
+        tracing::error!("cannot delete expired web sessions: {error}");
+    }
+    if let Err(error) = fronde_db::kv::purge_expired(db).await {
+        tracing::error!("cannot delete expired key-value entries: {error}");
+    }
+}
+
+/// [`purge_expired`] every `period`, the first one `period` from now, for as long as it is polled.
+async fn purge_every(db: fronde_db::DatabaseConnection, sessions: SqliteStore, period: Duration) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        purge_expired(&db, &sessions).await;
+    }
+}
+
 /// Resolve secrets, start the hub and serve HTTP in the background.
 pub async fn start(config: Config) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     start_with(config, process_connector(), &site_root()).await
@@ -185,6 +212,16 @@ pub async fn start_with(
     let components = component_sources(&config)?;
     fronde_hub::private::prepare_data_dir(&data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
+    // The store creates its own table, `tower_sessions`, which the entities leave out.
+    let sessions = SqliteStore::new(db.get_sqlite_connection_pool().clone());
+    sessions.migrate().await.with_context(|| {
+        format!(
+            "cannot create the web sessions table in {}",
+            fronde_db::path(&data_dir).display()
+        )
+    })?;
+    purge_expired(&db, &sessions).await;
+    let purge = purge_every(db.clone(), sessions.clone(), PURGE_EVERY);
     let hub = Arc::new(Hub::start(config, db.clone(), components).await?);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -211,11 +248,16 @@ pub async fn start_with(
                 password,
                 throttle: Default::default(),
             },
+            sessions,
             secure_cookie,
             site_root,
         ));
     }
     let handle = tokio::spawn(async move {
+        // A task of its own, so that not even a panic there stops the server, and owned by the
+        // server's task, so that it stops with the server.
+        let mut background = tokio::task::JoinSet::new();
+        background.spawn(purge);
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("http server stopped: {e}");
         }
@@ -226,6 +268,115 @@ pub async fn start_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tower_sessions::SessionStore;
+    use tower_sessions::cookie::time::{self, OffsetDateTime};
+    use tower_sessions::session::{Id, Record};
+    use tower_sessions_sqlx_store::sqlx;
+
+    /// What is logged while it is the thread's subscriber.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    async fn count(db: &fronde_db::DatabaseConnection, sql: &'static str) -> Option<i64> {
+        sqlx::query_scalar(sql)
+            .fetch_one(db.get_sqlite_connection_pool())
+            .await
+            .ok()
+    }
+
+    /// Waits until `sql` counts `expected` rows.
+    async fn until_count(db: &fronde_db::DatabaseConnection, sql: &'static str, expected: i64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while count(db, sql).await != Some(expected) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{sql} never gave {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_repeats_and_outlives_its_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fronde_db::open(dir.path()).await.unwrap();
+        // The sessions table is missing, so every session purge fails until it is created.
+        let sessions = SqliteStore::new(db.get_sqlite_connection_pool().clone());
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        let _logged = tracing::subscriber::set_default(subscriber);
+        let purge = tokio::spawn(purge_every(
+            db.clone(),
+            sessions.clone(),
+            Duration::from_millis(20),
+        ));
+
+        fronde_db::kv::set(&db, "test", "old", vec![1], Some(Duration::ZERO))
+            .await
+            .unwrap();
+        fronde_db::kv::set(&db, "test", "kept", vec![2], None)
+            .await
+            .unwrap();
+        let kv = "SELECT count(*) FROM kv WHERE scope = 'test'";
+        // A failed session purge does not keep the key-value purge from running.
+        until_count(&db, kv, 1).await;
+        assert!(
+            logs.text().contains("cannot delete expired web sessions"),
+            "{}",
+            logs.text()
+        );
+        assert!(!purge.is_finished());
+
+        sessions.migrate().await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        for (id, expiry_date) in [
+            (1, now - time::Duration::minutes(1)),
+            (2, now + time::Duration::days(1)),
+        ] {
+            let record = Record {
+                id: Id(id),
+                data: Default::default(),
+                expiry_date,
+            };
+            sessions.save(&record).await.unwrap();
+        }
+        fronde_db::kv::set(&db, "test", "later", vec![3], Some(Duration::ZERO))
+            .await
+            .unwrap();
+        // The same task goes on: the expired session and entry go, the others stay.
+        until_count(&db, "SELECT count(*) FROM tower_sessions", 1).await;
+        until_count(&db, kv, 1).await;
+        assert!(sessions.load(&Id(2)).await.unwrap().is_some());
+        assert_eq!(
+            fronde_db::kv::get(&db, "test", "kept").await.unwrap(),
+            Some(vec![2])
+        );
+        purge.abort();
+    }
 
     #[test]
     fn reachable_maps_every_interface_to_loopback() {

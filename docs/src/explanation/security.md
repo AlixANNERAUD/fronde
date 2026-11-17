@@ -56,9 +56,9 @@ As belt and braces, disable core dumps outside Fronde too: `fronde service insta
 ## Personal data on disk
 
 Fronde creates its data directory and every directory inside it with mode 0700, and every file it
-writes (memory, the database `fronde.db`, which holds the conversation and the session id, its
-`-wal` and `-shm` files, temporary files) with mode 0600,
-whatever the umask. At start, a data directory that group or others could enter is tightened to
+writes (memory, the database `fronde.db`, which holds the conversation, the agent's session id
+and the web sessions, its `-wal` and `-shm` files, temporary files) with mode 0600, whatever the
+umask. At start, a data directory that group or others could enter is tightened to
 0700 and a warning is logged. Other users on the same machine cannot read your memory or
 conversation. This does not encrypt anything: see below.
 
@@ -75,10 +75,17 @@ conversation. This does not encrypt anything: see below.
 
 ## The browser
 
-The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` behind https. Pages cannot be
-framed by another site (`frame-ancestors 'none'`). Browsers do not apply the same-origin policy
-to WebSockets, so `/ws` checks that the page's `Origin` matches the `Host` it was sent to: another
-site cannot open your chat with your cookie. This is why a reverse proxy must forward `Host`.
+The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` behind https. Sessions live in
+`fronde.db`, so a restart signs no one out. Their ids are stored as they are: anyone who can read
+that file can take over a signed-in browser, one more reason it is 0600. Fronde never logs a
+session id. Signing out deletes the session at once. A session is refused as soon as it expires,
+after 30 days without use, and its row is deleted within the hour. Only a successful sign-in
+stores a session: a cookie a client made up is never saved.
+
+Pages cannot be framed by another site (`frame-ancestors 'none'`). Browsers do not apply the
+same-origin policy to WebSockets, so `/ws` checks that the page's `Origin` matches the `Host` it
+was sent to: another site cannot open your chat with your cookie. This is why a reverse proxy must
+forward `Host`.
 
 ## The agent
 

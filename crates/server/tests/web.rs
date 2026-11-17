@@ -6,8 +6,10 @@ use futures::{SinkExt, StreamExt};
 use reqwest::header::{
     ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE,
 };
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -16,6 +18,10 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tower_sessions::SessionStore;
+use tower_sessions::cookie::time::{self, OffsetDateTime};
+use tower_sessions::session::{Id, Record};
+use tower_sessions_sqlx_store::{SqliteStore, sqlx};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PASSWORD: &str = "correct horse battery staple";
@@ -703,6 +709,7 @@ async fn forged_cookie_creates_no_session() {
         .await
         .unwrap();
     assert_eq!(close_code(&mut socket).await, 4401);
+    assert_eq!(session_rows(dir.path()).await, 0);
 }
 
 #[tokio::test]
@@ -908,4 +915,263 @@ async fn relative_data_dir_gives_an_absolute_agent_cwd() {
     let spec = seen.lock().unwrap().clone().unwrap();
     assert!(spec.cwd.is_absolute(), "{}", spec.cwd.display());
     assert_eq!(spec.cwd, dir.path().join("fronde").join("agent"));
+}
+
+/// The database of the server whose configuration [`config`] wrote in `dir`, opened beside it.
+async fn database(dir: &Path) -> fronde_db::DatabaseConnection {
+    fronde_db::open(&dir.join("data")).await.unwrap()
+}
+
+fn session_store(db: &fronde_db::DatabaseConnection) -> SqliteStore {
+    SqliteStore::new(db.get_sqlite_connection_pool().clone())
+}
+
+/// How many web sessions the database holds.
+async fn session_rows(dir: &Path) -> i64 {
+    let db = database(dir).await;
+    sqlx::query_scalar("SELECT count(*) FROM tower_sessions")
+        .fetch_one(db.get_sqlite_connection_pool())
+        .await
+        .unwrap()
+}
+
+/// Writes a signed-in session that expires at `expiry_date` straight into the database, and
+/// returns its cookie.
+async fn plant_session(dir: &Path, id: i128, expiry_date: OffsetDateTime) -> String {
+    let db = database(dir).await;
+    let store = session_store(&db);
+    store.migrate().await.unwrap();
+    let record = Record {
+        id: Id(id),
+        data: [("signed_in".to_owned(), serde_json::Value::Bool(true))].into(),
+        expiry_date,
+    };
+    store.save(&record).await.unwrap();
+    format!("fronde_session={}", Id(id))
+}
+
+async fn sign_out(addr: SocketAddr, cookie: &str) -> reqwest::Response {
+    timeout(
+        WAIT,
+        client()
+            .post(format!("http://{addr}/auth/sign-out"))
+            .header(COOKIE, cookie)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn sign_out_deletes_the_session_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    assert_eq!(session_rows(dir.path()).await, 0);
+
+    let cookie = sign_in(addr).await;
+    assert_eq!(session_rows(dir.path()).await, 1);
+    // A second browser signs in beside the first.
+    let other = sign_in(addr).await;
+    assert_eq!(session_rows(dir.path()).await, 2);
+
+    assert_eq!(sign_out(addr, &cookie).await.status(), 303);
+    assert_eq!(session_rows(dir.path()).await, 1);
+    assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 303);
+    assert_eq!(get(addr, "/", Some(&other)).await.status(), 200);
+}
+
+#[tokio::test]
+async fn expired_session_is_refused_before_the_purge() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    // Planted after the start, so the purge has not seen it: only its expiry refuses it.
+    let expired = plant_session(
+        dir.path(),
+        7,
+        OffsetDateTime::now_utc() - time::Duration::minutes(1),
+    )
+    .await;
+    let live = plant_session(
+        dir.path(),
+        8,
+        OffsetDateTime::now_utc() + time::Duration::days(1),
+    )
+    .await;
+
+    let page = get(addr, "/", Some(&expired)).await;
+    assert_eq!(page.status(), 303);
+    assert_eq!(page.headers()[LOCATION], "/sign-in");
+    // The browser may be told to drop the cookie, never given a fresh lifetime for it.
+    if let Some(cleared) = page.headers().get(SET_COOKIE) {
+        let cleared = cleared.to_str().unwrap();
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    }
+    let mut socket = connect(addr, Some(&expired), Some(&format!("http://{addr}")))
+        .await
+        .unwrap();
+    assert_eq!(close_code(&mut socket).await, 4401);
+    assert_eq!(session_rows(dir.path()).await, 2);
+
+    // The same row with a later expiry opens the chat: the expiry alone refused it.
+    assert_eq!(get(addr, "/", Some(&live)).await.status(), 200);
+}
+
+#[tokio::test]
+async fn expired_sessions_are_purged() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fronde_hub::private::prepare_data_dir(&data).unwrap();
+    let past = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+    let future = OffsetDateTime::now_utc() + time::Duration::days(1);
+    plant_session(dir.path(), 1, past).await;
+    let live = plant_session(dir.path(), 2, future).await;
+    {
+        let db = database(dir.path()).await;
+        fronde_db::kv::set(&db, "test", "old", b"x".to_vec(), Some(Duration::ZERO))
+            .await
+            .unwrap();
+        fronde_db::kv::set(&db, "test", "kept", b"y".to_vec(), None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(session_rows(dir.path()).await, 2);
+
+    // The server purges at start, then every hour.
+    let (addr, _) = start(dir.path()).await;
+
+    assert_eq!(session_rows(dir.path()).await, 1);
+    assert_eq!(get(addr, "/", Some(&live)).await.status(), 200);
+    let db = database(dir.path()).await;
+    let keys: Vec<String> = sqlx::query_scalar(r#"SELECT "key" FROM kv WHERE scope = 'test'"#)
+        .fetch_all(db.get_sqlite_connection_pool())
+        .await
+        .unwrap();
+    assert_eq!(keys, ["kept"]);
+}
+
+/// A `fronde serve` process on the configuration [`config`] wrote in `dir`, killed when dropped.
+struct Server {
+    child: Child,
+    addr: SocketAddr,
+    /// Everything it wrote to its standard error.
+    log: Arc<Mutex<String>>,
+}
+
+impl Server {
+    fn spawn(dir: &Path, log_filter: &str) -> Server {
+        let config = config(dir, true);
+        let path = dir.join("fronde.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n[web]\npassword = {{ file = {:?} }}\n",
+                dir.join("token").display().to_string(),
+                config.data.dir.display().to_string(),
+                dir.join("password").display().to_string(),
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fronde"))
+            .args(["serve", "--config"])
+            .arg(&path)
+            .env("FRONDE_SITE_ROOT", site(dir))
+            .env("RUST_LOG", log_filter)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        let log = Arc::new(Mutex::new(String::new()));
+        let (found, listening) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let log = log.clone();
+            move || {
+                for line in stderr.lines() {
+                    let Ok(line) = line else { break };
+                    if let Some(rest) = line.split("listening on http://").nth(1) {
+                        let addr = rest.split_whitespace().next().unwrap_or_default();
+                        let _ = found.send(addr.parse::<SocketAddr>().unwrap());
+                    }
+                    let mut log = log.lock().unwrap();
+                    log.push_str(&line);
+                    log.push('\n');
+                }
+            }
+        });
+        let addr = listening
+            .recv_timeout(WAIT)
+            .unwrap_or_else(|_| panic!("the server did not start:\n{}", log.lock().unwrap()));
+        Server { child, addr, log }
+    }
+
+    /// Stops the process at once, as a crash or a `kill -9` would, and returns its log.
+    fn kill(mut self) -> String {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        // The reader thread gets the last lines once the pipe closes.
+        std::thread::sleep(Duration::from_millis(100));
+        self.log.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn session_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Server::spawn(dir.path(), "info");
+    let cookie = sign_in(first.addr).await;
+    assert_eq!(get(first.addr, "/", Some(&cookie)).await.status(), 200);
+    first.kill();
+
+    let second = Server::spawn(dir.path(), "info");
+    let page = get(second.addr, "/", Some(&cookie)).await;
+    assert_eq!(page.status(), 200);
+    assert_index(page).await;
+    let mut socket = open_chat(second.addr, &cookie).await;
+    let (log_id, _) = hello(&mut socket, 0, None).await;
+    assert!(!log_id.is_empty());
+
+    // Signing out still ends it, across the restart too.
+    assert_eq!(sign_out(second.addr, &cookie).await.status(), 303);
+    second.kill();
+    let third = Server::spawn(dir.path(), "info");
+    assert_eq!(get(third.addr, "/", Some(&cookie)).await.status(), 303);
+}
+
+#[tokio::test]
+async fn session_id_is_never_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    // Everything every library logs, from every thread of the process.
+    let server = Server::spawn(dir.path(), "trace");
+    let addr = server.addr;
+    let cookie = sign_in(addr).await;
+    assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 200);
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    drop(socket);
+    assert_eq!(get(addr, "/", Some(FORGED)).await.status(), 303);
+    assert_eq!(sign_out(addr, &cookie).await.status(), 303);
+    assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 303);
+    let log = server.kill();
+
+    // The session layer's own lines are there: the filter let everything through.
+    assert!(log.contains("saving session"), "{log}");
+    let value = cookie.strip_prefix("fronde_session=").unwrap();
+    let id = value.parse::<Id>().unwrap();
+    // The cookie's text, and the number it encodes, which `Id`'s `Debug` prints.
+    for secret in [value.to_owned(), id.0.to_string()] {
+        assert!(
+            !log.contains(&secret),
+            "the log shows the session id {secret}"
+        );
+    }
 }

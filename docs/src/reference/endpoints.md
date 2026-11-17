@@ -35,7 +35,8 @@ with a redirect to `/sign-in?error=2`. There is one password, so the count is gl
 
 The session cookie is `fronde_session`: `HttpOnly`, `SameSite=Lax`, and `Secure` when
 `secure_cookie = true`. A session ends after 30 days without a signed-in request; each request
-renews it. Sessions are kept in memory: restarting Fronde signs everyone out.
+renews it. Sessions are kept in `fronde.db`, so they survive a restart. Signing out deletes the
+session; an expired one is refused at once and its row deleted within the hour.
 
 ### Security headers
 
