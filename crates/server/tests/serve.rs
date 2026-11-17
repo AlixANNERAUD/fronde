@@ -1066,3 +1066,205 @@ async fn check_reports_stored_upstream_tokens() {
         "{shown}"
     );
 }
+
+/// A configuration with `[web]`, so that `fronde check` prints the agent's lines, its data in
+/// `dir/data` and its master key a file. Returns the configuration's path and the data directory.
+fn with_web(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(dir.join("password"), "correct horse battery staple\n").unwrap();
+    let data = dir.join("data");
+    let path = dir.join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+             [secrets]\nbackend = \"file\"\nmaster_key = {{ file = \"master.key\" }}\n\
+             [web]\npassword = {{ file = \"password\" }}\n",
+            data.display().to_string(),
+        ),
+    )
+    .unwrap();
+    (path, data)
+}
+
+/// The `usage:` line `fronde check` printed.
+fn usage_printed(out: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("usage: "))
+        .unwrap_or_else(|| panic!("no usage line: {stdout}"))
+        .to_owned()
+}
+
+/// Stores `windows` as Claude's reading in the database of `data`, as the server keeps it.
+async fn store_reading(data: &std::path::Path, windows: Vec<fronde_protocol::usage::Window>) {
+    fronde_hub::private::create_dir_all(data).unwrap();
+    let db = fronde_db::open(data).await.unwrap();
+    let usage = fronde_protocol::usage::ProviderUsage {
+        provider: "claude".into(),
+        known_since: chrono::Utc::now() - chrono::TimeDelta::minutes(12),
+        windows,
+    };
+    fronde_db::kv::set(
+        &db,
+        "provider/claude",
+        "usage",
+        serde_json::to_vec(&usage).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+}
+
+fn window(
+    kind: fronde_protocol::usage::WindowKind,
+    used: f64,
+    resets_at: chrono::DateTime<chrono::Utc>,
+) -> fronde_protocol::usage::Window {
+    fronde_protocol::usage::Window {
+        kind,
+        used: Some(used),
+        status: Some(fronde_protocol::usage::LimitStatus::Allowed),
+        resets_at: Some(resets_at),
+        as_of: chrono::Utc::now() - chrono::TimeDelta::minutes(12),
+        reset_since_reading: false,
+    }
+}
+
+/// Whether every database file of `before` is still there, byte for byte; the names of those
+/// that changed.
+fn changed_files(data: &std::path::Path, before: &[(String, Vec<u8>)]) -> Vec<String> {
+    let after = database_files(data);
+    before
+        .iter()
+        .filter(|(name, bytes)| !after.iter().any(|(n, b)| n == name && b == bytes))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The database files of `data`, byte for byte.
+fn database_files(data: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(data)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("fronde.db")
+        })
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(&path).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// `fronde check` prints the stored reading of the owner's account: each window, when it
+/// resets in the configured time zone, how old the reading is and whether background work may
+/// run; the database is read, never changed.
+#[tokio::test]
+async fn check_prints_usage() {
+    use fronde_protocol::usage::WindowKind;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    // Resets at 16:40 Paris time, a few days on: the day is named.
+    let resets_at = chrono::DateTime::parse_from_rfc3339("2100-01-04T16:40:00+01:00")
+        .unwrap()
+        .to_utc();
+    store_reading(
+        &data,
+        vec![
+            window(WindowKind::Weekly, 0.18, resets_at),
+            window(WindowKind::Session, 0.42, resets_at),
+        ],
+    )
+    .await;
+    let before = database_files(&data);
+    let line = usage_printed(&run_check(&path));
+    assert_eq!(
+        line,
+        "claude: 5 h 42 % (resets Mon 04 Jan 16:40), week 18 % (resets Mon 04 Jan 16:40), \
+         read 12 min ago; background work allowed below 70%"
+    );
+    assert_eq!(
+        changed_files(&data, &before),
+        Vec::<String>::new(),
+        "check changed the database"
+    );
+
+    // Past the line, the pause and its end.
+    store_reading(
+        &data,
+        vec![
+            window(WindowKind::Session, 0.75, resets_at),
+            window(WindowKind::Weekly, 0.18, resets_at),
+        ],
+    )
+    .await;
+    let line = usage_printed(&run_check(&path));
+    assert!(
+        line.ends_with(
+            "background work paused until Mon 04 Jan 16:40 (5-hour window past the reserve's \
+             line, 70%)"
+        ),
+        "{line}"
+    );
+}
+
+/// Without a database, or without a reading in it, the daily counts are said to decide.
+#[tokio::test]
+async fn check_prints_no_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    let expected = "claude: no reading yet; background work bounded by the daily counts";
+    assert_eq!(usage_printed(&run_check(&path)), expected);
+    assert!(!fronde_db::path(&data).exists(), "check made a database");
+    fronde_hub::private::create_dir_all(&data).unwrap();
+    fronde_db::open(&data).await.unwrap().close().await.unwrap();
+    let before = database_files(&data);
+    assert_eq!(usage_printed(&run_check(&path)), expected);
+    assert_eq!(changed_files(&data, &before), Vec::<String>::new());
+    assert!(!before.is_empty());
+}
+
+/// A window whose reset time passed since its reading reads as reset, and decides nothing.
+#[tokio::test]
+async fn check_prints_reset_since_reading() {
+    use fronde_protocol::usage::WindowKind;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    let past = chrono::Utc::now() - chrono::TimeDelta::minutes(5);
+    let later = chrono::DateTime::parse_from_rfc3339("2100-01-04T16:40:00+01:00")
+        .unwrap()
+        .to_utc();
+    store_reading(
+        &data,
+        vec![
+            window(WindowKind::Session, 0.95, past),
+            window(WindowKind::Weekly, 0.18, later),
+        ],
+    )
+    .await;
+    let line = usage_printed(&run_check(&path));
+    assert!(
+        line.starts_with("claude: 5 h 0 % (reset since the reading), week 18 %"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("no complete reading; background work bounded by the daily counts"),
+        "{line}"
+    );
+}

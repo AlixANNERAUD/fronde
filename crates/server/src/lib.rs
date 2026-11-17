@@ -33,6 +33,7 @@ use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::{HubServer, McpCaller};
 use fronde_hub::source::ToolSource;
+use fronde_protocol::usage::ProviderUsage;
 use fronde_requests::{Requests, SecretStore};
 use fronde_wasm::{Checks, ComponentHost, ComponentSource, PythonSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -591,6 +592,98 @@ pub fn children_line(config: &Config) -> String {
     )
 }
 
+/// The subscription's usage, for the start log and `fronde check`, one part per provider:
+/// `claude: 5 h 42 % (resets 16:40), week 18 % (resets Mon 09:00), read 12 min ago; background
+/// work allowed below 70 %`, or `claude: no reading yet; background work bounded by the daily
+/// counts`. `readings`: each provider's reading of the owner's account, if any; times in `tz`.
+pub fn usage_line(
+    readings: &[(&str, Option<ProviderUsage>)],
+    reserve: u8,
+    now: chrono::DateTime<chrono::Utc>,
+    tz: chrono_tz::Tz,
+) -> String {
+    use fronde_protocol::usage::{Background, GUARDED, LimitStatus, WindowKind, line, percent};
+    let at = |when: chrono::DateTime<chrono::Utc>| {
+        let local = when.with_timezone(&tz);
+        if local.date_naive() == now.with_timezone(&tz).date_naive() {
+            local.format("%H:%M").to_string()
+        } else {
+            local.format("%a %d %b %H:%M").to_string()
+        }
+    };
+    let limit = format!("{}%", percent(line(reserve)));
+    let parts: Vec<String> = readings
+        .iter()
+        .map(|(provider, reading)| {
+            let Some(reading) = reading.as_ref().map(|reading| reading.now(now)) else {
+                return format!(
+                    "{provider}: no reading yet; background work bounded by the daily counts"
+                );
+            };
+            let mut windows: Vec<_> = reading.windows.iter().collect();
+            windows.sort_by_key(|window| {
+                GUARDED
+                    .iter()
+                    .position(|kind| *kind == window.kind)
+                    .unwrap_or(GUARDED.len())
+            });
+            let windows: Vec<String> = windows
+                .into_iter()
+                .map(|window| {
+                    let name = match &window.kind {
+                        WindowKind::Session => "5 h".to_owned(),
+                        WindowKind::Weekly => "week".to_owned(),
+                        WindowKind::WeeklyModel(model) => format!("week {model}"),
+                        WindowKind::Extra => "extra usage".to_owned(),
+                        WindowKind::Other(id) => id.clone(),
+                    };
+                    let used = match (window.used, window.status) {
+                        (_, Some(LimitStatus::Rejected)) => "rejected".to_owned(),
+                        (Some(used), _) => format!("{} %", percent(used)),
+                        (None, Some(LimitStatus::Warning)) => "near its limit".to_owned(),
+                        (None, _) => "use not given".to_owned(),
+                    };
+                    let reset = match window.resets_at {
+                        _ if window.reset_since_reading => " (reset since the reading)".to_owned(),
+                        Some(when) => format!(" (resets {})", at(when)),
+                        None => String::new(),
+                    };
+                    format!("{name} {used}{reset}")
+                })
+                .collect();
+            let age = (now - reading.known_since).num_minutes().max(0);
+            let age = match age {
+                0 => "read just now".to_owned(),
+                1..=59 => format!("read {age} min ago"),
+                60..=1439 => format!("read {} h ago", age / 60),
+                _ => format!("read {} days ago", age / 1440),
+            };
+            let background = match reading.background(reserve, now) {
+                Background::Allowed { .. } => format!("background work allowed below {limit}"),
+                Background::Paused(pause) => {
+                    let until = pause
+                        .resets_at
+                        .map(|when| format!(" until {}", at(when)))
+                        .unwrap_or_default();
+                    format!(
+                        "background work paused{until} ({} past the reserve's line, {limit})",
+                        pause.window.describe()
+                    )
+                }
+                Background::Unknown if reserve == 0 => {
+                    "no reserve (reserve = \"0%\"); background work bounded by the daily counts"
+                        .to_owned()
+                }
+                Background::Unknown => {
+                    "no complete reading; background work bounded by the daily counts".to_owned()
+                }
+            };
+            format!("{provider}: {}, {age}; {background}", windows.join(", "))
+        })
+        .collect();
+    parts.join("; ")
+}
+
 /// The pool of agents and their memory together, for the start log and `fronde check`:
 /// `at most 3 at once (one kept for your own threads), stopped after 10m idle, 4 GiB for all of
 /// them (2 GiB each)`.
@@ -848,6 +941,7 @@ pub async fn start_with(
     let listen = config.server.listen;
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
+    let timezone = config.data.timezone;
     let agent = config.agent.clone();
     let budget = budget(&config);
     warn_if_keychain_off();
@@ -915,9 +1009,27 @@ pub async fn start_with(
                     .map(|token| agent_oauth_token(token, db.clone(), backends.clone())),
                 system_prompt: system_prompt(&user),
                 builtin_tools: agent.builtin_tools,
-                // The latest usage reading per provider, from every agent process.
+                // The latest usage reading per account, from every agent process.
                 usage: Some(fronde_agent::usage::UsageBook::load(db.clone()).await),
             };
+            if let Some(book) = &spec.usage {
+                let readings: Vec<_> = fronde_hub::config::PROVIDERS
+                    .iter()
+                    .map(|provider| {
+                        let account = fronde_agent::usage::account_of(&user, provider);
+                        (*provider, book.get(&account))
+                    })
+                    .collect();
+                tracing::info!(
+                    "usage: {}",
+                    usage_line(
+                        &readings,
+                        budget.limits.reserve,
+                        chrono::Utc::now(),
+                        timezone
+                    )
+                );
+            }
             // The one user so far is the owner, an admin.
             let owner = fronde_requests::User {
                 name: user.clone(),

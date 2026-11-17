@@ -93,6 +93,7 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         writeln!(out, "agent limits: {limits}")?;
         writeln!(out, "agents: {}", crate::pool_line(config, scope.as_ref()))?;
         writeln!(out, "sub-agents: {}", crate::children_line(config))?;
+        writeln!(out, "usage: {}", usage_check_line(config).await?)?;
         // A stored token is opened at each start of the agent, with the master key.
         match &config.agent.oauth_token {
             Some(fronde_hub::config::Secret::Stored { stored }) => {
@@ -117,6 +118,39 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         )?;
     }
     Ok(())
+}
+
+/// [`crate::usage_line`] from the owner's readings stored in the database, opened read-only:
+/// never created, migrated or written. A data directory without a database has no reading.
+async fn usage_check_line(config: &Config) -> anyhow::Result<String> {
+    let file = fronde_db::path(&config.data.dir);
+    let exists = file
+        .try_exists()
+        .with_context(|| format!("cannot look for the database {}", file.display()))?;
+    let db = match exists {
+        true => Some(fronde_db::open_read_only(&config.data.dir).await?),
+        false => None,
+    };
+    let mut readings = Vec::new();
+    for provider in fronde_hub::config::PROVIDERS {
+        let account = fronde_agent::usage::account_of(&config.data.user, provider);
+        let reading = match &db {
+            Some(db) => fronde_agent::usage::read_usage(db, &account)
+                .await
+                .with_context(|| format!("cannot read the usage of {account}"))?,
+            None => None,
+        };
+        readings.push((provider, reading));
+    }
+    if let Some(db) = db {
+        db.close().await?;
+    }
+    Ok(crate::usage_line(
+        &readings,
+        config.threads.reserve.0,
+        chrono::Utc::now(),
+        config.data.timezone,
+    ))
 }
 
 /// The checks serving would make. The database is read, never created, migrated or written: a

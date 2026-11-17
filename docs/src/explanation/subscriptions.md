@@ -99,8 +99,9 @@ Fronde keeps a share of each window for your own turns: past `[threads] reserve`
 default), sub-agents are neither started nor sent messages, and their results wait for your next
 message (see [What background work may spend](threads.md#what-background-work-may-spend)).
 The chat's header shows the windows as a meter, to an admin (see
-[Use several conversations](../how-to/use-threads.md#see-how-much-of-your-subscription-is-used));
-showing them in `fronde check` is **planned**.
+[Use several conversations](../how-to/use-threads.md#see-how-much-of-your-subscription-is-used)),
+and `fronde check` and the start log print them on a `usage:` line (see
+[Command line](../reference/command-line.md)).
 
 ## Why MCP for the tools
 

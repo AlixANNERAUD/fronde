@@ -72,8 +72,16 @@ agent's (it starts one that runs `true`), or `agent limits: none (…)` with the
 many agents run at once and their memory together: `agents: at most 3 at once (one kept for your
 own threads), stopped after 10m idle, 4 GiB for all of them (2 GiB each)`, then the limits on
 sub-agents: `sub-agents: your threads may start sub-agents, theirs may not; 3 running at once per
-thread, 30 a day in all (100 turns), 200 kept per thread, 30m per turn, 10 wakes in a row without
-you`, then, with
+thread, 200 kept per thread, 30m per turn, 10 wakes in a row without you; 30% of each subscription
+window kept for you; 30 a day in all (100 turns), daily counts apply only without a usage
+reading`, then the latest usage reading of your subscription, read from the database opened
+read-only: `usage: claude: 5 h 42 % (resets 16:40), week 18 % (resets Mon 24 Nov 09:00), read 12
+min ago; background work allowed below 70%` (times in `[data] timezone`, the day added when it is
+not today; « reset since the reading » once a reset time has passed; `background work paused
+until 16:40 (5-hour window past the reserve's line, 70%)` past `[threads] reserve`), or `usage:
+claude: no reading yet; background work bounded by the daily counts` before Fronde's first turn
+(see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)); the start log prints
+the same line; then, with
 `[agent] oauth_token`, `agent token: [agent] oauth_token, read` once it read a
 file or variable token (a stored one is named, and opened when the agent starts), and refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the
