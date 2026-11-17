@@ -111,6 +111,9 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
   `mise run entities`: entities are generated, never edited by hand.
   The bundled SQLite is held at `libsqlite3-sys` 0.37 by sqlx-sqlite, so `deny.toml` ignores
   RUSTSEC-2026-0459: drop that ignore as soon as a sqlx release accepts 0.39.
+  It also ignores the zbus 5 sub-crates flagged unmaintained (RUSTSEC-2026-0370 to 0372), which
+  keyring-core's Secret Service store brings: oo7 0.7 is on zbus 6, but no keyring-core store uses
+  it yet. Revisit by 2027-03.
 - Secrets never appear in the configuration file, logs or tool output: `{ file = "…" }` or
   `{ env = "…" }` only, or `{ stored = "…" }` (sealed in `fronde.db`) for a component's
   credential.
