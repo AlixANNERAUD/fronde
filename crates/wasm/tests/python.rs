@@ -295,12 +295,23 @@ async fn wall_clock_is_capped() {
 /// A relative sleep that wasi-libc hands to `poll_oneoff` alone (as `select` and `poll` do) must
 /// not block the runtime's thread: on a single worker, the call timeout still fires and other
 /// runs go on.
+///
+/// The bounds are relative to the call timeout, not small absolute times. Both runs share the one
+/// worker thread, and a debug-build Python start-up costs 0.5 to 1.8 s of it (more on a loaded
+/// machine), so a tight wall-clock bound measured start-up, not the sleep. The timeout is long
+/// enough for the start-up to reach the sleep, and the bound leaves a wide margin above it yet
+/// stays far below the 60 s sleep: a blocked worker would end the call after about 60 s, or never
+/// let the concurrent `1+1` run at all.
+/// Each test has its own `Python`, so its `MAX_RUNS` turns are not shared with other tests; these
+/// two runs take both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn relative_sleeps_never_block_the_runtime() {
-    let python = python().await;
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const MARGIN: Duration = Duration::from_secs(25);
+    let python = python().await.with_limits(turn_budget());
     let sleepy = python.clone().with_limits(Limits {
-        call_timeout: Duration::from_millis(500),
-        ..Limits::default()
+        call_timeout: TIMEOUT,
+        ..turn_budget()
     });
     for code in [
         "import select\nselect.select([], [], [], 60)",
@@ -308,14 +319,11 @@ async fn relative_sleeps_never_block_the_runtime() {
     ] {
         let started = Instant::now();
         let (slept, other) = tokio::join!(run(&sleepy, code), run(&python, "1+1"));
+        let elapsed = started.elapsed();
         let e = error(&slept);
         assert!(e.contains("timed out"), "{code}: {e}");
         assert_eq!(value(&other), &json!({"value": 2}), "{code}");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{code}: {:?}",
-            started.elapsed()
-        );
+        assert!(elapsed < TIMEOUT + MARGIN, "{code}: {elapsed:?}");
     }
 }
 
@@ -350,7 +358,14 @@ async fn output_flood_is_capped() {
 
 #[tokio::test]
 async fn next_run_is_clean_after_a_failure() {
-    let python = python().await.with_limits(small_budget());
+    // Start-up of a debug build takes up to 1.8 s of CPU, so every run gets a budget well above
+    // it, and a wall-clock timeout that machine load cannot reach first: the failing run must end
+    // on the compute budget (5 s of CPU, inside its loop) and the next ones must not.
+    let python = python().await.with_limits(Limits {
+        cpu_ticks: 50,
+        call_timeout: Duration::from_secs(120),
+        ..turn_budget()
+    });
     let e = error(
         &run(
             &python,
@@ -359,6 +374,10 @@ async fn next_run_is_clean_after_a_failure() {
         .await,
     );
     assert!(e.contains("compute budget"), "{e}");
+    let python = python.with_limits(Limits {
+        call_timeout: Duration::from_secs(120),
+        ..turn_budget()
+    });
     let e = error(&run(&python, "secret").await);
     assert!(e.starts_with("NameError"), "{e}");
     let out = run(&python, "import json\nhasattr(json, 'leak')").await;
