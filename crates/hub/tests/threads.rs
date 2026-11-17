@@ -29,9 +29,9 @@ impl Recording {
 
 #[async_trait]
 impl ThreadControl for Recording {
-    async fn may_delegate(&self, _caller: ThreadId) -> bool {
-        self.record("may_delegate");
-        true
+    async fn delegation(&self, _caller: ThreadId) -> Result<(), ThreadError> {
+        self.record("delegation");
+        Ok(())
     }
 
     async fn providers(&self) -> Result<Vec<ProviderModels>, ThreadError> {
@@ -83,6 +83,7 @@ impl ThreadControl for Recording {
     async fn wait(
         &self,
         _: ThreadId,
+        _: Option<u64>,
         _: ThreadId,
         _: u64,
         _: Duration,
@@ -141,12 +142,10 @@ async fn an_outside_client_never_reaches_the_threads() {
     info.client_info = Implementation::new("Fronde", "1.0");
     let client = info.serve(b).await.unwrap();
     let info = client.peer_info().unwrap();
-    assert!(
-        info.instructions
-            .as_deref()
-            .is_some_and(|text| text.contains("threads_start a sub-agent")),
-        "{info:?}"
-    );
+    // Its instructions do not speak of tools it does not get.
+    let instructions = info.instructions.as_deref().unwrap_or_default();
+    assert!(!instructions.contains("threads_"), "{instructions}");
+    assert!(instructions.contains("memory_add"), "{instructions}");
     let names: Vec<String> = client
         .list_all_tools()
         .await

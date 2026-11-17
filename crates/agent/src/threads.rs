@@ -42,9 +42,10 @@ use crate::tokens::Tokens;
 
 mod children;
 
+pub(crate) use children::Handoff;
 pub use children::{
-    ChildEnd, ChildTask, DEFAULT_MAX_DEPTH, Delegation, MAX_LISTED, StartedChild, final_answer,
-    may_access,
+    ChildEnd, ChildTask, DEFAULT_MAX_DEPTH, Delegation, MAX_CHILDREN_KEPT, MAX_CHILDREN_RUNNING,
+    MAX_LISTED, StartedChild, TurnResult, final_answer, may_access,
 };
 
 /// Where the agent's session id was kept before threads: the key-value table's scope and key.
@@ -455,12 +456,14 @@ impl Threads {
         let tokens = Tokens::new();
         let pool = Pool::new(budget);
         let changes = Changes::new();
+        let handoff = Arc::new(Handoff::default());
         let shared = Shared {
             db: db.clone(),
             connector: connector.clone(),
             tokens: tokens.clone(),
             pool: pool.clone(),
             changes: changes.clone(),
+            handoff: handoff.clone(),
         };
         let main = Assistant::open(
             ThreadId::MAIN,
@@ -485,7 +488,7 @@ impl Threads {
             requests: OnceLock::new(),
             changes,
             tails: Mutex::new(HashMap::new()),
-            children: children::Children::default(),
+            children: children::Children::new(handoff),
         });
         for row in threads.list(false).await? {
             if row.id == ThreadId::MAIN {
@@ -548,6 +551,7 @@ impl Threads {
             tokens: self.tokens.clone(),
             pool: self.pool.clone(),
             changes: self.changes.clone(),
+            handoff: self.children.handoff.clone(),
         };
         let assistant = Assistant::open(
             id,

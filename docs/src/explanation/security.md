@@ -382,7 +382,11 @@ thread's first message, with its own directories, its own sandbox and its own hu
   own directories, so it reads neither its parent's conversation nor its files, and its
   parent's secrets "for this conversation" are refused in its thread. A sub-agent cannot start or
   drive sub-agents of its own: the hub does not offer it `threads_start` and `threads_send`, and
-  the threads refuse them, through `use_tool` too. An outside MCP client, which holds
+  the threads refuse them, through `use_tool` too. A thread's token lives while its agent idles,
+  and every process the agent starts inherits it: the tools that act (`threads_start`,
+  `threads_send`, `threads_read`, `threads_cancel`) work only while the thread is in a turn, and a
+  wait ends with the turn. A thread has at most 3 sub-agents in a turn at once and keeps at most 30.
+  An outside MCP client, which holds
   `server.token`, gets no `threads_*` tool and is refused them. What a sub-agent writes reaches
   its parent capped, with hidden characters shown as U+FFFD and marked as data, not
   instructions: a page the sub-agent read cannot pass for its parent's instructions unseen,

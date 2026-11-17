@@ -8,7 +8,7 @@ use crate::confine::Confine;
 use crate::elicitation;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
-use crate::threads::{self, Changes, Pool, Slot, ThreadId};
+use crate::threads::{self, Changes, Handoff, Pool, Slot, ThreadId, TurnResult};
 use crate::tokens::{TokenLease, Tokens};
 use agent_client_protocol::v1::schema::CreateElicitationResponse;
 use anyhow::{Context, anyhow};
@@ -81,6 +81,8 @@ pub(crate) struct Shared {
     pub(crate) pool: Arc<Pool>,
     /// Told when a thread's status changes, for the thread list.
     pub(crate) changes: Changes,
+    /// Where a turn's end hands its result to the calls waiting for it.
+    pub(crate) handoff: Arc<Handoff>,
 }
 
 pub struct Assistant {
@@ -120,6 +122,8 @@ pub struct Assistant {
     activity: Mutex<Activity>,
     /// Told when [`Assistant::status`] changes.
     changes: Changes,
+    /// Where a turn's end hands its result to the calls waiting for it.
+    handoff: Arc<Handoff>,
 }
 
 /// Where a thread's turns stand, as the thread list shows it.
@@ -190,6 +194,7 @@ impl Assistant {
             tokens,
             pool,
             changes,
+            handoff,
         } = shared;
         let log = ConversationLog::open(&db, &topic).await?;
         let assistant = Arc::new(Self {
@@ -212,6 +217,7 @@ impl Assistant {
             elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
             activity: Mutex::new(Activity::default()),
             changes,
+            handoff,
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
         let last_turn = assistant
@@ -389,6 +395,15 @@ impl Assistant {
             assistant.cancel_requests(seq).await;
             let mut turn = assistant.turn.lock().await;
             assistant.append(Event::TurnEnded { outcome }).await;
+            // After its end is logged, still under the turn's lock: a call that waits for this
+            // turn and registered before gets its result here; one that registers later finds
+            // the end in the log (see `Handoff`).
+            if let Some(seq) = seq {
+                let answer = threads::final_answer(&assistant.log.since(seq.saturating_sub(1)));
+                assistant
+                    .handoff
+                    .turn_ended(assistant.thread, seq, TurnResult { outcome, answer });
+            }
             *turn = None;
             assistant.set_activity(|activity| {
                 *activity = Activity {

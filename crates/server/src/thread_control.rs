@@ -25,11 +25,8 @@ fn hub_error(error: anyhow::Error) -> ThreadError {
 
 #[async_trait]
 impl ThreadControl for ThreadBridge {
-    async fn may_delegate(&self, caller: ThreadId) -> bool {
-        self.0.may_delegate(caller).await.unwrap_or_else(|error| {
-            tracing::error!("cannot tell whether thread {caller} may delegate: {error:#}");
-            false
-        })
+    async fn delegation(&self, caller: ThreadId) -> Result<(), ThreadError> {
+        self.0.check_delegate(caller).await.map_err(hub_error)
     }
 
     async fn providers(&self) -> Result<Vec<ProviderModels>, ThreadError> {
@@ -149,6 +146,7 @@ impl ThreadControl for ThreadBridge {
     async fn wait(
         &self,
         caller: ThreadId,
+        caller_turn: Option<u64>,
         thread: ThreadId,
         seq: u64,
         timeout: Duration,
@@ -156,12 +154,13 @@ impl ThreadControl for ThreadBridge {
     ) -> Result<Waited, ThreadError> {
         let end = self
             .0
-            .wait_child(caller, thread, seq, timeout, &cancelled)
+            .wait_child(caller, caller_turn, thread, seq, timeout, &cancelled)
             .await
             .map_err(hub_error)?;
         Ok(match end {
             ChildEnd::Ended { outcome, answer } => Waited::Ended { outcome, answer },
             ChildEnd::WaitingForUser => Waited::WaitingForUser,
+            ChildEnd::Queued => Waited::Queued,
             ChildEnd::TimedOut => Waited::TimedOut,
             ChildEnd::GaveUp => Waited::GaveUp,
         })

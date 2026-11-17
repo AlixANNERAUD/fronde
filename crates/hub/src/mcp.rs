@@ -3,10 +3,12 @@
 use crate::Hub;
 use crate::guide::instructions;
 use crate::tools::CallContext;
+use crate::tools::ToolDef;
 use fronde_requests::{Caller, ThreadId};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -75,6 +77,33 @@ impl HubServer {
         }
     }
 
+    /// Whether `caller` may start and drive sub-agents.
+    async fn delegates(&self, caller: &Caller) -> bool {
+        match (caller, &self.hub.threads) {
+            (Caller::Thread(id), Some(threads)) => threads.delegation(*id).await.is_ok(),
+            _ => false,
+        }
+    }
+
+    /// The tools `caller` is offered among `tools`.
+    async fn offered(&self, caller: &Caller, tools: Vec<ToolDef>) -> Vec<ToolDef> {
+        let delegates = self.delegates(caller).await;
+        tools
+            .into_iter()
+            .filter(|d| Self::offers(&d.name, caller, delegates))
+            .collect()
+    }
+
+    /// The hub's instructions, from the tools `caller` is offered.
+    async fn instructions_for(&self, caller: &Caller) -> String {
+        let tools = self.offered(caller, self.hub.registry.all()).await;
+        instructions(
+            &self.hub.config.data.user,
+            &tools,
+            &self.hub.memory.core_now(),
+        )
+    }
+
     /// Whether `caller` is offered the tool `name`: the `threads_*` tools only to a thread's
     /// agent, and those that start or drive sub-agents only to a thread that may still
     /// delegate. Each tool refuses the others' calls anyway.
@@ -90,15 +119,37 @@ impl HubServer {
 }
 
 impl ServerHandler for HubServer {
+    /// Without a caller, the instructions are an outside client's; [`Self::initialize`] gives
+    /// each caller its own.
     fn get_info(&self) -> ServerConfig {
+        let outside = Caller::Mcp(String::new());
+        let tools: Vec<ToolDef> = self
+            .hub
+            .registry
+            .all()
+            .into_iter()
+            .filter(|d| Self::offers(&d.name, &outside, false))
+            .collect();
         let text = instructions(
             &self.hub.config.data.user,
-            &self.hub.registry.all(),
+            &tools,
             &self.hub.memory.core_now(),
         );
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fronde-hub", env!("CARGO_PKG_VERSION")))
             .with_instructions(text)
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        context.peer.set_peer_info(request.clone());
+        let mut result = self.negotiate_initialize(&request)?;
+        let caller = self.call_context(&context).caller;
+        result.instructions = Some(self.instructions_for(&caller).await);
+        Ok(result)
     }
 
     async fn list_tools(
@@ -107,16 +158,10 @@ impl ServerHandler for HubServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let caller = self.call_context(&context).caller;
-        let delegates = match (&caller, &self.hub.threads) {
-            (Caller::Thread(id), Some(threads)) => threads.may_delegate(*id).await,
-            _ => false,
-        };
         let tools = self
-            .hub
-            .registry
-            .visible()
+            .offered(&caller, self.hub.registry.visible())
+            .await
             .into_iter()
-            .filter(|d| Self::offers(&d.name, &caller, delegates))
             .map(|d| {
                 let schema = match d.input_schema {
                     Value::Object(m) => m,

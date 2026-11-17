@@ -19,6 +19,7 @@ use fronde_protocol::{ThreadStatus, ThreadSummary};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{StartedBy, ThreadId, ThreadRow, Threads, lock};
@@ -40,29 +41,189 @@ const MAX_CHAIN: usize = 64;
 /// The most sub-agents [`Threads::children`] lists, newest first.
 pub const MAX_LISTED: usize = 50;
 
+/// The most sub-agents of one thread in a turn at once, waiting for an agent slot included.
+pub const MAX_CHILDREN_RUNNING: usize = 3;
+
+/// The most sub-agents one thread keeps, archived ones left out.
+pub const MAX_CHILDREN_KEPT: usize = 30;
+
 /// What the registry keeps for sub-agents.
 pub(super) struct Children {
     /// How deep a thread may be and still start sub-agents.
     max_depth: AtomicU32,
     /// Held while a sub-agent starts: a retry of the same call finds the first one's child with
-    /// its task logged.
+    /// its task logged, and two starts never both pass the limits.
     starting: tokio::sync::Mutex<()>,
-    /// The child each `(parent, client_request_id)` started, and in which of the parent's turns:
-    /// a retry joins it only in the same turn. In memory, since no turn outlives Fronde.
-    retries: Mutex<HashMap<(ThreadId, String), (ThreadId, u64)>>,
-    /// For each child, the seq of the message of its last turn whose result a waiting call
-    /// took: that result has reached its parent.
-    delivered: Mutex<HashMap<ThreadId, u64>>,
+    /// Shared with every thread's assistant, whose turns' ends go through it.
+    pub(super) handoff: Arc<Handoff>,
 }
 
-impl Default for Children {
-    fn default() -> Self {
+impl Children {
+    pub(super) fn new(handoff: Arc<Handoff>) -> Self {
         Self {
             max_depth: AtomicU32::new(DEFAULT_MAX_DEPTH),
             starting: tokio::sync::Mutex::new(()),
-            retries: Mutex::new(HashMap::new()),
-            delivered: Mutex::new(HashMap::new()),
+            handoff,
         }
+    }
+}
+
+/// How a sub-agent's turn ended, as its parent gets it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnResult {
+    pub outcome: TurnOutcome,
+    /// [`final_answer`] of the turn.
+    pub answer: String,
+}
+
+/// Where the end of a turn meets the calls waiting for it, so that its result reaches the parent
+/// once: either a waiting call takes it, or nobody does and the parent is told otherwise.
+///
+/// The contract, every step under the one lock:
+///
+/// - a call that waits for turn `seq` of thread `child` [`Handoff::register`]s before it
+///   blocks; registering a turn whose end was already decided is refused
+///   ([`AlreadyEnded`]), and that call reads the result from the stream, the end being logged
+///   there before it was decided;
+/// - the turn's end, once logged, calls [`Handoff::turn_ended`]: the result goes through a
+///   oneshot to every call registered for that turn, which is then marked delivered, and the
+///   function says whether one took it. A turn nobody took is for the parent to be told of
+///   otherwise (the planned `ChildEnded` wake goes there);
+/// - a call that stops waiting (timeout, given up, a card, its turn over)
+///   [`Handoff::withdraw`]s: if the result was handed over meanwhile, it gets it then, so that
+///   a result marked delivered is never lost.
+///
+/// It also remembers which child each `(parent, client_request_id)` started, in which of the
+/// parent's turns, so that a retry joins it only in that turn; those entries go when that turn
+/// ends. Everything is in memory: no turn outlives Fronde.
+#[derive(Default)]
+pub struct Handoff {
+    state: Mutex<HandoffState>,
+}
+
+/// The calls waiting for one turn: each one's id and where its result goes.
+type Waiting = Vec<(u64, oneshot::Sender<TurnResult>)>;
+
+#[derive(Default)]
+struct HandoffState {
+    next: u64,
+    /// The calls waiting, by thread and turn.
+    waiting: HashMap<(ThreadId, u64), Waiting>,
+    /// The last turn of each thread whose end was decided.
+    ended: HashMap<ThreadId, u64>,
+    /// The last turn of each thread whose result a waiting call took.
+    delivered: HashMap<ThreadId, u64>,
+    /// `(parent, client_request_id)` → (child, the parent's turn that started it).
+    retries: HashMap<(ThreadId, String), (ThreadId, u64)>,
+}
+
+/// The turn's end was decided before the call registered: its result is in the stream.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AlreadyEnded;
+
+/// A call's place among those waiting for a turn.
+pub struct Registration {
+    id: u64,
+    result: oneshot::Receiver<TurnResult>,
+}
+
+impl Handoff {
+    /// Registers a call waiting for turn `seq` of `thread`.
+    pub fn register(&self, thread: ThreadId, seq: u64) -> Result<Registration, AlreadyEnded> {
+        let mut state = lock(&self.state);
+        if state.ended.get(&thread).is_some_and(|ended| *ended >= seq) {
+            return Err(AlreadyEnded);
+        }
+        state.next += 1;
+        let id = state.next;
+        let (sender, result) = oneshot::channel();
+        state
+            .waiting
+            .entry((thread, seq))
+            .or_default()
+            .push((id, sender));
+        Ok(Registration { id, result })
+    }
+
+    /// The call of `registration` stops waiting for turn `seq` of `thread`: the result, if it
+    /// was handed over meanwhile.
+    pub fn withdraw(
+        &self,
+        thread: ThreadId,
+        seq: u64,
+        mut registration: Registration,
+    ) -> Option<TurnResult> {
+        let mut state = lock(&self.state);
+        if let Some(waiting) = state.waiting.get_mut(&(thread, seq)) {
+            let before = waiting.len();
+            waiting.retain(|(id, _)| *id != registration.id);
+            let withdrawn = waiting.len() < before;
+            if waiting.is_empty() {
+                state.waiting.remove(&(thread, seq));
+            }
+            if withdrawn {
+                return None;
+            }
+        }
+        registration.result.try_recv().ok()
+    }
+
+    /// Turn `seq` of `thread` ended, logged as `result`: hands it to every call registered for
+    /// it, and forgets the retries the turn started. Whether a call took it.
+    pub fn turn_ended(&self, thread: ThreadId, seq: u64, result: TurnResult) -> bool {
+        let mut state = lock(&self.state);
+        state.ended.insert(thread, seq);
+        state
+            .retries
+            .retain(|(parent, _), (_, turn)| !(*parent == thread && *turn <= seq));
+        let mut delivered = false;
+        for (_, sender) in state.waiting.remove(&(thread, seq)).unwrap_or_default() {
+            delivered |= sender.send(result.clone()).is_ok();
+        }
+        if delivered {
+            state.delivered.insert(thread, seq);
+        } else {
+            state.delivered.remove(&thread);
+        }
+        delivered
+    }
+
+    /// The last turn of `thread` whose result a waiting call took.
+    pub fn delivered(&self, thread: ThreadId) -> Option<u64> {
+        lock(&self.state).delivered.get(&thread).copied()
+    }
+
+    /// Remembers that `client_request_id` started `child` in `parent`'s turn `turn`.
+    fn remember_retry(
+        &self,
+        parent: ThreadId,
+        client_request_id: &str,
+        child: ThreadId,
+        turn: u64,
+    ) {
+        lock(&self.state)
+            .retries
+            .insert((parent, client_request_id.to_owned()), (child, turn));
+    }
+
+    /// Whether `client_request_id` started `child` in `parent`'s turn `turn`.
+    fn started_in(
+        &self,
+        parent: ThreadId,
+        client_request_id: &str,
+        child: ThreadId,
+        turn: u64,
+    ) -> bool {
+        lock(&self.state)
+            .retries
+            .get(&(parent, client_request_id.to_owned()))
+            .is_some_and(|started| *started == (child, turn))
+    }
+
+    fn forget_retry(&self, parent: ThreadId, client_request_id: &str) {
+        lock(&self.state)
+            .retries
+            .remove(&(parent, client_request_id.to_owned()));
     }
 }
 
@@ -101,9 +262,11 @@ pub enum ChildEnd {
     },
     /// A card opened in the sub-agent's thread: the user has to answer it first.
     WaitingForUser,
+    /// The sub-agent waits for an agent slot: it starts once another agent stops.
+    Queued,
     /// The wait timed out; the sub-agent goes on.
     TimedOut,
-    /// The call waiting was given up; the sub-agent goes on.
+    /// The call waiting was given up, or the caller's turn is over; the sub-agent goes on.
     GaveUp,
 }
 
@@ -114,6 +277,12 @@ pub enum Delegation {
     NoSuchThread,
     /// The caller is a sub-agent as deep as sub-agents go.
     TooDeep { max_depth: u32 },
+    /// The caller's own thread is archived.
+    CallerArchived,
+    /// The caller has as many sub-agents in a turn as it may.
+    TooManyRunning { limit: usize },
+    /// The caller keeps as many sub-agents as it may.
+    TooManyKept { limit: usize },
     /// The caller named its own thread.
     Itself,
     /// The sub-agent is in a turn: one message at a time.
@@ -139,6 +308,17 @@ impl std::fmt::Display for Delegation {
             Self::TooDeep { max_depth } => write!(
                 f,
                 "you are a sub-agent, and sub-agents go {max_depth} level(s) deep at most: you cannot start or drive sub-agents; do the task yourself"
+            ),
+            Self::CallerArchived => f.write_str(
+                "your thread is archived: it cannot start or drive sub-agents",
+            ),
+            Self::TooManyRunning { limit } => write!(
+                f,
+                "you already have {limit} sub-agents running or waiting for an agent, the most at once; wait for one to end, or stop one with threads_cancel"
+            ),
+            Self::TooManyKept { limit } => write!(
+                f,
+                "you already have {limit} sub-agents, the most a thread keeps; reuse one with threads_send, or ask the user to archive some"
             ),
             Self::Itself => f.write_str("that is your own thread; name one of your sub-agents"),
             Self::Busy => f.write_str(
@@ -214,10 +394,58 @@ impl Threads {
     /// Whether thread `caller` may start sub-agents and send them messages: it exists, is not
     /// archived and is less deep than [`Threads::max_depth`].
     pub async fn may_delegate(&self, caller: ThreadId) -> anyhow::Result<bool> {
-        Ok(self
-            .get(caller)
+        match self.check_delegate(caller).await {
+            Ok(()) => Ok(true),
+            Err(error) if error.is::<Delegation>() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`Threads::may_delegate`], with the refusal: [`Delegation::CallerArchived`] or
+    /// [`Delegation::TooDeep`].
+    pub async fn check_delegate(&self, caller: ThreadId) -> anyhow::Result<()> {
+        let Some(row) = self.get(caller).await? else {
+            bail!(Delegation::NoSuchThread);
+        };
+        Self::delegates(&row, self.max_depth())
+    }
+
+    fn delegates(row: &ThreadRow, max_depth: u32) -> anyhow::Result<()> {
+        if row.archived_at.is_some() {
+            bail!(Delegation::CallerArchived);
+        }
+        if row.depth >= max_depth {
+            bail!(Delegation::TooDeep { max_depth });
+        }
+        Ok(())
+    }
+
+    /// `parent`'s own sub-agents not archived.
+    async fn kept_children(&self, parent: ThreadId) -> anyhow::Result<Vec<ThreadId>> {
+        Ok(threads::Entity::find()
+            .filter(threads::Column::ParentId.eq(parent.0))
+            .filter(threads::Column::ArchivedAt.is_null())
+            .all(&self.db)
             .await?
-            .is_some_and(|row| row.archived_at.is_none() && row.depth < self.max_depth()))
+            .into_iter()
+            .map(|row| ThreadId(row.id))
+            .collect())
+    }
+
+    /// How many of `children` are in a turn or waiting for an agent: only an open thread runs
+    /// one.
+    async fn running_among(&self, children: &[ThreadId]) -> usize {
+        let open = self.open.lock().await;
+        children
+            .iter()
+            .filter_map(|id| open.get(id))
+            .filter(|assistant| {
+                matches!(
+                    assistant.status(),
+                    ThreadStatus::Running | ThreadStatus::Queued
+                )
+            })
+            .count()
     }
 
     /// The providers a sub-agent may run on: the configured one.
@@ -228,7 +456,7 @@ impl Threads {
     /// For each child of `parent`, the seq of the message of the last turn whose result a
     /// waiting call took: that result reached the parent already.
     pub fn delivered(&self, child: ThreadId) -> Option<u64> {
-        lock(&self.children.delivered).get(&child).copied()
+        self.children.handoff.delivered(child)
     }
 
     /// Thread `target` if `caller` may reach it ([`may_access`]); else
@@ -286,10 +514,7 @@ impl Threads {
         let Some(parent_row) = self.get(parent).await? else {
             bail!(Delegation::NoSuchThread);
         };
-        let max_depth = self.max_depth();
-        if parent_row.archived_at.is_some() || parent_row.depth >= max_depth {
-            bail!(Delegation::TooDeep { max_depth });
-        }
+        Self::delegates(&parent_row, self.max_depth())?;
         let provider = child
             .provider
             .clone()
@@ -329,6 +554,18 @@ impl Threads {
                 child: earlier.id,
             });
         }
+        // Under the start lock: two starts never both pass.
+        let kept = self.kept_children(parent).await?;
+        if kept.len() >= MAX_CHILDREN_KEPT {
+            bail!(Delegation::TooManyKept {
+                limit: MAX_CHILDREN_KEPT
+            });
+        }
+        if self.running_among(&kept).await >= MAX_CHILDREN_RUNNING {
+            bail!(Delegation::TooManyRunning {
+                limit: MAX_CHILDREN_RUNNING
+            });
+        }
         let transaction = fronde_db::begin_write(&self.db).await?;
         let mut row = self
             .insert(
@@ -352,18 +589,41 @@ impl Threads {
         transaction.commit().await?;
         self.changes.notify();
         if let (Some(client_request_id), Some(turn)) = (&child.client_request_id, turn) {
-            lock(&self.children.retries)
-                .insert((parent, client_request_id.clone()), (row.id, turn));
+            self.children
+                .handoff
+                .remember_retry(parent, client_request_id, row.id, turn);
         }
-        let assistant = self.opened(row.id).await?;
-        let seq = match assistant
-            .try_send(child.task, Some(parent_row.title.clone()))
-            .await
-        {
+        let sent = match self.opened(row.id).await {
+            Ok(assistant) => assistant
+                .try_send(child.task, Some(parent_row.title.clone()))
+                .await
+                .map_err(|refused| match refused {
+                    Refused::Busy => anyhow::Error::new(Delegation::Busy),
+                    Refused::Archived => anyhow::Error::new(Delegation::Archived),
+                }),
+            Err(error) => Err(error),
+        };
+        let seq = match sent {
             Ok(Some(seq)) => seq,
-            Ok(None) => bail!("the task of sub-agent {} could not be logged", row.id),
-            Err(Refused::Busy) => bail!(Delegation::Busy),
-            Err(Refused::Archived) => bail!(Delegation::Archived),
+            failed => {
+                // A child without its task: archived, so that a retry does not find its
+                // `client_request_id` taken and starts anew.
+                if let Some(client_request_id) = &child.client_request_id {
+                    self.children
+                        .handoff
+                        .forget_retry(parent, client_request_id);
+                }
+                if let Err(error) = self.set_archived(row.id, true).await {
+                    tracing::error!(
+                        "cannot archive the sub-agent {} left without its task: {error:#}",
+                        row.id
+                    );
+                }
+                match failed {
+                    Err(error) => return Err(error),
+                    _ => bail!("the task of sub-agent {} could not be logged", row.id),
+                }
+            }
         };
         tracing::info!("thread {parent} started the sub-agent {}", row.id);
         Ok(StartedChild {
@@ -390,9 +650,10 @@ impl Threads {
         let Some(client_request_id) = &child.client_request_id else {
             return Ok(None);
         };
-        let same_turn = lock(&self.children.retries)
-            .get(&(parent, client_request_id.clone()))
-            .is_some_and(|started| *started == (earlier.id, turn));
+        let same_turn =
+            self.children
+                .handoff
+                .started_in(parent, client_request_id, earlier.id, turn);
         if !same_turn
             || earlier.title != title
             || earlier.provider != provider
@@ -423,9 +684,13 @@ impl Threads {
         text: String,
     ) -> anyhow::Result<u64> {
         let row = self.descendant(caller, target).await?;
-        if !self.may_delegate(caller).await? {
-            bail!(Delegation::TooDeep {
-                max_depth: self.max_depth()
+        self.check_delegate(caller).await?;
+        // The sub-agent itself is idle, or the send is refused below as busy.
+        let _starting = self.children.starting.lock().await;
+        let kept = self.kept_children(caller).await?;
+        if self.running_among(&kept).await >= MAX_CHILDREN_RUNNING {
+            bail!(Delegation::TooManyRunning {
+                limit: MAX_CHILDREN_RUNNING
             });
         }
         let by = self.get(caller).await?.map(|caller| caller.title);
@@ -545,12 +810,15 @@ impl Threads {
     }
 
     /// Waits for the turn of `caller`'s sub-agent `target` whose message is `seq` to end, at
-    /// most `timeout`, and while `cancelled` is not: ends early when a card opens in that turn,
-    /// for the user to answer. A result returned here is marked delivered
-    /// ([`Threads::delivered`]).
+    /// most `timeout`, while `cancelled` is not and while `caller`'s turn is still `caller_turn`
+    /// with its agent running. Ends early when a card opens in that turn, for the user to answer,
+    /// or when the sub-agent waits for an agent slot. The result comes through the [`Handoff`],
+    /// which marks it delivered ([`Threads::delivered`]); a turn whose end was decided before
+    /// this call registered is read from the stream, and is not marked.
     pub async fn wait_child(
         &self,
         caller: ThreadId,
+        caller_turn: Option<u64>,
         target: ThreadId,
         seq: u64,
         timeout: Duration,
@@ -558,12 +826,19 @@ impl Threads {
     ) -> anyhow::Result<ChildEnd> {
         let row = self.descendant(caller, target).await?;
         let assistant = self.opened(row.id).await?;
-        // Listening before reading: an entry written in between is not missed.
+        let parent = self.opened(caller).await?;
+        // Listening before registering and reading: an entry written in between is not missed.
         let mut live = assistant.log().subscribe();
+        let mut parent_live = parent.log().subscribe();
+        let handoff = &self.children.handoff;
+        let mut registration = match handoff.register(row.id, seq) {
+            Ok(registration) => registration,
+            Err(AlreadyEnded) => return Ok(ended_in_log(&assistant, seq)),
+        };
         let deadline = tokio::time::Instant::now() + timeout;
         let mut seen = seq;
         let mut open_cards = HashSet::new();
-        loop {
+        let stopped = loop {
             for entry in assistant.log().since(seen) {
                 seen = entry.seq;
                 match entry.event {
@@ -573,36 +848,66 @@ impl Threads {
                     Event::RequestClosed { id, .. } => {
                         open_cards.remove(&id);
                     }
-                    Event::TurnEnded { outcome } => {
-                        let turn: Vec<Entry> = assistant
-                            .log()
-                            .since(seq.saturating_sub(1))
-                            .into_iter()
-                            .take_while(|entry| entry.seq <= seen)
-                            .collect();
-                        lock(&self.children.delivered).insert(row.id, seq);
-                        return Ok(ChildEnd::Ended {
-                            outcome,
-                            answer: final_answer(&turn),
-                        });
-                    }
+                    // The turn's end comes through the handoff, once decided.
                     _ => {}
                 }
             }
             if !open_cards.is_empty() {
-                return Ok(ChildEnd::WaitingForUser);
+                break ChildEnd::WaitingForUser;
+            }
+            if assistant.status() == ThreadStatus::Queued {
+                break ChildEnd::Queued;
+            }
+            if parent.current_turn().await != caller_turn || !parent.agent_running() {
+                break ChildEnd::GaveUp;
             }
             tokio::select! {
                 biased;
-                () = cancelled.cancelled() => return Ok(ChildEnd::GaveUp),
-                () = tokio::time::sleep_until(deadline) => return Ok(ChildEnd::TimedOut),
+                () = cancelled.cancelled() => break ChildEnd::GaveUp,
+                () = tokio::time::sleep_until(deadline) => break ChildEnd::TimedOut,
+                result = &mut registration.result => match result {
+                    Ok(TurnResult { outcome, answer }) => {
+                        return Ok(ChildEnd::Ended { outcome, answer });
+                    }
+                    Err(_) => bail!("the end of sub-agent {target}'s turn was lost"),
+                },
                 received = live.recv() => {
                     if let Err(RecvError::Closed) = received {
-                        bail!("the stream of sub-agent {target} closed");
+                        break ChildEnd::GaveUp;
+                    }
+                }
+                received = parent_live.recv() => {
+                    if let Err(RecvError::Closed) = received {
+                        break ChildEnd::GaveUp;
                     }
                 }
             }
+        };
+        // Handed over while this call was stopping: it takes the result, marked delivered.
+        Ok(match handoff.withdraw(row.id, seq, registration) {
+            Some(TurnResult { outcome, answer }) => ChildEnd::Ended { outcome, answer },
+            None => stopped,
+        })
+    }
+}
+
+/// The end of turn `seq` of `assistant`, read from its stream: logged before it was decided.
+fn ended_in_log(assistant: &Assistant, seq: u64) -> ChildEnd {
+    let turn: Vec<Entry> = assistant.log().since(seq.saturating_sub(1));
+    let end = turn
+        .iter()
+        .position(|entry| matches!(entry.event, Event::TurnEnded { .. }));
+    match end {
+        Some(end) => {
+            let Event::TurnEnded { outcome } = turn[end].event else {
+                unreachable!("found as a turn's end");
+            };
+            ChildEnd::Ended {
+                outcome,
+                answer: final_answer(&turn[..end]),
+            }
         }
+        None => ChildEnd::GaveUp,
     }
 }
 
@@ -653,6 +958,73 @@ mod tests {
         assert!(!may_access(ThreadId(1), ThreadId(7), |id| cycle
             .get(&id)
             .copied()));
+    }
+
+    fn result(answer: &str) -> TurnResult {
+        TurnResult {
+            outcome: TurnOutcome::Done,
+            answer: answer.into(),
+        }
+    }
+
+    #[test]
+    fn a_registered_wait_gets_the_result_once_delivered() {
+        let handoff = Handoff::default();
+        let (child, other) = (ThreadId(2), ThreadId(3));
+        let mut waiting = handoff.register(child, 5).unwrap();
+        assert!(
+            !handoff.turn_ended(other, 5, result("autre")),
+            "another thread's turn"
+        );
+        assert!(handoff.turn_ended(child, 5, result("Fini.")));
+        assert_eq!(waiting.result.try_recv().unwrap(), result("Fini."));
+        assert_eq!(handoff.delivered(child), Some(5));
+        // A turn whose end was decided is read from the stream: registering is refused.
+        assert!(matches!(handoff.register(child, 5), Err(AlreadyEnded)));
+        assert!(matches!(handoff.register(child, 3), Err(AlreadyEnded)));
+        assert!(handoff.register(child, 9).is_ok());
+    }
+
+    #[test]
+    fn a_wait_that_stops_takes_a_result_handed_meanwhile() {
+        let handoff = Handoff::default();
+        let child = ThreadId(2);
+        // Withdrawn before the end: nobody takes it, nothing is delivered.
+        let early = handoff.register(child, 5).unwrap();
+        assert_eq!(handoff.withdraw(child, 5, early), None);
+        assert!(!handoff.turn_ended(child, 5, result("Fini.")));
+        assert_eq!(handoff.delivered(child), None);
+        // Handed over while it was stopping: it gets it.
+        let late = handoff.register(child, 7).unwrap();
+        assert!(handoff.turn_ended(child, 7, result("Encore.")));
+        assert_eq!(handoff.withdraw(child, 7, late), Some(result("Encore.")));
+        // Two waits for the same turn both get it.
+        let (first, second) = (
+            handoff.register(child, 9).unwrap(),
+            handoff.register(child, 9).unwrap(),
+        );
+        assert!(handoff.turn_ended(child, 9, result("Deux.")));
+        assert_eq!(handoff.withdraw(child, 9, first), Some(result("Deux.")));
+        assert_eq!(handoff.withdraw(child, 9, second), Some(result("Deux.")));
+        // A later turn nobody waited for clears the mark.
+        assert!(!handoff.turn_ended(child, 11, result("Seul.")));
+        assert_eq!(handoff.delivered(child), None);
+    }
+
+    #[test]
+    fn retries_go_with_the_turn_that_started_them() {
+        let handoff = Handoff::default();
+        let (parent, other, child) = (ThreadId(1), ThreadId(5), ThreadId(2));
+        handoff.remember_retry(parent, "a", child, 4);
+        handoff.remember_retry(other, "a", ThreadId(6), 4);
+        assert!(handoff.started_in(parent, "a", child, 4));
+        assert!(!handoff.started_in(parent, "a", child, 5), "another turn");
+        handoff.turn_ended(parent, 4, result(""));
+        assert!(!handoff.started_in(parent, "a", child, 4));
+        assert!(
+            handoff.started_in(other, "a", ThreadId(6), 4),
+            "another parent's"
+        );
     }
 
     fn entry(seq: u64, event: Event) -> Entry {
