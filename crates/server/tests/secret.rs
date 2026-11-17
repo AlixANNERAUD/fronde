@@ -47,6 +47,8 @@ fn auto_config(
 
 fn fronde(args: &[&str], config: &Path, stdin: Option<&[u8]>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fronde"))
+        // Never the machine's keychain, whatever the environment the tests run in.
+        .env("FRONDE_KEYCHAIN", "off")
         .args(args)
         .arg("--config")
         .arg(config)
@@ -428,4 +430,198 @@ async fn the_agent_token_is_read_at_each_start() {
     assert_eq!(from_file().await.unwrap().expose_secret(), "from-file");
     fronde_hub::private::write(&file, "changed\n").unwrap();
     assert_eq!(from_file().await.unwrap().expose_secret(), "changed");
+}
+
+/// The key file's line without its prefix and line break: the key's bytes, as they would show.
+fn key_material(config: &Path) -> String {
+    let file = config.parent().unwrap().join("master.key");
+    let line = std::fs::read_to_string(file).unwrap();
+    line.trim_end()
+        .strip_prefix("fronde-key-v1:")
+        .unwrap()
+        .to_owned()
+}
+
+fn set_from_cli(path: &Path, name: &str, value: &str) {
+    let out = fronde(
+        &["secret", "set", name, "--origin", "https://cloud.example"],
+        path,
+        Some(value.as_bytes()),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}
+
+/// `fronde secret rotate-key` seals every secret again with a new key in the key file, and shows
+/// neither key nor any value.
+#[tokio::test]
+async fn rotate_key_from_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path());
+    set_from_cli(&path, "caldav", CANARY);
+    set_from_cli(&path, "other", "canary-cli-other-61b0");
+    let old = key_material(&path);
+
+    let out = fronde(&["secret", "rotate-key"], &path, None);
+    let shown = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(shown.contains("rotated the master key"), "{shown}");
+    assert!(shown.contains("2 stored secret(s) sealed again"), "{shown}");
+    let new = key_material(&path);
+    assert_ne!(new, old);
+    for material in [&old, &new, &CANARY.to_owned()] {
+        assert!(!shown.contains(material.as_str()), "{shown}");
+    }
+    assert!(!dir.path().join("master.key.next").exists());
+    assert_eq!(stored(&path, "caldav").await, CANARY);
+    assert_eq!(stored(&path, "other").await, "canary-cli-other-61b0");
+}
+
+/// While `fronde serve` runs on the data directory, rotating or moving the key is refused, naming
+/// the process; once it stops, the rotation goes through.
+#[tokio::test]
+async fn rotate_key_is_refused_while_fronde_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path());
+    set_from_cli(&path, "caldav", CANARY);
+    let old = key_material(&path);
+    let mut config = fronde_hub::config::load(&path).unwrap();
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    let (_, server) = fronde::start(config).await.unwrap();
+
+    for args in [
+        &["secret", "rotate-key"][..],
+        &["secret", "move-key", "--to", "file"],
+    ] {
+        let out = fronde(args, &path, None);
+        let shown = text(&out);
+        assert_ne!(out.status.code(), Some(0), "{shown}");
+        assert!(
+            shown.contains(&format!("process {} (fronde serve)", std::process::id())),
+            "{shown}"
+        );
+        assert!(shown.contains("Stop it first"), "{shown}");
+    }
+    assert_eq!(key_material(&path), old, "nothing changed");
+
+    server.abort();
+    let _ = server.await;
+    let out = fronde(&["secret", "rotate-key"], &path, None);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_ne!(key_material(&path), old);
+    assert_eq!(stored(&path, "caldav").await, CANARY);
+}
+
+/// A rotation that stopped after sealing the secrets with the new key, before that key replaced
+/// the old one in the file, is finished when Fronde starts.
+#[tokio::test]
+async fn serve_finishes_an_interrupted_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path());
+    set_from_cli(&path, "caldav", CANARY);
+    let old = key_material(&path);
+    let mut config = fronde_hub::config::load(&path).unwrap();
+    {
+        let db = fronde_db::open(&config.data.dir).await.unwrap();
+        let backends = config.master_key_backends().unwrap();
+        fronde_db::master_key::rotate_crashing_after(
+            &db,
+            &backends,
+            fronde_db::master_key::Step::Resealed,
+        )
+        .await
+        .unwrap_err();
+        db.close().await.unwrap();
+    }
+    assert_eq!(
+        key_material(&path),
+        old,
+        "the old key is still the current one"
+    );
+    assert!(dir.path().join("master.key.next").exists());
+
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    let (_, server) = fronde::start(config).await.unwrap();
+    server.abort();
+    let _ = server.await;
+    assert_ne!(key_material(&path), old, "the new key was promoted");
+    assert!(!dir.path().join("master.key.next").exists());
+    assert_eq!(stored(&path, "caldav").await, CANARY);
+}
+
+/// `fronde secret move-key` moves the key from the file to the keychain and back, saying where
+/// without showing it; a keychain that cannot take it, or a configuration that names the file
+/// backend, changes nothing.
+#[tokio::test]
+async fn move_key_between_the_file_and_the_keychain() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = fronde_db::master_key::FakeKeychain::new();
+    let path = config(dir.path());
+    set_from_cli(&path, "caldav", CANARY);
+    let material = key_material(&path);
+    let key_file = dir.path().join("master.key");
+
+    // `[secrets] backend = "file"`: the key would be looked for there.
+    let named = fronde::secret::move_key(
+        &fronde_hub::config::load(&path).unwrap(),
+        "keychain",
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{named:#}").contains("backend = \"file\""),
+        "{named:#}"
+    );
+    let unknown = fronde::secret::move_key(
+        &fronde_hub::config::load(&path).unwrap(),
+        "vault",
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{unknown:#}").contains("file, keychain or systemd"));
+
+    let config = auto_config(dir.path(), &keychain, None);
+    keychain.lock();
+    let locked = fronde::secret::move_key(&config, "keychain", &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(format!("{locked:#}").contains("locked"), "{locked:#}");
+    keychain.unlock();
+    assert_eq!(key_material(&path), material, "nothing changed");
+    assert!(keychain.entry(&config.data.dir).is_none());
+
+    let mut out = Vec::new();
+    fronde::secret::move_key(&config, "keychain", &mut out)
+        .await
+        .unwrap();
+    let shown = String::from_utf8(out).unwrap();
+    assert!(shown.contains("moved the master key from"), "{shown}");
+    assert!(shown.contains("to the keychain (fake"), "{shown}");
+    assert!(shown.contains("removed it from"), "{shown}");
+    assert!(
+        !shown.contains(&material) && !shown.contains(CANARY),
+        "{shown}"
+    );
+    assert!(!key_file.exists());
+    assert!(
+        keychain
+            .entry(&config.data.dir)
+            .unwrap()
+            .contains(&material)
+    );
+    assert_eq!(stored_with(&config, "caldav").await, CANARY);
+
+    let mut out = Vec::new();
+    fronde::secret::move_key(&config, "file", &mut out)
+        .await
+        .unwrap();
+    let shown = String::from_utf8(out).unwrap();
+    assert!(
+        !shown.contains(&material) && !shown.contains(CANARY),
+        "{shown}"
+    );
+    assert_eq!(key_material(&path), material);
+    assert!(keychain.entry(&config.data.dir).is_none());
+    assert_eq!(stored_with(&config, "caldav").await, CANARY);
 }

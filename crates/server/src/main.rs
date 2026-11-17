@@ -45,7 +45,8 @@ enum Command {
         #[command(subcommand)]
         action: ServiceCommand,
     },
-    /// Store, list and remove the secrets kept encrypted in the database.
+    /// Store, list and remove the secrets kept encrypted in the database; rotate or move the
+    /// master key that seals them.
     Secret {
         #[command(subcommand)]
         action: SecretCommand,
@@ -87,6 +88,21 @@ enum SecretCommand {
     /// Remove a stored secret.
     Remove {
         name: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Replace the master key with a new one and seal every stored secret again with it.
+    /// Fronde must be stopped.
+    RotateKey {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Keep the master key in another backend (file or keychain): the same key, removed from
+    /// the old backend once the new one holds it. Fronde must be stopped.
+    MoveKey {
+        /// The backend to keep the key in: file, keychain or systemd (which only explains how).
+        #[arg(long)]
+        to: String,
         #[arg(long)]
         config: PathBuf,
     },
@@ -215,6 +231,12 @@ async fn secret(action: &SecretCommand) -> anyhow::Result<ExitCode> {
         }
         SecretCommand::Remove { name, config } => {
             fronde::secret::remove(&fronde_hub::config::load(config)?, name, &mut out).await?;
+        }
+        SecretCommand::RotateKey { config } => {
+            fronde::secret::rotate_key(&fronde_hub::config::load(config)?, &mut out).await?;
+        }
+        SecretCommand::MoveKey { to, config } => {
+            fronde::secret::move_key(&fronde_hub::config::load(config)?, to, &mut out).await?;
         }
     }
     Ok(ExitCode::SUCCESS)

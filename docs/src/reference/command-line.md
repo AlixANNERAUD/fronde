@@ -82,16 +82,20 @@ It prints `config OK` when all is well. It does not connect to anything.
 
 ## `fronde secret`
 
-Stores, lists and removes the secrets kept encrypted in `fronde.db`, scope `sources` (see
+Stores, lists and removes the secrets kept encrypted in `fronde.db`, scope `sources`, and
+rotates or moves the master key that seals them (see
 [Store a secret](../how-to/store-a-secret.md) and
 [Security model](../explanation/security.md#stored-secrets)). Each command makes itself
 non-dumpable on Linux, moves a master key an earlier version left in the data directory to its
-place, and opens the database, each as `serve` does, and works while Fronde runs.
+place, and opens the database, each as `serve` does. `set`, `list` and `remove` work while
+Fronde runs; `rotate-key` and `move-key` do not.
 
 ```text
 fronde secret set <name> --origin <origin> --config <file>  < value
 fronde secret list --config <file>
 fronde secret remove <name> --config <file>
+fronde secret rotate-key --config <file>
+fronde secret move-key --to <file|keychain|systemd> --config <file>
 ```
 
 - `set` reads the value from standard input, never from an argument, and refuses a terminal,
@@ -112,6 +116,24 @@ fronde secret remove <name> --config <file>
 - `remove` removes one secret, and exits with 1 if there is none by that name. Removing the last
   one also removes the key check, so a lost key then no longer blocks a new one; the backend
   recorded for it stays.
+- `rotate-key` makes a new master key, seals every stored secret (of every scope) and the key
+  check again with it in one transaction, and puts it in place of the old one, in the same
+  backend. It prints `rotated the master key <place>: <n> stored secret(s) sealed again with the
+  new key`. A key in a systemd credential is refused: Fronde never writes one.
+- `move-key --to <backend>` keeps the same key in another backend, `file` or `keychain`: it
+  copies the key there, reads it back, checks that it opens the stored secrets, records the new
+  backend, then removes the key from the old one, and prints both places. It is refused, with
+  nothing changed, when nothing is stored, when the key is there already, when `[secrets]
+  backend` names another backend than the target, when the target cannot be written (a locked or
+  unreachable keychain, with the keychain's own error) or already holds a different key. `--to
+  systemd` only explains how to make the credential yourself.
+
+Both refuse to run while Fronde runs on the same data directory, and name the process that
+holds it (`process <pid> (fronde serve)`); `serve` likewise refuses to start while either runs.
+Both print where the key is, never the key. Each step is durable before the next, so that a
+crash leaves a key that opens every stored secret; `serve` finishes an interrupted rotation when
+it starts, with a warning in the log, and so does the next `rotate-key` or `move-key`. Until
+then, `fronde check` and `fronde secret set` say that a rotation was interrupted.
 
 A component's credential names a stored secret with `{ stored = "<name>" }` (see
 [Configuration](configuration.md#kind--component)).

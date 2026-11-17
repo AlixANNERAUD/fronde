@@ -22,6 +22,27 @@ pub const LOCK_FILE: &str = "master-key.lock";
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
+/// Where a backend keeps a key: the key in use, or the next one while a rotation is under way
+/// ([`super::rotation`]): `master.key.next` beside the key file, or the keychain entry's user
+/// followed by `.next`. A systemd credential has no next slot: Fronde never writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Slot {
+    Current,
+    Next,
+}
+
+/// The user of the keychain entry that holds the next key, beside the entry of `user`.
+pub(super) fn next_entry(user: &str) -> String {
+    format!("{user}.next")
+}
+
+/// The file that holds the next key, beside the key file `file`.
+fn next_file(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_owned();
+    name.push(".next");
+    PathBuf::from(name)
+}
+
 /// `[secrets] backend`: one backend, or `auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Choice {
@@ -166,9 +187,17 @@ impl Backends {
             .map_err(|e| self.unavailable(backend, entry, e))?;
         match key {
             Some(key) => {
-                crate::secrets::check_key(db, &key)
-                    .await
-                    .map_err(|e| e.context(format!("master key {}", self.place_of(&key))))?;
+                if let Err(e) = crate::secrets::check_key(db, &key).await {
+                    let e = e.context(format!("master key {}", self.place_of(&key)));
+                    // Read-only callers such as `fronde check` cannot finish it themselves.
+                    return Err(match super::rotation::interrupted(db).await {
+                        Ok(Some(_)) => e.context(
+                            "a rotation of the master key was interrupted: `fronde serve` or \
+                             `fronde secret rotate-key` finishes it",
+                        ),
+                        _ => e,
+                    });
+                }
                 Ok(Some(Arc::new(key)))
             }
             // The last secret was removed since.
@@ -259,7 +288,7 @@ impl Backends {
 
     /// The keychain entry's user: the one recorded with the first secret, else the one this data
     /// directory's path gives.
-    async fn entry(&self, db: &DatabaseConnection) -> anyhow::Result<String> {
+    pub(super) async fn entry(&self, db: &DatabaseConnection) -> anyhow::Result<String> {
         Ok(crate::secrets::recorded_keychain_entry(db)
             .await?
             .unwrap_or_else(|| self.keychain.user()))
@@ -277,6 +306,135 @@ impl Backends {
                 systemd::read(self.credentials.as_deref()).map_err(KeychainError::Failed)
             }
             Backend::Keychain => self.keychain.read(entry).await,
+        }
+    }
+
+    /// The backend `[secrets] backend` names, if it names one.
+    pub(super) fn named(&self) -> Option<Backend> {
+        match self.choice {
+            Choice::Only(backend) => Some(backend),
+            Choice::Auto => None,
+        }
+    }
+
+    /// Where `backend` keeps the key of `slot`, for messages; `entry` is the keychain entry's
+    /// user.
+    pub(super) fn slot_place(&self, backend: Backend, entry: &str, slot: Slot) -> String {
+        match (backend, slot) {
+            (Backend::Keychain, Slot::Current) => self.keychain.describe(entry),
+            (Backend::Keychain, Slot::Next) => self.keychain.describe(&next_entry(entry)),
+            (Backend::File, Slot::Next) => next_file(&self.file).display().to_string(),
+            (backend, _) => self.place(backend),
+        }
+    }
+
+    /// The key in `slot` of `backend`, if it holds one; `entry` is the keychain entry's user.
+    pub(super) async fn read_slot(
+        &self,
+        backend: Backend,
+        entry: &str,
+        slot: Slot,
+    ) -> anyhow::Result<Option<MasterKey>> {
+        match (backend, slot) {
+            (_, Slot::Current) => self
+                .read(backend, entry)
+                .await
+                .map_err(|e| self.unavailable(backend, entry, e)),
+            (Backend::File, Slot::Next) => super::read(&next_file(&self.file)),
+            (Backend::Keychain, Slot::Next) => {
+                let next = next_entry(entry);
+                self.keychain
+                    .read(&next)
+                    .await
+                    .map_err(|e| e.into_anyhow(&self.keychain.describe(&next)))
+            }
+            (Backend::Systemd, Slot::Next) => Ok(None),
+        }
+    }
+
+    /// Put `key` in `slot` of `backend`, replacing what it held, durably, and check that it
+    /// reads back the same. Fronde never writes a systemd credential.
+    pub(super) async fn write_slot(
+        &self,
+        backend: Backend,
+        entry: &str,
+        slot: Slot,
+        key: &MasterKey,
+    ) -> anyhow::Result<()> {
+        let place = self.slot_place(backend, entry, slot);
+        match backend {
+            Backend::Systemd => bail!(
+                "Fronde never writes the systemd credential {}",
+                systemd::CREDENTIAL
+            ),
+            Backend::Keychain => {
+                let user = match slot {
+                    Slot::Current => entry.to_owned(),
+                    Slot::Next => next_entry(entry),
+                };
+                self.keychain
+                    .put(&user, key)
+                    .await
+                    .map_err(|e| e.into_anyhow(&place))?;
+            }
+            Backend::File => {
+                let file = match slot {
+                    Slot::Current => self.file.clone(),
+                    Slot::Next => next_file(&self.file),
+                };
+                fronde_fs::write_atomic(&file, key.encode().as_slice()).map_err(|e| {
+                    if super::unwritable(&e) {
+                        super::not_writable(&file, e)
+                    } else {
+                        anyhow::Error::new(e)
+                            .context(format!("cannot write the master key {place}"))
+                    }
+                })?;
+                let back = super::read(&file)?;
+                if back.is_none_or(|back| back.encode() != key.encode()) {
+                    bail!("the master key read back from {place} is not the one written");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the key in `slot` of `backend`; false if it held none. A systemd credential is
+    /// never removed by Fronde: the unit loads it.
+    pub(super) async fn delete_slot(
+        &self,
+        backend: Backend,
+        entry: &str,
+        slot: Slot,
+    ) -> anyhow::Result<bool> {
+        let place = self.slot_place(backend, entry, slot);
+        match backend {
+            Backend::Systemd => Ok(false),
+            Backend::Keychain => {
+                let user = match slot {
+                    Slot::Current => entry.to_owned(),
+                    Slot::Next => next_entry(entry),
+                };
+                self.keychain
+                    .delete(&user)
+                    .await
+                    .map_err(|e| e.into_anyhow(&place))
+            }
+            Backend::File => {
+                let file = match slot {
+                    Slot::Current => self.file.clone(),
+                    Slot::Next => next_file(&self.file),
+                };
+                match std::fs::remove_file(&file) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("cannot remove {place}"));
+                    }
+                }
+                super::sync_dir(&file).with_context(|| format!("cannot remove {place}"))?;
+                Ok(true)
+            }
         }
     }
 

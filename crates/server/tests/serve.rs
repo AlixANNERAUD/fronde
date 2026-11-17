@@ -760,7 +760,9 @@ async fn a_key_in_the_data_directory_is_read_by_check_and_moved_by_serve() {
     config.data.dir = data.clone();
     assert_eq!(config.master_key_file().unwrap(), key_file);
     let (_addr, server) = fronde::start(config.clone()).await.unwrap();
+    // Stopped for good, so that it no longer holds the data directory.
     server.abort();
+    let _ = server.await;
     assert!(!legacy.exists(), "the data directory still holds the key");
     assert_eq!(std::fs::read(&key_file).unwrap(), line);
 

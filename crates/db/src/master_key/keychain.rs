@@ -209,6 +209,36 @@ impl Keychain {
         Ok((parse(&line, user)?, created))
     }
 
+    /// Store `key` in the entry of `user`, replacing what it held, and read it back: an error
+    /// unless the entry then holds this very key.
+    pub(super) async fn put(&self, user: &str, key: &MasterKey) -> Result<(), KeychainError> {
+        let encoded = key.encode();
+        let line = self
+            .run(user, move |entry| {
+                let text =
+                    std::str::from_utf8(encoded.trim_ascii_end()).expect("a key line is ASCII");
+                entry.set_password(text)?;
+                Ok(Zeroizing::new(entry.get_password()?))
+            })
+            .await?;
+        if parse(&line, user)?.encode() != key.encode() {
+            return Err(KeychainError::Failed(anyhow::anyhow!(
+                "the master key read back from the keychain is not the one written"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Remove the entry of `user`; false if there was none.
+    pub(super) async fn delete(&self, user: &str) -> Result<bool, KeychainError> {
+        self.run(user, |entry| match entry.delete_credential() {
+            Ok(()) => Ok(true),
+            Err(Error::NoEntry) => Ok(false),
+            Err(e) => Err(e),
+        })
+        .await
+    }
+
     /// Once no call of this keychain is in flight, within [`TIMEOUT`]. A call that timed out may
     /// still hold the [`super::KeyLock`] on its thread: waiting for the lock would then wait on
     /// this process itself.
@@ -482,6 +512,17 @@ impl FakeKeychain {
         let entry = self
             .store
             .build(SERVICE, &user(data_dir), None)
+            .expect("a mock entry");
+        entry.get_password().ok()
+    }
+
+    /// The text of the entry that holds the next key while a rotation of `data_dir`'s first key
+    /// is under way, whatever the state, if there is one.
+    pub fn next_entry(&self, data_dir: &Path) -> Option<String> {
+        use keyring_core::api::CredentialStoreApi as _;
+        let entry = self
+            .store
+            .build(SERVICE, &super::backends::next_entry(&user(data_dir)), None)
             .expect("a mock entry");
         entry.get_password().ok()
     }

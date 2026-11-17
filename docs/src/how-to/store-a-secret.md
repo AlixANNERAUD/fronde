@@ -148,3 +148,42 @@ These commands work while Fronde runs. A component waiting for a secret that is 
 or that is stored for another origin, is tried again, and starts within a minute of
 `fronde secret set`. A component already running keeps the value it read when it started: after
 replacing or removing a secret, restart Fronde.
+
+## Rotate the master key
+
+To replace the master key with a new one, for instance after a copy of it may have leaked, stop
+Fronde, then run:
+
+```sh
+fronde secret rotate-key --config fronde.toml
+```
+
+It makes a new key, seals every stored secret again with it, puts it where the old one was (the
+key file, or the keychain entry), and prints how many secrets it sealed again. It never prints a
+key. Back up the new key as you did the first one: the old one opens nothing now. A key kept in
+a systemd credential is not rotated in place, since Fronde never writes one: move it to a file,
+rotate it there, then make the credential again from the new file.
+
+The command refuses to run while Fronde runs on the same data directory, and names the process
+(`process 4242 (fronde serve)`): stop the service (`systemctl --user stop fronde`) first. If the
+command is interrupted, by a crash or a power cut, nothing is lost: the next `fronde serve`, or
+the next `rotate-key`, finishes it with the key that opens the stored secrets, and the log says
+so.
+
+## Move the master key
+
+To keep the same key elsewhere, for instance in the keychain after storing secrets on a machine
+without one, stop Fronde, set `[secrets] backend = "auto"` (or the new backend), then run:
+
+```sh
+fronde secret move-key --to keychain --config fronde.toml
+```
+
+or `--to file`. It copies the key to the new place, reads it back, checks that it opens the stored
+secrets, records the new place, and only then removes the key from the old one. It prints both
+places, never the key. If the keychain is locked or cannot be reached, or already holds another
+key in that entry, it stops and changes nothing. `--to systemd` explains how to make the
+credential from the key file with `systemd-creds encrypt` (see
+[Run as a systemd service](run-as-a-service.md#keep-the-master-key-in-a-systemd-credential)):
+Fronde never writes one. Moving a key out of a systemd credential works under a unit that loads
+it; Fronde then leaves the credential in place, for you to remove from the unit.

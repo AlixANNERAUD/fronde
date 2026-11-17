@@ -40,7 +40,7 @@ pub const VERSION: i64 = 1;
 const NONCE_LEN: usize = 24;
 
 /// Where the key check lives in `kv`.
-const CHECK_SCOPE: &str = "secrets";
+pub(crate) const CHECK_SCOPE: &str = "secrets";
 const CHECK_KEY: &str = "key_check";
 /// Where the record of the key's backend lives in `kv`, beside the key check.
 const BACKEND_KEY: &str = "backend";
@@ -107,13 +107,27 @@ impl From<secrets::Model> for Sealed {
 impl Sealed {
     /// The value, if `key` sealed it for this row's version, scope, name and origin.
     pub fn open(&self, key: &MasterKey) -> anyhow::Result<SecretString> {
-        let damaged = || {
-            format!(
-                "the stored secret {} cannot be opened: its row was changed or moved; set it \
-                 again with `fronde secret set {} --origin …`",
-                self.name, self.name
-            )
-        };
+        let plain = self.plain(&key.cipher())?;
+        let text = std::str::from_utf8(&plain)
+            .ok()
+            .with_context(|| self.damaged())?;
+        // Exactly the value's length, so making the `SecretString` does not move it and leave a
+        // copy behind.
+        let mut value = String::with_capacity(text.len());
+        value.push_str(text);
+        Ok(SecretString::from(value))
+    }
+
+    fn damaged(&self) -> String {
+        format!(
+            "the stored secret {} cannot be opened: its row was changed or moved; set it again \
+             with `fronde secret set {} --origin …`",
+            self.name, self.name
+        )
+    }
+
+    /// The value's bytes, zeroed when dropped, if `cipher`'s key sealed it for this row.
+    fn plain(&self, cipher: &XChaCha20Poly1305) -> anyhow::Result<Zeroizing<Vec<u8>>> {
         if self.version != VERSION {
             bail!(
                 "the stored secret {} is sealed in format {}, which this Fronde does not read; \
@@ -122,19 +136,13 @@ impl Sealed {
                 self.version
             );
         }
-        let plain = open_with(
-            &key.cipher(),
+        open_with(
+            cipher,
             &self.nonce,
             &self.ciphertext,
             &associated_data(self.version, &self.scope, &self.name, &self.origin),
         )
-        .with_context(damaged)?;
-        let text = std::str::from_utf8(&plain).ok().with_context(damaged)?;
-        // Exactly the value's length, so making the `SecretString` does not move it and leave a
-        // copy behind.
-        let mut value = String::with_capacity(text.len());
-        value.push_str(text);
-        Ok(SecretString::from(value))
+        .with_context(|| self.damaged())
     }
 }
 
@@ -497,6 +505,58 @@ pub async fn store(
     set(db, &key, scope, name, origin, value).await?;
     drop(lock);
     Ok((key, created))
+}
+
+/// Seal every stored secret, of every scope, and the key check again with `new`, each under a
+/// fresh nonce, in one write transaction: `old` must open the key check and every row, or nothing
+/// changes. The record of the key's backend is left as it is: a rotation keeps the key where it
+/// was. Returns how many secrets were sealed again.
+pub(crate) async fn reseal(
+    db: &DatabaseConnection,
+    old: &MasterKey,
+    new: &MasterKey,
+) -> anyhow::Result<usize> {
+    let transaction = crate::begin_write(db)
+        .await
+        .context("cannot write to the database")?;
+    let Some(check) = stored_check(&transaction).await? else {
+        bail!("no secret is stored: there is no master key to rotate yet");
+    };
+    opens(old, &check)?;
+    let (old_cipher, new_cipher) = (old.cipher(), new.cipher());
+    let rows = secrets::Entity::find()
+        .all(&transaction)
+        .await
+        .context("cannot read the stored secrets")?;
+    let count = rows.len();
+    for row in rows {
+        let sealed = Sealed::from(row);
+        let plain = sealed.plain(&old_cipher)?;
+        let nonce = new_nonce()?;
+        let ciphertext = seal_with(
+            &new_cipher,
+            &nonce,
+            &plain,
+            &associated_data(VERSION, &sealed.scope, &sealed.name, &sealed.origin),
+        )?;
+        secrets::Entity::update(secrets::ActiveModel {
+            scope: Set(sealed.scope.clone()),
+            name: Set(sealed.name.clone()),
+            version: Set(VERSION),
+            nonce: Set(nonce.to_vec()),
+            ciphertext: Set(ciphertext),
+            ..Default::default()
+        })
+        .exec(&transaction)
+        .await
+        .with_context(|| format!("cannot seal the stored secret {} again", sealed.name))?;
+    }
+    write_check(&transaction, seal_check(&new_cipher)?).await?;
+    transaction
+        .commit()
+        .await
+        .context("cannot store the secrets sealed with the new key")?;
+    Ok(count)
 }
 
 /// Remove the secret under `scope` and `name`; true if there was one. Removing the last secret

@@ -82,6 +82,22 @@ directory (`master-key.lock`), so that the keychain, which replaces an entry it 
 up holding another key than the one that sealed; and every write checks, inside its transaction,
 that its key opens the key check.
 
+`fronde secret rotate-key` replaces the key and `fronde secret move-key` moves it to another
+backend, both only while Fronde is stopped: each locks `fronde.lock` in the data directory, which
+`serve` holds while it runs, and says which process holds it. Neither can leave the stored
+secrets without a key that opens them. A rotation first records in the database that it is under
+way, then writes the new key to a second slot beside the current one (`master.key.next`, or the
+keychain entry's name followed by `.next`) and reads it back, then seals every secret and the key
+check again with the new key in one transaction, then replaces the current key with the new one
+(the file atomically), and then empties the second slot and the record. Before that transaction
+commits, the current key still opens the key check; after it, the second slot does. When Fronde
+starts after an interrupted rotation, it keeps the key that opens the key check as the current one
+and empties the second slot, with a warning in the log. A move copies the key to the new backend,
+reads it back, checks it against the key check and records the new backend in one transaction,
+and only then removes the key from the old backend: a crash leaves the key in one place or both,
+with the record naming one that holds it. A move never replaces a different key it finds in the
+new place.
+
 What this protects against: a backup of the data directory, or a snapshot of the volume that
 holds it, contains `fronde.db` but not the key, so it reveals no stored secret; and nothing in the
 database's files, its write-ahead log included, holds a value in clear.

@@ -1,4 +1,5 @@
-//! `fronde secret`: store, list and remove the secrets kept encrypted in `fronde.db`.
+//! `fronde secret`: store, list and remove the secrets kept encrypted in `fronde.db`, and rotate
+//! or move the master key that seals them.
 
 use anyhow::{Context as _, bail};
 use fronde_db::master_key::Backend;
@@ -115,5 +116,57 @@ pub async fn remove(config: &Config, name: &str, out: &mut impl Write) -> anyhow
         bail!("no stored secret is named {name}; `fronde secret list` shows them");
     }
     writeln!(out, "removed secret {name}")?;
+    Ok(())
+}
+
+/// Replace the master key with a new one and seal every stored secret again with it, in the
+/// backend that keeps the key now. Refused while Fronde is running on the same data directory.
+pub async fn rotate_key(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
+    fronde_hub::private::prepare_data_dir(&config.data.dir)?;
+    let _running = fronde_db::running::claim(&config.data.dir, "fronde secret rotate-key")?;
+    let db = open(config).await?;
+    crate::warn_if_keychain_off();
+    let backends = config.master_key_backends()?;
+    let rotated = fronde_db::master_key::rotate(&db, &backends).await;
+    db.close().await?;
+    let rotated = rotated?;
+    writeln!(
+        out,
+        "rotated the master key {}: {} stored secret(s) sealed again with the new key. Back up \
+         the new key apart from the data directory: the old one opens nothing now",
+        rotated.place, rotated.secrets
+    )?;
+    Ok(())
+}
+
+/// Keep the master key in the backend named `to` instead: the same key, so every stored secret
+/// still opens. Refused while Fronde is running on the same data directory.
+pub async fn move_key(config: &Config, to: &str, out: &mut impl Write) -> anyhow::Result<()> {
+    let Some(to) = Backend::from_name(to) else {
+        bail!("there is no master key backend {to:?}: name file, keychain or systemd");
+    };
+    fronde_hub::private::prepare_data_dir(&config.data.dir)?;
+    let _running = fronde_db::running::claim(&config.data.dir, "fronde secret move-key")?;
+    let db = open(config).await?;
+    crate::warn_if_keychain_off();
+    let backends = config.master_key_backends()?;
+    let moved = fronde_db::master_key::move_to(&db, &backends, to).await;
+    db.close().await?;
+    let moved = moved?;
+    writeln!(
+        out,
+        "moved the master key from {} to {}",
+        moved.from_place, moved.to_place
+    )?;
+    if moved.removed {
+        writeln!(out, "removed it from {}", moved.from_place)?;
+    } else if moved.from == Backend::Systemd {
+        writeln!(
+            out,
+            "Fronde never removes a systemd credential: remove LoadCredentialEncrypted={}:… \
+             from the unit, and the encrypted file it names",
+            fronde_db::master_key::CREDENTIAL
+        )?;
+    }
     Ok(())
 }

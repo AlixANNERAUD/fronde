@@ -107,7 +107,9 @@ read-only, as in a container where it is mounted read-only, set `master_key` to 
 writable directory of its own (see [Run in Docker](../how-to/run-in-docker.md)). A key left in
 the data directory by an earlier version is moved to this file at the next start or
 `fronde secret` command; if both hold a key and they differ, Fronde refuses to start.
-Moving the key from one backend to another (`fronde secret move-key`) is **planned**.
+To move the key from one backend to another, use `fronde secret move-key` (see
+[Store a secret](../how-to/store-a-secret.md#move-the-master-key)): set `backend` to `"auto"`
+or to the new backend first.
 
 With the environment variable `FRONDE_KEYCHAIN=off`, Fronde behaves as if the machine had no
 keychain: `auto` keeps a first key in the file, and `backend = "keychain"` fails with an error

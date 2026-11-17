@@ -5,12 +5,16 @@
 //! the file in the data directory: [`migrate`] moves it. [`Backends`] picks the place and keeps
 //! it. The key never comes from the environment, which the processes Fronde starts may inherit.
 //!
+//! [`rotate`] replaces the key with a new one and [`move_to`] moves it to another backend, each
+//! so that a crash at any step leaves a key that opens the stored secrets ([`finish`]).
+//!
 //! The key is written as one line, `fronde-key-v1:` followed by its 32 bytes in unpadded
 //! base64url, the same in a file, a keychain entry or a systemd credential, so that anything else
 //! is refused with a clear message.
 
 mod backends;
 mod keychain;
+mod rotation;
 mod systemd;
 
 pub(crate) use backends::parse_recorded;
@@ -18,6 +22,9 @@ pub use backends::{Backends, Choice, KeyLock, LOCK_FILE};
 #[cfg(feature = "testing")]
 pub use keychain::FakeKeychain;
 pub use keychain::Keychain;
+pub use rotation::{Finished, Moved, Rotated, Step, finish, move_to, rotate};
+#[cfg(feature = "testing")]
+pub use rotation::{move_crashing_after, rotate_crashing_after};
 pub use systemd::CREDENTIAL;
 
 use anyhow::{Context as _, bail};

@@ -627,9 +627,14 @@ pub async fn start_with(
     warn_if_keychain_off();
     let backends = config.master_key_backends()?;
     fronde_hub::private::prepare_data_dir(&data_dir)?;
+    // Held as long as the server runs: a rotation or a move of the master key waits for it.
+    let running = fronde_db::running::claim(&data_dir, "fronde serve")?;
     // A key an earlier version kept in the data directory moves to the configured key file.
     fronde_db::master_key::migrate(backends.key_file(), &data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
+    // A rotation of the master key that a crash interrupted is finished first, so that the key
+    // loaded below is the one that opens the stored secrets.
+    fronde_db::master_key::finish(&db, &backends).await?;
     // A wrong master key, none while secrets are stored, or a backend holding them that cannot
     // be read (a locked keychain), stops Fronde here, whether or not a component needs a stored
     // secret.
@@ -720,6 +725,7 @@ pub async fn start_with(
         ));
     }
     let handle = tokio::spawn(async move {
+        let _running = running;
         let _forget = ForgetOnDrop(ephemeral);
         // A task of its own, so that not even a panic there stops the server, and owned by the
         // server's task, so that it stops with the server. A panic restarts it.
