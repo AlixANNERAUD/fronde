@@ -37,7 +37,10 @@ long-lived token, which you make once and give to Fronde as `[agent] oauth_token
 
    - an environment variable of the service, with `oauth_token = { env = "CLAUDE_TOKEN" }` (for a
      systemd unit, through a file only you can read with `EnvironmentFile=`).
-3. Restart Fronde. It reads the token at each start of the agent, so a new token in the file or
+3. Keep the token on one line: Fronde refuses a token with a space or a line break inside, which is
+   what a token pasted across the terminal's wrapped lines looks like (Claude's API would answer
+   *401 Invalid bearer token*).
+4. Restart Fronde. It reads the token at each start of the agent, so a new token in the file or
    the store applies from the next one.
 
 Do not sign the agent in by running `claude` with `HOME` set to its home (`/login` there). The

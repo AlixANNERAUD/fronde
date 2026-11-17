@@ -165,8 +165,12 @@ run = '''
 set -eu
 dev=target/dev
 mkdir -p "$dev/data"
+umask 077
 [ -f "$dev/token" ] || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$dev/token"
 [ -f "$dev/password" ] || printf fronde > "$dev/password"
+# Fronde refuses secret files others can read: fix those an earlier run made with the usual umask.
+chmod 600 "$dev/token" "$dev/password"
+[ ! -f "$dev/claude-token" ] || chmod 600 "$dev/claude-token"
 cat > "$dev/fronde.toml" <<EOF
 [server]
 listen = "127.0.0.1:8484"

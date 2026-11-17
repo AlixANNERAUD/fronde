@@ -155,7 +155,7 @@ const ALLOWED: &[(&str, usize)] = &[
     ("crates/hub/src/upstream.rs", 1),
     // `check_token`'s length, `check_password`'s emptiness, and `same_secret`'s digest, which
     // compares the `/mcp` token and the web password in constant time.
-    ("crates/server/src/lib.rs", 3),
+    ("crates/server/src/lib.rs", 4),
     // The gate: the Basic and Bearer headers built for each request, and the Bearer token's
     // bytes checked once when the grants are made.
     ("crates/wasm/src/egress.rs", 3),

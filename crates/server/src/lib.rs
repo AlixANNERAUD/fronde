@@ -670,10 +670,18 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
     for skipped in &granted.skipped {
         tracing::warn!("agent sandbox: {skipped}");
     }
-    for dir in &granted.under_home {
+    // One line, not one per directory: a mise PATH alone holds a dozen of them.
+    if !granted.under_home.is_empty() {
+        let dirs: Vec<String> = granted
+            .under_home
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect();
         tracing::warn!(
-            "agent sandbox: the agent may read {}, inside your home; keep secrets out of it",
-            dir.display()
+            "agent sandbox: the agent may read {} directories inside your home (its PATH and \
+             install); keep secrets out of them: {}",
+            dirs.len(),
+            dirs.join(", ")
         );
     }
     let mut connect_ports = CONNECT_PORTS.to_vec();
@@ -704,14 +712,28 @@ pub fn agent_oauth_token(
     fronde_agent::acp::oauth_token(move || {
         let (token, db, backends) = (token.clone(), db.clone(), backends.clone());
         async move {
-            match token {
+            let token = match token {
                 fronde_hub::config::Secret::Stored { stored } => {
                     open_claude_token(&stored, &db, &backends).await
                 }
                 token => token.resolve(),
-            }
+            }?;
+            one_line(token)
         }
     })
+}
+
+/// A sign-in token is one word: a space or line break inside (a token pasted across the
+/// terminal's wrapped lines) would reach Claude's API as an invalid bearer token.
+fn one_line(token: SecretString) -> anyhow::Result<SecretString> {
+    let text = token.expose_secret();
+    if text.is_empty() || text.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!(
+            "the sign-in token is empty or holds spaces or line breaks; keep only the line \
+             `claude setup-token` printed, on one line"
+        );
+    }
+    Ok(token)
 }
 
 async fn open_claude_token(
@@ -892,6 +914,23 @@ pub async fn start_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sign_in_token_must_be_one_line() {
+        assert!(super::one_line("sk-ant-oat01-abc".to_string().into()).is_ok());
+        for bad in [
+            "",
+            "sk-ant-oat01-a\nbc",
+            "sk-ant-oat01-a bc",
+            "sk-ant-oat01-a\tbc",
+        ] {
+            let e = super::one_line(bad.to_string().into())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("one line"), "{e}");
+            assert!(!e.contains("abc") && !e.contains("bc\""), "{e}");
+        }
+    }
+
     use super::*;
     use std::sync::Mutex;
     use tower_sessions::SessionStore;
