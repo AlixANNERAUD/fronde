@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use fronde_client::RequestStatus;
 use fronde_protocol::request::check;
 use fronde_protocol::{
-    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, Invalid, Keep, Outcome, Remember,
+    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, Invalid, Keep, KeyPlace, Outcome, Remember,
     RequestId, Response, SecretValue,
 };
 use std::collections::BTreeMap;
@@ -188,16 +188,23 @@ fn secret_badge(outcome: &Outcome, remember: Option<&Remember>) -> Element {
     match outcome {
         Outcome::Saved {
             kept: Keep::Conversation,
+            ..
         } => rsx! {
             Badge { class: "whitespace-normal", "Enregistré, jamais montré à l'agent" }
         },
-        Outcome::Saved { kept: Keep::Stored } => match remember {
-            Some(remember) => rsx! {
+        Outcome::Saved {
+            kept: Keep::Stored,
+            new_key,
+        } => rsx! {
+            if let Some(remember) = remember {
                 Badge { class: "whitespace-normal", "Gardé pour {remember.origin}" }
-            },
-            None => rsx! {
+            } else {
                 Badge { "Gardé" }
-            },
+            }
+            // The first secret kept made the master key: the owner learns where, to back it up.
+            if let Some(place) = new_key.map(key_place) {
+                span { class: "text-muted-foreground text-xs", "clé maîtresse créée : {place}" }
+            }
         },
         Outcome::Answered { .. } => rsx! {
             Badge { "Répondu" }
@@ -211,6 +218,15 @@ fn secret_badge(outcome: &Outcome, remember: Option<&Remember>) -> Element {
         Outcome::Cancelled => rsx! {
             Badge { variant: BadgeVariant::Muted, "Annulée" }
         },
+    }
+}
+
+/// Where a new master key was made, in a word.
+fn key_place(place: KeyPlace) -> &'static str {
+    match place {
+        KeyPlace::Keychain => "trousseau",
+        KeyPlace::File => "fichier",
+        KeyPlace::Systemd => "identifiant systemd",
     }
 }
 
@@ -1644,12 +1660,23 @@ mod tests {
             (
                 Outcome::Saved {
                     kept: Keep::Conversation,
+                    new_key: None,
                 },
                 "Enregistré, jamais montré à l&#39;agent",
             ),
             (
-                Outcome::Saved { kept: Keep::Stored },
+                Outcome::Saved {
+                    kept: Keep::Stored,
+                    new_key: None,
+                },
                 "Gardé pour https://cloud.example",
+            ),
+            (
+                Outcome::Saved {
+                    kept: Keep::Stored,
+                    new_key: Some(KeyPlace::Keychain),
+                },
+                "clé maîtresse créée : trousseau",
             ),
             (Outcome::Declined, "Refusé"),
             (Outcome::Expired, "Expirée"),

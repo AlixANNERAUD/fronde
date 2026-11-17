@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_db::ephemeral::{EphemeralScope, EphemeralSecrets};
-use fronde_db::master_key::Backends;
+use fronde_db::master_key::{Backend, Backends};
 use fronde_entity::requests;
 use fronde_protocol::request::{
-    self, Card, Invalid, Keep, Outcome, RequestId, Response, SecretValue,
+    self, Card, Invalid, Keep, KeyPlace, Outcome, RequestId, Response, SecretValue,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -496,6 +496,7 @@ impl Requests {
         if current.is_none_or(|current| current.status != PENDING) {
             return Err(Refusal::Closed);
         }
+        let mut new_key = None;
         let saved = match (keep, card) {
             (Keep::Conversation, _) => {
                 let scope = EphemeralScope {
@@ -530,14 +531,10 @@ impl Requests {
                         remember.name, remember.name
                     )));
                 }
-                let (key, created) = store
-                    .backends
-                    .load_or_create(&self.db)
-                    .await
-                    .map_err(failed)?;
-                fronde_db::secrets::set(
+                // Under the backends' key lock: a first key is made and seals in one go.
+                let (key, created) = fronde_db::secrets::store(
                     &self.db,
-                    &key,
+                    &store.backends,
                     fronde_db::secrets::SOURCES,
                     &remember.name,
                     &remember.origin,
@@ -551,6 +548,11 @@ impl Requests {
                          without it the stored secrets are lost",
                         store.backends.place(key.backend())
                     );
+                    new_key = Some(match key.backend() {
+                        Backend::Keychain => KeyPlace::Keychain,
+                        Backend::File => KeyPlace::File,
+                        Backend::Systemd => KeyPlace::Systemd,
+                    });
                 }
                 Saved::Stored {
                     name: remember.name.clone(),
@@ -565,7 +567,10 @@ impl Requests {
         let answer = serde_json::to_value(&saved)
             .context("cannot encode where the secret was kept")
             .map_err(failed)?;
-        let outcome = Outcome::Saved { kept: keep };
+        let outcome = Outcome::Saved {
+            kept: keep,
+            new_key,
+        };
         let won = self
             .close(id, ANSWERED, Some(answer), outcome, Some(&by.name))
             .await;

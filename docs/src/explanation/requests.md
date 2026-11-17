@@ -82,8 +82,9 @@ secret store. The page empties the box once it is sent, and never shows the secr
 server, the message is wiped once read, and the value becomes a `SecretString`, wiped once it is
 stored. Then the request closes: its row keeps where the secret went (`{"kept": "conversation",
 "secret_ref": …}` or `{"kept": "stored", "name": …, "origin": …}`), the conversation says
-*Enregistré, jamais montré à l'agent* or *Gardé pour <origin>*, and the agent gets the reference
-or the name. Two pages answering at once keep one secret: the first answer wins, and the second
+*Enregistré, jamais montré à l'agent* or *Gardé pour <origin>* (with *clé maîtresse créée :
+trousseau*, *fichier* or *identifiant systemd* when that secret made the master key, to back up),
+and the agent gets the reference or the name. Two pages answering at once keep one secret: the first answer wins, and the second
 is refused before anything is kept.
 
 A `secret_ref` is useless outside its conversation and to another asker, and every refusal says

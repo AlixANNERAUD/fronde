@@ -909,7 +909,8 @@ mod secrets {
             Some(&Shown::Closed {
                 id,
                 outcome: Outcome::Saved {
-                    kept: Keep::Conversation
+                    kept: Keep::Conversation,
+                    new_key: None,
                 },
                 by: Some("alix".into()),
             })
@@ -1013,6 +1014,23 @@ mod secrets {
         let response = row(&bench.data(), id).await.response.unwrap().to_string();
         assert!(response.contains(r#""kept":"stored""#), "{response}");
         assert!(!response.contains(CANARY), "{response}");
+        // The card says where the key it made lives; the next secret kept makes none.
+        let stored = |new_key| Outcome::Saved {
+            kept: Keep::Stored,
+            new_key,
+        };
+        assert!(
+            matches!(bench.journal.shown().last(), Some(Shown::Closed { outcome, .. }) if *outcome == stored(Some(fronde_protocol::KeyPlace::File)))
+        );
+        let again = bench.requests.ask(ask_secret(true)).await.unwrap();
+        bench
+            .requests
+            .answer(again.id(), secret("rotated", Keep::Stored), &alix())
+            .await
+            .unwrap();
+        assert!(
+            matches!(bench.journal.shown().last(), Some(Shown::Closed { outcome, .. }) if *outcome == stored(None))
+        );
     }
 
     #[tokio::test]

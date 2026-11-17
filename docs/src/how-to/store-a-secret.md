@@ -47,7 +47,8 @@ Refuse the card if you did not expect it.
 ## Where the master key goes
 
 The first secret creates the master key that seals them all, and `fronde secret set` says where
-it put it (a secret kept from a card writes it in Fronde's log). By default (`[secrets] backend = "auto"`, see
+it put it (for a secret kept from a card, the closed card says *clé maîtresse créée : …*, and the
+log names the place). By default (`[secrets] backend = "auto"`, see
 [Configuration](../reference/configuration.md#secrets-1)):
 
 - under a systemd service that loads the credential `fronde-master-key`, the key is that

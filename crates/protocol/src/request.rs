@@ -78,6 +78,15 @@ pub enum Keep {
     Stored,
 }
 
+/// Where a master key is kept: the backends of the stored secrets.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyPlace {
+    Keychain,
+    File,
+    Systemd,
+}
+
 /// A secret on its way from the page to the server's store. It prints as `[REDACTED]` and is
 /// wiped from memory when dropped; the server turns it into a `SecretString` at once.
 #[derive(Clone, PartialEq, Eq)]
@@ -209,9 +218,12 @@ pub enum Outcome {
     Answered {
         summary: String,
     },
-    /// A secret was kept as `kept` says; never its value.
+    /// A secret was kept as `kept` says; never its value. `new_key`: where keeping it made the
+    /// master key, when it did, to be backed up.
     Saved {
         kept: Keep,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_key: Option<KeyPlace>,
     },
     Declined,
     Expired,
@@ -636,8 +648,20 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), answer);
         assert_eq!(
-            serde_json::to_string(&Outcome::Saved { kept: Keep::Stored }).unwrap(),
+            serde_json::to_string(&Outcome::Saved {
+                kept: Keep::Stored,
+                new_key: None
+            })
+            .unwrap(),
             r#"{"type":"saved","kept":"stored"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Outcome::Saved {
+                kept: Keep::Stored,
+                new_key: Some(KeyPlace::Keychain)
+            })
+            .unwrap(),
+            r#"{"type":"saved","kept":"stored","new_key":"keychain"}"#
         );
     }
 

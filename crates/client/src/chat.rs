@@ -661,6 +661,7 @@ mod tests {
         assert_eq!(chat.open_requests().count(), 1);
         let saved = Outcome::Saved {
             kept: fronde_protocol::Keep::Conversation,
+            new_key: None,
         };
         apply_all(
             &mut chat,

@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use request::{
-    Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Keep, Outcome, Remember, RequestId, Response,
-    SecretValue,
+    Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Keep, KeyPlace, Outcome, Remember, RequestId,
+    Response, SecretValue,
 };
 
 /// State of a tool call shown in the conversation.

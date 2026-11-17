@@ -178,8 +178,8 @@ A secret **kept for an origin** is sealed like one stored with `fronde secret se
 admin can choose that: the box is shown to admins only, and the server refuses it from anyone
 else. The agent proposes the name and origin, and the card shows the origin. A name already
 stored for another origin is refused: a card cannot move a stored secret to another origin. The
-first secret kept this way makes the master key, as `fronde secret set` does, and Fronde logs
-where, to be backed up.
+first secret kept this way makes the master key, as `fronde secret set` does, under the same
+lock, and the closed card and the log say where, to be backed up.
 
 The card's link button takes an `https://` address only, with no user name or password before
 the host, and names the host it opens: the agent's text never becomes a link otherwise.
