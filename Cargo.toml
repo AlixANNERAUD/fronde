@@ -20,6 +20,8 @@ async-trait = "0.1"
 backon = { version = "1.6", default-features = false, features = ["std"] }
 base64 = "0.22"
 bytes = "1"
+# Stored secrets (crates/db): XChaCha20-Poly1305, its key state zeroed on drop.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 dioxus = { version = "0.7.10", features = ["router"] }
 dioxus-html = "0.7.10"
 dioxus-ssr = "0.7.10"
@@ -72,6 +74,7 @@ wiremock = "0.6"
 uuid = { version = "1", features = ["v4"] }
 wasm-bindgen = "0.2"
 webpki-roots = "1"
+zeroize = "1"
 web-sys = "0.3"
 # Only what a host of tool components uses: no GC, threads, cache or debugging support.
 wasmtime = { version = "50.0.1", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"] }

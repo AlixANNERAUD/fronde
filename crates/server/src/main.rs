@@ -43,6 +43,36 @@ enum Command {
         #[command(subcommand)]
         action: ServiceCommand,
     },
+    /// Store, list and remove the secrets kept encrypted in the database.
+    Secret {
+        #[command(subcommand)]
+        action: SecretCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Store a secret for one origin, reading its value from standard input (never a terminal).
+    Set {
+        /// The secret's name: letters, digits, '-', '_' or '.'.
+        name: String,
+        /// The only origin the secret is for, such as https://cloud.example.
+        #[arg(long)]
+        origin: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// List the stored secrets' names and origins, never their values.
+    List {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Remove a stored secret.
+    Remove {
+        name: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -131,6 +161,30 @@ fn init(config: &std::path::Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn secret(action: &SecretCommand) -> anyhow::Result<()> {
+    use std::io::IsTerminal as _;
+    let mut out = std::io::stdout();
+    match action {
+        SecretCommand::Set {
+            name,
+            origin,
+            config,
+        } => {
+            let config = fronde_hub::config::load(config)?;
+            let stdin = std::io::stdin();
+            let terminal = stdin.is_terminal();
+            let value = fronde::secret::read_value(stdin.lock(), terminal)?;
+            fronde::secret::set(&config, name, origin, &value, &mut out).await
+        }
+        SecretCommand::List { config } => {
+            fronde::secret::list(&fronde_hub::config::load(config)?, &mut out).await
+        }
+        SecretCommand::Remove { name, config } => {
+            fronde::secret::remove(&fronde_hub::config::load(config)?, name, &mut out).await
+        }
+    }
+}
+
 async fn healthcheck(path: &std::path::Path) -> anyhow::Result<()> {
     let config = fronde_hub::config::load(path)?;
     fronde::healthcheck(config.server.listen).await
@@ -181,6 +235,7 @@ async fn main() -> ExitCode {
             ServiceCommand::Uninstall => fronde::service::uninstall().map(|()| ExitCode::SUCCESS),
             ServiceCommand::Status => fronde::service::status(),
         },
+        Command::Secret { action } => secret(action).await.map(|()| ExitCode::SUCCESS),
     };
     match result {
         Ok(code) => code,

@@ -3,6 +3,7 @@
 pub mod check;
 pub mod hardening;
 pub mod init;
+pub mod secret;
 pub mod service;
 pub mod sessions;
 mod web;

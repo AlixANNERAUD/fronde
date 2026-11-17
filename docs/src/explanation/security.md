@@ -14,6 +14,33 @@ A secret file must be mode 0600 and owned by the user running Fronde; otherwise 
 read it. Setting `FRONDE_ALLOW_SHARED_SECRET_FILES=1` lifts the check for setups like Docker
 secrets, where the runtime sets the file's mode and owner.
 
+## Stored secrets
+
+`fronde secret set` keeps a secret in `fronde.db`, encrypted, so that it needs no file of its own
+(see [Store a secret](../how-to/store-a-secret.md)). Each value is sealed with
+XChaCha20-Poly1305 under a master key of 256 bits and a random 24-byte nonce drawn for every
+write. The seal also covers, without encrypting them, the row's format version, its scope, its
+name and the canonical origin it is for: a row edited, or moved to another name or origin,
+fails to open instead of handing its secret to another place. With the first secret, Fronde
+stores a key check, a fixed text sealed with the same key: a wrong key is then reported as a
+wrong key, and Fronde never makes a new key while secrets are stored, since it could not open
+them. The value is read from standard input, never from the command line, where other users
+could see it in the process list, and never from a terminal, which would echo it. Decrypted
+values are held in buffers zeroed when dropped, and no command, log or tool output shows one.
+
+The master key is one line, `fronde-key-v1:` followed by the key in base64url, in `master.key`
+in the data directory, mode 0600, created with the first secret. Fronde never takes it from an
+environment variable: the agent inherits Fronde's environment. Keeping it in the system's
+keychain or in a systemd credential is **planned**.
+
+What this protects against, today: a copy of `fronde.db` alone, such as a backup made without
+the key file, reveals no stored secret; and nothing in the database's files, its write-ahead log
+included, holds a value in clear. What it does not protect against yet: the key file sits beside
+the database, so whoever can read the data directory can read both, and that includes any
+process running as Fronde's user, the agent among them. Until the key moves to a keychain, treat
+the data directory, and any backup of it that holds `master.key`, as holding the secrets
+themselves.
+
 ## Secrets in memory
 
 Fronde holds the secrets it resolves (the `/mcp` bearer token, the web chat password, upstream MCP
@@ -56,11 +83,11 @@ As belt and braces, disable core dumps outside Fronde too: `fronde service insta
 ## Personal data on disk
 
 Fronde creates its data directory and every directory inside it with mode 0700, and every file it
-writes (memory, the database `fronde.db`, which holds the conversation, the agent's session id
-and the web sessions, its `-wal` and `-shm` files, temporary files) with mode 0600, whatever the
-umask. At start, a data directory that group or others could enter is tightened to
-0700 and a warning is logged. Other users on the same machine cannot read your memory or
-conversation. This does not encrypt anything: see below.
+writes (memory, the database `fronde.db`, which holds the conversation, the agent's session id,
+the web sessions and the stored secrets, its `-wal` and `-shm` files, the master key, temporary
+files) with mode 0600, whatever the umask. At start, a data directory that group or others could
+enter is tightened to 0700 and a warning is logged. Other users on the same machine cannot read
+your memory or conversation. Only stored secrets are encrypted: see above, and below.
 
 ## Two doors
 
@@ -199,6 +226,7 @@ needs write access to the installation, which would also allow replacing the `fr
 ## What is out of scope
 
 - Several users: there is one password and one conversation.
-- Encryption at rest: file modes keep other users out, but not someone with the disk. Protect
-  the data directory with the machine's own means.
+- Encryption at rest, beyond stored secrets: file modes keep other users out, but not someone
+  with the disk, who finds the memory, the conversation and the master key beside the stored
+  secrets. Protect the data directory with the machine's own means.
 - TLS: put Fronde behind a reverse proxy for https. Built-in TLS is **planned** with federation.

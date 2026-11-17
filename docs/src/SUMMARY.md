@@ -15,6 +15,7 @@
 - [Add upstream MCP servers](how-to/add-upstream-mcp-servers.md)
 - [Configure the calendar](how-to/configure-calendar.md)
 - [Enable Python](how-to/enable-python.md)
+- [Store a secret](how-to/store-a-secret.md)
 - [Run behind a reverse proxy](how-to/reverse-proxy.md)
 - [Develop and contribute](how-to/develop.md)
 

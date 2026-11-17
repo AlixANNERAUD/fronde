@@ -12,6 +12,7 @@ mod m20261117_000001_kv;
 mod m20261117_000002_memory_fts;
 mod m20261117_000003_streams;
 mod m20261117_000004_approvals;
+mod m20261117_000005_secrets;
 
 /// Every migration of Fronde, in the order they apply.
 pub struct Migrator;
@@ -24,6 +25,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261117_000002_memory_fts::Migration),
             Box::new(m20261117_000003_streams::Migration),
             Box::new(m20261117_000004_approvals::Migration),
+            Box::new(m20261117_000005_secrets::Migration),
         ]
     }
 }

@@ -4,6 +4,8 @@
 
 pub mod approvals;
 pub mod kv;
+pub mod master_key;
+pub mod secrets;
 
 use anyhow::Context as _;
 use fronde_migration::{Migrator, MigratorTrait};

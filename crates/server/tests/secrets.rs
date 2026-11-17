@@ -144,6 +144,11 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 const ALLOWED: &[(&str, usize)] = &[
     // The ACP session's MCP header towards the hub.
     ("crates/agent/src/acp.rs", 1),
+    // The master key: its bytes given to the cipher, and its one line written to the new key
+    // file.
+    ("crates/db/src/master_key.rs", 2),
+    // A stored secret's value, sealed by the cipher.
+    ("crates/db/src/secrets.rs", 1),
     // The upstream MCP token handed to rmcp's transport.
     ("crates/hub/src/upstream.rs", 1),
     // `check_token`'s length, `check_password`'s emptiness, and `same_secret`'s digest, which

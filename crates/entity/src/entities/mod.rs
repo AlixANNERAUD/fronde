@@ -4,5 +4,6 @@ pub mod prelude;
 
 pub mod approvals;
 pub mod kv;
+pub mod secrets;
 pub mod stream_entries;
 pub mod streams;

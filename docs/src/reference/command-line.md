@@ -53,10 +53,38 @@ table has no stored approval, which is what `serve` would find after updating it
 `[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
 `python: approved (CPython 3.15.2)`. It also checks that `[data] dir` can be created and written:
 it creates the directory (mode 0700), writes a probe file and removes it, and otherwise names the
-path and the fix (set `[data] dir` to a directory you own, such as `~/.local/share/fronde`). A `[server]
-listen` that is not an address is reported by the parse. When `[web]` is set and the agent
-command is not found on `PATH` (or at the path given), it prints a warning, not an error. It
-prints `config OK` when all is well. It does not connect to anything.
+path and the fix (set `[data] dir` to a directory you own, such as `~/.local/share/fronde`). A
+`[server] listen` that is not an address is reported by the parse. When `[web]` is set and the
+agent command is not found on `PATH` (or at the path given), it prints a warning, not an error.
+It prints `config OK` when all is well. It does not connect to anything.
+
+## `fronde secret`
+
+Stores, lists and removes the secrets kept encrypted in `fronde.db`, scope `sources` (see
+[Store a secret](../how-to/store-a-secret.md) and
+[Security model](../explanation/security.md#stored-secrets)). Each command opens the database,
+creating or updating it as `serve` does, and works while Fronde runs.
+
+```text
+fronde secret set <name> --origin <origin> --config <file>  < value
+fronde secret list --config <file>
+fronde secret remove <name> --config <file>
+```
+
+- `set` reads the value from standard input, never from an argument, and refuses a terminal,
+  which would echo it. One final line break (`\n` or `\r\n`) is dropped; an empty value, one
+  that is not UTF-8 or one over 64 KiB is refused. The name is 1 to 64 letters, digits, `-`, `_`
+  or `.`. The origin is `scheme://host[:port]` over http or https, stored as Fronde normalises it
+  (`HTTPS://Cloud.Example:443` becomes `https://cloud.example`); the secret is bound to it.
+  Setting a name again replaces its value and origin. The first secret creates `master.key` in
+  the data directory and says so; while secrets are stored, a missing or different key file is
+  an error and no new key is made. It prints `stored secret <name> for <origin>`.
+- `list` prints one line per secret: its name, origin and last change (UTC), separated by tabs,
+  or `no stored secret`. It never prints a value.
+- `remove` removes one secret, and exits with 1 if there is none by that name. Removing the last
+  one also removes the key check, so a lost `master.key` then no longer blocks a new one.
+
+Using a stored secret as a component's credential is **planned**.
 
 ## `fronde healthcheck`
 

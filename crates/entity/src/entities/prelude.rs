@@ -2,5 +2,6 @@
 
 pub use super::approvals::Entity as Approvals;
 pub use super::kv::Entity as Kv;
+pub use super::secrets::Entity as Secrets;
 pub use super::stream_entries::Entity as StreamEntries;
 pub use super::streams::Entity as Streams;
