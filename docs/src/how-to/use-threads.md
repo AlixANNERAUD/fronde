@@ -45,4 +45,6 @@ When Fronde refuses an action, the reason shows above the chat, with a button to
 When an agent hands a task to a sub-agent, the sub-agent's thread appears indented under its
 parent's, marked *sous-agent*. Open it to follow the work. Its first message is the task, marked
 *Écrit par* followed by the parent thread's title, since the parent wrote it, not you. A card the
-sub-agent asks shows in its own thread, and its row says *attend ta réponse*.
+sub-agent asks shows in its own thread, and its row says *attend ta réponse*. What you write in a
+sub-agent's thread is read by its parent agent too, with `threads_read` (see
+[Threads and sub-agents](../explanation/threads.md#how-the-answer-comes-back)).

@@ -286,9 +286,9 @@ Optional. The agent Fronde runs for the chat, over ACP on standard input and out
 started on the first message, and only when `[web]` is set. These are the settings of Claude, the
 only provider so far; another provider will come with a table of its own, `[providers.<id>]`
 (**planned**, see [Why subscriptions and ACP](../explanation/subscriptions.md#other-providers)).
-Until then a `[providers]` table is refused, and so will be a thread asked to run on `codex` or
-`gemini` (`threads_start`, planned): "only claude is configured; Codex and Gemini/Antigravity are
-planned".
+Until then a `[providers]` table is refused, and so is a sub-agent asked to run on `codex` or
+`gemini` (the `provider` of [`threads_start`](tools.md#threads)): "only claude is configured;
+Codex and Gemini/Antigravity are planned".
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -349,7 +349,7 @@ Optional. Each conversation (thread) has its own agent process, started on its f
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `max_running` | integer | `3` | How many agent processes run at once, the main thread's included; at least 1. When none is free, Fronde stops the agent idle for the longest time; when every agent is in a turn, the message waits, its thread shows « En attente : d'autres conversations utilisent l'agent. », and it starts once another turn ends (Stop gives up the wait). Threads you did not start (an agent's children, an outside client's, planned) share all of them but one, kept for yours. |
+| `max_running` | integer | `3` | How many agent processes run at once, the main thread's included; at least 1. When none is free, Fronde stops the agent idle for the longest time; when every agent is in a turn, the message waits, its thread shows « En attente : d'autres conversations utilisent l'agent. », and it starts once another turn ends (Stop gives up the wait). Threads you did not start (the sub-agents an agent starts with [`threads_start`](tools.md#threads); an outside client's are planned) share all of them but one, kept for yours. |
 | `idle_stop` | duration | `"10m"` | How long an agent is kept after its turn ends without a new message (`"90s"`, `"1h 30m"`). It then stops, freeing its place and revoking its hub token; the next message starts it again and resumes its session. |
 
 The agent with its Claude Code uses about 0.3 to 0.45 GiB before its first turn (measured, see
