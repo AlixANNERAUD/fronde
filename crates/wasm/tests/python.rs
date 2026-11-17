@@ -262,6 +262,15 @@ fn small_budget() -> Limits {
     }
 }
 
+/// For the tests of turns: what they measure is waiting, so a loaded machine must not run them out
+/// of CPU first.
+fn turn_budget() -> Limits {
+    Limits {
+        cpu_ticks: 100,
+        ..small_budget()
+    }
+}
+
 #[tokio::test]
 async fn infinite_loop_is_stopped() {
     let python = python().await.with_limits(small_budget());
@@ -430,7 +439,7 @@ async fn open_files_are_capped() {
 async fn runs_take_turns() {
     let python = python().await.with_limits(Limits {
         call_timeout: Duration::from_secs(10),
-        ..small_budget()
+        ..turn_budget()
     });
     let started = Instant::now();
     let timed = |code: &'static str| {
@@ -455,12 +464,12 @@ async fn runs_take_turns() {
 async fn a_run_that_waits_too_long_for_a_turn_times_out() {
     let python = python().await.with_limits(Limits {
         call_timeout: Duration::from_secs(3),
-        ..small_budget()
+        ..turn_budget()
     });
     // The same runtime, so the same turns, with less patience.
     let hurried = python.clone().with_limits(Limits {
         call_timeout: Duration::from_millis(500),
-        ..small_budget()
+        ..turn_budget()
     });
     let started = Instant::now();
     let (a, b, c) = tokio::join!(
