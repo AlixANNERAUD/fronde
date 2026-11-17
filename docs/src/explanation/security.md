@@ -373,6 +373,20 @@ thread's first message, with its own directories, its own sandbox and its own hu
 - **What it asks.** A thread's cards appear in that thread's stream, and a secret given in one of
   them "for this conversation" can be used only by that thread's agent, in that thread: another
   thread's agent, or an outside client, gets the same refusal as for an unknown reference.
+- **Sub-agents.** A thread's agent starts and drives sub-agents with the `threads_*` tools (see
+  [Threads and sub-agents](threads.md)), always as the thread its token names. It reaches only
+  the threads it started, and theirs: one rule, checked by the threads for every call, walks the
+  target's parents up to the caller. Any other thread, the caller's own parent and siblings
+  among them, gets the same error as a thread that does not exist, so a call learns nothing of
+  the threads it may not reach. A sub-agent starts with only its task, in a new session and its
+  own directories, so it reads neither its parent's conversation nor its files, and its
+  parent's secrets "for this conversation" are refused in its thread. A sub-agent cannot start or
+  drive sub-agents of its own: the hub does not offer it `threads_start` and `threads_send`, and
+  the threads refuse them, through `use_tool` too. An outside MCP client, which holds
+  `server.token`, gets no `threads_*` tool and is refused them. What a sub-agent writes reaches
+  its parent capped, with hidden characters shown as U+FFFD and marked as data, not
+  instructions: a page the sub-agent read cannot pass for its parent's instructions unseen,
+  though the parent's model still reads it, as it reads any tool result.
 - **Limits.** Each agent process has its own systemd scope, named after its thread
   (`fronde-agent-<hash>-t<id>-…`), with the limits of `[agent.limits]`; starting or stopping one
   never stops another. At most `[threads] max_running` run at once, and `fronde-agents.slice`

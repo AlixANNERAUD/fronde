@@ -35,5 +35,6 @@
 - [How Fronde works](explanation/architecture.md)
 - [Security model](explanation/security.md)
 - [Requests and cards](explanation/requests.md)
+- [Threads and sub-agents](explanation/threads.md)
 - [Memory](explanation/memory.md)
 - [Why subscriptions and ACP](explanation/subscriptions.md)

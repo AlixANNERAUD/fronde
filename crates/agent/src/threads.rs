@@ -40,6 +40,13 @@ use crate::legacy;
 use crate::log::{Event, TurnOutcome, new_log_id, new_stream};
 use crate::tokens::Tokens;
 
+mod children;
+
+pub use children::{
+    ChildEnd, ChildTask, DEFAULT_MAX_DEPTH, Delegation, MAX_LISTED, StartedChild, final_answer,
+    may_access,
+};
+
 /// Where the agent's session id was kept before threads: the key-value table's scope and key.
 /// Read once, then moved to thread 1's row.
 const LEGACY_SESSION: (&str, &str) = ("agent", "session");
@@ -406,6 +413,8 @@ pub struct Threads {
     changes: Changes,
     /// What the thread list shows of the threads not open, read once from their streams.
     tails: Mutex<HashMap<ThreadId, Tail>>,
+    /// What the threads' agents may do with sub-agents: see [`children`].
+    children: children::Children,
 }
 
 impl Threads {
@@ -476,6 +485,7 @@ impl Threads {
             requests: OnceLock::new(),
             changes,
             tails: Mutex::new(HashMap::new()),
+            children: children::Children::default(),
         });
         for row in threads.list(false).await? {
             if row.id == ThreadId::MAIN {
@@ -541,8 +551,8 @@ impl Threads {
         };
         let assistant = Assistant::open(
             id,
-            row.topic,
-            self.spec_for(id),
+            row.topic.clone(),
+            self.spec_for(&row),
             shared,
             row.archived_at.is_some(),
             row.started_by == StartedBy::User,
@@ -556,17 +566,24 @@ impl Threads {
         Ok(Some(assistant))
     }
 
-    /// How thread `id`'s agent starts: the main thread's spec, with another thread's own
-    /// directories and scope name.
-    fn spec_for(&self, id: ThreadId) -> AgentSpec {
+    /// How thread `row`'s agent starts: the main thread's spec, with another thread's own
+    /// directories and scope name, and a sub-agent's own system prompt.
+    fn spec_for(&self, row: &ThreadRow) -> AgentSpec {
+        let id = row.id;
         if id == ThreadId::MAIN {
             return self.spec.clone();
         }
         let ThreadDirs { work, home } = thread_dirs(&self.data_dir, id);
+        let system_prompt = if row.parent.is_some() {
+            children::SYSTEM_PROMPT.to_owned()
+        } else {
+            self.spec.system_prompt.clone()
+        };
         AgentSpec {
             thread: id,
             cwd: work,
             home,
+            system_prompt,
             ..self.spec.clone()
         }
     }
@@ -798,24 +815,35 @@ impl Threads {
         let open = self.open.lock().await.clone();
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
-            let (status, at) = match open.get(&row.id) {
-                Some(assistant) => (assistant.status(), assistant.last_activity()),
-                None => {
-                    let tail = self.tail(&row).await?;
-                    (assistant::status_after(tail.outcome), tail.at)
-                }
-            };
-            summaries.push(ThreadSummary {
-                id: row.id,
-                parent: row.parent,
-                status,
-                open_requests: pending.get(&row.topic).copied().unwrap_or(0),
-                updated_at: at.map_or(row.updated_at, |at| at.max(row.updated_at)),
-                archived: row.archived_at.is_some(),
-                title: row.title,
-            });
+            summaries.push(self.summary(row, &open, &pending).await?);
         }
         Ok(summaries)
+    }
+
+    /// What the thread list shows of `row`, given the threads open and the cards pending by
+    /// stream.
+    async fn summary(
+        &self,
+        row: ThreadRow,
+        open: &HashMap<ThreadId, Arc<Assistant>>,
+        pending: &HashMap<String, u32>,
+    ) -> anyhow::Result<ThreadSummary> {
+        let (status, at) = match open.get(&row.id) {
+            Some(assistant) => (assistant.status(), assistant.last_activity()),
+            None => {
+                let tail = self.tail(&row).await?;
+                (assistant::status_after(tail.outcome), tail.at)
+            }
+        };
+        Ok(ThreadSummary {
+            id: row.id,
+            parent: row.parent,
+            status,
+            open_requests: pending.get(&row.topic).copied().unwrap_or(0),
+            updated_at: at.map_or(row.updated_at, |at| at.max(row.updated_at)),
+            archived: row.archived_at.is_some(),
+            title: row.title,
+        })
     }
 
     /// What the thread list shows of `row`, a thread not open: read from its stream the first

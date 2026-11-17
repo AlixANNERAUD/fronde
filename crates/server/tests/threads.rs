@@ -1,14 +1,16 @@
 //! Each thread's agent has its own hub identity: the token its process was given, and nothing
 //! else, names the thread to `/mcp`; it dies with the process.
 
+use fronde::thread_control::ThreadBridge;
 use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::{Assistant, Connector};
 use fronde_agent::fake::{FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::Event;
-use fronde_agent::threads::{StartedBy, ThreadId, Threads, thread_dirs};
+use fronde_agent::threads::{Budget, StartedBy, ThreadId, Threads, thread_dirs};
 use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_db::master_key::Backends;
 use fronde_hub::Hub;
+use fronde_hub::threads::ThreadControl;
 use fronde_hub::tools::{CallContext, ToolOutput, typed_tool_with_context};
 use fronde_protocol::{ChoiceAnswer, Keep, Response, SecretValue};
 use fronde_requests::{Requests, SecretStore, User};
@@ -46,6 +48,8 @@ struct Bench {
     fakes: Arc<Mutex<Vec<FakeHandle>>>,
     /// Releases the turns the fake agents hold open.
     gate: Arc<Notify>,
+    /// The data directory.
+    data: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -57,6 +61,12 @@ fn alix() -> User {
 }
 
 async fn bench(script: FakeScript) -> Bench {
+    bench_with(script, None, Budget::default()).await
+}
+
+/// [`bench`], sub-agents playing `child` when given, at most `budget.max_running` agents at
+/// once.
+async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budget) -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let config: fronde_hub::config::Config = toml::from_str(&format!(
@@ -76,7 +86,12 @@ async fn bench(script: FakeScript) -> Bench {
                 .lock()
                 .unwrap()
                 .push((spec.thread, spec.hub_token.expose_secret().to_owned()));
-            let (spec, script, fakes) = (spec.clone(), script.clone(), fakes.clone());
+            // A sub-agent is told it is one in its system prompt.
+            let script = match &child {
+                Some(child) if spec.system_prompt.contains("sub-agent") => child.clone(),
+                _ => script.clone(),
+            };
+            let (spec, fakes) = (spec.clone(), fakes.clone());
             Box::pin(async move {
                 let (transport, handle) = fake_agent(script);
                 fakes.lock().unwrap().push(handle);
@@ -98,7 +113,7 @@ async fn bench(script: FakeScript) -> Bench {
         system_prompt: String::new(),
         builtin_tools: Vec::new(),
     };
-    let threads = Threads::open(db.clone(), &data, spec, connector, alix())
+    let threads = Threads::open_with(db.clone(), &data, spec, connector, alix(), budget)
         .await
         .unwrap();
     let ephemeral = Arc::new(EphemeralSecrets::new());
@@ -110,7 +125,8 @@ async fn bench(script: FakeScript) -> Bench {
         .await
         .unwrap();
     threads.set_requests(&requests).await;
-    let hub = Hub::start(config, db, vec![], Some(requests.clone()))
+    let control: Arc<dyn ThreadControl> = Arc::new(ThreadBridge(threads.clone()));
+    let hub = Hub::start(config, db, vec![], Some(requests.clone()), Some(control))
         .await
         .unwrap();
     let (def, handler) = typed_tool_with_context(
@@ -159,6 +175,7 @@ async fn bench(script: FakeScript) -> Bench {
         starts,
         fakes,
         gate: Arc::new(Notify::new()),
+        data,
         _dir: dir,
     }
 }
@@ -710,4 +727,796 @@ async fn an_mcp_session_keeps_the_token_that_opened_it() {
     // So does another session, opened by the other token.
     let outside = post(TOKEN, None, INITIALIZE).await.unwrap();
     assert_eq!(outside.status(), 200);
+}
+
+// Sub-agents: the `threads_*` tools.
+
+const TASK: &str = "Trouve trois recettes de soupe à la courge.";
+
+/// Enough agents at once for a parent, its sub-agents and another thread.
+fn many() -> Budget {
+    Budget {
+        max_running: 8,
+        ..Budget::default()
+    }
+}
+
+/// Every agent, sub-agents included, holds its turns open until the gate is notified.
+async fn held_bench() -> Bench {
+    let gate = Arc::new(Notify::new());
+    let mut bench = bench_with(held(&gate), None, many()).await;
+    bench.gate = gate;
+    bench
+}
+
+/// The thread's agents hold their turns open; sub-agents play `child`.
+async fn held_parent(child: FakeScript) -> Bench {
+    let gate = Arc::new(Notify::new());
+    let mut bench = bench_with(held(&gate), Some(child), many()).await;
+    bench.gate = gate;
+    bench
+}
+
+/// Starts a sub-agent of the thread holding `client`'s token: its thread.
+async fn start_child(client: &Client, task: &str) -> ThreadId {
+    let started = call(
+        client,
+        "threads_start",
+        json!({"arguments": {"task": task}}),
+    )
+    .await;
+    ThreadId(
+        started["result"]["thread"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{started}")),
+    )
+}
+
+/// The hub token of thread `id`'s agent, once it started.
+async fn token_of(bench: &Bench, id: ThreadId) -> String {
+    timeout(WAIT, async {
+        loop {
+            if let Some(token) = bench.tokens_of(id).last() {
+                return token.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent never started")
+}
+
+/// What `client` gets from reading, sending to and stopping thread `target`.
+async fn refusals(client: &Client, target: i64) -> Vec<Value> {
+    let mut answers = Vec::new();
+    for (tool, arguments) in [
+        ("threads_read", json!({"thread": target})),
+        (
+            "threads_send",
+            json!({"thread": target, "text": "Arrête tout."}),
+        ),
+        (
+            "threads_send",
+            json!({"thread": target, "text": "Et alors ?", "wait": true}),
+        ),
+        ("threads_cancel", json!({"thread": target})),
+    ] {
+        answers.push(call(client, tool, json!({"arguments": arguments})).await);
+    }
+    answers
+}
+
+fn no_such_thread() -> Value {
+    json!({"error": fronde_hub::threads::NO_SUCH_THREAD})
+}
+
+async fn tool_names(client: &Client) -> Vec<String> {
+    timeout(WAIT, client.list_all_tools())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect()
+}
+
+/// The sub-agents of `parent`, oldest first.
+async fn children_of(bench: &Bench, parent: ThreadId) -> Vec<ThreadId> {
+    bench
+        .threads
+        .list(true)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.parent == Some(parent))
+        .map(|row| row.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn child_cannot_read_parent_thread() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let first = start_child(&main, TASK).await;
+    let second = start_child(&main, "Trouve un vin pour la soupe.").await;
+    let child = bench
+        .client(&token_of(&bench, first).await, "claude-code", &[])
+        .await;
+
+    // Its parent, its sibling and an unknown thread get the same answer.
+    let unknown = refusals(&child, 999).await;
+    assert!(
+        unknown.iter().all(|answer| *answer == no_such_thread()),
+        "{unknown:?}"
+    );
+    assert_eq!(refusals(&child, ThreadId::MAIN.0).await, unknown);
+    assert_eq!(refusals(&child, second.0).await, unknown);
+    // Nothing reached the main thread or the sibling.
+    let main_assistant = bench.assistant(ThreadId::MAIN).await;
+    assert_eq!(
+        main_assistant
+            .log()
+            .since(0)
+            .iter()
+            .filter(|entry| matches!(entry.event, Event::User { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !bench
+            .assistant(second)
+            .await
+            .log()
+            .since(0)
+            .iter()
+            .any(|entry| matches!(&entry.event, Event::User { text, .. } if text != "Trouve un vin pour la soupe."))
+    );
+
+    // The parent reads its child.
+    let read = call(
+        &main,
+        "threads_read",
+        json!({"arguments": {"thread": first.0}}),
+    )
+    .await;
+    assert_eq!(
+        read["result"]["items"][0],
+        json!({"seq": 1, "kind": "user", "text": TASK}),
+        "{read}"
+    );
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn a_thread_cannot_drive_another_threads_children() {
+    let bench = held_bench().await;
+    let other = bench.new_thread().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let child = start_child(&main, TASK).await;
+    let other_token = bench.start(other).await;
+    // Another thread, everything but its token naming the main thread.
+    let posing = bench
+        .client(
+            &other_token,
+            "Fronde",
+            &[("x-fronde-thread", "1"), ("x-fronde-topic", "conversation")],
+        )
+        .await;
+    assert_eq!(
+        refusals(&posing, child.0).await,
+        refusals(&posing, 999).await
+    );
+    assert!(
+        refusals(&posing, child.0)
+            .await
+            .iter()
+            .all(|answer| *answer == no_such_thread())
+    );
+    let listed = call(
+        &posing,
+        "threads_list",
+        json!({"arguments": {"thread": 1}, "_meta": {"thread": 1}}),
+    )
+    .await;
+    assert_eq!(listed["result"]["children"], json!([]), "{listed}");
+    // The main thread's child goes on, untouched.
+    assert_eq!(
+        bench.assistant(child).await.status(),
+        fronde_protocol::ThreadStatus::Running
+    );
+    bench.gate.notify_waiters();
+}
+
+/// The parent of a sub-agent is the thread whose token started it, whatever the call names.
+#[tokio::test]
+async fn threads_tools_take_the_caller_from_the_token_only() {
+    let bench = held_bench().await;
+    let other = bench.new_thread().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let posing = bench
+        .client(
+            &bench.start(other).await,
+            "Fronde",
+            &[("x-fronde-thread", "1")],
+        )
+        .await;
+    let started = call(
+        &posing,
+        "threads_start",
+        json!({
+            "arguments": {
+                "task": "Résume la journée.",
+                "thread": 1, "parent": 1, "parent_id": 1, "caller": "thread:1", "depth": 0,
+            },
+            "_meta": {"thread": 1, "fronde/thread": "1"},
+        }),
+    )
+    .await;
+    let id = ThreadId(started["result"]["thread"].as_i64().unwrap());
+    let row = bench.threads.get(id).await.unwrap().unwrap();
+    assert_eq!(row.parent, Some(other));
+    assert_eq!(row.started_by, StartedBy::Thread(other));
+    assert_eq!(row.depth, 1);
+    // Through use_tool too.
+    let through = call(
+        &posing,
+        "use_tool",
+        json!({"arguments": {"name": "threads_start", "arguments": {"task": "Autre chose.", "parent": 1}}}),
+    )
+    .await;
+    let through = ThreadId(through["result"]["thread"].as_i64().unwrap());
+    assert_eq!(
+        bench.threads.get(through).await.unwrap().unwrap().parent,
+        Some(other)
+    );
+    // The main thread sees neither.
+    let listed = call(&main, "threads_list", json!({})).await;
+    assert_eq!(listed["result"]["children"], json!([]), "{listed}");
+    assert!(children_of(&bench, ThreadId::MAIN).await.is_empty());
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn child_starts_with_only_its_task() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let child = start_child(&main, TASK).await;
+    token_of(&bench, child).await;
+    let fake = latest_fake(&bench, 2).await;
+    timeout(WAIT, async {
+        while fake.record().prompts.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent got no prompt");
+    let record = fake.record();
+    assert_eq!(record.new_sessions.len(), 1);
+    assert!(record.resumes.is_empty(), "a new session, never a resume");
+    assert_eq!(
+        record.new_sessions[0].cwd,
+        thread_dirs(&bench.data, child).work
+    );
+    assert_eq!(record.prompts, [TASK]);
+    let system = serde_json::to_string(&record.new_sessions[0].system_prompt).unwrap();
+    assert!(system.contains("You are a sub-agent of Fronde"), "{system}");
+    assert!(!system.contains("personal assistant"), "{system}");
+
+    let row = bench.threads.get(child).await.unwrap().unwrap();
+    assert_eq!(row.parent, Some(ThreadId::MAIN));
+    assert_eq!(row.depth, 1);
+    assert_eq!(row.started_by, StartedBy::Thread(ThreadId::MAIN));
+    assert_eq!(row.owner, "alix");
+    let first = bench.assistant(child).await.log().since(0)[0].event.clone();
+    assert_eq!(
+        first,
+        Event::User {
+            text: TASK.into(),
+            by: Some("Fronde".into()),
+        }
+    );
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn wait_returns_the_final_answer() {
+    let bench = held_parent(FakeScript {
+        updates: vec![text_chunk("Trois "), text_chunk("recettes.")],
+        ..FakeScript::default()
+    })
+    .await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let waited = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": TASK, "wait": true}}),
+    )
+    .await;
+    let child = waited["result"]["thread"].as_i64().unwrap();
+    assert_eq!(
+        waited["result"],
+        json!({"thread": child, "status": "done", "outcome": "done", "answer": "Trois recettes."}),
+        "{waited}"
+    );
+    assert!(
+        waited["next"].as_str().unwrap().contains("data"),
+        "{waited}"
+    );
+    assert_eq!(bench.threads.delivered(ThreadId(child)), Some(1));
+
+    // A new turn, waited for too.
+    let again = call(
+        &main,
+        "threads_send",
+        json!({"arguments": {"thread": child, "text": "Et une quatrième ?", "wait": true}}),
+    )
+    .await;
+    assert_eq!(again["result"]["status"], "done", "{again}");
+    assert_eq!(again["result"]["answer"], "Trois recettes.");
+    let entries = bench.assistant(ThreadId(child)).await.log().since(0);
+    let second = entries
+        .iter()
+        .rfind(|entry| matches!(entry.event, Event::User { .. }))
+        .unwrap();
+    assert_eq!(bench.threads.delivered(ThreadId(child)), Some(second.seq));
+    assert_eq!(
+        second.event,
+        Event::User {
+            text: "Et une quatrième ?".into(),
+            by: Some("Fronde".into()),
+        }
+    );
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn wait_ends_when_the_child_asks() {
+    let bench = held_parent(FakeScript {
+        ask_permission: true,
+        ..FakeScript::default()
+    })
+    .await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let waited = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": TASK, "wait": true}}),
+    )
+    .await;
+    assert_eq!(waited["result"]["status"], "waiting_for_user", "{waited}");
+    let child = ThreadId(waited["result"]["thread"].as_i64().unwrap());
+    let assistant = bench.assistant(child).await;
+    assert_eq!(
+        requests_in(&assistant),
+        1,
+        "the card is in the sub-agent's thread"
+    );
+    assert_eq!(requests_in(&*bench.assistant(ThreadId::MAIN).await), 0);
+    assert_eq!(bench.threads.delivered(child), None);
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn wait_timeout_leaves_the_child_running() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let waited = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": TASK, "wait": true, "timeout_secs": 1}}),
+    )
+    .await;
+    assert_eq!(waited["result"]["status"], "running", "{waited}");
+    let child = ThreadId(waited["result"]["thread"].as_i64().unwrap());
+    let assistant = bench.assistant(child).await;
+    assert_eq!(assistant.status(), fronde_protocol::ThreadStatus::Running);
+    assert!(assistant.current_turn().await.is_some());
+    // It ends on its own, with its answer.
+    bench.gate.notify_waiters();
+    until_idle(&assistant).await;
+    let read = call(
+        &main,
+        "threads_read",
+        json!({"arguments": {"thread": child.0}}),
+    )
+    .await;
+    let items = read["result"]["items"].as_array().unwrap();
+    assert_eq!(
+        items[1],
+        json!({"seq": 2, "kind": "assistant", "text": "Je regarde. Voilà."})
+    );
+    assert_eq!(
+        items[2],
+        json!({"seq": 4, "kind": "turn_ended", "outcome": "done"})
+    );
+    assert_eq!(read["result"]["status"], "done");
+}
+
+#[tokio::test]
+async fn cancelled_call_stops_waiting_not_the_child() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let call = main.peer().call_tool_once(
+        CallToolRequestParams::new("threads_start").with_arguments(
+            json!({"task": TASK, "wait": true})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+    );
+    // The client gives up: dropping the call sends `notifications/cancelled`.
+    let given_up = timeout(Duration::from_millis(500), call).await;
+    assert!(given_up.is_err(), "the call should still be waiting");
+    let child = timeout(WAIT, async {
+        loop {
+            if let Some(child) = children_of(&bench, ThreadId::MAIN).await.first() {
+                return *child;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no sub-agent was started");
+    let assistant = bench.assistant(child).await;
+    // Given time to notice, the call stops waiting; the sub-agent goes on.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(assistant.status(), fronde_protocol::ThreadStatus::Running);
+    bench.gate.notify_waiters();
+    until_idle(&assistant).await;
+    assert_eq!(
+        assistant.status(),
+        fronde_protocol::ThreadStatus::Done,
+        "the sub-agent finished its turn"
+    );
+    assert_eq!(
+        bench.threads.delivered(child),
+        None,
+        "nobody was waiting any more to take its result"
+    );
+}
+
+#[tokio::test]
+async fn retry_with_the_same_client_request_id_joins_the_child() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let args = json!({"arguments": {"task": TASK, "client_request_id": "soupe-1"}});
+    let first = call(&main, "threads_start", args.clone()).await;
+    let again = call(&main, "threads_start", args.clone()).await;
+    let child = first["result"]["thread"].clone();
+    assert_eq!(again["result"]["thread"], child, "{again}");
+    assert_eq!(again["result"]["joined"], true);
+    assert!(first["result"].get("joined").is_none());
+    assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 1);
+    // The same id for another task, or another title, is refused.
+    for other in [
+        json!({"task": "Autre chose.", "client_request_id": "soupe-1"}),
+        json!({"task": TASK, "title": "Soupes", "client_request_id": "soupe-1"}),
+    ] {
+        let refused = call(&main, "threads_start", json!({"arguments": other})).await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("already started sub-agent")),
+            "{refused}"
+        );
+    }
+    assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 1);
+
+    // Another turn of the parent: the same call does not join the earlier child.
+    let main_assistant = bench.assistant(ThreadId::MAIN).await;
+    bench.gate.notify_waiters();
+    until_idle(&main_assistant).await;
+    main_assistant.send("Encore".into()).await;
+    assert!(main_assistant.current_turn().await.is_some());
+    let refused = call(&main, "threads_start", args).await;
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("another turn")),
+        "{refused}"
+    );
+    let fresh = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": TASK, "client_request_id": "soupe-2"}}),
+    )
+    .await;
+    assert_ne!(fresh["result"]["thread"], child, "{fresh}");
+    assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 2);
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn threads_start_is_hidden_and_refused_past_max_depth() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let all = [
+        "threads_cancel",
+        "threads_list",
+        "threads_read",
+        "threads_send",
+        "threads_start",
+    ];
+    let names = tool_names(&main).await;
+    for name in all {
+        assert!(
+            names.contains(&name.to_owned()),
+            "{name} missing from {names:?}"
+        );
+    }
+    let child = start_child(&main, TASK).await;
+    let child_client = bench
+        .client(&token_of(&bench, child).await, "claude-code", &[])
+        .await;
+    let names = tool_names(&child_client).await;
+    for name in ["threads_start", "threads_send"] {
+        assert!(
+            !names.contains(&name.to_owned()),
+            "{name} offered to a sub-agent"
+        );
+    }
+    for name in ["threads_read", "threads_list", "threads_cancel"] {
+        assert!(
+            names.contains(&name.to_owned()),
+            "{name} missing from {names:?}"
+        );
+    }
+    // Refused when called anyway, directly or through use_tool: no grandchild.
+    let direct = call(
+        &child_client,
+        "threads_start",
+        json!({"arguments": {"task": TASK}}),
+    )
+    .await;
+    let through = call(
+        &child_client,
+        "use_tool",
+        json!({"arguments": {"name": "threads_start", "arguments": {"task": TASK}}}),
+    )
+    .await;
+    for refused in [&direct, &through] {
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("sub-agent")),
+            "{refused}"
+        );
+    }
+    // The threads refuse it too, whoever asks.
+    let error = bench
+        .threads
+        .start_child(
+            child,
+            None,
+            fronde_agent::threads::ChildTask {
+                task: TASK.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<fronde_agent::threads::Delegation>(),
+        Some(&fronde_agent::threads::Delegation::TooDeep { max_depth: 1 })
+    );
+    assert!(children_of(&bench, child).await.is_empty());
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn outside_client_gets_no_threads_tools() {
+    let bench = held_bench().await;
+    bench.start(ThreadId::MAIN).await;
+    let outside = bench
+        .client(TOKEN, "Fronde", &[("x-fronde-thread", "1")])
+        .await;
+    let names = tool_names(&outside).await;
+    assert!(
+        !names.iter().any(|name| name.starts_with("threads_")),
+        "{names:?}"
+    );
+    for (tool, arguments) in [
+        ("threads_start", json!({"task": TASK, "thread": 1})),
+        ("threads_list", json!({})),
+        ("threads_read", json!({"thread": 1})),
+    ] {
+        let refused = call(
+            &outside,
+            tool,
+            json!({"arguments": arguments, "_meta": {"thread": 1}}),
+        )
+        .await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("outside MCP client")),
+            "{tool}: {refused}"
+        );
+    }
+    assert!(children_of(&bench, ThreadId::MAIN).await.is_empty());
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn threads_list_shows_children_and_models() {
+    let gate = Arc::new(Notify::new());
+    let mut bench = bench_with(
+        FakeScript {
+            models: true,
+            ..held(&gate)
+        },
+        Some(FakeScript {
+            models: true,
+            ..FakeScript::default()
+        }),
+        many(),
+    )
+    .await;
+    bench.gate = gate;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    timeout(WAIT, async {
+        while bench.threads.models("claude").await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the models were never learnt");
+
+    // A model the provider does not offer, an unknown provider and a planned one are refused,
+    // saying what may be chosen.
+    for (arguments, expected) in [
+        (
+            json!({"task": TASK, "model": "gpt-9"}),
+            "fake-small, fake-large",
+        ),
+        (
+            json!({"task": TASK, "provider": "mistral"}),
+            "only claude is configured",
+        ),
+        (json!({"task": TASK, "provider": "codex"}), "planned"),
+        (
+            json!({"task": TASK, "provider": "claude", "model": "fake-huge"}),
+            "fake-small, fake-large",
+        ),
+    ] {
+        let refused = call(&main, "threads_start", json!({"arguments": arguments})).await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(expected)),
+            "{refused}"
+        );
+    }
+    assert!(children_of(&bench, ThreadId::MAIN).await.is_empty());
+
+    let started = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": TASK, "provider": "claude", "model": "fake-large", "title": "Soupes"}}),
+    )
+    .await;
+    let child = ThreadId(started["result"]["thread"].as_i64().unwrap());
+    token_of(&bench, child).await;
+    let fake = latest_fake(&bench, 2).await;
+    timeout(WAIT, async {
+        while !fake
+            .record()
+            .config_sets
+            .contains(&("model".to_owned(), "fake-large".to_owned()))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent's model was never set");
+
+    let listed = call(&main, "threads_list", json!({})).await;
+    let children = listed["result"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "{listed}");
+    assert_eq!(children[0]["thread"], child.0);
+    assert_eq!(children[0]["title"], "Soupes");
+    assert_eq!(children[0]["provider"], "claude");
+    assert_eq!(children[0]["model"], "fake-large");
+    assert!(children[0]["status"].is_string());
+    assert_eq!(
+        listed["result"]["providers"],
+        json!([{"id": "claude", "models": [
+            {"id": "fake-small", "name": "fake small"},
+            {"id": "fake-large", "name": "fake large"},
+        ]}])
+    );
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn cancel_stops_the_child_and_keeps_what_it_wrote() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let child = start_child(&main, TASK).await;
+    let assistant = bench.assistant(child).await;
+    timeout(WAIT, async {
+        while !assistant
+            .log()
+            .since(0)
+            .iter()
+            .any(|entry| matches!(entry.event, Event::Assistant { .. }))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stopped = call(
+        &main,
+        "threads_cancel",
+        json!({"arguments": {"thread": child.0, "reason": "Plus besoin."}}),
+    )
+    .await;
+    assert_eq!(
+        stopped["result"],
+        json!({"thread": child.0, "stopped": true}),
+        "{stopped}"
+    );
+    // The sub-agent was told to stop; its parent's own turn goes on.
+    let fake = latest_fake(&bench, 2).await;
+    assert!(fake.record().cancels >= 1);
+    assert!(
+        bench
+            .assistant(ThreadId::MAIN)
+            .await
+            .current_turn()
+            .await
+            .is_some()
+    );
+    // The fake agent ends its turn once released.
+    bench.gate.notify_waiters();
+    until_idle(&assistant).await;
+    let read = call(
+        &main,
+        "threads_read",
+        json!({"arguments": {"thread": child.0}}),
+    )
+    .await;
+    let items = read["result"]["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|item| item["kind"] == "notice"
+            && item["text"].as_str().unwrap().contains("Plus besoin.")),
+        "{read}"
+    );
+    assert!(
+        items.iter().any(|item| item["kind"] == "assistant"),
+        "{read}"
+    );
+    // Stopping it again stops nothing; its result stays.
+    let again = call(
+        &main,
+        "threads_cancel",
+        json!({"arguments": {"thread": child.0}}),
+    )
+    .await;
+    assert_eq!(again["result"]["stopped"], false, "{again}");
 }

@@ -82,8 +82,9 @@ offers (the Claude adapter's option `model`). After each open or resume, Fronde 
 `session/set_config_option` with the thread's model, since a resumed session may come back on
 the default. A model the agent does not list fails the start, and the log says which it lists;
 an agent with no model option refuses any model. The models an agent listed are kept in the
-key-value table (`provider/<id>`, `models`) for choosing one before an agent runs. Nothing sets a
-thread's model from the chat yet: that comes with `threads_start` (**planned**).
+key-value table (`provider/<id>`, `models`) for choosing one before an agent runs: a sub-agent's
+model is chosen among them by `threads_start` (see [Threads and sub-agents](threads.md)). Nothing
+sets a thread's model from the chat yet.
 
 Each turn streams back as events: text, tool calls, permission requests, the end of the turn.
 Fronde numbers them and saves each one in the database, committed to disk, before it broadcasts
@@ -103,7 +104,8 @@ Each thread has its own agent process, started on the thread's first message, in
 directories (`agent/` and `home/` for the main thread, `threads/<id>/work/` and
 `threads/<id>/home/` for another), confined to them, in a systemd scope named after the thread,
 and with its own hub token (see [Threads](security.md#threads)). Starting or stopping one never
-stops another. Threads that agents start for a task are planned.
+stops another. A thread's agent can start threads of its own for a task, sub-agents, with the
+`threads_*` tools: see [Threads and sub-agents](threads.md).
 
 The chat's WebSocket carries every thread (see
 [the chat WebSocket](../reference/endpoints.md#the-chat-websocket)). A socket streams one thread

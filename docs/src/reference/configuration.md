@@ -145,7 +145,7 @@ An upstream MCP server. See [Add upstream MCP servers](../how-to/add-upstream-mc
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | Required. Prefixes the server's tools, so it cannot overlap the hub's reserved prefixes (`code_`, `hub_`, `memory_`, `search_`, `use_`). |
+| `name` | string | Required. Prefixes the server's tools, so it cannot overlap the hub's reserved prefixes (`code_`, `hub_`, `memory_`, `search_`, `threads_`, `use_`, `user_`). |
 | `url` | URL | Streamable HTTP address of the server. |
 | `command` | array of strings | Program and arguments to run, talking MCP over standard input and output. |
 | `token` | secret | Optional, with `url` only: sent as `Authorization: Bearer <token>`. |
@@ -168,7 +168,7 @@ origins granted here. Its manifest says what it asks for (see
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | Required. The source of its tools, which keep the names the component gives them, each starting with one of its manifest's `tool_prefixes`. No other source's tools may use those prefixes: a component whose prefix is `<another source's name>_`, a prefix of the hub's own tools (`code_`, `hub_`, `memory_`, `search_`, `use_`) or another component's is not loaded. |
+| `name` | string | Required. The source of its tools, which keep the names the component gives them, each starting with one of its manifest's `tool_prefixes`. No other source's tools may use those prefixes: a component whose prefix is `<another source's name>_`, a prefix of the hub's own tools (`code_`, `hub_`, `memory_`, `search_`, `threads_`, `use_`, `user_`) or another component's is not loaded. |
 | `path` | path | Required. The `.wasm` file. |
 | `manifest` | path | The manifest. Default: the `.toml` file beside `path` with the same name (`calendar.wasm`, `calendar.toml`). |
 | `sha256` | hex string | SHA-256 of the `.wasm` file. Set it with `manifest_sha256`, or neither for a component shipped with Fronde. |

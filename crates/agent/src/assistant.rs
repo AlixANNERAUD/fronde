@@ -133,6 +133,15 @@ struct Activity {
     last_outcome: Option<TurnOutcome>,
 }
 
+/// Why a message was not sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// A turn runs: one message at a time.
+    Busy,
+    /// The thread is archived: it receives no message.
+    Archived,
+}
+
 struct Turn {
     cancel: CancellationToken,
     /// The seq of its user message, if it was logged.
@@ -300,12 +309,29 @@ impl Assistant {
     /// Logs the message and runs the turn in the background; refused while a turn runs, and
     /// when the thread is archived.
     pub async fn send(self: &Arc<Self>, text: String) {
+        match self.try_send(text, None).await {
+            Ok(_) => {}
+            Err(Refused::Archived) => {
+                self.append(Event::Notice {
+                    text: ARCHIVED.into(),
+                })
+                .await;
+            }
+            Err(Refused::Busy) => self.append(Event::Notice { text: BUSY.into() }).await,
+        }
+    }
+
+    /// Logs the message, written by `by` when it is not the page's user (a parent thread for its
+    /// child's task), and runs the turn in the background: the seq of the message, `None` when
+    /// it could not be logged. Refused, with nothing logged, while a turn runs and when the
+    /// thread is archived.
+    pub async fn try_send(
+        self: &Arc<Self>,
+        text: String,
+        by: Option<String>,
+    ) -> Result<Option<u64>, Refused> {
         if self.archived.load(Ordering::SeqCst) {
-            self.append(Event::Notice {
-                text: ARCHIVED.into(),
-            })
-            .await;
-            return;
+            return Err(Refused::Archived);
         }
         // The turn is locked while its start or refusal is logged, as it is while its end is
         // logged: a message sent on seeing `TurnEnded` finds the turn over. Locks are always
@@ -313,12 +339,11 @@ impl Assistant {
         let (cancel, seq) = {
             let mut turn = self.turn.lock().await;
             if turn.is_some() {
-                self.append(Event::Notice { text: BUSY.into() }).await;
-                return;
+                return Err(Refused::Busy);
             }
             let message = Event::User {
                 text: text.clone(),
-                by: None,
+                by,
             };
             let seq = match self.log.append(message).await {
                 Ok(entry) => Some(entry.seq),
@@ -377,6 +402,7 @@ impl Assistant {
             assistant.arm_idle_stop();
             assistant.pool.turn_ended();
         });
+        Ok(seq)
     }
 
     /// The agent was used now.
@@ -857,7 +883,7 @@ impl Assistant {
         self.append(event).await;
     }
 
-    async fn append(&self, event: Event) {
+    pub(crate) async fn append(&self, event: Event) {
         if let Err(error) = self.log.append(event).await {
             tracing::error!("cannot write the conversation log: {error:#}");
         }

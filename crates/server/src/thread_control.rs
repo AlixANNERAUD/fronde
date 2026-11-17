@@ -1,0 +1,169 @@
+//! The bridge between the hub's `threads_*` tools and the threads: the hub keeps no dependency
+//! on `fronde-agent`, so the server hands it [`ThreadBridge`] over [`Threads`].
+
+use async_trait::async_trait;
+use fronde_agent::threads::{ChildEnd, ChildTask, Delegation, ThreadId, Threads};
+use fronde_hub::threads::{
+    Child, NewChild, ProviderModels, ReadThread, Started, ThreadControl, ThreadError, Waited,
+};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// [`ThreadControl`] over the threads: every check of what a caller may reach is theirs.
+pub struct ThreadBridge(pub Arc<Threads>);
+
+/// What the hub tells the agent of `error`: a refusal as the threads word it, an unknown
+/// thread and one out of reach alike, anything else a failure logged by the hub.
+fn hub_error(error: anyhow::Error) -> ThreadError {
+    match error.downcast_ref::<Delegation>() {
+        Some(Delegation::NoSuchThread) => ThreadError::NoSuchThread,
+        Some(refused) => ThreadError::Refused(refused.to_string()),
+        None => ThreadError::Failed(error),
+    }
+}
+
+#[async_trait]
+impl ThreadControl for ThreadBridge {
+    async fn may_delegate(&self, caller: ThreadId) -> bool {
+        self.0.may_delegate(caller).await.unwrap_or_else(|error| {
+            tracing::error!("cannot tell whether thread {caller} may delegate: {error:#}");
+            false
+        })
+    }
+
+    async fn providers(&self) -> Result<Vec<ProviderModels>, ThreadError> {
+        let mut providers = Vec::new();
+        for id in self.0.providers() {
+            let models = self.0.models(id).await.map_err(hub_error)?;
+            providers.push(ProviderModels {
+                id: id.to_owned(),
+                models: models
+                    .into_iter()
+                    .map(|model| (model.id, model.name))
+                    .collect(),
+            });
+        }
+        Ok(providers)
+    }
+
+    async fn start(
+        &self,
+        parent: ThreadId,
+        turn: Option<u64>,
+        child: NewChild,
+    ) -> Result<Started, ThreadError> {
+        let NewChild {
+            task,
+            title,
+            provider,
+            model,
+            client_request_id,
+        } = child;
+        let task = ChildTask {
+            task,
+            title,
+            provider,
+            model,
+            client_request_id,
+        };
+        let started = self
+            .0
+            .start_child(parent, turn, task)
+            .await
+            .map_err(hub_error)?;
+        let status = match self.0.assistant(started.row.id).await {
+            Ok(Some(assistant)) => assistant.status(),
+            Ok(None) => return Err(ThreadError::NoSuchThread),
+            Err(error) => return Err(hub_error(error)),
+        };
+        Ok(Started {
+            thread: started.row.id,
+            title: started.row.title,
+            status,
+            joined: started.joined,
+            seq: started.seq,
+        })
+    }
+
+    async fn send(
+        &self,
+        caller: ThreadId,
+        thread: ThreadId,
+        text: String,
+    ) -> Result<u64, ThreadError> {
+        self.0
+            .send_child(caller, thread, text)
+            .await
+            .map_err(hub_error)
+    }
+
+    async fn read(
+        &self,
+        caller: ThreadId,
+        thread: ThreadId,
+        after: u64,
+    ) -> Result<ReadThread, ThreadError> {
+        let (row, status, entries) = self
+            .0
+            .read_child(caller, thread, after)
+            .await
+            .map_err(hub_error)?;
+        Ok(ReadThread {
+            title: row.title,
+            status,
+            entries,
+        })
+    }
+
+    async fn children(&self, caller: ThreadId) -> Result<(Vec<Child>, usize), ThreadError> {
+        let (children, more) = self.0.children(caller).await.map_err(hub_error)?;
+        let children = children
+            .into_iter()
+            .map(|(row, summary)| Child {
+                thread: row.id,
+                title: row.title,
+                parent: row.parent,
+                status: summary.status,
+                provider: row.provider,
+                model: row.model,
+                archived: row.archived_at.is_some(),
+                open_requests: summary.open_requests,
+            })
+            .collect();
+        Ok((children, more))
+    }
+
+    async fn cancel(
+        &self,
+        caller: ThreadId,
+        thread: ThreadId,
+        reason: Option<String>,
+    ) -> Result<bool, ThreadError> {
+        self.0
+            .cancel_child(caller, thread, reason.as_deref())
+            .await
+            .map_err(hub_error)
+    }
+
+    async fn wait(
+        &self,
+        caller: ThreadId,
+        thread: ThreadId,
+        seq: u64,
+        timeout: Duration,
+        cancelled: CancellationToken,
+    ) -> Result<Waited, ThreadError> {
+        let end = self
+            .0
+            .wait_child(caller, thread, seq, timeout, &cancelled)
+            .await
+            .map_err(hub_error)?;
+        Ok(match end {
+            ChildEnd::Ended { outcome, answer } => Waited::Ended { outcome, answer },
+            ChildEnd::WaitingForUser => Waited::WaitingForUser,
+            ChildEnd::TimedOut => Waited::TimedOut,
+            ChildEnd::GaveUp => Waited::GaveUp,
+        })
+    }
+}

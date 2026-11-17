@@ -732,9 +732,10 @@ fn default_user() -> String {
 }
 
 /// Prefixes of the hub's own tools (`search_tools`, `use_tool`, `memory_*`, `code_run_python`,
-/// `user_*`) and of its source name: no component may declare them.
-pub const RESERVED_TOOL_PREFIXES: [&str; 6] =
-    ["code_", "hub_", "memory_", "search_", "use_", "user_"];
+/// `user_*`, `threads_*`) and of its source name: no component may declare them.
+pub const RESERVED_TOOL_PREFIXES: [&str; 7] = [
+    "code_", "hub_", "memory_", "search_", "threads_", "use_", "user_",
+];
 
 /// True for names usable as tool prefixes: `^[a-z][a-z0-9_]{0,63}$`.
 pub fn is_valid_name(name: &str) -> bool {

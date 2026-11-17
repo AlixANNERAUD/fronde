@@ -106,6 +106,8 @@ pub struct FakeRecord {
     pub modes: Vec<String>,
     /// Each `session/set_config_option`: the option's id and the value asked.
     pub config_sets: Vec<(String, String)>,
+    /// The text of each prompt, its text blocks joined.
+    pub prompts: Vec<String>,
     pub permission_outcomes: Vec<RequestPermissionOutcome>,
     /// What each elicitation got: the response, or the error.
     pub elicitation_responses: Vec<Result<CreateElicitationResponse, String>>,
@@ -295,6 +297,15 @@ fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectT
                     let record = record.clone();
                     let script = script.clone();
                     let cancelled = cancelled.clone();
+                    let text: String = request
+                        .prompt
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    lock(&record).prompts.push(text);
                     // Waiting for the permission answer inside the handler would block the
                     // dispatch loop that delivers it.
                     cx.clone().spawn(async move {

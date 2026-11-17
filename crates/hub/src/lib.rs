@@ -8,6 +8,7 @@ pub mod origin;
 pub mod private;
 pub mod search;
 pub mod source;
+pub mod threads;
 pub mod tools;
 pub mod upstream;
 pub mod user;
@@ -19,6 +20,7 @@ use memory::index::MemoryIndex;
 use memory::{MemoryStore, tools::memory_tools};
 use source::{Native, Supervisor, ToolSource};
 use std::sync::Arc;
+use threads::ThreadControl;
 use tools::{Registry, meta_tools};
 use upstream::Upstream;
 
@@ -30,18 +32,22 @@ pub struct Hub {
     pub config: Config,
     /// Fronde's database (`fronde_db::open`), shared with the rest of the server.
     pub db: DatabaseConnection,
+    /// The threads the `threads_*` tools drive, when the chat runs.
+    pub threads: Option<Arc<dyn ThreadControl>>,
 }
 
 impl Hub {
     /// Open memory, register the hub's own tools, start `components` (one that fails is skipped
     /// with a warning, unless it is waiting for a stored secret: that one is tried again) and
     /// connect upstream servers in the background. With `requests` (the chat runs), the `user_*`
-    /// tools ask the user through it.
+    /// tools ask the user through it; with `threads`, the `threads_*` tools let a thread's agent
+    /// start and follow sub-agents.
     pub async fn start(
         config: Config,
         db: DatabaseConnection,
         components: Vec<Arc<dyn ToolSource>>,
         requests: Option<Arc<Requests>>,
+        threads: Option<Arc<dyn ThreadControl>>,
     ) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
         private::prepare_data_dir(dir)?;
@@ -69,6 +75,9 @@ impl Hub {
         if let Some(requests) = requests {
             own.extend(user::user_tools(requests));
         }
+        if let Some(threads) = &threads {
+            own.extend(threads::thread_tools(threads.clone()));
+        }
         sources.start(Arc::new(Native::new("hub", own))).await?;
         for component in components {
             let name = component.name().to_string();
@@ -91,6 +100,7 @@ impl Hub {
             sources,
             config,
             db,
+            threads,
         })
     }
 }

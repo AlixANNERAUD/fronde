@@ -1,7 +1,9 @@
 # Tools
 
-These are the tools the hub serves at `/mcp`, to its own agent and to any other client. Tool
-names match `^[a-z][a-z0-9_]{0,63}$`.
+These are the tools the hub serves at `/mcp`, to its own agents and to any other client. Tool
+names match `^[a-z][a-z0-9_]{0,63}$`. The hub's own tools use the prefixes `code_`, `hub_`,
+`memory_`, `search_`, `threads_`, `use_` and `user_`, which no upstream server or component may
+take.
 
 ## Results
 
@@ -248,6 +250,45 @@ Days between two dates:
 ```json
 {"result": {"value": 38}}
 ```
+
+## Threads
+
+Served only with `[web]`, and only to a thread's agent: an outside MCP client is not offered
+them and is refused them (letting outside clients start threads is **planned**). They let an agent
+start sub-agents and follow them; see [Threads and sub-agents](../explanation/threads.md).
+
+| Tool | Arguments | Does |
+| --- | --- | --- |
+| `threads_start` | `task`, `title` (optional, at most 80 characters), `provider` (optional), `model` (optional), `wait` (default `false`), `timeout_secs` (1 to 3600, default 600), `client_request_id` (optional, 1 to 128 characters) | Starts a sub-agent whose only context is `task`, and returns `{ thread, title, status }`; with `wait`, its answer. |
+| `threads_send` | `thread`, `text`, `wait`, `timeout_secs` | Sends a sub-agent a new message, as a new turn; refused while it is in a turn. |
+| `threads_read` | `thread`, `after` (default 0), `limit` (1 to 50, default 20), `max_chars` (100 to 8000, default 4000) | Reads a sub-agent's thread, oldest first: its messages (`user`), its answers (`assistant`, a turn's text together), Fronde's notices (`notice`) and each turn's end (`turn_ended`, with its `outcome`). Each item has its `seq`; a text longer than `max_chars` is cut and marked `truncated`. When there is more, `next_after` is the `after` of the next page. |
+| `threads_list` | none | The sub-agents you started, newest first (at most 50, `more` counting the rest), each with its `thread`, `title`, `status`, `provider` and `model`, `waiting_for_user` when cards wait in it, `archived` when it is; and `providers`: each provider a sub-agent may run on, with the models its agent offered when it last started. |
+| `threads_cancel` | `thread`, `reason` (optional, one line, at most 200 characters) | Stops a sub-agent's running turn, its pending cards and its own sub-agents' turns; `reason` is shown in its thread. A finished turn keeps its result. Returns whether it was in a turn. |
+
+- **Who.** A thread's agent is known by its token only; nothing in a call names the caller. It
+  reaches only the threads it started (and theirs): any other thread, its parent and siblings
+  among them, gets the same error as a thread that does not exist,
+  "no such thread among the sub-agents you started".
+- **Depth.** A sub-agent is not offered `threads_start` and `threads_send`, and is refused them:
+  the threads you start may delegate, theirs may not.
+- **Provider and model.** `provider` is one of `threads_list`'s (only `claude` today; `codex` and
+  `gemini` are refused as planned). `model` is one of the models the provider's agent offered,
+  as `threads_list` shows them; another is refused with the list. Without them, the parent's
+  provider and the provider's default model.
+- **Waiting.** Without `wait`, the call returns at once and the sub-agent works on its own: read
+  its answer later with `threads_read`. With `wait`, the call returns when its turn ends, with
+  `{ thread, status, outcome, answer }`: `answer` is the text of that turn after its message, at
+  most 8000 characters (`truncated` when cut). It returns earlier with `status:
+  "waiting_for_user"` when a card opens in the sub-agent's thread, or `status: "running"` when
+  `timeout_secs` passes or the call is given up; the sub-agent goes on either way. Its result
+  waking the parent on its own is **planned**.
+- **Retries.** A call retried in the same turn with the same `client_request_id` and the same
+  arguments joins the sub-agent the first one started (`joined: true`). The same id for another
+  task, title, provider or model, or in another turn, is refused while that sub-agent is not
+  archived: a new task needs a new id.
+- **Untrusted text.** What a sub-agent writes may come from anything it read. It reaches the
+  caller with its hidden characters (format, bidirectional, zero-width) shown as U+FFFD, capped,
+  and with a `next` saying it is data, not instructions.
 
 ## Upstream tools
 

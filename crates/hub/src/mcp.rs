@@ -74,6 +74,19 @@ impl HubServer {
             cancelled: context.ct.clone(),
         }
     }
+
+    /// Whether `caller` is offered the tool `name`: the `threads_*` tools only to a thread's
+    /// agent, and those that start or drive sub-agents only to a thread that may still
+    /// delegate. Each tool refuses the others' calls anyway.
+    fn offers(name: &str, caller: &Caller, delegates: bool) -> bool {
+        if !name.starts_with("threads_") {
+            return true;
+        }
+        match caller {
+            Caller::Thread(_) => delegates || !crate::threads::DELEGATING_TOOLS.contains(&name),
+            Caller::Mcp(_) | Caller::Source(_) | Caller::Unknown(_) => false,
+        }
+    }
 }
 
 impl ServerHandler for HubServer {
@@ -91,13 +104,19 @@ impl ServerHandler for HubServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let caller = self.call_context(&context).caller;
+        let delegates = match (&caller, &self.hub.threads) {
+            (Caller::Thread(id), Some(threads)) => threads.may_delegate(*id).await,
+            _ => false,
+        };
         let tools = self
             .hub
             .registry
             .visible()
             .into_iter()
+            .filter(|d| Self::offers(&d.name, &caller, delegates))
             .map(|d| {
                 let schema = match d.input_schema {
                     Value::Object(m) => m,
@@ -190,7 +209,7 @@ mod tests {
         let config: crate::config::Config = toml::from_str(&toml).unwrap();
         crate::private::prepare_data_dir(dir).unwrap();
         let db = fronde_db::open(dir).await.unwrap();
-        let hub = Hub::start(config, db, vec![], None).await.unwrap();
+        let hub = Hub::start(config, db, vec![], None, None).await.unwrap();
         let (mut d, h) = typed_tool(
             "mcphub_secret_tool",
             "Hidden",
@@ -434,7 +453,7 @@ mod tests {
             .await
             .unwrap();
         let hub = Arc::new(
-            Hub::start(config, db, vec![], Some(requests))
+            Hub::start(config, db, vec![], Some(requests), None)
                 .await
                 .unwrap(),
         );

@@ -6,6 +6,7 @@ pub mod init;
 pub mod secret;
 pub mod service;
 pub mod sessions;
+pub mod thread_control;
 mod web;
 mod ws;
 
@@ -881,7 +882,13 @@ pub async fn start_with(
         None => None,
     };
     let requests = chat.as_ref().map(|(_, requests, ..)| requests.clone());
-    let hub = Arc::new(Hub::start(config, db.clone(), components, requests).await?);
+    // The `threads_*` tools drive the threads through the bridge, which checks nothing itself:
+    // the threads do, against the calling thread the gate found from its token.
+    let control = chat.as_ref().map(|(threads, ..)| {
+        Arc::new(thread_control::ThreadBridge(threads.clone()))
+            as Arc<dyn fronde_hub::threads::ThreadControl>
+    });
+    let hub = Arc::new(Hub::start(config, db.clone(), components, requests, control).await?);
     let threads = chat.as_ref().map(|(threads, ..)| threads.clone());
     let mut app = router(hub, token, threads);
     if let Some((threads, requests, password, secure_cookie)) = chat {
