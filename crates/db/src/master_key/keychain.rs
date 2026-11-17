@@ -24,6 +24,11 @@ use zeroize::{Zeroize as _, Zeroizing};
 /// The entry's service.
 pub(super) const SERVICE: &str = "fronde";
 
+/// The environment variable that, set to `off`, makes the platform's keychain absent, so that
+/// `auto` keeps the key in a file. `mise.toml` sets it for every test and development run, which
+/// must never reach the keychain of the machine they run on.
+pub const SWITCH: &str = "FRONDE_KEYCHAIN";
+
 /// How long a keychain call may take, waiting for an earlier one included, before the keychain
 /// counts as locked behind a prompt.
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -88,9 +93,18 @@ impl KeychainError {
 }
 
 impl Keychain {
-    /// The platform's keychain, for the data directory `data_dir`. Every handle on it shares one
-    /// call in flight: they all reach the same keychain.
+    /// The platform's keychain, for the data directory `data_dir`, or none when
+    /// `FRONDE_KEYCHAIN` is `off` ([`SWITCH`]). Every handle on it shares one call in flight: they
+    /// all reach the same keychain.
     pub fn platform(data_dir: &Path) -> Self {
+        Self::platform_unless(data_dir, std::env::var_os(SWITCH).as_deref())
+    }
+
+    /// [`Keychain::platform`], with `switch` the value of [`SWITCH`].
+    fn platform_unless(data_dir: &Path, switch: Option<&std::ffi::OsStr>) -> Self {
+        if switch.is_some_and(|value| value.eq_ignore_ascii_case("off")) {
+            return Self::none();
+        }
         static CALLS: OnceLock<Arc<Semaphore>> = OnceLock::new();
         Self {
             open: Arc::new(platform_store),
@@ -538,5 +552,36 @@ impl keyring_core::api::CredentialApi for SlowEntry {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[tokio::test]
+    async fn switched_off_the_platform_keychain_is_absent() {
+        let dir = Path::new("/srv/fronde/data");
+        for off in ["off", "OFF"] {
+            let keychain = Keychain::platform_unless(dir, Some(OsStr::new(off)));
+            assert_eq!(keychain.kind, "none");
+            assert!(keychain.data_dir().is_none());
+            for result in [
+                keychain.read("master-key@x").await.map(drop),
+                keychain
+                    .read_or_create("master-key@x", None)
+                    .await
+                    .map(drop),
+            ] {
+                assert!(matches!(result, Err(KeychainError::Absent(_))), "{off}");
+            }
+        }
+        // Anything else leaves the platform's keychain in place, untouched by this test.
+        for other in [None, Some(OsStr::new("on")), Some(OsStr::new(""))] {
+            let keychain = Keychain::platform_unless(dir, other);
+            assert_eq!(keychain.kind, PLATFORM_KIND, "{other:?}");
+            assert_eq!(keychain.data_dir(), Some(dir));
+        }
     }
 }

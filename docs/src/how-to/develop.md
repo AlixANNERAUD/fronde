@@ -101,6 +101,12 @@ FRONDE_LIVE_AGENT=$PWD/agent/node_modules/.bin/claude-agent-acp \
 The path must be absolute: tests run from their crate's directory. `FRONDE_LIVE_CLAUDE` optionally
 names the Claude Code to run instead of the adapter's own.
 
+Tests and development runs never reach your keychain either: `mise.toml` sets
+`FRONDE_KEYCHAIN=off`, which makes Fronde act as if the machine had none, so a master key made by
+a test or by `mise run dev` goes to a file. Run Cargo through `mise exec` or a mise task to get
+it; a bare `cargo` outside mise does not set it. Tests of the keychain backend use the fake
+keychain (`fronde-db`'s `testing` feature), never the real one.
+
 ## Documentation
 
 This guide lives in `docs/src` and follows Diátaxis. A change to settings, endpoints, tools or

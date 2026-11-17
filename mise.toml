@@ -21,6 +21,9 @@ wasmtime = "50.0.1"
 # commands leave it out.
 FRONDE_SERVER_PACKAGES = "--workspace --exclude fronde-web"
 DX_TELEMETRY_ENABLED = "false"
+# Tests and development runs never reach this machine's keychain: with it off, `[secrets]
+# backend = "auto"` keeps a master key in a file. A deployed Fronde does not get this variable.
+FRONDE_KEYCHAIN = "off"
 # Tool components: standalone Cargo projects (own lock file and release profile), built for
 # wasm32-wasip2 against the guest SDK, which stands alone too.
 FRONDE_COMPONENTS = "components/echo components/calendar"
