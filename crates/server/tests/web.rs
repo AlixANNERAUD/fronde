@@ -1,3 +1,4 @@
+use fronde::sessions::Sessions;
 use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::Connector;
 use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
@@ -21,7 +22,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tower_sessions::SessionStore;
 use tower_sessions::cookie::time::{self, OffsetDateTime};
 use tower_sessions::session::{Id, Record};
-use tower_sessions_sqlx_store::{SqliteStore, sqlx};
+use tower_sessions_sqlx_store::sqlx;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const PASSWORD: &str = "correct horse battery staple";
@@ -922,8 +923,9 @@ async fn database(dir: &Path) -> fronde_db::DatabaseConnection {
     fronde_db::open(&dir.join("data")).await.unwrap()
 }
 
-fn session_store(db: &fronde_db::DatabaseConnection) -> SqliteStore {
-    SqliteStore::new(db.get_sqlite_connection_pool().clone())
+/// The server's own session store, which keys the rows by the hash of each id.
+fn session_store(db: &fronde_db::DatabaseConnection) -> Sessions {
+    Sessions::new(db.get_sqlite_connection_pool().clone())
 }
 
 /// How many web sessions the database holds.
@@ -979,6 +981,36 @@ async fn sign_out_deletes_the_session_row() {
     assert_eq!(session_rows(dir.path()).await, 1);
     assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 303);
     assert_eq!(get(addr, "/", Some(&other)).await.status(), 200);
+}
+
+#[tokio::test]
+async fn the_database_holds_no_session_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 200);
+
+    let id = cookie
+        .strip_prefix("fronde_session=")
+        .unwrap()
+        .parse::<Id>()
+        .unwrap();
+    let db = database(dir.path()).await;
+    let rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT id, data FROM tower_sessions")
+        .fetch_all(db.get_sqlite_connection_pool())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let (stored, data) = &rows[0];
+    assert_eq!(*stored, fronde::sessions::stored_id(&id).to_string());
+    assert_ne!(*stored, id.to_string());
+    for raw in [id.0.to_le_bytes(), id.0.to_be_bytes()] {
+        assert!(
+            !data.windows(raw.len()).any(|window| window == raw),
+            "the row's data holds the session id"
+        );
+    }
+    assert!(!String::from_utf8_lossy(data).contains(&id.to_string()));
 }
 
 #[tokio::test]

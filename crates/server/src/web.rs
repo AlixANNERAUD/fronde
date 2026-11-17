@@ -1,6 +1,7 @@
 //! The chat's web side: password sign-in kept in a session cookie, sessions kept in the database,
 //! and the web interface's files.
 
+use crate::sessions::Sessions;
 use crate::ws;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -21,7 +22,6 @@ use tower_http::services::ServeDir;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::cookie::time;
 use tower_sessions::{Expiry, Session, SessionManagerLayer};
-use tower_sessions_sqlx_store::SqliteStore;
 
 const SIGNED_IN: &str = "signed_in";
 /// How long a session survives without a signed-in request; each one renews it ([`renew`]).
@@ -80,7 +80,7 @@ async fn attempt(throttle: &Mutex<Throttle>, right: bool) -> Attempt {
 
 /// `sessions` keeps the sessions in `fronde.db`, so a restart signs no one out; `site_root` holds
 /// what `dx build` writes: `index.html`, the single page of the interface, and `assets/`.
-pub fn router(web: Web, sessions: SqliteStore, secure_cookie: bool, site_root: &Path) -> Router {
+pub fn router(web: Web, sessions: Sessions, secure_cookie: bool, site_root: &Path) -> Router {
     // Not `with_always_save`: that would store a session for any cookie a client makes up.
     // Signed-in requests renew theirs instead.
     let sessions = SessionManagerLayer::new(sessions)

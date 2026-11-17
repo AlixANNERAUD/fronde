@@ -4,6 +4,7 @@ pub mod check;
 pub mod hardening;
 pub mod init;
 pub mod service;
+pub mod sessions;
 mod web;
 mod ws;
 
@@ -24,6 +25,7 @@ use fronde_wasm::{Checks, ComponentHost, ComponentSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use secrecy::{ExposeSecret, SecretString};
+use sessions::Sessions;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -31,10 +33,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tower_sessions::ExpiredDeletion;
-use tower_sessions_sqlx_store::SqliteStore;
 
 /// How often expired web sessions and key-value entries are deleted.
 const PURGE_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How long a background task that panicked waits before it starts again.
+const RESTART_AFTER: Duration = Duration::from_secs(5);
 
 pub fn check_token(token: &SecretString) -> anyhow::Result<()> {
     if token.expose_secret().chars().count() < 32 {
@@ -168,7 +171,7 @@ async fn component_sources(
 /// Deletes expired web sessions and key-value entries. Reads already refuse them (the session
 /// store and `fronde_db::kv::get` check the expiry), so this only frees their rows: a failure is
 /// logged, never fatal.
-async fn purge_expired(db: &fronde_db::DatabaseConnection, sessions: &SqliteStore) {
+async fn purge_expired(db: &fronde_db::DatabaseConnection, sessions: &Sessions) {
     if let Err(error) = sessions.delete_expired().await {
         tracing::error!("cannot delete expired web sessions: {error}");
     }
@@ -178,12 +181,36 @@ async fn purge_expired(db: &fronde_db::DatabaseConnection, sessions: &SqliteStor
 }
 
 /// [`purge_expired`] every `period`, the first one `period` from now, for as long as it is polled.
-async fn purge_every(db: fronde_db::DatabaseConnection, sessions: SqliteStore, period: Duration) {
+async fn purge_every(db: fronde_db::DatabaseConnection, sessions: Sessions, period: Duration) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
         purge_expired(&db, &sessions).await;
+    }
+}
+
+/// Runs `task` in a task of its own, again `backoff` after each panic, until dropped (which
+/// stops the task too).
+async fn restart_on_panic<F, T>(name: &str, backoff: Duration, mut task: F)
+where
+    F: FnMut() -> T,
+    T: Future<Output = ()> + Send + 'static,
+{
+    loop {
+        let mut running = tokio::task::JoinSet::new();
+        running.spawn(task());
+        match running.join_next().await {
+            Some(Err(error)) if error.is_panic() => {
+                tracing::error!("{name} panicked, restarting it in {backoff:?}: {error}");
+                tokio::time::sleep(backoff).await;
+            }
+            Some(Err(error)) => {
+                tracing::error!("{name} stopped: {error}");
+                return;
+            }
+            Some(Ok(())) | None => return,
+        }
     }
 }
 
@@ -217,7 +244,7 @@ pub async fn start_with(
     let db = fronde_db::open(&data_dir).await?;
     let components = component_sources(&config, &db).await?;
     // The store creates its own table, `tower_sessions`, which the entities leave out.
-    let sessions = SqliteStore::new(db.get_sqlite_connection_pool().clone());
+    let sessions = Sessions::new(db.get_sqlite_connection_pool().clone());
     sessions.migrate().await.with_context(|| {
         format!(
             "cannot create the web sessions table in {}",
@@ -225,7 +252,12 @@ pub async fn start_with(
         )
     })?;
     purge_expired(&db, &sessions).await;
-    let purge = purge_every(db.clone(), sessions.clone(), PURGE_EVERY);
+    let purge = {
+        let (db, sessions) = (db.clone(), sessions.clone());
+        restart_on_panic("the purge of expired entries", RESTART_AFTER, move || {
+            purge_every(db.clone(), sessions.clone(), PURGE_EVERY)
+        })
+    };
     let hub = Arc::new(Hub::start(config, db.clone(), components).await?);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -259,7 +291,7 @@ pub async fn start_with(
     }
     let handle = tokio::spawn(async move {
         // A task of its own, so that not even a panic there stops the server, and owned by the
-        // server's task, so that it stops with the server.
+        // server's task, so that it stops with the server. A panic restarts it.
         let mut background = tokio::task::JoinSet::new();
         background.spawn(purge);
         if let Err(e) = axum::serve(listener, app).await {
@@ -323,7 +355,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fronde_db::open(dir.path()).await.unwrap();
         // The sessions table is missing, so every session purge fails until it is created.
-        let sessions = SqliteStore::new(db.get_sqlite_connection_pool().clone());
+        let sessions = Sessions::new(db.get_sqlite_connection_pool().clone());
         let logs = Logs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer({
@@ -380,6 +412,49 @@ mod tests {
             Some(vec![2])
         );
         purge.abort();
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_is_restarted() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let mut done = Some(done);
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        let _logged = tracing::subscriber::set_default(subscriber);
+        let supervisor = tokio::spawn({
+            let runs = runs.clone();
+            restart_on_panic("the test purge", Duration::from_millis(10), move || {
+                let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let done = (run == 3).then(|| done.take()).flatten();
+                async move {
+                    assert!(run >= 3, "injected panic {run}");
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
+                    std::future::pending::<()>().await;
+                }
+            })
+        });
+        tokio::time::timeout(Duration::from_secs(10), finished)
+            .await
+            .expect("the task was not restarted")
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!supervisor.is_finished());
+        assert_eq!(
+            logs.text().matches("the test purge panicked").count(),
+            2,
+            "{}",
+            logs.text()
+        );
+        supervisor.abort();
     }
 
     #[test]

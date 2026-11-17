@@ -38,7 +38,9 @@ inconsistent: SQLite may move changes from the `-wal` file into the database bet
 copies. For a copy without stopping Fronde, let SQLite make it:
 `sqlite3 fronde.db ".backup /path/to/fronde.db"`, then copy the other files. A `fronde backup`
 command is planned. The database refuses to open after a newer Fronde used it: run that version
-again or restore a backup.
+again or restore a backup. Sign-ins are stored by the hash of their id; the first start of the
+version that began hashing them signs every browser out once, and so does restoring a backup
+made before it.
 
 The memory files are plain Markdown: you can read and edit them by hand. An edit by hand is
 indexed at the next start, and committed with the next change Fronde makes.

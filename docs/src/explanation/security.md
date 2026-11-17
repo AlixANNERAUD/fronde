@@ -76,9 +76,9 @@ conversation. This does not encrypt anything: see below.
 ## The browser
 
 The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` behind https. Sessions live in
-`fronde.db`, so a restart signs no one out. Their ids are stored as they are: anyone who can read
-that file can take over a signed-in browser, one more reason it is 0600. Fronde never logs a
-session id. Signing out deletes the session at once. A session is refused as soon as it expires,
+`fronde.db`, so a restart signs no one out. Their ids are stored hashed (SHA-256): a copy of that
+file, a backup for instance, does not let anyone take over a signed-in browser. Fronde never logs
+a session id. Signing out deletes the session at once. A session is refused as soon as it expires,
 after 30 days without use, and its row is deleted within the hour. Only a successful sign-in
 stores a session: a cookie a client made up is never saved.
 
