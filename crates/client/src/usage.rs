@@ -63,13 +63,17 @@ pub struct MeterRow {
     pub reset: Option<String>,
 }
 
+/// The page's offset from UTC at an instant, in minutes east: it changes with daylight saving
+/// time, so each time shown asks for its own.
+pub type Offset<'a> = &'a dyn Fn(DateTime<Utc>) -> i32;
+
 /// The meter of `reading` at `now`, under a reserve of `reserve` percent, its times in the
-/// page's time (`offset` minutes east of UTC); `None` without any window read: no pill.
+/// page's time (`offset`); `None` without any window read: no pill.
 pub fn meter(
     reading: &ProviderUsage,
     reserve: u8,
     now: DateTime<Utc>,
-    offset: i32,
+    offset: Offset<'_>,
 ) -> Option<Meter> {
     let reading = reading.now(now);
     let mut windows: Vec<&Window> = reading.windows.iter().collect();
@@ -110,6 +114,7 @@ pub fn meter(
         .iter()
         .map(|window| MeterRow {
             name: window_label(&window.kind),
+            // A window reset since its reading has no use known: never « 0 % ».
             used: match window.used {
                 Some(used) => format!("{} % utilisé", percent(used)),
                 None => "utilisation inconnue".to_owned(),
@@ -153,10 +158,11 @@ pub fn level(window: &Window, reserve: u8) -> Level {
     }
     let pauses =
         reserve > 0 && (GUARDED.contains(&window.kind) || window.kind == WindowKind::Extra);
-    let line = if pauses { usage::line(reserve) } else { 1.0 };
-    match window.used {
+    // Compared in whole percent, as shown and as the server decides.
+    let line = if pauses { usage::line(reserve) } else { 100 };
+    match window.used.map(percent) {
         Some(used) if pauses && used >= line => Level::Paused,
-        Some(used) if used >= line - 0.10 => Level::Near,
+        Some(used) if used + 10 >= line => Level::Near,
         Some(_) => Level::Low,
         None if pauses && window.status == Some(LimitStatus::Warning) => Level::Paused,
         None if window.status == Some(LimitStatus::Warning) => Level::Near,
@@ -169,7 +175,7 @@ fn background_line(
     reading: &ProviderUsage,
     reserve: u8,
     now: DateTime<Utc>,
-    offset: i32,
+    offset: Offset<'_>,
 ) -> String {
     match reading.background(reserve, now) {
         Background::Allowed { .. } => format!("Tâches de fond permises (réserve {reserve} %)"),
@@ -191,11 +197,12 @@ fn background_line(
 
 const WEEKDAYS: [&str; 7] = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."];
 
-/// `at` in the page's time: « 16:40 » the same day as `now`, else « lun. 09:00 » within a week,
-/// else « 24/11 09:00 ».
-pub fn when(at: DateTime<Utc>, now: DateTime<Utc>, offset: i32) -> String {
-    let shift = Duration::minutes(i64::from(offset));
-    let (local, today) = ((at + shift).naive_utc(), (now + shift).naive_utc());
+/// `at` in the page's time, rounded up to the minute: « 16:40 » the same day as `now`, else
+/// « lun. 09:00 » within a week, else « 24/11 09:00 ».
+pub fn when(at: DateTime<Utc>, now: DateTime<Utc>, offset: Offset<'_>) -> String {
+    let at = usage::ceil_minute(at);
+    let local = (at + Duration::minutes(i64::from(offset(at)))).naive_utc();
+    let today = (now + Duration::minutes(i64::from(offset(now)))).naive_utc();
     let time = local.format("%H:%M");
     if local.date() == today.date() {
         time.to_string()
@@ -208,7 +215,7 @@ pub fn when(at: DateTime<Utc>, now: DateTime<Utc>, offset: i32) -> String {
 }
 
 /// [`when`] after a verb: « à 16:40 » the same day, else as `when` says it.
-fn on(at: DateTime<Utc>, now: DateTime<Utc>, offset: i32) -> String {
+fn on(at: DateTime<Utc>, now: DateTime<Utc>, offset: Offset<'_>) -> String {
     let text = when(at, now, offset);
     if text.contains(' ') {
         text
@@ -289,7 +296,7 @@ mod tests {
                 4,
             ),
         ]);
-        let meter = meter(&usage, 30, now(), 60).unwrap();
+        let meter = meter(&usage, 30, now(), &|_| 60).unwrap();
         assert_eq!(meter.pill, "5 h 42 %");
         assert_eq!(meter.label, "5 h : 42 % utilisé");
         assert_eq!(meter.level, Level::Low);
@@ -330,7 +337,7 @@ mod tests {
                 150,
             ),
         ]);
-        let weekly = super::meter(&usage, 30, now(), 0).unwrap();
+        let weekly = super::meter(&usage, 30, now(), &|_| 0).unwrap();
         assert_eq!(
             (weekly.pill.as_str(), weekly.level),
             ("semaine 65 %", Level::Near)
@@ -364,7 +371,7 @@ mod tests {
                 150,
             ),
         ]);
-        let meter = meter(&usage, 30, now(), 0).unwrap();
+        let meter = meter(&usage, 30, now(), &|_| 0).unwrap();
         assert_eq!(meter.level, Level::Paused);
         assert_eq!(
             meter.background,
@@ -388,11 +395,13 @@ mod tests {
                 150,
             ),
         ]);
-        let meter = meter(&usage, 30, now(), 0).unwrap();
+        let meter = meter(&usage, 30, now(), &|_| 0).unwrap();
         assert_eq!(
             meter.rows[0].reset.as_deref(),
             Some("réinitialisée depuis le relevé")
         );
+        // What was used since the reset is not known: never « 0 % ».
+        assert_eq!(meter.rows[0].used, "utilisation inconnue");
         assert_eq!(meter.rows[0].level, Level::Low);
         assert_eq!(meter.pill, "semaine 10 %");
         assert_eq!(
@@ -407,22 +416,35 @@ mod tests {
             window(WindowKind::Session, None, Some(LimitStatus::Warning), 2),
             window(WindowKind::Weekly, Some(0.3), None, 150),
         ]);
-        let meter = meter(&usage, 30, now(), 0).unwrap();
+        let meter = meter(&usage, 30, now(), &|_| 0).unwrap();
         assert_eq!(meter.pill, "5 h ?");
         assert_eq!(meter.label, "5 h : utilisation inconnue");
         assert_eq!(meter.level, Level::Paused);
         assert_eq!(meter.rows[0].used, "utilisation inconnue");
         assert_eq!(meter.rows[0].status.as_deref(), Some("proche de la limite"));
         // No window, no pill.
-        assert_eq!(super::meter(&reading(Vec::new()), 30, now(), 0), None);
+        assert_eq!(super::meter(&reading(Vec::new()), 30, now(), &|_| 0), None);
     }
 
     #[test]
     fn times_read_in_the_page_time() {
-        assert_eq!(when(now() + Duration::hours(3), now(), 0), "15:00");
-        assert_eq!(when(now() + Duration::hours(3), now(), 120), "17:00");
-        assert_eq!(when(now() + Duration::days(1), now(), 0), "mer. 12:00");
-        assert_eq!(when(now() + Duration::days(9), now(), 0), "26/11 12:00");
+        assert_eq!(when(now() + Duration::hours(3), now(), &|_| 0), "15:00");
+        assert_eq!(when(now() + Duration::hours(3), now(), &|_| 120), "17:00");
+        assert_eq!(when(now() + Duration::days(1), now(), &|_| 0), "mer. 12:00");
+        assert_eq!(
+            when(now() + Duration::days(9), now(), &|_| 0),
+            "26/11 12:00"
+        );
+        // Seconds round up: a reset is never shown earlier than it is.
+        assert_eq!(
+            when(now() + Duration::seconds(3 * 3600 + 1), now(), &|_| 0),
+            "15:01"
+        );
+        // Each instant in its own offset: a reset after a change to daylight saving time.
+        let change = now() + Duration::hours(2);
+        let offset = |at: DateTime<Utc>| if at < change { 60 } else { 120 };
+        assert_eq!(when(now() + Duration::hours(3), now(), &offset), "17:00");
+        assert_eq!(when(now() + Duration::hours(1), now(), &offset), "14:00");
         assert_eq!(age(now(), now()), "à l'instant");
         assert_eq!(age(now() - Duration::hours(3), now()), "il y a 3 h");
         assert_eq!(age(now() - Duration::days(2), now()), "il y a 2 j");

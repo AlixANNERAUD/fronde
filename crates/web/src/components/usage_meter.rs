@@ -8,7 +8,7 @@ use fronde_client::usage::{Level, meter};
 use fronde_protocol::usage::ProviderUsage;
 
 use crate::components::request_card::focus;
-use crate::components::thread_list::now_and_offset;
+use crate::components::thread_list::{now_and_offset, offset_at};
 
 /// The meter's element ids: one meter to a page.
 const BOX: &str = "usage-meter-box";
@@ -40,8 +40,10 @@ fn level_word(level: Level) -> &'static str {
 #[component]
 pub fn UsageMeter(usage: ProviderUsage, reserve: u8) -> Element {
     let mut shown = use_signal(|| false);
-    let (now, offset) = now_and_offset(usage.known_since);
-    let Some(meter) = meter(&usage, reserve, now, offset) else {
+    // Read at each render, opening the panel included: the pause line and the ages follow the
+    // clock, a reset passed since the last reading among them.
+    let (now, _) = now_and_offset(usage.known_since);
+    let Some(meter) = meter(&usage, reserve, now, &offset_at) else {
         return rsx! {};
     };
     let pill = format!(

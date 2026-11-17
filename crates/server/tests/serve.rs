@@ -1139,15 +1139,29 @@ fn window(
     }
 }
 
-/// Whether every database file of `before` is still there, byte for byte; the names of those
-/// that changed.
+/// The database files of `data` that differ from `before`: changed, gone, or new. A read-only
+/// connection to a WAL database leaves SQLite's own `-shm` index and an empty `-wal` behind (it
+/// may not remove them: another process may be opening the database); those alone are not
+/// counted, as long as the `-wal` holds no page.
 fn changed_files(data: &std::path::Path, before: &[(String, Vec<u8>)]) -> Vec<String> {
     let after = database_files(data);
-    before
+    let mut changed: Vec<String> = before
         .iter()
         .filter(|(name, bytes)| !after.iter().any(|(n, b)| n == name && b == bytes))
         .map(|(name, _)| name.clone())
-        .collect()
+        .collect();
+    changed.extend(
+        after
+            .iter()
+            .filter(|(name, _)| !before.iter().any(|(n, _)| n == name))
+            .filter(|(name, bytes)| match name.as_str() {
+                "fronde.db-shm" => false,
+                "fronde.db-wal" => !bytes.is_empty(),
+                _ => true,
+            })
+            .map(|(name, _)| format!("{name} (new)")),
+    );
+    changed
 }
 
 /// The database files of `data`, byte for byte.
@@ -1260,11 +1274,29 @@ async fn check_prints_reset_since_reading() {
     .await;
     let line = usage_printed(&run_check(&path));
     assert!(
-        line.starts_with("claude: 5 h 0 % (reset since the reading), week 18 %"),
+        line.starts_with("claude: 5 h use unknown (reset since the reading), week 18 %"),
         "{line}"
     );
     assert!(
         line.ends_with("no complete reading; background work bounded by the daily counts"),
         "{line}"
     );
+}
+
+/// A stored reading that does not read is said, and the check goes on.
+#[tokio::test]
+async fn check_says_when_usage_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    fronde_hub::private::create_dir_all(&data).unwrap();
+    let db = fronde_db::open(&data).await.unwrap();
+    fronde_db::kv::set(&db, "provider/claude", "usage", b"not json".to_vec(), None)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    let before = database_files(&data);
+    let line = usage_printed(&run_check(&path));
+    assert!(line.starts_with("cannot read ("), "{line}");
+    assert!(line.contains("does not read"), "{line}");
+    assert_eq!(changed_files(&data, &before), Vec::<String>::new());
 }

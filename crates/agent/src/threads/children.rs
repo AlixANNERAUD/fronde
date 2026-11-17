@@ -14,7 +14,9 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use fronde_entity::{stream_entries, threads};
-use fronde_protocol::usage::{Background, LimitStatus, Pause as UsagePause, WindowKind};
+use fronde_protocol::usage::{
+    Background, LimitStatus, Pause as UsagePause, WindowKind, ceil_minute,
+};
 use fronde_protocol::{ThreadStatus, ThreadSummary};
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -618,7 +620,10 @@ impl std::fmt::Display for Delegation {
                     (None, _) => String::new(),
                 };
                 let reset = match resets_at {
-                    Some(at) => format!("it resets at {}", at.format("%Y-%m-%d %H:%M UTC")),
+                    Some(at) => format!(
+                        "it resets at {}",
+                        ceil_minute(*at).format("%Y-%m-%d %H:%M UTC")
+                    ),
                     None => "its reset time is not known".to_owned(),
                 };
                 write!(
@@ -690,7 +695,7 @@ impl Threads {
         };
         self.providers()
             .into_iter()
-            .filter_map(|provider| book.get(&crate::usage::account_of(user, provider)))
+            .filter_map(|provider| book.get(&Self::account(user, provider)))
             .collect()
     }
 
@@ -779,14 +784,18 @@ impl Threads {
         account: &str,
         since: chrono::DateTime<Utc>,
     ) -> anyhow::Result<u64> {
-        let started = threads::Entity::find()
+        let started: Vec<(String, String)> = threads::Entity::find()
+            .select_only()
+            .column(threads::Column::Owner)
+            .column(threads::Column::Provider)
             .filter(threads::Column::StartedBy.starts_with("thread:"))
             .filter(threads::Column::CreatedAt.gt(since))
+            .into_tuple()
             .all(&self.db)
             .await?;
         let on_account = started
             .iter()
-            .filter(|row| crate::usage::account_of(&row.owner, &row.provider) == account)
+            .filter(|(owner, provider)| Self::account(owner, provider) == account)
             .count();
         Ok(u64::try_from(on_account).unwrap_or(u64::MAX))
     }
@@ -814,14 +823,16 @@ impl Threads {
             return Ok(0);
         }
         let accounts: HashMap<String, String> = threads::Entity::find()
+            .select_only()
+            .column(threads::Column::Topic)
+            .column(threads::Column::Owner)
+            .column(threads::Column::Provider)
             .filter(threads::Column::Topic.is_in(by_topic.iter().map(|(topic, _)| topic.clone())))
+            .into_tuple::<(String, String, String)>()
             .all(&self.db)
             .await?
             .into_iter()
-            .map(|row| {
-                let account = crate::usage::account_of(&row.owner, &row.provider);
-                (row.topic, account)
-            })
+            .map(|(topic, owner, provider)| (topic, Self::account(&owner, &provider)))
             .collect();
         Ok(by_topic
             .into_iter()
@@ -973,7 +984,7 @@ impl Threads {
         // Under the start lock: two starts never both pass. The owner's reserve first, from
         // Fronde's own book: nothing the agent says changes it.
         // The sub-agent spends the account of its parent's owner on its provider.
-        let account = crate::usage::account_of(&parent_row.owner, &provider);
+        let account = Self::account(&parent_row.owner, &provider);
         let counts = self.check_reserve(&account)?;
         let limits = self.limits();
         let kept = self.kept_children(parent).await?;
@@ -1122,7 +1133,7 @@ impl Threads {
         // sub-agent itself is idle, or the send is refused below as busy.
         let _starting = self.children.starting.lock().await;
         self.check_delegate(caller).await?;
-        let account = Self::account(&row);
+        let account = Self::account(&row.owner, &row.provider);
         let counts = self.check_reserve(&account)?;
         let kept = self.kept_children(caller).await?;
         let limit = self.limits().children_running;

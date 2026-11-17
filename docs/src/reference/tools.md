@@ -364,7 +364,8 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
   refused, whichever turn calls them: « the owner's reserve of the 5-hour window is reached
   (72 % used, 30 % kept for the owner, the setting [threads] reserve); it resets at 2026-11-17
   16:40 UTC; sub-agents can neither start nor get messages until then: do the task yourself or
-  tell the user ». Only when no usage reading decides do the daily counts apply instead: all
+  tell the user » (the reset rounded up to the minute, as in `threads_list`'s `paused until`).
+  Only when no usage reading decides do the daily counts apply instead: all
   threads together start at most 30 sub-agents in 24 hours (`children_per_day`) and at most 100
   turns of sub-agents, each task and each `threads_send` (`child_turns_per_day`) (see
   [What background work may spend](../explanation/threads.md#what-background-work-may-spend)).

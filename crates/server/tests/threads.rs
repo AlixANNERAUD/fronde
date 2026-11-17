@@ -123,6 +123,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         system_prompt: String::new(),
         builtin_tools: Vec::new(),
         usage: Some(usage.clone()),
+        account: "claude".into(),
     };
     let threads = Threads::open_with(db.clone(), &data, spec, connector, alix(), budget)
         .await

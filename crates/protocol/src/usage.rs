@@ -67,16 +67,34 @@ impl Pause {
     }
 }
 
-/// `used`, a fraction from 0 to 1, in whole percent.
+/// `used`, a fraction from 0 to 1, in whole percent, rounded down: what is shown, and what the
+/// line is compared with, so that both always agree. The small nudge keeps a fraction such as
+/// 0.82, which is 81.999… in binary, at 82.
 pub fn percent(used: f64) -> u8 {
     // Within 0..=100 once clamped: the cast loses nothing.
-    (used * 100.0).round().clamp(0.0, 100.0) as u8
+    (used * 100.0 + 1e-6).floor().clamp(0.0, 100.0) as u8
 }
 
-/// The line of a reserve of `reserve` percent: the fraction of a window background work may
-/// use.
-pub fn line(reserve: u8) -> f64 {
-    1.0 - f64::from(reserve.min(100)) / 100.0
+/// The line of a reserve of `reserve` percent, in whole percent: the use background work may
+/// reach before it pauses (70 for a reserve of 30).
+pub fn line(reserve: u8) -> u8 {
+    100 - reserve.min(100)
+}
+
+/// Whether `used` is at the line of a reserve of `reserve` percent or past it, compared in
+/// whole percent ([`percent`]).
+pub fn at_line(used: f64, reserve: u8) -> bool {
+    percent(used) >= line(reserve)
+}
+
+/// `at` rounded up to the next whole minute: a reset shown to the minute is never earlier than
+/// the provider's.
+pub fn ceil_minute(at: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = at.timestamp();
+    let whole = at.timestamp_subsec_nanos() == 0 && seconds.rem_euclid(60) == 0;
+    let floor = seconds - seconds.rem_euclid(60);
+    let minute = if whole { floor } else { floor + 60 };
+    DateTime::from_timestamp(minute, 0).unwrap_or(at)
 }
 
 /// [`ProviderUsage::background`] of `usage`, [`Background::Unknown`] without a reading.
@@ -100,7 +118,6 @@ impl ProviderUsage {
         if reserve == 0 {
             return Background::Unknown;
         }
-        let line = line(reserve);
         let windows: Vec<Window> = self.windows.iter().map(|window| window.now(now)).collect();
         let pauses = |window: &Window| {
             if window.reset_since_reading {
@@ -109,7 +126,7 @@ impl ProviderUsage {
             match window.kind {
                 WindowKind::Session | WindowKind::Weekly => {
                     window.status == Some(LimitStatus::Rejected)
-                        || window.used.is_some_and(|used| used >= line)
+                        || window.used.is_some_and(|used| at_line(used, reserve))
                         || (window.status == Some(LimitStatus::Warning) && window.used.is_none())
                 }
                 WindowKind::Extra => window.status == Some(LimitStatus::Warning),
@@ -135,7 +152,10 @@ impl ProviderUsage {
                 return Background::Unknown;
             };
             match window.used {
-                Some(used) if !window.reset_since_reading => headroom = headroom.min(line - used),
+                Some(used) if !window.reset_since_reading => {
+                    let left = f64::from(line(reserve)) - f64::from(percent(used));
+                    headroom = headroom.min(left / 100.0);
+                }
                 _ => return Background::Unknown,
             }
         }
@@ -178,12 +198,12 @@ pub struct Window {
 
 impl Window {
     /// The window as it stands at `now`: once its `resets_at` has passed, it reads as reset,
-    /// with nothing used and no status, marked `reset_since_reading`. That follows the
-    /// provider's own reset time; nothing else is inferred.
+    /// marked `reset_since_reading`, with neither use nor status: what was used since the reset
+    /// is not known. That follows the provider's own reset time; nothing else is inferred.
     pub fn now(&self, now: DateTime<Utc>) -> Self {
         match self.resets_at {
             Some(at) if at <= now => Self {
-                used: Some(0.0),
+                used: None,
                 status: None,
                 reset_since_reading: true,
                 ..self.clone()
@@ -364,7 +384,7 @@ mod tests {
         assert_eq!(window.now(at(1_999)), window);
         for now in [at(2_000), at(9_000)] {
             let reset = window.now(now);
-            assert_eq!(reset.used, Some(0.0));
+            assert_eq!(reset.used, None, "not known since the reset");
             assert_eq!(reset.status, None);
             assert!(reset.reset_since_reading);
             assert_eq!(reset.resets_at, window.resets_at);
@@ -547,11 +567,46 @@ mod tests {
     }
 
     #[test]
-    fn percent_rounds_within_bounds() {
+    fn percent_rounds_down_within_bounds() {
         assert_eq!(percent(0.724), 72);
-        assert_eq!(percent(0.726), 73);
+        assert_eq!(percent(0.729), 72);
+        assert_eq!(percent(0.82), 82);
+        assert_eq!(percent(0.07), 7);
         assert_eq!(percent(1.03), 100);
         assert_eq!(percent(-0.02), 0);
+    }
+
+    /// The line compares in whole percent: a reserve of 18 % pauses at exactly 82 %, as shown.
+    #[test]
+    fn a_reading_exactly_at_the_line_pauses() {
+        assert_eq!(line(18), 82);
+        assert!(at_line(0.82, 18));
+        assert!(!at_line(0.8199, 18));
+        for reserve in 1..=100u8 {
+            let edge = f64::from(line(reserve)) / 100.0;
+            assert!(at_line(edge, reserve), "{reserve}");
+        }
+        let usage = both(0.82, 0.1);
+        assert!(matches!(
+            usage.background(18, at(2_000)),
+            Background::Paused(Pause {
+                window: WindowKind::Session,
+                ..
+            })
+        ));
+        assert!(matches!(
+            both(0.8199, 0.1).background(18, at(2_000)),
+            Background::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn reset_times_round_up_to_the_minute() {
+        assert_eq!(ceil_minute(at(120)), at(120));
+        assert_eq!(ceil_minute(at(121)), at(180));
+        assert_eq!(ceil_minute(at(179)), at(180));
+        let with_millis = DateTime::from_timestamp_millis(120_001).unwrap();
+        assert_eq!(ceil_minute(with_millis), at(180));
     }
 
     #[test]

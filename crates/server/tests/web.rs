@@ -2549,3 +2549,96 @@ async fn usage_pushed_on_change() {
     };
     assert_eq!(again, usage);
 }
+
+/// A family member's page never gets the meter's usage: not after a reading, not after a later
+/// hello.
+#[tokio::test]
+async fn usage_not_sent_to_a_family_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        updates: vec![
+            text_chunk("Bonjour"),
+            fronde_agent::fake::usage_update(rate_limit(0.42)),
+        ],
+        ..FakeScript::default()
+    });
+    let (addr, _server) = timeout(
+        WAIT,
+        fronde::start_signed_in_as(
+            config(dir.path(), true),
+            connector,
+            &site(dir.path()),
+            false,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    let mut seen = Vec::new();
+    loop {
+        let message = next_message(&mut socket).await;
+        let ended = matches!(
+            &message,
+            ServerMsg::Entry(Entry {
+                event: Event::TurnEnded { .. },
+                ..
+            })
+        );
+        seen.push(message);
+        if ended {
+            break;
+        }
+    }
+    // Whatever was still on its way.
+    while let Ok(Some(Ok(Message::Text(text)))) =
+        timeout(Duration::from_millis(300), socket.next()).await
+    {
+        seen.push(serde_json::from_str(&text).unwrap());
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|message| matches!(message, ServerMsg::Usage { .. })),
+        "{seen:?}"
+    );
+    let mut later = open_chat(addr, &cookie).await;
+    hello(&mut later, 0, None).await;
+    let mut after = Vec::new();
+    while let Ok(Some(Ok(Message::Text(text)))) =
+        timeout(Duration::from_millis(300), later.next()).await
+    {
+        after.push(serde_json::from_str::<ServerMsg>(&text).unwrap());
+    }
+    assert!(
+        !after
+            .iter()
+            .any(|message| matches!(message, ServerMsg::Usage { .. })),
+        "{after:?}"
+    );
+    // Not for want of a reading: the server kept it.
+    let db = fronde_db::open_read_only(&dir.path().join("data"))
+        .await
+        .unwrap();
+    timeout(WAIT, async {
+        while fronde_agent::usage::read_usage(&db, "claude")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the reading was never kept");
+}

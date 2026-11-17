@@ -64,7 +64,7 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>) {
     // Whoever signed in is the owner, the one user so far, and an admin.
     let user = User {
         name: web.user.clone(),
-        admin: true,
+        admin: web.admin,
     };
     let mut talk = Talk {
         web: &web,

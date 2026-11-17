@@ -80,6 +80,9 @@ pub struct AgentSpec {
     /// Where the usage readings the agent sends go, read with its provider's
     /// [`UsageSource`](crate::usage::UsageSource): the server's one book. `None` drops them.
     pub usage: Option<Arc<UsageBook>>,
+    /// The subscription account the agent signs in with, which its readings are kept under
+    /// ([`Threads::account`](crate::threads::Threads::account)).
+    pub account: String,
 }
 
 impl fmt::Debug for AgentSpec {
@@ -100,6 +103,7 @@ impl fmt::Debug for AgentSpec {
             .field("system_prompt", &self.system_prompt)
             .field("builtin_tools", &self.builtin_tools)
             .field("usage", &self.usage)
+            .field("account", &self.account)
             .finish()
     }
 }

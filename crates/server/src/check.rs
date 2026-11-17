@@ -93,7 +93,7 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         writeln!(out, "agent limits: {limits}")?;
         writeln!(out, "agents: {}", crate::pool_line(config, scope.as_ref()))?;
         writeln!(out, "sub-agents: {}", crate::children_line(config))?;
-        writeln!(out, "usage: {}", usage_check_line(config).await?)?;
+        writeln!(out, "usage: {}", usage_check_line(config).await)?;
         // A stored token is opened at each start of the agent, with the master key.
         match &config.agent.oauth_token {
             Some(fronde_hub::config::Secret::Stored { stored }) => {
@@ -121,8 +121,24 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
 }
 
 /// [`crate::usage_line`] from the owner's readings stored in the database, opened read-only:
-/// never created, migrated or written. A data directory without a database has no reading.
-async fn usage_check_line(config: &Config) -> anyhow::Result<String> {
+/// never created, migrated or written. A data directory without a database has no reading. A
+/// database or a row that cannot be read is said, `cannot read (…)`, and the check goes on.
+async fn usage_check_line(config: &Config) -> String {
+    match stored_usage(config).await {
+        Ok(readings) => crate::usage_line(
+            &readings,
+            config.threads.reserve.0,
+            chrono::Utc::now(),
+            config.data.timezone,
+        ),
+        Err(error) => format!("cannot read ({error:#})"),
+    }
+}
+
+/// The owner's reading of each provider stored in the database, if any.
+async fn stored_usage(
+    config: &Config,
+) -> anyhow::Result<Vec<(&'static str, Option<fronde_protocol::usage::ProviderUsage>)>> {
     let file = fronde_db::path(&config.data.dir);
     let exists = file
         .try_exists()
@@ -132,12 +148,17 @@ async fn usage_check_line(config: &Config) -> anyhow::Result<String> {
         false => None,
     };
     let mut readings = Vec::new();
+    let mut failed = None;
     for provider in fronde_hub::config::PROVIDERS {
-        let account = fronde_agent::usage::account_of(&config.data.user, provider);
+        let account = fronde_agent::threads::Threads::account(&config.data.user, provider);
         let reading = match &db {
-            Some(db) => fronde_agent::usage::read_usage(db, &account)
-                .await
-                .with_context(|| format!("cannot read the usage of {account}"))?,
+            Some(db) => match fronde_agent::usage::read_usage(db, &account).await {
+                Ok(reading) => reading,
+                Err(error) => {
+                    failed = Some(error.context(format!("the usage of {account}")));
+                    break;
+                }
+            },
             None => None,
         };
         readings.push((provider, reading));
@@ -145,12 +166,10 @@ async fn usage_check_line(config: &Config) -> anyhow::Result<String> {
     if let Some(db) = db {
         db.close().await?;
     }
-    Ok(crate::usage_line(
-        &readings,
-        config.threads.reserve.0,
-        chrono::Utc::now(),
-        config.data.timezone,
-    ))
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(readings),
+    }
 }
 
 /// The checks serving would make. The database is read, never created, migrated or written: a

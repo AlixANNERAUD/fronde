@@ -101,6 +101,7 @@ impl Setup {
             system_prompt: String::new(),
             builtin_tools: Vec::new(),
             usage: None,
+            account: "claude".into(),
         }
     }
 

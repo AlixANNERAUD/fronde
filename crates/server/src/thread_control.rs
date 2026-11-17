@@ -39,7 +39,10 @@ pub fn background_text(background: &Background) -> String {
     match background {
         Background::Allowed { .. } => "allowed".to_owned(),
         Background::Paused(pause) => match pause.resets_at {
-            Some(at) => format!("paused until {}", at.format("%Y-%m-%d %H:%M UTC")),
+            Some(at) => format!(
+                "paused until {}",
+                fronde_protocol::usage::ceil_minute(at).format("%Y-%m-%d %H:%M UTC")
+            ),
             None => "paused".to_owned(),
         },
         Background::Unknown => "unknown".to_owned(),
@@ -59,7 +62,7 @@ impl ThreadControl for ThreadBridge {
         let mut providers = Vec::new();
         for id in self.0.providers() {
             // The account a sub-agent of the caller would spend on this provider.
-            let account = fronde_agent::usage::account_of(&caller.owner, id);
+            let account = Threads::account(&caller.owner, id);
             let models = self.0.models(id).await.map_err(hub_error)?;
             providers.push(ProviderModels {
                 id: id.to_owned(),

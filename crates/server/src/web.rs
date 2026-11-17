@@ -41,6 +41,8 @@ pub struct Web {
     pub requests: Arc<Requests>,
     /// Who signs in with the password: the owner, the one user so far.
     pub user: String,
+    /// Whether that user is an admin: the owner is.
+    pub admin: bool,
     pub password: SecretString,
     pub throttle: Mutex<Throttle>,
 }

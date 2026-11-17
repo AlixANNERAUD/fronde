@@ -21,16 +21,6 @@ use serde_json::{Map, Value};
 use std::fmt;
 use std::sync::Arc;
 
-/// The subscription account a thread's turns spend, from the thread's owner and provider: the
-/// key of its usage readings in the [`UsageBook`], of the owner's reserve and of the daily
-/// counts that stand in for it. Today a provider has one account, whose id is the provider's
-/// (`claude`), so readings stored before accounts still read; per-person accounts replace this
-/// one function.
-pub fn account_of(owner: &str, provider: &str) -> String {
-    let _ = owner;
-    provider.to_owned()
-}
-
 /// The key of the Claude adapter's `_meta` that holds the CLI's latest `rate_limit_info`.
 pub const CLAUDE_RATE_LIMIT: &str = "_claude/rateLimit";
 
@@ -39,9 +29,23 @@ pub const CLAUDE_RATE_LIMIT: &str = "_claude/rateLimit";
 /// a percentage) and is dropped rather than rescaled.
 const FRACTION_SLACK: f64 = 0.05;
 
-/// How far from the reading's time a `resetsAt` may be: the longest window is a week, extra
-/// usage a month. Further off, it is not Unix seconds (milliseconds, say) and is dropped.
-const RESET_RANGE_DAYS: i64 = 366;
+/// How far before the reading's time a `resetsAt` may be. Further back, it is not Unix seconds.
+const RESET_PAST_DAYS: i64 = 366;
+
+/// How long past its window's length a `resetsAt` may still be, for clocks a little apart.
+const RESET_SLACK: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+
+/// How far after the reading's time a window of `kind` may reset: its length, plus
+/// [`RESET_SLACK`]. A reset further off would keep a window, and a pause, from ever ending: the
+/// reading is refused.
+fn reset_horizon(kind: &WindowKind) -> chrono::TimeDelta {
+    let length = match kind {
+        WindowKind::Session => chrono::TimeDelta::hours(5),
+        WindowKind::Weekly | WindowKind::WeeklyModel(_) => chrono::TimeDelta::days(7),
+        WindowKind::Extra | WindowKind::Other(_) => chrono::TimeDelta::days(31),
+    };
+    length + RESET_SLACK
+}
 
 /// Where a provider's agent says how much of its subscription is used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,16 +183,20 @@ fn claude_windows(info: &Value, as_of: DateTime<Utc>) -> Option<(Vec<Window>, Op
             .iter()
             .any(|window| window.kind == WindowKind::Extra)
     {
-        windows.push(Window {
-            kind: WindowKind::Extra,
-            used: None,
-            status: Some(LimitStatus::Warning),
-            resets_at: info
-                .get("overageResetsAt")
-                .and_then(|value| reset_time(WindowKind::Extra, value, as_of)),
-            as_of,
-            reset_since_reading: false,
-        });
+        let resets_at = match info.get("overageResetsAt") {
+            None | Some(Value::Null) => Some(None),
+            Some(value) => reset_time(WindowKind::Extra, value, as_of).map(Some),
+        };
+        if let Some(resets_at) = resets_at {
+            windows.push(Window {
+                kind: WindowKind::Extra,
+                used: None,
+                status: Some(LimitStatus::Warning),
+                resets_at,
+                as_of,
+                reset_since_reading: false,
+            });
+        }
     }
     Some((windows, representative))
 }
@@ -204,9 +212,12 @@ fn claude_window(
         .get("utilization")
         .and_then(|value| fraction(&kind, value));
     let status = fields.get("status").and_then(|value| status(&kind, value));
-    let resets_at = fields
-        .get("resetsAt")
-        .and_then(|value| reset_time(kind.clone(), value, as_of));
+    let resets_at = match fields.get("resetsAt") {
+        None | Some(Value::Null) => None,
+        // A window whose reset does not read is refused whole: without it, it could never be
+        // told from a later window.
+        Some(value) => Some(reset_time(kind.clone(), value, as_of)?),
+    };
     if used.is_none() && status.is_none() && resets_at.is_none() {
         return None;
     }
@@ -273,15 +284,20 @@ fn status(kind: &WindowKind, value: &Value) -> Option<LimitStatus> {
     }
 }
 
-/// A `resetsAt` in Unix seconds, within [`RESET_RANGE_DAYS`] of `as_of`.
+/// A `resetsAt` in Unix seconds, at most [`RESET_PAST_DAYS`] before `as_of` and at most the
+/// window's length ([`reset_horizon`]) after it.
 fn reset_time(kind: WindowKind, value: &Value, as_of: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let seconds = value.as_f64().filter(|seconds| seconds.is_finite());
-    let range = (RESET_RANGE_DAYS * 86_400) as f64;
+    let past = (RESET_PAST_DAYS * 86_400) as f64;
+    let ahead = reset_horizon(&kind).num_seconds() as f64;
     let at = seconds
-        .filter(|seconds| (seconds - as_of.timestamp() as f64).abs() <= range)
+        .filter(|seconds| {
+            let from_now = seconds - as_of.timestamp() as f64;
+            (-past..=ahead).contains(&from_now)
+        })
         .and_then(|seconds| DateTime::from_timestamp_millis((seconds * 1000.0).round() as i64));
     if at.is_none() {
-        tracing::debug!(window = %kind, "ignored a reset time that is not Unix seconds near now");
+        tracing::debug!(window = %kind, "refused a usage window whose reset time is not Unix seconds within its length");
     }
     at
 }
@@ -346,11 +362,11 @@ where
 
 /// What one agent connection does with the readings it receives: read them with its provider's
 /// [`UsageSource`] and record them in the book, if it has one, under the account the agent
-/// signs in with: today its provider's one account, whose id is the provider's
-/// ([`account_of`]).
+/// signs in with ([`AgentSpec::account`]).
 #[derive(Clone)]
 pub(crate) struct Capture {
     provider: &'static str,
+    account: String,
     source: UsageSource,
     book: Option<Arc<UsageBook>>,
 }
@@ -359,6 +375,7 @@ impl Capture {
     pub(crate) fn of(spec: &AgentSpec) -> Self {
         Self {
             provider: spec.provider.id,
+            account: spec.account.clone(),
             source: spec.provider.usage,
             book: spec.usage.clone(),
         }
@@ -392,11 +409,11 @@ impl Capture {
             .collect();
         match &self.book {
             Some(book) => {
-                let changed = book.record(self.provider, windows);
-                tracing::debug!(provider = self.provider, ?kinds, changed, "usage reading");
+                let changed = book.record(&self.account, windows);
+                tracing::debug!(account = %self.account, ?kinds, changed, "usage reading");
             }
             None => tracing::debug!(
-                provider = self.provider,
+                account = %self.account,
                 ?kinds,
                 "usage reading not kept: no book"
             ),
@@ -574,7 +591,8 @@ mod tests {
             .unwrap();
             assert_eq!(windows[0].used, Some(used), "{given}");
         }
-        // Reset times in milliseconds, far off or not numbers are dropped.
+        // A window whose reset time is in milliseconds, far off or not a number is refused
+        // whole: without its reset it could not be told from a later window.
         for bad in [
             json!(1_794_931_200_000_i64),
             json!(0),
@@ -582,10 +600,58 @@ mod tests {
             json!(-1),
         ] {
             let windows =
-                read(json!({"status": "allowed", "rateLimitType": "five_hour", "resetsAt": bad}))
-                    .unwrap();
-            assert_eq!(windows[0].resets_at, None, "{bad}");
+                read(json!({"status": "allowed", "rateLimitType": "five_hour", "resetsAt": bad}));
+            assert_eq!(windows, None, "{bad}");
         }
+    }
+
+    /// A reset further off than its window's length (plus ten minutes) is refused: it would
+    /// keep a pause from ever ending, or a window from ever being replaced.
+    #[test]
+    fn usage_refuses_a_reset_past_its_window() {
+        let ahead = |kind: &str, seconds: i64| {
+            read(json!({
+                "status": "allowed",
+                "rateLimitType": kind,
+                "utilization": 0.9,
+                "resetsAt": as_of().timestamp() + seconds,
+            }))
+            .unwrap_or_default()
+        };
+        let hour = 3_600;
+        let day = 24 * hour;
+        assert_eq!(ahead("five_hour", 5 * hour + 600).len(), 1, "at the edge");
+        assert!(ahead("five_hour", 5 * hour + 601).is_empty());
+        assert!(ahead("five_hour", 3 * day).is_empty());
+        assert_eq!(ahead("seven_day", 7 * day + 600).len(), 1);
+        assert!(ahead("seven_day", 7 * day + 601).is_empty());
+        assert!(ahead("seven_day_opus", 8 * day).is_empty());
+        assert_eq!(ahead("thirty_day", 31 * day).len(), 1);
+        assert!(ahead("thirty_day", 32 * day).is_empty());
+        // In unifiedWindows too, the others kept.
+        let windows = read(json!({
+            "unifiedWindows": {
+                "five_hour": {"utilization": 0.1, "resetsAt": as_of().timestamp() + 40 * day},
+                "seven_day": {"utilization": 0.2, "resetsAt": as_of().timestamp() + 2 * day},
+            }
+        }))
+        .unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].kind, WindowKind::Weekly);
+        // Paid extra usage resetting too far off is not kept either.
+        let windows = read(json!({
+            "status": "allowed",
+            "rateLimitType": "five_hour",
+            "utilization": 0.5,
+            "isUsingOverage": true,
+            "overageResetsAt": as_of().timestamp() + 60 * day,
+        }))
+        .unwrap();
+        assert!(
+            windows
+                .iter()
+                .all(|window| window.kind != WindowKind::Extra)
+        );
     }
 
     #[test]

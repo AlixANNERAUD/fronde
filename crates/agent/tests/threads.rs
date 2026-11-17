@@ -42,6 +42,7 @@ fn spec() -> AgentSpec {
         system_prompt: "You are Fronde.".into(),
         builtin_tools: Vec::new(),
         usage: None,
+        account: "claude".into(),
     }
 }
 
@@ -3497,4 +3498,46 @@ async fn reserve_hold_survives_a_restart() {
     assert_eq!(given.len(), 1, "{given:?}");
     assert!(given[0].contains("\n83 cm\n"), "{given:?}");
     assert!(given[0].ends_with("The message:\nEt ?"), "{given:?}");
+}
+
+/// A hold is named after what caused it: the owner's Stop says so even past the reserve, and
+/// the reserve only when it alone holds.
+#[tokio::test]
+async fn the_hold_names_its_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    let (threads, pooled, _requests) = open_reserved(dir.path(), Limits::default(), &book).await;
+    pooled.gate(ThreadId::MAIN);
+    let main = threads.main();
+    main.send("Va".into()).await;
+    pooled.until_held(ThreadId::MAIN).await;
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    until_done(&child).await;
+    wait_until(&main, "the result never came", |events| {
+        children_ended(events) == 1
+    })
+    .await;
+    read(&book, 0.9, 0.1);
+    main.cancel().await;
+    pooled.open(ThreadId::MAIN);
+    until_done(&main).await;
+    let shown = events(&main);
+    assert!(
+        shown.contains(&Event::WakesHeld {
+            count: 1,
+            returned: false,
+            reason: HoldReason::Stopped,
+        }),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|event| matches!(
+            event,
+            Event::WakesHeld {
+                reason: HoldReason::Reserve { .. },
+                ..
+            }
+        )),
+        "{shown:?}"
+    );
 }

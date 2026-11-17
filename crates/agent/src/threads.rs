@@ -464,8 +464,10 @@ impl Threads {
         ensure_main(&db, &owner.name, spec.provider.id)
             .await
             .context("cannot make the main thread in the database")?;
+        // The main thread is the owner's.
         let spec = AgentSpec {
             thread: ThreadId::MAIN,
+            account: Self::account(&owner.name, spec.provider.id),
             ..spec
         };
         let tokens = Tokens::new();
@@ -482,7 +484,6 @@ impl Threads {
             handoff: handoff.clone(),
             registry: registry.clone(),
             limits: budget.limits,
-            account: crate::usage::account_of(&owner.name, spec.provider.id),
         };
         let (main, _) = Assistant::open(
             ThreadId::MAIN,
@@ -621,7 +622,6 @@ impl Threads {
             handoff: self.children.handoff.clone(),
             registry: self.registry.clone(),
             limits: self.limits(),
-            account: Self::account(&row),
         };
         // Only a thread's sub-agent wakes its parent.
         let parent = match row.started_by {
@@ -648,15 +648,18 @@ impl Threads {
         Ok(Some((assistant, interrupted.filter(|_| parent.is_some()))))
     }
 
-    /// How thread `row`'s agent starts: the main thread's spec, with another thread's own
-    /// directories and scope name, and a sub-agent's own system prompt.
-    /// The subscription account thread `row`'s turns spend: its usage readings, the owner's
-    /// reserve and the daily counts are that account's. The one lookup from a thread to its
-    /// account.
-    pub fn account(row: &ThreadRow) -> String {
-        crate::usage::account_of(&row.owner, &row.provider)
+    /// The subscription account the threads `owner` owns spend on `provider`: the key of their
+    /// usage readings, of the owner's reserve and of the daily counts that stand in for it, and
+    /// the account their agents sign in with. The one lookup from a thread to its account. Today
+    /// a provider has one account, whose id is the provider's (`claude`), whoever the owner: the
+    /// readings stored before accounts still read. Per-person accounts replace this function.
+    pub fn account(owner: &str, provider: &str) -> String {
+        let _ = owner;
+        provider.to_owned()
     }
 
+    /// How thread `row`'s agent starts: the main thread's spec, with another thread's own
+    /// directories and scope name, a sub-agent's own system prompt, and its owner's account.
     fn spec_for(&self, row: &ThreadRow) -> AgentSpec {
         let id = row.id;
         if id == ThreadId::MAIN {
@@ -673,6 +676,7 @@ impl Threads {
             cwd: work,
             home,
             system_prompt,
+            account: Self::account(&row.owner, &row.provider),
             ..self.spec.clone()
         }
     }

@@ -35,6 +35,7 @@ fn spec(usage: Option<Arc<UsageBook>>) -> AgentSpec {
         system_prompt: "You are Fronde.".into(),
         builtin_tools: Vec::new(),
         usage,
+        account: "claude".into(),
     }
 }
 
@@ -120,6 +121,32 @@ async fn usage_update_with_rate_limit_reaches_the_book() {
     assert_eq!(texts, [AgentEvent::Text("Bonjour".into())]);
 }
 
+/// A reading is kept under the account the agent signs in with, the spec's, not its provider:
+/// the seam for an account per person.
+#[tokio::test]
+async fn readings_go_to_the_agents_account() {
+    let book = UsageBook::in_memory();
+    let script = FakeScript {
+        updates: vec![usage_update(rate_limit(
+            0.42,
+            "allowed",
+            hence(3),
+            hence(100),
+        ))],
+        ..FakeScript::default()
+    };
+    let spec = AgentSpec {
+        account: "claude:lea".into(),
+        ..spec(Some(book.clone()))
+    };
+    let (client, _rx) = connect(&spec, script).await;
+    assert_eq!(prompt(&client).await.unwrap(), TurnEnd::Done);
+    assert_eq!(book.get("claude"), None);
+    let usage = book.get("claude:lea").expect("no reading for the account");
+    assert_eq!(usage.provider, "claude:lea");
+    assert_eq!(used(&usage, WindowKind::Session), Some(0.42));
+}
+
 #[tokio::test]
 async fn usage_update_without_rate_limit_is_ignored() {
     let book = UsageBook::in_memory();
@@ -164,19 +191,9 @@ async fn bad_usage_never_fails_a_turn() {
         rx.try_recv().unwrap(),
         AgentEvent::Text("Toujours là".into())
     );
-    // Only what read: the status of the five-hour window, its use and reset left out.
-    let usage = book.get("claude").expect("the one readable status");
-    assert_eq!(
-        usage.windows,
-        [Window {
-            kind: WindowKind::Session,
-            used: None,
-            status: Some(LimitStatus::Allowed),
-            resets_at: None,
-            as_of: usage.known_since,
-            reset_since_reading: false,
-        }]
-    );
+    // The one window with a readable status has a reset that does not read: refused whole,
+    // since without its reset it could never be told from a later window.
+    assert_eq!(book.get("claude"), None);
 }
 
 #[tokio::test]
@@ -242,8 +259,9 @@ async fn later_reading_replaces_the_earlier_one() {
         Some(LimitStatus::Warning)
     );
 
-    // The next window, from another turn: replaces it again.
-    let next = hence(8);
+    // The next window, from another turn: replaces it again. Within five hours of now, as a
+    // 5-hour window's reset must be.
+    let next = hence(4);
     let script = FakeScript {
         updates: vec![usage_update(rate_limit(
             0.05,
@@ -343,7 +361,7 @@ fn connector(script: FakeScript) -> Connector {
 /// The threads of `dir`, with the book stored there, as the server opens them.
 async fn open(dir: &Path, script: FakeScript) -> (Arc<Threads>, Arc<UsageBook>) {
     let db = fronde_db::open(dir).await.unwrap();
-    let book = UsageBook::load(db.clone()).await;
+    let book = UsageBook::load(db.clone(), &["claude".to_owned()]).await;
     let threads = Threads::open(db, dir, spec(Some(book.clone())), connector(script), alix())
         .await
         .unwrap();
@@ -482,7 +500,7 @@ fn window(kind: WindowKind, used: f64, resets_at: i64, as_of: DateTime<Utc>) -> 
 async fn newest_window_wins() {
     let dir = tempfile::tempdir().unwrap();
     let db = fronde_db::open(dir.path()).await.unwrap();
-    let book = UsageBook::load(db.clone()).await;
+    let book = UsageBook::load(db.clone(), &["claude".to_owned()]).await;
     let (old_reset, new_reset) = (hence(1), hence(6));
     let now = Utc::now();
     // The second agent saw the new window first.
@@ -509,7 +527,7 @@ async fn newest_window_wins() {
     assert_eq!(used(&expected, WindowKind::Weekly), Some(0.3));
     assert_eq!(expected.known_since, late);
     drop(book);
-    let book = UsageBook::load(db.clone()).await;
+    let book = UsageBook::load(db.clone(), &["claude".to_owned()]).await;
     assert_eq!(book.get("claude"), Some(expected));
 }
 
@@ -517,7 +535,7 @@ async fn newest_window_wins() {
 async fn unchanged_reading_moves_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let db = fronde_db::open(dir.path()).await.unwrap();
-    let book = UsageBook::load(db.clone()).await;
+    let book = UsageBook::load(db.clone(), &["claude".to_owned()]).await;
     let mut changes = book.changes();
     let reset = hence(3);
     let first = Utc::now();
@@ -563,8 +581,9 @@ async fn bad_usage_row_is_ignored() {
         fronde_db::kv::set(&db, "provider/claude", "usage", bad.clone(), None)
             .await
             .unwrap();
-        assert_eq!(read_usage(&db, "claude").await.unwrap(), None);
-        let book = UsageBook::load(db.clone()).await;
+        // Read alone, it is an error (`fronde check` says so); the book leaves it out.
+        assert!(read_usage(&db, "claude").await.is_err());
+        let book = UsageBook::load(db.clone(), &["claude".to_owned()]).await;
         assert_eq!(book.get("claude"), None);
         // The book still records, and replaces the bad row.
         assert!(book.record("claude", vec![window(WindowKind::Session, 0.2, hence(3), Utc::now())]));

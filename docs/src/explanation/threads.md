@@ -196,7 +196,8 @@ of your subscription's 5-hour and weekly windows is used (see
 30 % by default. From its own latest reading, never from what an agent says:
 
 - **Paused** when the 5-hour or the weekly window is used at the line (`100%` minus `reserve`) or
-  above, is refused by the provider, or warns without saying how much is used, or when paid extra
+  above (compared in whole percent, rounded down as the meter shows it: with `"18%"`, 82 % pauses
+  and 81.9 % does not), is refused by the provider, or warns without saying how much is used, or when paid extra
   usage is being spent. Then `threads_start` and `threads_send` are refused, even from a turn you
   started (a page or a mail the agent read in your turn can steer it too; the agent can still do
   the task itself, in your turn), naming the window, its use, the setting and the reset time.

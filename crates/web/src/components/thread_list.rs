@@ -135,6 +135,11 @@ pub(crate) fn now_and_offset(_at: DateTime<Utc>) -> (DateTime<Utc>, i32) {
     (Utc::now(), 0)
 }
 
+/// The browser's offset from UTC at `at`, in minutes east: daylight saving time included.
+pub(crate) fn offset_at(at: DateTime<Utc>) -> i32 {
+    now_and_offset(at).1
+}
+
 /// The id of thread `id`'s link in the list.
 pub fn link_id(id: ThreadId) -> String {
     format!("tl-{id}")

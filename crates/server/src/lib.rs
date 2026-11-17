@@ -602,16 +602,18 @@ pub fn usage_line(
     now: chrono::DateTime<chrono::Utc>,
     tz: chrono_tz::Tz,
 ) -> String {
-    use fronde_protocol::usage::{Background, GUARDED, LimitStatus, WindowKind, line, percent};
+    use fronde_protocol::usage::{
+        Background, GUARDED, LimitStatus, WindowKind, ceil_minute, line, percent,
+    };
     let at = |when: chrono::DateTime<chrono::Utc>| {
-        let local = when.with_timezone(&tz);
+        let local = ceil_minute(when).with_timezone(&tz);
         if local.date_naive() == now.with_timezone(&tz).date_naive() {
             local.format("%H:%M").to_string()
         } else {
             local.format("%a %d %b %H:%M").to_string()
         }
     };
-    let limit = format!("{}%", percent(line(reserve)));
+    let limit = format!("{}%", line(reserve));
     let parts: Vec<String> = readings
         .iter()
         .map(|(provider, reading)| {
@@ -641,7 +643,7 @@ pub fn usage_line(
                         (_, Some(LimitStatus::Rejected)) => "rejected".to_owned(),
                         (Some(used), _) => format!("{} %", percent(used)),
                         (None, Some(LimitStatus::Warning)) => "near its limit".to_owned(),
-                        (None, _) => "use not given".to_owned(),
+                        (None, _) => "use unknown".to_owned(),
                     };
                     let reset = match window.resets_at {
                         _ if window.reset_since_reading => " (reset since the reading)".to_owned(),
@@ -928,6 +930,18 @@ pub async fn start_with(
     connector: Connector,
     site_root: &Path,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    start_signed_in_as(config, connector, site_root, true).await
+}
+
+/// [`start_with`], whoever signs in with the password being an admin or not: for tests of what
+/// a family member's page gets, before family members sign in on their own.
+#[doc(hidden)]
+pub async fn start_signed_in_as(
+    config: Config,
+    connector: Connector,
+    site_root: &Path,
+    admin: bool,
+) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let token = config.server.token.resolve().context("server.token")?;
     check_token(&token)?;
     let password = match &config.web {
@@ -986,6 +1000,11 @@ pub async fn start_with(
     // The chat's assistant and its requests come first: the hub's tools ask through them.
     let chat = match password {
         Some((password, secure_cookie)) => {
+            // The accounts the threads may spend: the owner's, the one user so far.
+            let accounts: Vec<String> = fronde_hub::config::PROVIDERS
+                .iter()
+                .map(|provider| Threads::account(&user, provider))
+                .collect();
             let main = thread_dirs(&data_dir, ThreadId::MAIN);
             for dir in [&main.work, &main.home] {
                 fronde_hub::private::create_dir_all(dir).with_context(|| {
@@ -1010,15 +1029,14 @@ pub async fn start_with(
                 system_prompt: system_prompt(&user),
                 builtin_tools: agent.builtin_tools,
                 // The latest usage reading per account, from every agent process.
-                usage: Some(fronde_agent::usage::UsageBook::load(db.clone()).await),
+                usage: Some(fronde_agent::usage::UsageBook::load(db.clone(), &accounts).await),
+                // `Threads::open_with` gives each thread its owner's.
+                account: accounts[0].clone(),
             };
             if let Some(book) = &spec.usage {
                 let readings: Vec<_> = fronde_hub::config::PROVIDERS
                     .iter()
-                    .map(|provider| {
-                        let account = fronde_agent::usage::account_of(&user, provider);
-                        (*provider, book.get(&account))
-                    })
+                    .map(|provider| (*provider, book.get(&Threads::account(&user, provider))))
                     .collect();
                 tracing::info!(
                     "usage: {}",
@@ -1083,6 +1101,7 @@ pub async fn start_with(
                 threads,
                 requests,
                 user,
+                admin,
                 password,
                 throttle: Default::default(),
             },

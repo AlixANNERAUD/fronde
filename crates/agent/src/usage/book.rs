@@ -1,10 +1,10 @@
-//! The latest usage reading per provider, kept in `fronde.db`'s `kv` table (scope
-//! `provider/<id>`, key `usage`, the JSON of a [`ProviderUsage`], no expiry), beside the models
-//! cache.
+//! The latest usage reading per subscription account, kept in `fronde.db`'s `kv` table (scope
+//! `provider/<account>`, key `usage`, the JSON of a [`ProviderUsage`], no expiry), beside the
+//! models cache. Today an account's id is its provider's (`claude`), so the scope is the one
+//! readings were first stored under.
 
-use crate::provider::Provider;
 use chrono::{DateTime, Utc};
-use fronde_protocol::usage::{ProviderUsage, Window};
+use fronde_protocol::usage::{LimitStatus, ProviderUsage, Window, WindowKind};
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use std::collections::HashMap;
 use std::fmt;
@@ -13,14 +13,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 const KEY: &str = "usage";
 
-fn scope(provider: &str) -> String {
-    format!("provider/{provider}")
+/// The most windows of kinds Fronde has no name for ([`WindowKind::Other`]) an account keeps.
+pub const MAX_OTHER_WINDOWS: usize = 4;
+
+fn scope(account: &str) -> String {
+    format!("provider/{account}")
 }
 
 /// The latest windows read for each subscription account, from every agent process, keyed by
-/// the account's id ([`super::account_of`]): today a provider has one account, whose id is the
-/// provider's, so the key is the provider's id and the `kv` scope `provider/<id>`. A window replaces the
-/// one of its kind only when it is newer (see [`UsageBook::record`]). Each change is written to
+/// the account's id ([`Threads::account`](crate::threads::Threads::account)). A window replaces
+/// the one of its kind only when it is newer, and within one window its use only goes up (see
+/// [`UsageBook::record`]). Each change is written to
 /// the database by a task of the book's own, so that a slow write never holds an agent's
 /// messages; a failed write is logged, and the reading stays in memory.
 pub struct UsageBook {
@@ -46,19 +49,19 @@ impl fmt::Debug for UsageBook {
 }
 
 impl UsageBook {
-    /// The book of `db`: the readings stored for each configured provider, and a task, on the
-    /// current Tokio runtime, that writes the changes back. A reading that cannot be read is
-    /// logged and left out: the book then starts without it.
-    pub async fn load(db: DatabaseConnection) -> Arc<Self> {
+    /// The book of `db`: the readings stored for each of `accounts`, and a task, on the current
+    /// Tokio runtime, that writes the changes back. A reading that cannot be read is logged and
+    /// left out: the book then starts without it.
+    pub async fn load(db: DatabaseConnection, accounts: &[String]) -> Arc<Self> {
         let mut readings = HashMap::new();
-        for provider in Provider::ALL {
-            match read_usage(&db, provider.id).await {
+        for account in accounts {
+            match read_usage(&db, account).await {
                 Ok(Some(usage)) => {
-                    readings.insert(provider.id.to_owned(), usage);
+                    readings.insert(account.clone(), usage);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!("cannot read the usage of {}: {error:#}", provider.id);
+                    tracing::warn!("ignored the stored usage of {account}: {error:#}");
                 }
             }
         }
@@ -80,26 +83,43 @@ impl UsageBook {
         })
     }
 
-    /// Records the windows of one reading of `provider`; true when it changed the book, which is
+    /// Records the windows of one reading of `account`; true when it changed the book, which is
     /// then saved and moves [`UsageBook::changes`].
     ///
-    /// Per kind, a window replaces the one known when its `resets_at` is later, or the same and
-    /// it was received later; one without `resets_at` replaces only one without. So readings
-    /// from several agent processes, arriving in any order, end on the newest window. A window
-    /// that says the same as the one known (its use, status and reset) changes nothing, and
-    /// keeps the time it was first read.
-    pub fn record(&self, provider: &str, windows: Vec<Window>) -> bool {
+    /// Per kind, a window replaces the one known when its `resets_at` is later: the window
+    /// started again. With the same `resets_at`, the two say how one window stood at two times,
+    /// and use only goes up until the reset: the greater use and the worse status are kept, so
+    /// that a reading held back by another agent process never lifts a pause. A window without
+    /// `resets_at` replaces only one without, received earlier. So readings from several agent
+    /// processes, arriving in any order, end on the newest window. A window that says the same
+    /// as the one known changes nothing, and keeps the time it was first read.
+    ///
+    /// A full reading (both the 5-hour and the weekly window) drops the windows of kinds Fronde
+    /// has no name for that it does not list, and at most [`MAX_OTHER_WINDOWS`] of those are
+    /// kept, the latest read.
+    pub fn record(&self, account: &str, windows: Vec<Window>) -> bool {
         let saved = {
             let mut readings = lock(&self.readings);
             let mut changed = false;
             let mut latest: Option<DateTime<Utc>> = None;
             let usage = readings
-                .entry(provider.to_owned())
+                .entry(account.to_owned())
                 .or_insert_with(|| ProviderUsage {
-                    provider: provider.to_owned(),
+                    provider: account.to_owned(),
                     known_since: DateTime::<Utc>::MIN_UTC,
                     windows: Vec::new(),
                 });
+            let full = [WindowKind::Session, WindowKind::Weekly]
+                .iter()
+                .all(|kind| windows.iter().any(|window| &window.kind == kind));
+            if full {
+                let before = usage.windows.len();
+                usage.windows.retain(|known| {
+                    !matches!(known.kind, WindowKind::Other(_))
+                        || windows.iter().any(|window| window.kind == known.kind)
+                });
+                changed |= usage.windows.len() != before;
+            }
             for window in windows {
                 let as_of = window.as_of;
                 if merge(&mut usage.windows, window) {
@@ -107,11 +127,12 @@ impl UsageBook {
                     latest = latest.max(Some(as_of));
                 }
             }
+            changed |= cap_others(&mut usage.windows);
             if let Some(latest) = latest {
                 usage.known_since = usage.known_since.max(latest);
             }
             if usage.windows.is_empty() {
-                readings.remove(provider);
+                readings.remove(account);
                 return false;
             }
             if !changed {
@@ -124,18 +145,18 @@ impl UsageBook {
         if let Some(saves) = &self.saves
             && saves.send(Save::Usage(saved)).is_err()
         {
-            tracing::warn!("cannot save the usage of {provider}: its writer has stopped");
+            tracing::warn!("cannot save the usage of {account}: its writer has stopped");
         }
         true
     }
 
-    /// The latest windows of `provider`, as read (see [`ProviderUsage::now`] for how they stand
+    /// The latest windows of `account`, as read (see [`ProviderUsage::now`] for how they stand
     /// now), and since when they are known; `None` before its first reading.
-    pub fn get(&self, provider: &str) -> Option<ProviderUsage> {
-        lock(&self.readings).get(provider).cloned()
+    pub fn get(&self, account: &str) -> Option<ProviderUsage> {
+        lock(&self.readings).get(account).cloned()
     }
 
-    /// Every provider's latest windows, by provider id.
+    /// Every account's latest windows, by account id.
     pub fn all(&self) -> Vec<ProviderUsage> {
         let mut all: Vec<_> = lock(&self.readings).values().cloned().collect();
         all.sort_by(|a, b| a.provider.cmp(&b.provider));
@@ -159,45 +180,91 @@ impl UsageBook {
     }
 }
 
-/// Puts `window` in `windows` when it is new or newer than the one of its kind; true if it was.
+/// Puts `window` in `windows` when it is new, newer than the one of its kind, or says that
+/// window is used more; true if it changed them.
 fn merge(windows: &mut Vec<Window>, window: Window) -> bool {
     let Some(known) = windows.iter_mut().find(|known| known.kind == window.kind) else {
         windows.push(window);
         return true;
     };
-    let newer = match (known.resets_at, window.resets_at) {
-        (Some(was), Some(is)) => is > was || (is == was && window.as_of >= known.as_of),
-        (None, Some(_)) => true,
-        (Some(_), None) => false,
-        (None, None) => window.as_of >= known.as_of,
+    let merged = match (known.resets_at, window.resets_at) {
+        (Some(was), Some(is)) if is > was => window,
+        (Some(was), Some(is)) if is < was => return false,
+        // The same window at two times: it is used at least as much as either says.
+        (Some(_), Some(_)) => Window {
+            used: match (known.used, window.used) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            },
+            status: worse(known.status, window.status),
+            as_of: known.as_of.max(window.as_of),
+            ..window
+        },
+        (None, Some(_)) => window,
+        (Some(_), None) => return false,
+        (None, None) if window.as_of >= known.as_of => window,
+        (None, None) => return false,
     };
-    if !newer || known.same_reading(&window) {
+    if known.same_reading(&merged) {
         return false;
     }
-    *known = window;
+    *known = merged;
     true
 }
 
-/// The reading stored for `provider` in `db`; `None` when there is none, or when it does not
-/// read (logged). `fronde check` reads it from a read-only connection.
+/// The status nearer the limit: rejected, then warning, then allowed.
+fn worse(a: Option<LimitStatus>, b: Option<LimitStatus>) -> Option<LimitStatus> {
+    let rank = |status: Option<LimitStatus>| match status {
+        None => 0,
+        Some(LimitStatus::Allowed) => 1,
+        Some(LimitStatus::Warning) => 2,
+        Some(LimitStatus::Rejected) => 3,
+    };
+    if rank(b) > rank(a) { b } else { a }
+}
+
+/// Keeps at most [`MAX_OTHER_WINDOWS`] windows of kinds Fronde has no name for, the latest read;
+/// true if it dropped some.
+fn cap_others(windows: &mut Vec<Window>) -> bool {
+    let mut others: Vec<(DateTime<Utc>, usize)> = windows
+        .iter()
+        .enumerate()
+        .filter(|(_, window)| matches!(window.kind, WindowKind::Other(_)))
+        .map(|(index, window)| (window.as_of, index))
+        .collect();
+    if others.len() <= MAX_OTHER_WINDOWS {
+        return false;
+    }
+    // The latest read first; of those read at once, the first listed.
+    others.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let dropped: std::collections::HashSet<usize> = others[MAX_OTHER_WINDOWS..]
+        .iter()
+        .map(|(_, index)| *index)
+        .collect();
+    let mut index = 0;
+    windows.retain(|_| {
+        let keep = !dropped.contains(&index);
+        index += 1;
+        keep
+    });
+    true
+}
+
+/// The reading stored for `account` in `db`; `None` when there is none, an error when it does
+/// not read or names another account. `fronde check` reads it from a read-only connection.
 pub async fn read_usage<C: ConnectionTrait>(
     db: &C,
-    provider: &str,
+    account: &str,
 ) -> anyhow::Result<Option<ProviderUsage>> {
-    let Some(value) = fronde_db::kv::get(db, &scope(provider), KEY).await? else {
+    let Some(value) = fronde_db::kv::get(db, &scope(account), KEY).await? else {
         return Ok(None);
     };
-    match serde_json::from_slice::<ProviderUsage>(&value) {
-        Ok(usage) if usage.provider == provider => Ok(Some(usage)),
-        Ok(_) => {
-            tracing::warn!("ignored the stored usage of {provider}: it names another provider");
-            Ok(None)
-        }
-        Err(error) => {
-            tracing::warn!("ignored the stored usage of {provider}: {error}");
-            Ok(None)
-        }
+    let usage = serde_json::from_slice::<ProviderUsage>(&value)
+        .map_err(|error| anyhow::anyhow!("the stored usage does not read: {error}"))?;
+    if usage.provider != account {
+        anyhow::bail!("the stored usage names another account");
     }
+    Ok(Some(usage))
 }
 
 /// Writes the readings sent, the latest of each provider when several wait, until the book is
@@ -299,5 +366,119 @@ mod tests {
         // An empty reading leaves no row.
         assert!(!book.record("codex", Vec::new()));
         assert_eq!(book.get("codex"), None);
+    }
+
+    /// Readings of one window arriving out of order never lower it: until its reset, the
+    /// greater use and the worse status stay, so that a reading another agent process held
+    /// back cannot lift a pause.
+    #[test]
+    fn a_window_only_goes_down_at_its_reset() {
+        let book = UsageBook::in_memory();
+        assert!(book.record(
+            "claude",
+            vec![window(WindowKind::Session, 0.75, Some(100), 20)]
+        ));
+        // An older reading of the same window, received later.
+        assert!(!book.record(
+            "claude",
+            vec![window(WindowKind::Session, 0.40, Some(100), 30)]
+        ));
+        let session = |book: &UsageBook| book.get("claude").unwrap().windows[0].clone();
+        assert_eq!(session(&book).used, Some(0.75));
+        // A rejected status stays, whatever a later reading of that window says.
+        let rejected = Window {
+            status: Some(LimitStatus::Rejected),
+            ..window(WindowKind::Session, 0.75, Some(100), 40)
+        };
+        assert!(book.record("claude", vec![rejected]));
+        assert!(!book.record(
+            "claude",
+            vec![window(WindowKind::Session, 0.2, Some(100), 50)]
+        ));
+        assert_eq!(session(&book).status, Some(LimitStatus::Rejected));
+        assert_eq!(session(&book).used, Some(0.75));
+        // More use is taken.
+        assert!(book.record(
+            "claude",
+            vec![window(WindowKind::Session, 0.8, Some(100), 60)]
+        ));
+        assert_eq!(session(&book).used, Some(0.8));
+        assert_eq!(session(&book).status, Some(LimitStatus::Rejected));
+        // The next window, after the reset, starts low.
+        assert!(book.record(
+            "claude",
+            vec![window(WindowKind::Session, 0.05, Some(200), 70)]
+        ));
+        assert_eq!(session(&book).used, Some(0.05));
+        assert_eq!(session(&book).status, Some(LimitStatus::Allowed));
+    }
+
+    fn other(id: &str, as_of: i64) -> Window {
+        window(WindowKind::Other(id.into()), 0.1, Some(1_000), as_of)
+    }
+
+    /// At most four windows of unknown kinds are kept, the latest read.
+    #[test]
+    fn other_windows_are_capped() {
+        let book = UsageBook::in_memory();
+        let reading: Vec<Window> = (0..6).map(|n| other(&format!("k{n}"), 10 + n)).collect();
+        assert!(book.record("claude", reading));
+        let kinds: Vec<String> = book
+            .get("claude")
+            .unwrap()
+            .windows
+            .iter()
+            .map(|window| window.kind.to_string())
+            .collect();
+        assert_eq!(kinds, ["other:k2", "other:k3", "other:k4", "other:k5"]);
+        // A seventh pushes out the oldest.
+        assert!(book.record("claude", vec![other("k6", 30)]));
+        let kinds: Vec<String> = book
+            .get("claude")
+            .unwrap()
+            .windows
+            .iter()
+            .map(|window| window.kind.to_string())
+            .collect();
+        assert_eq!(kinds, ["other:k3", "other:k4", "other:k5", "other:k6"]);
+    }
+
+    /// A full reading (both guarded windows) drops the unknown kinds it no longer lists; a
+    /// partial one keeps them.
+    #[test]
+    fn a_full_reading_drops_unknown_kinds_it_leaves_out() {
+        let book = UsageBook::in_memory();
+        assert!(book.record(
+            "claude",
+            vec![
+                window(WindowKind::Session, 0.1, Some(100), 10),
+                window(WindowKind::Weekly, 0.1, Some(900), 10),
+                other("gone", 10),
+                other("kept", 10),
+            ]
+        ));
+        // Partial: nothing dropped.
+        assert!(book.record(
+            "claude",
+            vec![window(WindowKind::Session, 0.2, Some(100), 20)]
+        ));
+        assert_eq!(book.get("claude").unwrap().windows.len(), 4);
+        // Full, without "gone": dropped, even though nothing else changed.
+        assert!(book.record(
+            "claude",
+            vec![
+                window(WindowKind::Session, 0.2, Some(100), 30),
+                window(WindowKind::Weekly, 0.1, Some(900), 30),
+                other("kept", 10),
+            ]
+        ));
+        let kinds: Vec<String> = book
+            .get("claude")
+            .unwrap()
+            .windows
+            .iter()
+            .map(|window| window.kind.to_string())
+            .collect();
+        assert_eq!(kinds, ["session", "weekly", "other:kept"]);
     }
 }

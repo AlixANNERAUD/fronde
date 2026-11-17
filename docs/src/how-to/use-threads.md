@@ -96,7 +96,8 @@ pill with the window nearest its line, such as « 5 h 42 % ». Its colour says h
 grey well below your reserve's line, amber within 10 points of it, orange at the line (background
 work paused), red when Claude refuses turns until the window resets; the words say the same for a
 screen reader. Tap it to see each window with its use and when it resets in your time
-(« réinitialisée à 16:40 », « réinitialisée lun. 09:00 », or « réinitialisée depuis le relevé »),
+(« réinitialisée à 16:40 », « réinitialisée lun. 09:00 », or « réinitialisée depuis le relevé »
+with « utilisation inconnue » until the next reading),
 how old the reading is (« relevé il y a 12 min »), and whether background work runs:
 « Tâches de fond permises (réserve 30 %) », « Tâches de fond en pause jusqu'à 16:40 (réserve
 30 %) », or, when no reading decides, that the daily counts limit it. Escape or a tap elsewhere

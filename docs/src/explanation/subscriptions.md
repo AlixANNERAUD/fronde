@@ -90,10 +90,22 @@ What it does not send, and Fronde does not make up:
 
 Every field is checked and anything odd is left out: a use outside 0 to 1 by more than a few
 points (`42` would be a percentage) is dropped rather than rescaled, a value just past an edge is
-clamped, a reset time more than a year from the reading (milliseconds, say) is dropped, and a
-reading that does not parse never fails a turn. The log names the fields it left out, never the
-whole `_meta`. Once a window's reset time has passed, it reads as reset since the reading. Codex
-and Antigravity send no reading Fronde reads yet.
+clamped, a window whose reset time does not read or lies further ahead than the window lasts
+(5 hours for the 5-hour window, 7 days for a weekly one, 31 days otherwise, each with 10 minutes
+to spare; milliseconds, say) is refused whole, and a reading that does not parse never fails a
+turn. The log names the fields it left out, never the whole `_meta`. Codex and Antigravity send
+no reading Fronde reads yet.
+
+Readings from several agent processes may arrive out of order. A window is replaced by one with a
+later reset time (it started again); for the same reset time, Fronde keeps the greater use and
+the worse status, so a window's use only goes down at its reset and a reading held back elsewhere
+never lifts a pause. Once a window's reset time has passed, it reads as reset since the reading,
+its use unknown (shown so, never as 0 %) until the next reading. Windows of kinds Fronde has no
+name for are kept, four at most, and dropped when a reading of both the 5-hour and the weekly
+window no longer lists them.
+
+Readings belong to a subscription account: today each provider has one, the one Fronde signs in
+with, whose id is the provider's (`claude`). An account per person is **planned**.
 
 Fronde keeps a share of each window for your own turns: past `[threads] reserve` (30 % by
 default), sub-agents are neither started nor sent messages, and their results wait for your next

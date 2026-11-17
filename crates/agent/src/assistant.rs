@@ -101,8 +101,6 @@ pub(crate) struct Shared {
     pub(crate) registry: Registry,
     /// What threads may do with sub-agents: the wake budget and the wake turns' time cap.
     pub(crate) limits: Limits,
-    /// The subscription account the thread's turns spend ([`crate::usage::account_of`]).
-    pub(crate) account: String,
 }
 
 pub struct Assistant {
@@ -143,8 +141,6 @@ pub struct Assistant {
     turn_timeout: Mutex<Option<Duration>>,
     /// The wake budget and the wake turns' time cap.
     limits: Limits,
-    /// The subscription account its turns spend, whose reserve holds its wakes.
-    account: String,
     /// Where its turns stand, for the thread list.
     activity: Mutex<Activity>,
     /// Told when [`Assistant::status`] changes.
@@ -298,7 +294,6 @@ impl Assistant {
             handoff,
             registry,
             limits,
-            account,
         } = shared;
         let log = ConversationLog::open(&db, &topic).await?;
         let assistant = Arc::new(Self {
@@ -321,7 +316,6 @@ impl Assistant {
             elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
             turn_timeout: Mutex::new(turn_timeout),
             limits,
-            account,
             activity: Mutex::new(Activity::default()),
             changes,
             handoff,
@@ -769,12 +763,17 @@ impl Assistant {
         }
         // Past the owner's reserve, held as past the wake budget: until the owner's next message.
         let reserve = self.reserve_hold();
-        let reason = reserve.clone().unwrap_or_default();
         let held = {
             let mut queue = lock(&self.wakes);
-            if unsure || reserve.is_some() || queue.holds(self.limits.wakes_without_owner) {
+            // Named the reserve's only when nothing else would hold it.
+            let other = unsure || queue.holds(self.limits.wakes_without_owner);
+            if other || reserve.is_some() {
+                let reason = match reserve {
+                    Some(reserve) if !other => reserve,
+                    _ => HoldReason::Budget,
+                };
                 queue.held.push(wake);
-                Some(queue.hold(None))
+                Some((queue.hold(None), reason))
             } else {
                 let after = wake.seq;
                 drop(queue);
@@ -782,7 +781,7 @@ impl Assistant {
                 None
             }
         };
-        if let Some(count) = held {
+        if let Some((count, reason)) = held {
             tracing::info!(
                 "thread {}: a sub-agent's result is held for the next message ({count} held)",
                 self.thread
@@ -816,7 +815,8 @@ impl Assistant {
     /// may run or no reading decides (then only the wake budget holds results).
     fn reserve_hold(&self) -> Option<HoldReason> {
         let book = self.spec.usage.as_ref()?;
-        let usage = book.get(&self.account);
+        // The account its agent signs in with: the thread's (`AgentSpec::account`).
+        let usage = book.get(&self.spec.account);
         match fronde_protocol::usage::background(usage.as_ref(), self.limits.reserve, Utc::now()) {
             Background::Paused(pause) => Some(HoldReason::Reserve {
                 used: pause.used_percent(),
@@ -923,11 +923,6 @@ impl Assistant {
                 // Past the owner's reserve, the results waiting are held, as past the wake
                 // budget: under the turn's lock, from Fronde's own book.
                 let reserve = self.reserve_hold();
-                let reason = match (reserve.clone(), stopped) {
-                    (Some(reserve), _) => reserve,
-                    (None, true) => HoldReason::Stopped,
-                    (None, false) => HoldReason::Budget,
-                };
                 // Before the turn's end, as `wakes::replay` reads it: the end then opens no wake.
                 // A late answer of the owner's goes next, as the owner's message, which carries
                 // the results held.
@@ -938,17 +933,22 @@ impl Assistant {
                     // The message never reached the agent: the results it carried are held
                     // again, for the next one.
                     let returned = if delivered { Vec::new() } else { carried };
-                    let hold_waiting = stopped
-                        || late
-                        || reserve.is_some()
-                        || queue.hold_at_end
-                        || queue.holds(self.limits.wakes_without_owner);
+                    let budget =
+                        late || queue.hold_at_end || queue.holds(self.limits.wakes_without_owner);
+                    let hold_waiting = stopped || budget || reserve.is_some();
                     queue.hold_at_end = false;
                     let again = !returned.is_empty();
+                    // Named after what holds them: the owner's Stop, else the budget or a
+                    // prompt that never went out, and the reserve only when it alone does.
+                    let reason = match reserve {
+                        _ if stopped => HoldReason::Stopped,
+                        Some(reserve) if !budget && !again && own.is_none() => reserve,
+                        _ => HoldReason::Budget,
+                    };
                     (again || own.is_some() || (hold_waiting && !queue.waiting.is_empty()))
-                        .then(|| (queue.hold_again(returned, own), again))
+                        .then(|| (queue.hold_again(returned, own), again, reason))
                 };
-                if let Some((count, again)) = held {
+                if let Some((count, again, reason)) = held {
                     tracing::info!(
                         "thread {}: {count} sub-agent result(s) held for the next message",
                         self.thread
