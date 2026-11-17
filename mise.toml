@@ -39,9 +39,11 @@ run = [
   "for p in $FRONDE_COMPONENT_SDK $FRONDE_COMPONENTS; do cargo fmt --manifest-path $p/Cargo.toml --all; done",
 ]
 
+# fronde-wasm's build script hashes components/dist, so lint waits for the components task
+# instead of compiling while `check` rewrites that directory.
 [tasks.lint]
 description = "Check formatting and run clippy on the server, web and component code"
-depends = ["web-css"]
+depends = ["web-css", "components"]
 run = [
   "cargo fmt --all --check",
   "cargo clippy $FRONDE_SERVER_PACKAGES --all-targets -- -D warnings",
