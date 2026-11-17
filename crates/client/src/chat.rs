@@ -57,7 +57,8 @@ pub enum Item {
     },
     Request {
         id: RequestId,
-        card: Card,
+        /// Boxed: a card is far bigger than any other item.
+        card: Box<Card>,
         /// Who asks, when it is not Fronde's assistant.
         from: Option<String>,
         status: RequestStatus,
@@ -262,7 +263,7 @@ impl Chat {
                 seq,
                 Item::Request {
                     id,
-                    card,
+                    card: Box::new(card),
                     from,
                     status: RequestStatus::Open,
                     refusal: None,

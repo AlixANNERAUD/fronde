@@ -110,7 +110,7 @@ fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>)
         } => rsx! {
             RequestCard {
                 id,
-                card,
+                card: *card,
                 from,
                 status,
                 refusal,
