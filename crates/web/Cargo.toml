@@ -22,7 +22,7 @@ futures.workspace = true
 gloo-net.workspace = true
 gloo-timers.workspace = true
 wasm-bindgen.workspace = true
-web-sys = { workspace = true, features = ["Document", "Element", "HtmlElement", "Location", "VisibilityState", "Window"] }
+web-sys = { workspace = true, features = ["Document", "Element", "HtmlElement", "HtmlInputElement", "Location", "VisibilityState", "Window"] }
 
 [dev-dependencies]
 # Events built from plain data, to send key presses natively in tests.

@@ -165,6 +165,10 @@ impl ToolKind {
 pub struct Remember {
     pub name: String,
     pub origin: String,
+    /// A secret was already kept under `name` for `origin` when the card was asked: keeping this
+    /// one replaces it, and the card says so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaces: bool,
 }
 
 /// How long a secret given in a card is kept.
@@ -729,6 +733,7 @@ mod tests {
             remember: remember.then(|| Remember {
                 name: "nextcloud".into(),
                 origin: "https://cloud.example".into(),
+                replaces: false,
             }),
         }
     }
@@ -750,6 +755,22 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Card>(&json).unwrap(), card);
         assert_eq!(card.kind(), "secret");
+        // A replacement says so; a card without the field replaces nothing.
+        let Card::Secret {
+            remember: Some(remember),
+            ..
+        } = card
+        else {
+            unreachable!()
+        };
+        let replacing = Remember {
+            replaces: true,
+            ..remember
+        };
+        assert_eq!(
+            serde_json::to_string(&replacing).unwrap(),
+            r#"{"name":"nextcloud","origin":"https://cloud.example","replaces":true}"#
+        );
 
         let answer = secret("s3cret", Keep::Conversation);
         let json = serde_json::to_string(&answer).unwrap();

@@ -156,23 +156,26 @@ async fn user_secret(requests: &Requests, context: CallContext, args: SecretArgs
     if let Err(message) = check_asker(&context.caller) {
         return ToolOutput::error(message);
     }
-    let (card, timeout) = match check_secret(&args) {
+    let (mut card, timeout) = match check_secret(&args) {
         Ok(checked) => checked,
         Err(message) => return ToolOutput::error(message),
     };
     if let Card::Secret {
         remember: Some(remember),
         ..
-    } = &card
+    } = &mut card
     {
         match requests.stored_origin(&remember.name).await {
+            // Which origin holds it is the owner's business: the asker learns only that the
+            // name is taken.
             Ok(Some(other)) if other != remember.origin => {
                 return ToolOutput::error(format!(
-                    "remember.name {:?} is already stored for {other}; give another name, or {other} as remember.origin to replace it",
+                    "remember.name {:?} is already used; pick another name",
                     remember.name
                 ));
             }
-            Ok(_) => {}
+            // The card tells the owner that keeping it replaces the secret stored there.
+            Ok(stored) => remember.replaces = stored.is_some(),
             Err(error) => {
                 tracing::error!("user_secret cannot read the stored secrets: {error:#}");
                 return ToolOutput::error(
@@ -332,6 +335,7 @@ fn check_remember(remember: &RememberArg) -> Result<Remember, String> {
     Ok(Remember {
         name: remember.name.clone(),
         origin: origin.to_string(),
+        replaces: false,
     })
 }
 

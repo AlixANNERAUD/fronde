@@ -135,8 +135,9 @@ The user picks how long the secret is kept:
   A component then uses it as `{ stored = "nextcloud" }` in its `[[sources.credentials]]` for
   that origin; the owner writes that in the configuration. A name already stored for another
   origin is refused, before the card is shown and again when the answer comes: a stored secret is
-  never moved to another origin behind the owner's back. The same name for the same origin
-  replaces the value.
+  never moved to another origin behind the owner's back. The error says only that the name is
+  already used, never for which origin. The same name for the same origin replaces the value, and
+  the card says so to the owner.
 
 The value never reaches the agent, the conversation, the request's row, a log or any file but the
 sealed row. Declined, expired and cancelled calls return as `user_ask`'s do. `user_secret` is

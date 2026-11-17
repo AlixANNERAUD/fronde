@@ -234,6 +234,7 @@ fn PermissionCard(
                                                 },
                                             },
                                             sent: Some(delivered),
+                                            dropped: None,
                                         })
                                     }
                                 },
@@ -476,12 +477,24 @@ fn OpenSecretCard(
     open: bool,
     on_send: EventHandler<Outgoing>,
 ) -> Element {
-    let mut value = use_signal(String::new);
     let mut shown = use_signal(|| false);
     let mut keep = use_signal(|| false);
     let mut invalid = use_signal(|| None::<Invalid>);
     let mut sent = use_signal(|| false);
-    let delivered = use_callback(move |()| sent.set(true));
+    // The answer was dropped: the socket closed before it went out.
+    let mut lost = use_signal(|| false);
+    let input_id = format!("r{id}-secret");
+    // The box keeps what was typed until the answer went out, and is emptied then: not kept in
+    // the page, not even to send again, so a refused answer is typed anew. One that was dropped
+    // stays in the box, to send again.
+    let delivered = use_callback({
+        let input_id = input_id.clone();
+        move |()| {
+            sent.set(true);
+            secret_box::clear(&input_id);
+        }
+    });
+    let dropped = use_callback(move |()| lost.set(true));
     let disabled = !open || sent() && refusal.is_none();
     // Only an admin keeps a secret for good, and only where the asker offered it.
     let keepable = remember.clone().filter(|_| admin);
@@ -494,14 +507,16 @@ fn OpenSecretCard(
     };
     let send = use_callback({
         let keepable = keepable.is_some();
+        let input_id = input_id.clone();
         move |()| {
             let keep = if keepable && keep() {
                 Keep::Stored
             } else {
                 Keep::Conversation
             };
+            // Read from the box only now: no signal holds it, and nothing renders it.
             let response = Response::Secret {
-                value: SecretValue::new(value.peek().clone()),
+                value: SecretValue::new(secret_box::read(&input_id)),
                 keep,
             };
             if let Err(error) = check(&card, &response) {
@@ -509,32 +524,36 @@ fn OpenSecretCard(
                 return;
             }
             invalid.set(None);
-            // Not kept in the page once sent, not even to send again: a refused answer is typed
-            // anew.
-            value.set(String::new());
+            lost.set(false);
             on_send.call(Outgoing {
                 message: ClientMsg::Answer { id, response },
                 sent: Some(delivered),
+                dropped: Some(dropped),
             });
         }
     });
-    let decline = move |_| {
-        invalid.set(None);
-        value.set(String::new());
-        on_send.call(Outgoing {
-            message: ClientMsg::Answer {
-                id,
-                response: Response::Decline,
-            },
-            sent: Some(delivered),
-        });
+    let decline = {
+        let input_id = input_id.clone();
+        move |_| {
+            invalid.set(None);
+            lost.set(false);
+            secret_box::clear(&input_id);
+            on_send.call(Outgoing {
+                message: ClientMsg::Answer {
+                    id,
+                    response: Response::Decline,
+                },
+                sent: Some(delivered),
+                dropped: Some(dropped),
+            });
+        }
     };
     let error = invalid
         .read()
         .as_ref()
         .map(|error| error.message.clone())
+        .or_else(|| lost().then(|| "Connexion perdue, réessaie.".to_owned()))
         .or(refusal);
-    let input_id = format!("r{id}-secret");
     let keep_id = format!("r{id}-keep");
     let link_class = format!(
         "inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium [&_svg]:size-4 {} {} {BUTTON_CLASS}",
@@ -572,17 +591,17 @@ fn OpenSecretCard(
                                 send.call(());
                             }
                         },
+                        // Uncontrolled: the page reads it only to send it. A new password, so
+                        // that neither the browser nor a password manager offers one it knows.
                         Input {
                             id: input_id.clone(),
                             r#type: if shown() { InputType::Text } else { InputType::Password },
-                            value: value(),
                             placeholder,
-                            autocomplete: "off",
+                            autocomplete: "new-password",
                             spellcheck: "false",
                             autocapitalize: "off",
                             disabled,
                             class: "h-11 md:h-9",
-                            oninput: move |event: FormEvent| value.set(event.value()),
                         }
                         Button {
                             id: "r{id}-show",
@@ -621,6 +640,11 @@ fn OpenSecretCard(
                             }
                             FieldContent {
                                 FieldTitle { class: "wrap-break-word", "Garder pour {remember.origin}" }
+                                if remember.replaces {
+                                    FieldDescription { class: "wrap-break-word",
+                                        "Remplace le secret « {remember.name} » déjà gardé pour {remember.origin}"
+                                    }
+                                }
                             }
                         }
                     }
@@ -726,9 +750,11 @@ fn FormCard(
                 return;
             }
             invalid.set(None);
+            // A dropped answer leaves the card as it was, to send again.
             on_send.call(Outgoing {
                 message: ClientMsg::Answer { id, response },
                 sent: Some(delivered),
+                dropped: None,
             });
         }
     });
@@ -740,6 +766,7 @@ fn FormCard(
                 response: Response::Decline,
             },
             sent: Some(delivered),
+            dropped: None,
         });
     };
     let error_for = |key: &str| {
@@ -1042,6 +1069,55 @@ fn ChoiceField(
     }
 }
 
+/// A secret card's box, which the page reads only to send it and empties once it went out.
+#[cfg(target_arch = "wasm32")]
+mod secret_box {
+    use wasm_bindgen::JsCast;
+
+    fn input(id: &str) -> Option<web_sys::HtmlInputElement> {
+        web_sys::window()?
+            .document()?
+            .get_element_by_id(id)?
+            .dyn_into()
+            .ok()
+    }
+
+    /// What is typed in the box `id`.
+    pub fn read(id: &str) -> String {
+        input(id).map(|input| input.value()).unwrap_or_default()
+    }
+
+    /// Empties the box `id`.
+    pub fn clear(id: &str) {
+        if let Some(input) = input(id) {
+            input.set_value("");
+        }
+    }
+}
+
+/// Natively there is no page: tests type in boxes of their own.
+#[cfg(not(target_arch = "wasm32"))]
+mod secret_box {
+    use std::{cell::RefCell, collections::HashMap};
+
+    thread_local! {
+        static BOXES: RefCell<HashMap<String, String>> = RefCell::default();
+    }
+
+    pub fn read(id: &str) -> String {
+        BOXES.with_borrow(|boxes| boxes.get(id).cloned().unwrap_or_default())
+    }
+
+    pub fn clear(id: &str) {
+        BOXES.with_borrow_mut(|boxes| boxes.remove(id));
+    }
+
+    #[cfg(test)]
+    pub fn type_in(id: &str, text: &str) {
+        BOXES.with_borrow_mut(|boxes| boxes.insert(id.to_owned(), text.to_owned()));
+    }
+}
+
 /// Moves the keyboard focus to the element `id`.
 #[cfg(target_arch = "wasm32")]
 fn focus(id: &str) {
@@ -1163,6 +1239,7 @@ mod tests {
         }
     }
 
+    /// One card. `deliver`: whether the socket says each message went out, or dropped it.
     #[component]
     fn Harness(
         card: Card,
@@ -1170,6 +1247,7 @@ mod tests {
         refusal: Option<String>,
         open: bool,
         admin: bool,
+        deliver: bool,
     ) -> Element {
         rsx! {
             RequestCard {
@@ -1182,8 +1260,9 @@ mod tests {
                 admin,
                 on_send: move |outgoing: Outgoing| {
                     SENT.with_borrow_mut(|sent| sent.push(outgoing.message));
-                    if let Some(sent) = outgoing.sent {
-                        sent.call(());
+                    let done = if deliver { outgoing.sent } else { outgoing.dropped };
+                    if let Some(done) = done {
+                        done.call(());
                     }
                 },
             }
@@ -1197,6 +1276,7 @@ mod tests {
             refusal: None,
             open: true,
             admin: false,
+            deliver: true,
         }
     }
 
@@ -1738,6 +1818,7 @@ mod tests {
             remember: remember.then(|| Remember {
                 name: "nextcloud".into(),
                 origin: "https://cloud.example".into(),
+                replaces: false,
             }),
         }
     }
@@ -1776,7 +1857,7 @@ mod tests {
         let input = tag(&page, "r7-secret").unwrap();
         for attribute in [
             r#"type="password""#,
-            r#"autocomplete="off""#,
+            r#"autocomplete="new-password""#,
             r#"spellcheck="false""#,
             r#"autocapitalize="off""#,
             r#"placeholder="xxxx-xxxx""#,
@@ -1813,9 +1894,17 @@ mod tests {
             "{}",
             card.html()
         );
-        card.type_text("r7-secret", CANARY);
+        secret_box::type_in("r7-secret", CANARY);
+        // Typed, it is in the box only: nothing in the page holds or renders it.
+        assert!(!card.html().contains(CANARY));
+        assert!(!tag(&card.html(), "r7-secret").unwrap().contains("value="));
         card.key_in("r7-secret", Key::Enter, Code::Enter);
         assert_eq!(sent(), [secret_answer(CANARY, Keep::Conversation)]);
+        assert_eq!(
+            secret_box::read("r7-secret"),
+            "",
+            "emptied once it went out"
+        );
         let page = card.html();
         assert!(!page.contains(CANARY), "the page still shows it: {page}");
         assert!(!page.contains("Saisis le secret"), "{page}");
@@ -1884,15 +1973,59 @@ mod tests {
             "{}",
             card.html()
         );
-        card.type_text("r7-secret", CANARY);
+        secret_box::type_in("r7-secret", CANARY);
         card.click("r7-send");
         assert_eq!(sent(), [secret_answer(CANARY, Keep::Stored)]);
 
         // Without ticking it, for the conversation only.
         let mut card = Live::new(admin(secret_card(None, true)));
-        card.type_text("r7-secret", CANARY);
+        secret_box::type_in("r7-secret", CANARY);
         card.click("r7-send");
         assert_eq!(sent(), [secret_answer(CANARY, Keep::Conversation)]);
+    }
+
+    #[test]
+    fn secret_card_says_when_it_replaces_a_kept_secret() {
+        let notice = "Remplace le secret « nextcloud » déjà gardé pour https://cloud.example";
+        let page = render(admin(secret_card(None, true)));
+        assert!(!page.contains("Remplace"), "{page}");
+        let mut card = secret_card(None, true);
+        if let Card::Secret {
+            remember: Some(remember),
+            ..
+        } = &mut card
+        {
+            remember.replaces = true;
+        }
+        let page = render(admin(card.clone()));
+        assert!(page.contains(notice), "{page}");
+        // Only beside the box that keeps it, which only an admin gets.
+        let page = render(props(card));
+        assert!(!page.contains("Remplace"), "{page}");
+    }
+
+    #[test]
+    fn secret_card_survives_a_lost_connection() {
+        let mut card = Live::new(HarnessProps {
+            deliver: false,
+            ..props(secret_card(None, false))
+        });
+        secret_box::type_in("r7-secret", CANARY);
+        card.click("r7-send");
+        assert_eq!(sent(), [secret_answer(CANARY, Keep::Conversation)]);
+        let page = card.html();
+        assert!(page.contains("Connexion perdue, réessaie."), "{page}");
+        assert!(!page.contains(CANARY), "{page}");
+        // Still answerable, with what was typed still in the box.
+        assert!(!disabled(&page, "r7-send") && !disabled(&page, "r7-decline"));
+        assert!(!tag(&page, "r7-secret").unwrap().contains("disabled=true"));
+        assert_eq!(secret_box::read("r7-secret"), CANARY);
+        card.click("r7-send");
+        assert_eq!(sent().len(), 2, "sent again");
+        // A decline that is dropped says so too.
+        card.click("r7-decline");
+        assert!(card.html().contains("Connexion perdue, réessaie."));
+        assert!(!disabled(&card.html(), "r7-send"));
     }
 
     #[test]

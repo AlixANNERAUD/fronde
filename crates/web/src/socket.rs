@@ -29,6 +29,18 @@ pub struct Outgoing {
     /// Called only if the message was sent: a message the page sends while the socket is not
     /// open is dropped.
     pub sent: Option<Callback<()>>,
+    /// Called if it was dropped instead, the socket closed before it went out.
+    pub dropped: Option<Callback<()>>,
+}
+
+impl Outgoing {
+    /// Says the message was dropped, to whoever asked.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn drop_it(self) {
+        if let Some(dropped) = self.dropped {
+            dropped.call(());
+        }
+    }
 }
 
 /// Connects the chat; messages sent to the returned coroutine go to the server.
@@ -104,7 +116,7 @@ mod imp {
         loop {
             select! {
                 _ = poll_fn(|cx| socket.poll_ready_unpin(cx)).fuse() => break,
-                _ = commands.next() => {}
+                outgoing = commands.next() => outgoing.map_or((), Outgoing::drop_it),
                 _ = visible.next() => {
                     connection.on_visible();
                 }
@@ -133,11 +145,14 @@ mod imp {
                     None => return ABNORMAL_CLOSURE,
                 },
                 outgoing = commands.next() => {
-                    if let Some(Outgoing { message, sent }) = outgoing
-                        && send(&mut socket, &message).await
-                        && let Some(sent) = sent
-                    {
-                        sent.call(());
+                    if let Some(outgoing) = outgoing {
+                        if send(&mut socket, &outgoing.message).await {
+                            if let Some(sent) = outgoing.sent {
+                                sent.call(());
+                            }
+                        } else {
+                            outgoing.drop_it();
+                        }
                     }
                 }
                 _ = visible.next() => {
@@ -165,7 +180,7 @@ mod imp {
                     }
                 }
                 // Nothing is sent while the socket is closed.
-                _ = commands.next() => {}
+                outgoing = commands.next() => outgoing.map_or((), Outgoing::drop_it),
             }
         }
     }

@@ -253,6 +253,7 @@ async fn user_secret_shows_a_secret_card() {
             remember: Some(Remember {
                 name: "nextcloud".into(),
                 origin: "https://cloud.example".into(),
+                replaces: false,
             }),
         }
     );
@@ -304,7 +305,11 @@ async fn user_secret_returns_the_stored_name() {
     let mut bench = bench().await;
     let remember = json!({"remember": {"name": "nextcloud", "origin": "https://cloud.example"}});
     let call = bench.call(context(), with(remember.clone()));
-    let (id, _, _) = bench.card().await;
+    let (id, card, _) = bench.card().await;
+    assert!(
+        matches!(&card, Card::Secret { remember: Some(remember), .. } if !remember.replaces),
+        "nothing stored yet: {card:?}"
+    );
     bench
         .requests
         .answer(id, secret(CANARY, Keep::Stored), &alix())
@@ -326,20 +331,35 @@ async fn user_secret_returns_the_stored_name() {
         "{value}"
     );
 
-    // The name is taken for that origin: another origin is refused before any card.
+    // The name is taken for that origin: another origin is refused before any card, without
+    // learning which origin holds it.
     let elsewhere = json!({"remember": {"name": "nextcloud", "origin": "https://other.example"}});
     let out = result(bench.call(context(), with(elsewhere))).await;
-    assert!(
-        out["error"]
-            .as_str()
-            .unwrap()
-            .contains("remember.name \"nextcloud\" is already stored for https://cloud.example"),
+    let error = out["error"].as_str().unwrap();
+    assert_eq!(
+        error, "remember.name \"nextcloud\" is already used; pick another name",
         "{out}"
     );
+    assert!(!error.contains("cloud.example"), "{error}");
     assert!(bench.shown.try_recv().is_err());
-    // The same origin replaces it: a card is shown.
+    // The same origin replaces it: a card is shown, which says so.
     let call = bench.call(context(), with(remember));
-    let (id, _, _) = bench.card().await;
+    let (id, card, _) = bench.card().await;
+    let Card::Secret {
+        remember: Some(remember),
+        ..
+    } = card
+    else {
+        panic!("{card:?}");
+    };
+    assert_eq!(
+        remember,
+        Remember {
+            name: "nextcloud".into(),
+            origin: "https://cloud.example".into(),
+            replaces: true,
+        }
+    );
     bench.requests.cancel(id).await.unwrap();
     output(call).await;
 }

@@ -104,26 +104,33 @@ next agent process asks again.
 
 `user_secret` asks for one secret on a card of its own, never in a question card. The card shows
 why it is needed, a button to the sign-in or setup page when the agent gave one (https only, named
-by its host), and a masked box that neither checks spelling nor fills itself in; *Afficher* shows
-what you typed, *Masquer* hides it again. *Enregistrer* sends it, *Refuser* declines.
+by its host), and a masked box that neither checks spelling nor fills itself in (browsers and
+password managers are told it is a new password, not one to offer); *Afficher* shows what you
+typed, *Masquer* hides it again. *Enregistrer* sends it, *Refuser* declines.
 
 By default the secret is kept **for this conversation**: in Fronde's memory only, never in
 `fronde.db`, for the agent that asked and in this conversation only (any later turn of it, not
-only the one that asked), for one hour, and used up by its first use. When the agent proposes a name and an origin, an admin also gets a box *Garder pour
-<origin>*: ticked, the secret is sealed in `fronde.db` under that name, to be sent to that origin
-only, as `fronde secret set` would store it. Nobody else sees the box, and the server refuses a
-kept secret from anyone but an admin.
+only the one that asked), for one hour, and used up by its first use. When the agent proposes a
+name and an origin, an admin also gets a box *Garder pour <origin>*: ticked, the secret is sealed
+in `fronde.db` under that name, to be sent to that origin only, as `fronde secret set` would store
+it. When a secret is already kept under that name for that origin, the card says so: *Remplace le
+secret « <name> » déjà gardé pour <origin>*. Nobody else sees the box, and the server refuses a
+kept secret from anyone but an admin. A name already kept for another origin is refused before
+the card is shown, and the agent is told only that the name is taken, not for which origin.
 
 The answer travels from the page to the server on the chat's WebSocket and goes straight to the
-secret store. The page empties the box once it is sent, and never shows the secret again. On the
-server, the value becomes a `SecretString` as soon as the message is parsed, wiped once it is
-stored. The message itself cannot be wiped: it may stay in the WebSocket library's buffer until
-that memory is reused (see [Secrets in memory](security.md#secrets-in-memory)). Then the request closes: its row keeps where the secret went (`{"kept": "conversation",
+secret store. The page keeps nothing of it: the box is read only when you send, and emptied once
+the answer went out; the secret is never shown again. If the connection drops before it went
+out, the card stays open with *Connexion perdue, réessaie* and what you typed is still in the
+box. On the server, the value becomes a `SecretString` as soon as the message is parsed, wiped
+once it is stored. The message itself cannot be wiped: it may stay in the WebSocket library's
+buffer until that memory is reused (see [Secrets in memory](security.md#secrets-in-memory)).
+Then the request closes: its row keeps where the secret went (`{"kept": "conversation",
 "secret_ref": …}` or `{"kept": "stored", "name": …, "origin": …}`), the conversation says
 *Enregistré, jamais montré à l'agent* or *Gardé pour <origin>* (with *clé maîtresse créée :
 trousseau*, *fichier* or *identifiant systemd* when that secret made the master key, to back up),
-and the agent gets the reference or the name. Two pages answering at once keep one secret: the first answer wins, and the second
-is refused before anything is kept.
+and the agent gets the reference or the name. Two pages answering at once keep one secret: the
+first answer wins, and the second is refused before anything is kept.
 
 A `secret_ref` is useless outside its conversation and to another asker, and every refusal says
 the same thing, so a guess learns nothing. Outside clients that give the same name share one

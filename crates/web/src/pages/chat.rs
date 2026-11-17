@@ -194,6 +194,7 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> E
             on_send.call(Outgoing {
                 message: ClientMsg::Send { text },
                 sent: Some(delivered),
+                dropped: None,
             });
         }
     };
@@ -229,6 +230,7 @@ fn Composer(running: bool, status: Status, on_send: EventHandler<Outgoing>) -> E
                                 on_send.call(Outgoing {
                                     message: ClientMsg::Cancel,
                                     sent: None,
+                                    dropped: None,
                                 })
                             },
                             Square { class: "size-3 fill-current" }

@@ -897,6 +897,7 @@ mod secrets {
             remember: remember.then(|| Remember {
                 name: "nextcloud".into(),
                 origin: "https://cloud.example".into(),
+                replaces: false,
             }),
         }
     }
@@ -1136,6 +1137,7 @@ mod secrets {
             remember: Some(Remember {
                 name: "nextcloud".into(),
                 origin: "https://other.example".into(),
+                replaces: false,
             }),
         };
         let first = bench.requests.ask(ask_secret(true)).await.unwrap();
