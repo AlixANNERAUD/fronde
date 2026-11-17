@@ -11,12 +11,15 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub topic: String,
     pub turn: Option<i64>,
-    #[sea_orm(column_type = "Text", unique_key = "requests_caller_client_request_id")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "requests_pending_caller_client_request_id"
+    )]
     pub caller: String,
     #[sea_orm(
         column_type = "Text",
         nullable,
-        unique_key = "requests_caller_client_request_id"
+        unique_key = "requests_pending_caller_client_request_id"
     )]
     pub client_request_id: Option<String>,
     #[sea_orm(column_type = "Text")]

@@ -351,3 +351,44 @@ async fn user_ask_retry_shows_one_card() {
     assert_eq!(first["result"]["answers"][0]["selected"], json!(["Seerr"]));
     assert!(bench.shown.try_recv().is_err(), "one card only");
 }
+
+#[tokio::test]
+async fn user_ask_reused_id_gets_no_old_answer() {
+    let mut bench = bench().await;
+    let mut args = one_question();
+    args["client_request_id"] = json!("q1");
+    let first = bench.ask(args.clone());
+    let (id, ..) = bench.card().await;
+    // Another question under the same id, while the first is pending: refused, no card.
+    let mut other = args.clone();
+    other["questions"][0]["question"] = json!("Et ensuite ?");
+    let out = result(bench.ask(other.clone())).await;
+    let error = out["error"].as_str().unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        error.contains("client_request_id \"q1\" already names another request")
+            && error.contains("give a new client_request_id"),
+        "{error}"
+    );
+    assert!(bench.shown.try_recv().is_err());
+    let answer = Response::Form {
+        values: [(
+            "q1".to_owned(),
+            ChoiceAnswer {
+                selected: vec!["Seerr".into()],
+                ..ChoiceAnswer::default()
+            },
+        )]
+        .into(),
+    };
+    bench.requests.answer(id, answer, &alix()).await.unwrap();
+    result(first).await;
+    // Once that one is answered, the other question gets its own card, not the old answer.
+    let second = bench.ask(other);
+    let (second_id, ..) = bench.card().await;
+    assert_ne!(second_id, id);
+    bench.requests.cancel(second_id).await.unwrap();
+    assert_eq!(
+        result(second).await["result"],
+        json!({"status": "cancelled"})
+    );
+}

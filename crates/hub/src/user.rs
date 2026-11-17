@@ -3,7 +3,7 @@
 use crate::source::Tool;
 use crate::tools::{CallContext, ToolOutput, typed_tool_with_context};
 use fronde_protocol::{Card, ChoiceOption, Field, Response};
-use fronde_requests::{Ask, Requests, Resolution};
+use fronde_requests::{Ask, Requests, Resolution, Reused};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,7 +29,8 @@ struct AskArgs {
     questions: Vec<QuestionArg>,
     /// How long to wait for the answers, in milliseconds: 1000 to 3600000 (default 600000).
     timeout_ms: Option<u64>,
-    /// Give the same value when retrying this call, so the user sees one card, not two.
+    /// Give the same value, with the same questions, when retrying this call in the same turn,
+    /// so the user sees one card, not two. A new question needs a new value.
     client_request_id: Option<String>,
 }
 
@@ -91,6 +92,11 @@ async fn user_ask(requests: &Requests, context: CallContext, args: AskArgs) -> T
     };
     let waiter = match requests.ask(ask).await {
         Ok(waiter) => waiter,
+        Err(error) if error.is::<Reused>() => {
+            return ToolOutput::error(format!(
+                "{error}; give a new client_request_id for a new question, or retry with exactly the same questions"
+            ));
+        }
         Err(error) => {
             tracing::error!("user_ask cannot open its request: {error:#}");
             return ToolOutput::error(

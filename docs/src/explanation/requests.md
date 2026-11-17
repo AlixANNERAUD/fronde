@@ -58,6 +58,14 @@ whose card never reached the conversation, because Fronde stopped in between, is
 others stay answerable. A tool call that is retried with the same `client_request_id` joins the
 request it started instead of showing a second card.
 
+The id alone proves nothing: the assistant reuses ids from one turn to the next, and outside
+clients choose their names, so two of them can share one. A retry therefore joins a request only
+when it asks the very same questions of the same user, and only while it is current: for the
+assistant, in the same turn; for an outside client, while the request is pending or within its
+timeout. A cancelled request is never joined. Anything else is a new question: it gets a card of
+its own, or an error asking for a new id while the request holding that id is still pending (the
+table allows one pending request per caller and id). A new question never gets an old answer.
+
 ## Cards on a phone
 
 Cards are built for a phone first: full width below 640 px, each option a row at least 44 px tall

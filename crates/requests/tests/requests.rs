@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use fronde_entity::requests;
 use fronde_protocol::{Card, ChoiceAnswer, ChoiceOption, Field, Outcome, RequestId, Response};
-use fronde_requests::{Ask, Caller, Journal, Refusal, Requests, Resolution, User};
-use sea_orm::{ActiveValue::Set, EntityTrait};
+use fronde_requests::{Ask, Caller, Journal, Refusal, Requests, Resolution, Reused, User};
+use sea_orm::{ActiveValue::Set, ConnectionTrait, EntityTrait};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -395,6 +395,198 @@ async fn retry_with_client_request_id_reuses_the_request() {
     assert_eq!(resolved(late).await, Resolution::Answered(pick("Mealie")));
 }
 
+/// `ask` with another question, under the same `client_request_id`.
+fn other_question(mut ask: Ask) -> Ask {
+    let Card::Form { fields, .. } = &mut ask.card;
+    let Field::Choice { question, .. } = &mut fields[0];
+    *question = "Et laquelle ensuite ?".into();
+    ask
+}
+
+fn with_id(mut ask: Ask, id: &str) -> Ask {
+    ask.client_request_id = Some(id.into());
+    ask
+}
+
+fn reused(error: anyhow::Error) -> Reused {
+    error
+        .downcast::<Reused>()
+        .unwrap_or_else(|error| panic!("not a reused id: {error:#}"))
+}
+
+#[tokio::test]
+async fn reused_id_with_another_question_does_not_get_the_old_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let first = requests.ask(with_id(ask(), "q1")).await.unwrap();
+    // Still pending: another question under its id is refused, and shows no card.
+    let error = requests
+        .ask(with_id(other_question(ask()), "q1"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reused(error),
+        Reused {
+            client_request_id: "q1".into()
+        }
+    );
+    assert_eq!(journal.shown().len(), 1);
+    // Nor does the same question for another user join it.
+    let mut sam = with_id(ask(), "q1");
+    sam.for_user = "sam".into();
+    reused(requests.ask(sam).await.unwrap_err());
+
+    requests
+        .answer(first.id(), pick("Mealie"), &alix())
+        .await
+        .unwrap();
+    assert_eq!(resolved(first).await, Resolution::Answered(pick("Mealie")));
+    // Answered: another question under the same id is a new request, never the old answer.
+    let second = requests
+        .ask(with_id(other_question(ask()), "q1"))
+        .await
+        .unwrap();
+    assert_ne!(second.id(), 0);
+    assert_eq!(row(dir.path(), second.id()).await.status, "pending");
+    requests
+        .answer(second.id(), pick("Seerr"), &alix())
+        .await
+        .unwrap();
+    assert_eq!(resolved(second).await, Resolution::Answered(pick("Seerr")));
+}
+
+#[tokio::test]
+async fn same_id_in_a_new_turn_is_a_new_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let first = requests.ask(with_id(ask(), "q1")).await.unwrap();
+    let id = first.id();
+    requests.answer(id, pick("Mealie"), &alix()).await.unwrap();
+    resolved(first).await;
+
+    // The assistant asks the very same question in its next turn: the user answers again.
+    let mut next_turn = with_id(ask(), "q1");
+    next_turn.turn = Some(9);
+    let again = requests.ask(next_turn.clone()).await.unwrap();
+    assert_ne!(again.id(), id);
+    assert_eq!(journal.shown().len(), 3, "a second card");
+    let waiting = tokio::spawn(again.wait());
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished(), "not the old answer");
+
+    // Outside a turn, the assistant's id names nothing to join either.
+    let mut no_turn = with_id(ask(), "q2");
+    no_turn.turn = None;
+    let one = requests.ask(no_turn.clone()).await.unwrap();
+    reused(requests.ask(no_turn).await.unwrap_err());
+    requests.cancel(one.id()).await.unwrap();
+    waiting.abort();
+}
+
+#[tokio::test]
+async fn outside_clients_of_one_name_join_only_the_same_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let codex = |ask: Ask| Ask {
+        caller: Caller::Mcp("Codex".into()),
+        turn: None,
+        ..with_id(ask, "q1")
+    };
+    // Two clients both called Codex, each with its own question and the same id.
+    let one = requests.ask(codex(ask())).await.unwrap();
+    reused(
+        requests
+            .ask(codex(other_question(ask())))
+            .await
+            .unwrap_err(),
+    );
+    requests
+        .answer(one.id(), pick("Mealie"), &alix())
+        .await
+        .unwrap();
+    resolved(one).await;
+    // The other one asks again once the first is answered: its own card, not that answer.
+    let two = requests.ask(codex(other_question(ask()))).await.unwrap();
+    assert_eq!(journal.shown().len(), 3);
+    requests
+        .answer(two.id(), pick("Seerr"), &alix())
+        .await
+        .unwrap();
+    assert_eq!(resolved(two).await, Resolution::Answered(pick("Seerr")));
+
+    // A genuine retry within the timeout gets the answer at once.
+    let retry = requests.ask(codex(other_question(ask()))).await.unwrap();
+    assert_eq!(resolved(retry).await, Resolution::Answered(pick("Seerr")));
+    // Once the first request's time is over, the same question is asked anew.
+    let mut short = codex(ask());
+    short.client_request_id = Some("q3".into());
+    short.timeout = Duration::from_millis(100);
+    let first = requests.ask(short.clone()).await.unwrap();
+    requests
+        .answer(first.id(), pick("Mealie"), &alix())
+        .await
+        .unwrap();
+    resolved(first).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let late = requests.ask(short).await.unwrap();
+    let waiting = tokio::spawn(late.wait());
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished(), "not the old answer");
+    waiting.abort();
+}
+
+#[tokio::test]
+async fn genuine_retry_in_the_same_turn_joins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let one = requests.ask(with_id(ask(), "q1")).await.unwrap();
+    let two = requests.ask(with_id(ask(), "q1")).await.unwrap();
+    assert_eq!(one.id(), two.id());
+    assert_eq!(journal.shown().len(), 1, "one card");
+    requests
+        .answer(one.id(), pick("Seerr"), &alix())
+        .await
+        .unwrap();
+    assert_eq!(resolved(one).await, Resolution::Answered(pick("Seerr")));
+    assert_eq!(resolved(two).await, Resolution::Answered(pick("Seerr")));
+    let late = requests.ask(with_id(ask(), "q1")).await.unwrap();
+    assert_eq!(resolved(late).await, Resolution::Answered(pick("Seerr")));
+}
+
+#[tokio::test]
+async fn cancelled_request_is_not_joined() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let one = requests.ask(with_id(ask(), "q1")).await.unwrap();
+    requests.cancel(one.id()).await.unwrap();
+    assert_eq!(resolved(one).await, Resolution::Cancelled);
+    let again = requests.ask(with_id(ask(), "q1")).await.unwrap();
+    assert_eq!(row(dir.path(), again.id()).await.status, "pending");
+    assert_eq!(journal.shown().len(), 3);
+}
+
+#[tokio::test]
+async fn waiter_expires_even_when_the_database_cannot_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    // Every expiry fails in the database, the timer's and the waiter's own attempt.
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    db.execute_unprepared(
+        "CREATE TRIGGER fail_expiry BEFORE UPDATE OF status ON requests \
+         WHEN NEW.status = 'expired' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .await
+    .unwrap();
+    let mut short = ask();
+    short.timeout = Duration::from_millis(100);
+    let waiter = requests.ask(short).await.unwrap();
+    let id = waiter.id();
+    assert_eq!(resolved(waiter).await, Resolution::Expired);
+    // The row could not change; the next start expires it.
+    assert_eq!(row(dir.path(), id).await.status, "pending");
+    assert_eq!(journal.shown().len(), 1);
+}
+
 #[tokio::test]
 async fn timeouts_expire_and_wake_the_waiter() {
     let dir = tempfile::tempdir().unwrap();
@@ -482,6 +674,39 @@ async fn pending_request_survives_a_restart() {
     requests.answer(id, pick("Mealie"), &alix()).await.unwrap();
     assert_eq!(row(dir.path(), id).await.status, "answered");
     assert!(matches!(journal.shown()[0], Shown::Closed { .. }));
+}
+
+#[tokio::test]
+async fn one_unreadable_row_does_not_stop_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, _) = open(dir.path()).await;
+    let good = requests.ask(ask()).await.unwrap().id();
+    drop(requests);
+    // A row a later version wrote, never shown, with a card this version cannot read.
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let unreadable = requests::ActiveModel {
+        topic: Set(TOPIC.into()),
+        turn: Set(None),
+        caller: Set("mcp:Codex".into()),
+        client_request_id: Set(None),
+        kind: Set("hologram".into()),
+        card: Set(serde_json::json!({"kind": "hologram"})),
+        for_user: Set("alix".into()),
+        admin_only: Set(false),
+        status: Set("pending".into()),
+        created_at: Set(chrono::Utc::now()),
+        expires_at: Set(Some(chrono::Utc::now() + chrono::Duration::minutes(10))),
+        ..Default::default()
+    };
+    let unreadable = requests::Entity::insert(unreadable)
+        .exec(&db)
+        .await
+        .unwrap()
+        .last_insert_id as RequestId;
+
+    let (requests, _) = open(dir.path()).await;
+    assert_eq!(row(dir.path(), unreadable).await.status, "cancelled");
+    requests.answer(good, pick("Seerr"), &alix()).await.unwrap();
 }
 
 #[tokio::test]

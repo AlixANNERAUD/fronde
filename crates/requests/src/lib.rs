@@ -13,7 +13,9 @@ use fronde_db::DatabaseConnection;
 use fronde_entity::requests;
 use fronde_protocol::request::{self, Card, Invalid, Outcome, RequestId, Response};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -25,6 +27,10 @@ const ANSWERED: &str = "answered";
 const DECLINED: &str = "declined";
 const EXPIRED: &str = "expired";
 const CANCELLED: &str = "cancelled";
+/// How long an asker waits past its request's expiry for the timer to close it, before it
+/// gives up on the timer: a database that failed to close the request must not leave the asker
+/// waiting forever.
+const EXPIRY_GRACE: Duration = Duration::from_secs(2);
 
 /// Who asked: Fronde's own assistant, an outside MCP client, or a tool source (an upstream
 /// server's elicitation).
@@ -80,7 +86,9 @@ pub struct Ask {
     /// The seq of the user message of the turn that asks, if a turn asks.
     pub turn: Option<u64>,
     pub caller: Caller,
-    /// A retried call with the same id from the same caller gets the same request.
+    /// A retried call with the same id from the same caller joins the same request, as long as
+    /// it asks the same thing of the same user in the same place: for the assistant in the same
+    /// turn, for anyone else while the first request is pending or within its timeout.
     pub client_request_id: Option<String>,
     pub card: Card,
     /// The only user who may answer.
@@ -122,6 +130,25 @@ impl fmt::Display for Refusal {
     }
 }
 
+/// A `client_request_id` already names another request that is still pending: a new question
+/// needs a new id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reused {
+    pub client_request_id: String,
+}
+
+impl fmt::Display for Reused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "client_request_id {:?} already names another request that is still pending",
+            self.client_request_id
+        )
+    }
+}
+
+impl std::error::Error for Reused {}
+
 /// Where requests are shown: a stream of entries, such as the conversation log.
 #[async_trait]
 pub trait Journal: Send + Sync {
@@ -149,6 +176,9 @@ pub trait Journal: Send + Sync {
 pub struct Waiter {
     id: RequestId,
     resolution: oneshot::Receiver<Resolution>,
+    /// When to stop waiting for the expiry timer: the request's expiry plus [`EXPIRY_GRACE`].
+    deadline: Option<tokio::time::Instant>,
+    requests: Weak<Requests>,
 }
 
 impl Waiter {
@@ -157,8 +187,37 @@ impl Waiter {
     }
 
     pub async fn wait(self) -> Resolution {
-        // The service went away with the request still open: nobody can answer it any more.
-        self.resolution.await.unwrap_or(Resolution::Cancelled)
+        let Self {
+            id,
+            mut resolution,
+            deadline,
+            requests,
+        } = self;
+        let Some(deadline) = deadline else {
+            return resolution.await.unwrap_or(Resolution::Cancelled);
+        };
+        tokio::select! {
+            // The service went away with the request still open: nobody can answer it any more.
+            resolved = &mut resolution => return resolved.unwrap_or(Resolution::Cancelled),
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+        // The timer could not close the request: try once more, and expire anyway.
+        let closed = match requests.upgrade() {
+            Some(requests) => requests.expire(id).await,
+            None => Ok(false),
+        };
+        match closed {
+            // Closed now, by this call or by an answer that came just before: its outcome.
+            Ok(_) => tokio::time::timeout(EXPIRY_GRACE, resolution)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(Resolution::Expired),
+            Err(error) => {
+                tracing::error!("cannot expire request {id}, the asker stops waiting: {error:#}");
+                Resolution::Expired
+            }
+        }
     }
 }
 
@@ -191,24 +250,35 @@ impl Requests {
             .await
             .context("cannot read the pending requests")?;
         for row in pending {
-            let id = row_id(&row)?;
-            if row.stream_seq.is_none() {
-                requests.announce(&row).await?;
+            // One row this version cannot show must not keep Fronde from starting.
+            if let Err(error) = requests.reopen(&row).await {
+                tracing::error!("cannot reopen request {}, cancelling it: {error:#}", row.id);
+                if let Ok(id) = row_id(&row)
+                    && let Err(error) = requests.cancel(id).await
+                {
+                    tracing::error!("cannot cancel request {id}: {error:#}");
+                }
             }
-            requests.expire_at(id, row.expires_at);
         }
         Ok(requests)
     }
 
-    /// Opens a request, shows its card and returns its waiter. A retry (same caller and
-    /// `client_request_id`) gets a waiter on the first request instead, already resolved if
-    /// that one ended.
+    /// Shows a pending request again if it never was, and starts its timer.
+    async fn reopen(&self, row: &requests::Model) -> anyhow::Result<()> {
+        let id = row_id(row)?;
+        if row.stream_seq.is_none() {
+            self.announce(row).await?;
+        }
+        self.expire_at(id, row.expires_at);
+        Ok(())
+    }
+
+    /// Opens a request, shows its card and returns its waiter. A retry (see
+    /// [`Ask::client_request_id`]) gets a waiter on the first request instead, already resolved
+    /// if that one ended. A [`Reused`] error when the id names another pending request.
     pub async fn ask(&self, ask: Ask) -> anyhow::Result<Waiter> {
         let caller = ask.caller.id();
-        if let Some(waiter) = self
-            .retried(&caller, ask.client_request_id.as_deref())
-            .await?
-        {
+        if let Some(waiter) = self.retried(&ask).await? {
             return Ok(waiter);
         }
         let now = Utc::now();
@@ -234,10 +304,7 @@ impl Requests {
             Ok(row) => row,
             Err(error) => {
                 // The same retry, sent twice at once: the other one inserted first.
-                if let Some(waiter) = self
-                    .retried(&caller, ask.client_request_id.as_deref())
-                    .await?
-                {
+                if let Some(waiter) = self.retried(&ask).await? {
                     return Ok(waiter);
                 }
                 return Err(anyhow::Error::new(error).context("cannot save the request"));
@@ -245,7 +312,7 @@ impl Requests {
         };
         let id = row_id(&row)?;
         // Waiting before the card is shown, so that the quickest answer finds the asker.
-        let waiter = self.wait_on(id);
+        let waiter = self.wait_on(id, Some(expires_at));
         if let Err(error) = self.announce(&row).await {
             // Nobody can answer a card that is not shown.
             if let Err(cancel) = self.cancel(id).await {
@@ -417,26 +484,31 @@ impl Requests {
         Ok(())
     }
 
-    /// A waiter on the request a retry names, if there is one.
-    async fn retried(
-        &self,
-        caller: &str,
-        client_request_id: Option<&str>,
-    ) -> anyhow::Result<Option<Waiter>> {
-        let Some(client_request_id) = client_request_id else {
+    /// A waiter on the request a retry names, if `ask` is a retry of it; [`Reused`] if its
+    /// `client_request_id` names another request still pending.
+    async fn retried(&self, ask: &Ask) -> anyhow::Result<Option<Waiter>> {
+        let Some(client_request_id) = ask.client_request_id.as_deref() else {
             return Ok(None);
         };
-        let row = requests::Entity::find()
-            .filter(requests::Column::Caller.eq(caller))
+        let rows = requests::Entity::find()
+            .filter(requests::Column::Caller.eq(ask.caller.id()))
             .filter(requests::Column::ClientRequestId.eq(client_request_id))
-            .one(&self.db)
+            .order_by_desc(requests::Column::Id)
+            .all(&self.db)
             .await
             .context("cannot look for the request to retry")?;
-        let Some(row) = row else {
+        let now = Utc::now();
+        let Some(row) = rows.iter().find(|row| retries(ask, row, now)) else {
+            if rows.iter().any(|row| row.status == PENDING) {
+                return Err(Reused {
+                    client_request_id: client_request_id.to_owned(),
+                }
+                .into());
+            }
             return Ok(None);
         };
-        let id = row_id(&row)?;
-        let waiter = self.wait_on(id);
+        let id = row_id(row)?;
+        let waiter = self.wait_on(id, row.expires_at);
         // Closed before the waiter was registered: it would never be woken.
         if let Some(row) = self.find(id).await?
             && row.status != PENDING
@@ -446,10 +518,19 @@ impl Requests {
         Ok(Some(waiter))
     }
 
-    fn wait_on(&self, id: RequestId) -> Waiter {
+    fn wait_on(&self, id: RequestId, expires_at: Option<chrono::DateTime<Utc>>) -> Waiter {
         let (sender, resolution) = oneshot::channel();
         self.waiters().entry(id).or_default().push(sender);
-        Waiter { id, resolution }
+        let deadline = expires_at.map(|expires_at| {
+            let left = (expires_at - Utc::now()).to_std().unwrap_or_default();
+            tokio::time::Instant::now() + left + EXPIRY_GRACE
+        });
+        Waiter {
+            id,
+            resolution,
+            deadline,
+            requests: self.this.clone(),
+        }
     }
 
     fn wake(&self, id: RequestId, resolution: Resolution) {
@@ -490,6 +571,27 @@ impl Requests {
     fn waiters(&self) -> MutexGuard<'_, HashMap<RequestId, Vec<oneshot::Sender<Resolution>>>> {
         self.waiters.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Whether `ask` retries the request `row`: the same caller and id (already matched), the same
+/// card for the same user in the same stream, not cancelled, and for the assistant the same
+/// turn, for anyone else while the request is pending or within its timeout. Callers share
+/// ids across turns and outside clients share a name, so the id alone proves nothing.
+fn retries(ask: &Ask, row: &requests::Model, now: chrono::DateTime<Utc>) -> bool {
+    let same_question = row.status != CANCELLED
+        && row.topic == ask.topic
+        && row.for_user == ask.for_user
+        && row.admin_only == ask.admin_only
+        && serde_json::from_value::<Card>(row.card.clone()).is_ok_and(|card| card == ask.card);
+    let still_current = match ask.caller {
+        Caller::Assistant => {
+            ask.turn.is_some() && row.turn == ask.turn.and_then(|turn| i64::try_from(turn).ok())
+        }
+        Caller::Mcp(_) | Caller::Source(_) => {
+            row.status == PENDING || row.expires_at.is_some_and(|expires_at| expires_at > now)
+        }
+    };
+    same_question && still_current
 }
 
 fn row_id(row: &requests::Model) -> anyhow::Result<RequestId> {

@@ -75,7 +75,11 @@ The call blocks until the request ends:
 saying what to do: a declined question is not asked again in the same turn.
 
 Give the same `client_request_id` when retrying a call that failed on the way: the retry joins the
-first request rather than showing a second card, and gets its answer, even one given already.
+first request rather than showing a second card, and gets its answer, even one given already. A
+retry joins only a request with the very same questions, for the same user, and not cancelled:
+from Fronde's assistant, one of the same turn; from an outside client, one still pending or within
+its `timeout_ms`. Otherwise the call opens a new request, or, while the request holding that id is
+still pending, fails with an error asking for a new `client_request_id`.
 
 A question from Fronde's own assistant is headed *Question de Fronde*; one from an outside client
 is headed with the name the client gave (`clientInfo.name`), such as *Question de Codex*. Never
