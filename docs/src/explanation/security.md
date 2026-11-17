@@ -17,7 +17,8 @@ secrets, where the runtime sets the file's mode and owner.
 ## Personal data on disk
 
 Fronde creates its data directory and every directory inside it with mode 0700, and every file it
-writes (memory, conversation log, session id, search index, temporary files) with mode 0600,
+writes (memory, conversation log, session id, search index, the database `fronde.db` and its
+`-wal` and `-shm` files, temporary files) with mode 0600,
 whatever the umask. At start, a data directory that group or others could enter is tightened to
 0700 and a warning is logged. Other users on the same machine cannot read your memory or
 conversation. This does not encrypt anything: see below.

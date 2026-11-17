@@ -12,6 +12,7 @@ chrono-tz.workspace = true
 axum = { workspace = true, features = ["ws"] }
 clap.workspace = true
 fronde-agent = { path = "../agent" }
+fronde-db = { path = "../db" }
 fronde-hub = { path = "../hub" }
 fronde-protocol = { path = "../protocol" }
 fronde-wasm = { path = "../wasm" }

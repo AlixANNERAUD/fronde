@@ -10,6 +10,9 @@ and offers a web chat.
 | --- | --- |
 | `crates/hub` (`fronde-hub`) | Tools registry and search, memory, upstream MCP servers, the MCP server; `source.rs` is where tools come from: the `ToolSource` trait and the one supervisor that starts every source (the hub's own tools, upstream servers, components), registers its tools and restarts it with backoff; `origin.rs` the gate's shared rules: `Origin` (scheme, host normalised by the URL standard, port), parsed once from the configuration and once per request, which addresses are local or never allowed, which origins may carry credentials |
 | `crates/fs` (`fronde-fs`) | Private-file helpers shared by the hub and the agent: 0700 directories, 0600 files, durable atomic replacement (`atomic-write-file`: sync of file and directory) |
+| `crates/db` (`fronde-db`) | The database, one SQLite file `<data>/fronde.db` through SeaORM: `open` (created 0600, WAL, `synchronous = FULL`, migrations applied), `begin_write` (`BEGIN IMMEDIATE`, for every transaction that writes), `kv` (values by scope and key, optionally expiring) |
+| `crates/migration` (`fronde-migration`) | The schema's migrations (sea-orm-migration), one per change, never edited once pushed; `examples/migrate.rs` applies them to a SQLite URL for `mise run entities` |
+| `crates/entity` (`fronde-entity`) | The SeaORM entities, generated from the migrated schema by `mise run entities`, never edited by hand |
 | `crates/protocol` (`fronde-protocol`) | Types shared by the conversation log, the server and the web interface (`Event`, `Entry`); serde and chrono only |
 | `crates/agent` (`fronde-agent`) | The ACP client that drives the coding agent (Claude Code through its ACP adapter); an in-process fake agent behind the `testing` feature |
 | `crates/client` (`fronde-client`) | The web UI's logic without any framework: `chat.rs` turns server messages into what the chat shows, `connection.rs` is the WebSocket reconnection state machine; depends on the protocol only |
@@ -59,6 +62,7 @@ through mr-boxington.
 | `mise run web-build` | Release build of the Dioxus interface into `target/dx/fronde-web/release/web/public` |
 | `mise run build` | Release build: `web-build`, then `target/release/fronde` |
 | `mise run docs` | Builds the user guide (mdBook, `docs/`) into `docs/book` |
+| `mise run entities` | Regenerates `crates/entity` from the migrations with `sea-orm-cli` |
 
 Builds are heavy: run one cargo command at a time, through `mise exec -- cargo …` or a mise task.
 
@@ -99,6 +103,9 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
 - Tool names match `^[a-z][a-z0-9_]{0,63}$`; tool descriptions are short imperative rules; a tool
   error always says how to fix it. A component's tools start with a prefix of its manifest's
   `tool_prefixes`, which no other source uses.
+- Durable structured state lives in the one database, `fronde.db`, through SeaORM; raw SQL only
+  for FTS5. A schema change is a new migration, never an edit of a pushed one, followed by
+  `mise run entities`: entities are generated, never edited by hand.
 - Secrets never appear in the configuration file, logs or tool output: `{ file = "…" }` or
   `{ env = "…" }` only.
 - Nothing read from an external source (web, email, document) is saved to memory automatically.

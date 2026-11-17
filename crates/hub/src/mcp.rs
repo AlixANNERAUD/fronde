@@ -97,6 +97,7 @@ mod tests {
             assert_eq!(mode(&data.join(p)), 0o700, "{p}");
         }
         assert_eq!(mode(&data.join("index.sqlite")), 0o600);
+        assert_eq!(mode(&data.join("fronde.db")), 0o600);
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
         start_hub(&data).await;
         assert_eq!(mode(&data), 0o700);
@@ -108,7 +109,9 @@ mod tests {
             dir.display().to_string()
         );
         let config: crate::config::Config = toml::from_str(&toml).unwrap();
-        let hub = Hub::start(config, vec![]).await.unwrap();
+        crate::private::prepare_data_dir(dir).unwrap();
+        let db = fronde_db::open(dir).await.unwrap();
+        let hub = Hub::start(config, db, vec![]).await.unwrap();
         let (mut d, h) = typed_tool(
             "mcphub_secret_tool",
             "Hidden",

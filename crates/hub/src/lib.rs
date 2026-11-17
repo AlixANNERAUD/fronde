@@ -12,6 +12,7 @@ pub mod tools;
 pub mod upstream;
 
 use config::{Config, SourceConfig};
+use fronde_db::DatabaseConnection;
 use memory::index::MemoryIndex;
 use memory::{MemoryStore, tools::memory_tools};
 use source::{Native, Supervisor, ToolSource};
@@ -25,6 +26,8 @@ pub struct Hub {
     pub memory: Arc<MemoryStore>,
     pub sources: Supervisor,
     pub config: Config,
+    /// Fronde's database (`fronde_db::open`), shared with the rest of the server.
+    pub db: DatabaseConnection,
 }
 
 impl Hub {
@@ -32,6 +35,7 @@ impl Hub {
     /// with a warning) and connect upstream servers in the background.
     pub async fn start(
         config: Config,
+        db: DatabaseConnection,
         components: Vec<Arc<dyn ToolSource>>,
     ) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
@@ -65,6 +69,7 @@ impl Hub {
             memory,
             sources,
             config,
+            db,
         })
     }
 }

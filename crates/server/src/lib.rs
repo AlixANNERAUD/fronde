@@ -172,7 +172,9 @@ pub async fn start_with(
     let user = config.data.user.clone();
     let agent = config.agent.clone();
     let components = component_sources(&config)?;
-    let hub = Arc::new(Hub::start(config, components).await?);
+    fronde_hub::private::prepare_data_dir(&data_dir)?;
+    let db = fronde_db::open(&data_dir).await?;
+    let hub = Arc::new(Hub::start(config, db, components).await?);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot listen on {listen}"))?;

@@ -1,0 +1,27 @@
+[package]
+name = "fronde-db"
+description = "Fronde's SQLite database: opening, migrations, transactions and the key-value table."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+fronde-entity = { path = "../entity" }
+fronde-fs = { path = "../fs" }
+fronde-migration = { path = "../migration" }
+percent-encoding = "2"
+sea-orm.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
+[lints]
+workspace = true

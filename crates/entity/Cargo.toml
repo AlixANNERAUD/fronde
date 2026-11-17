@@ -1,0 +1,15 @@
+[package]
+name = "fronde-entity"
+description = "Database entities of Fronde."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+sea-orm.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

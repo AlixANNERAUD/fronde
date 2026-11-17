@@ -8,6 +8,8 @@ mr-boxington = "latest"
 # The Dioxus CLI builds the web interface. It downloads the tools it needs itself (wasm-bindgen
 # matching Cargo.lock, wasm-opt, esbuild) into ~/.local/share/.dx, or $DX_HOME when set.
 "github:DioxusLabs/dioxus" = "0.7.10"
+# Generates the entities from the migrated schema (mise run entities).
+"github:SeaQL/sea-orm" = { version = "2.0.4", version_prefix = "sea-orm-cli@", bin = "sea-orm-cli" }
 # Builds the documentation in docs/ (mise run docs).
 "github:rust-lang/mdBook" = { version = "0.5.4", bin = "mdbook" }
 
@@ -153,6 +155,25 @@ run = '''
 tailwindcss --input crates/web/style/tailwind.css --output crates/web/assets/tailwind.css --watch=always &
 trap 'kill $!' EXIT
 dx serve --package fronde-web --platform web
+'''
+
+# The throwaway database and the generated files live under target/ rather than the system
+# temporary directory, and the committed entities are only replaced once generation succeeded.
+# The example applies the migrations without building the server. FTS5 tables (virtual and
+# shadow) and the session store's table are not entities.
+[tasks.entities]
+description = "Regenerate the SeaORM entities from the migrations"
+run = '''
+set -eu
+directory=target/entities-schema
+rm -rf "$directory"
+mkdir -p "$directory"
+cargo run --quiet --package fronde-migration --example migrate -- "sqlite://$PWD/$directory/schema.db?mode=rwc"
+sea-orm-cli generate entity --database-url "sqlite://$PWD/$directory/schema.db" --output-dir "$directory/entities" --with-serde both --date-time-crate chrono --banner-version off --ignore-tables seaql_migrations,tower_sessions,memory_fts,memory_fts_data,memory_fts_idx,memory_fts_content,memory_fts_docsize,memory_fts_config
+rm -rf crates/entity/src/entities
+mv "$directory/entities" crates/entity/src/entities
+rm -rf "$directory"
+cargo fmt --package fronde-entity
 '''
 
 [tasks.docs]

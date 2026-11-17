@@ -26,6 +26,7 @@ mise run agent   # the Claude adapter, to chat with a real agent
 | `mise run web-build` | Release build of the web interface |
 | `mise run build` | Release build: `web-build` and `components`, then `target/release/fronde`, which approves the components of `components/dist` it was built with |
 | `mise run docs` | Builds this guide into `docs/book` |
+| `mise run entities` | Regenerates the database entities (`crates/entity`) from the migrations |
 
 Builds are heavy: run one Cargo command at a time, through a task or `mise exec -- cargo …`.
 
@@ -43,6 +44,15 @@ Open <http://127.0.0.1:8080>. dx serves the pages and passes the chat's WebSocke
 sign-in forms (`/auth/…`) to the server, so any route only the backend answers must stay under one
 of those. `mise run dev` writes its configuration, a random token and its data under `target/dev`,
 and needs the Claude adapter on the `PATH` to chat.
+
+## Change the database schema
+
+The database is SQLite through [SeaORM](https://www.sea-ql.org/SeaORM/). A schema change is a new
+migration in `crates/migration`, named `mYYYYMMDD_NNNNNN_purpose` and appended to
+`Migrator::migrations`; a migration that was pushed is never edited, since databases that applied
+it would never see the change. Then run `mise run entities`, which applies the migrations to a
+throwaway database under `target/` and regenerates `crates/entity` with `sea-orm-cli`. The
+entities are generated, never edited by hand. Fronde applies pending migrations at each start.
 
 ## Tests
 

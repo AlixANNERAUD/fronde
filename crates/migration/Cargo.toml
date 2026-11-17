@@ -1,0 +1,17 @@
+[package]
+name = "fronde-migration"
+description = "Database migrations of Fronde."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+sea-orm-migration.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
