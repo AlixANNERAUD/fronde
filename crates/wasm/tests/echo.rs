@@ -513,7 +513,7 @@ async fn rejects_unsupported_api_version() {
 #[tokio::test]
 async fn tools_register_in_the_hub_registry() {
     let registry = Arc::new(Registry::new());
-    registry.replace_source("hub", meta_tools(&registry, None));
+    registry.replace_source("hub", meta_tools(&registry, None, None));
     registry.replace_source("echo", load(spec()).await.tools());
 
     let visible: Vec<String> = registry.visible().into_iter().map(|d| d.name).collect();

@@ -26,7 +26,7 @@ the current `USER.md` and `MEMORY.md`. The client does not need to search memory
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `search_tools` | `need` (text), `limit` (1 to 10, default 5) | Finds deferred tools by need, best first, and returns their names, descriptions and input schemas. With the chat, it also lists to a thread's agent (never to an outside client) the shipped components not set up yet that the need may be about (all of them when no tool matches), as `{"integration", "description", "status": "available, not set up: call integrations_request_setup"}`. |
+| `search_tools` | `need` (text), `limit` (1 to 10, default 5) | Finds deferred tools by need, best first, and returns their names, descriptions and input schemas. With the chat, it also lists to the agent of a thread the owner talks to (never to an outside client or a sub-agent) the shipped components not set up yet that the need may be about (all of them when no tool matches), as `{"integration", "description", "status": "available, not set up: call integrations_request_setup"}`. |
 | `use_tool` | `name`, `arguments` (object) | Calls a tool found with `search_tools`. |
 
 Deferred tools are hidden from the tool list to keep the agent's context small. Today the
@@ -192,15 +192,22 @@ saying why. Once answered, Fronde:
 2. asks the admin to confirm on a second card when the answer sends a secret or allows an origin
    the first card did not show (a URL changed to another server), allows local addresses (each
    origin listed), or replaces a stored secret the first card did not name;
-3. under a lock per integration, held until the entry is added (a second setup of it is refused
-   before keeping anything), seals each secret in `fronde.db` for each origin of its credential
-   (`<integration>_<credential>`, numbered when that name is stored for another origin);
+3. under a lock per integration, held until the entry is added (a second setup of it, or one
+   the supervisor already runs, is refused before keeping anything; a call cut while waiting for
+   it stops), reads `fronde.toml` again and checks the entry could be added to it, then seals
+   each secret in `fronde.db` for each origin of its credential (`<integration>_<credential>`,
+   numbered when that name is stored for another origin; a name stored meanwhile is not
+   replaced unless the card said so);
 4. checks the whole entry again, with the stored secrets, then reads `fronde.toml` again and
    writes it at the end (comments, order and file mode kept, never through a link, replaced by an
    atomic rename that detaches a hard link) when the file has no entry of that name and still
-   passes every check of `fronde check` with it, read again once if it changed meanwhile; when
-   the file cannot be written, shows the entry to paste on a card of its own;
-5. starts the component.
+   passes every check of `config::load` with it, read again once if it changed meanwhile (by
+   inode, modification time and size: an edit keeping the size within the timestamps' precision
+   goes unnoticed); when the file cannot be written, shows the entry to paste on a card of its
+   own. A file that no longer loads is reported to the agent without its content (`fronde check`
+   says why); the log names the file and the line;
+5. starts the component, which runs until Fronde stops and is not offered again meanwhile, even
+   if its entry is not in `fronde.toml`.
 
 ```json
 {"result": {"status": "set_up", "integration": "calendar", "tools": ["calendar_create", "…"],
@@ -210,10 +217,12 @@ saying why. Once answered, Fronde:
 `config` is `not_written` with a `snippet` when the file could not be written; `master_key_made`
 says where the first secret kept made the master key. A declined, expired or cancelled card
 returns `{"status": "declined"}`, `"expired"` or `"cancelled"`. A failure after the answer is an
-error saying what was kept (stored secrets) and that the configuration is unchanged.
+error saying what was kept (stored secrets) and that the configuration is unchanged; before the
+entry is written, the secrets stored under new names are removed again.
 
-The card is tied to the call: a call its client cuts cancels it (cut after the answer, it keeps
-no secret and writes nothing), a restart expires it, and its answer never comes later as a
+The card is tied to the call: a call its client cuts cancels it (cut after the answer, it writes
+nothing, and removes the secrets it stored under new names; one it replaced keeps the new
+value), a restart expires it, and its answer never comes later as a
 message. A turn a sub-agent's result started cannot ask for it (the call is refused), nor a
 sub-agent in any turn, nor a call outside the caller's turn. See
 [Set up an integration from the chat](../how-to/set-up-an-integration-from-the-chat.md).

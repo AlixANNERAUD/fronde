@@ -2978,3 +2978,105 @@ async fn a_sub_agent_cannot_ask_for_a_setup() {
     assert_eq!(requests_in(&assistant), 0, "no card was shown");
     bench.gate.notify_waiters();
 }
+
+/// Whether `found`, what `search_tools` returned, lists the integration `name`.
+fn lists_integration(found: &Value, name: &str) -> bool {
+    found["result"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["integration"] == name))
+}
+
+/// `search_tools` tells only the agent of a thread the owner talks to of the integrations it
+/// may set up: a sub-agent, which cannot, is not told.
+#[tokio::test]
+async fn search_tools_lists_no_integration_to_a_sub_agent() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let need = json!({"arguments": {"need": "echo some text"}});
+    let found = call(&main, "search_tools", need.clone()).await;
+    assert!(lists_integration(&found, "echo"), "{found}");
+    let child = start_child(&main, TASK).await;
+    let child_client = bench
+        .client(&token_of(&bench, child).await, "claude-code", &[])
+        .await;
+    let found = call(&child_client, "search_tools", need).await;
+    assert!(!lists_integration(&found, "echo"), "{found}");
+    assert!(
+        !found.to_string().contains("integrations_request_setup"),
+        "{found}"
+    );
+    bench.gate.notify_waiters();
+}
+
+/// The confirmation a setup asks once its turn ended is refused, as any card of that turn
+/// would be: nothing is kept or set up.
+#[tokio::test]
+async fn a_setup_confirmation_after_the_turn_ended_is_refused() {
+    use fronde_protocol::{FieldValue, SecretAnswer};
+    const OTHER: &str = "https://dav.example.org/calendars/alix/";
+    let bench = Bench::held().await;
+    let main = bench.assistant(ThreadId::MAIN).await;
+    main.send("Salut".into()).await;
+    let turn = main.current_turn().await;
+    assert!(turn.is_some());
+    let asked = call_in_turn(
+        &bench,
+        turn,
+        "integrations_request_setup",
+        json!({"integration": "calendar", "prefill": {"events_url": "https://cloud.example/dav/"}}),
+    );
+    let (id, _) = next_request(&main, 0).await;
+    // The answer's end is held, so the call waits for it while the turn ends.
+    let closing = bench.journal.hold(Step::Close);
+    let answer = Response::Form {
+        values: [
+            ("events_url".to_owned(), FieldValue::Text(OTHER.into())),
+            ("reminders_url".to_owned(), FieldValue::Text(OTHER.into())),
+            (
+                "caldav.username".to_owned(),
+                FieldValue::Text("alix".into()),
+            ),
+            (
+                "caldav.secret".to_owned(),
+                FieldValue::Secret(SecretAnswer {
+                    secret: SecretValue::new(CANARY.into()),
+                }),
+            ),
+            ("allow.local".to_owned(), FieldValue::Toggle(false)),
+        ]
+        .into(),
+    };
+    let answering = tokio::spawn({
+        let requests = bench.requests.clone();
+        async move { requests.answer(id, answer, &alix()).await }
+    });
+    bench.journal.reached().await;
+    bench.gate.notify_one();
+    timeout(WAIT, async {
+        while main.current_turn().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the turn never ended");
+    closing.notify_one();
+    answering.await.unwrap().unwrap();
+    let refused = timeout(WAIT, asked).await.unwrap().unwrap();
+    let error = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("confirmation could not be asked") && error.contains("turn ended"),
+        "{refused}"
+    );
+    wait_for_stream(&main, turn_ended).await;
+    assert_eq!(requests_in(&main), 1, "no confirmation was shown");
+    assert_eq!(
+        bench
+            .requests
+            .stored_origin("calendar_caldav")
+            .await
+            .unwrap(),
+        None
+    );
+}

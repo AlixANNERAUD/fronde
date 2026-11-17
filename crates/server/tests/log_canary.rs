@@ -23,6 +23,7 @@ const CALDAV_CANARY: &str = "canary-caldav-secret-9f8e7d6c";
 const MCP_CANARY: &str = "canary-mcp-token-0123456789abcdef0123456789";
 const WEB_CANARY: &str = "canary-web-secret-4a5b6c7d";
 const SETUP_CANARY: &str = "canary-setup-secret-3b9d1e";
+const CONFIG_CANARY: &str = "canary-config-line-5e2f81";
 
 fn dist(file: &str) -> PathBuf {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -974,47 +975,8 @@ async fn setup_secret_never_appears() {
         ..Scan::default()
     };
 
-    let dir = tempfile::tempdir().unwrap();
-    let etc = dir.path().join("etc");
-    std::fs::create_dir(&etc).unwrap();
-    let path = etc.join("fronde.toml");
-    std::fs::write(
-        &path,
-        "[server]\ntoken = { env = \"UNUSED\" }\n[data]\ndir = \"../data\"\ntimezone = \"Europe/Paris\"\nuser = \"alix\"\n[memory]\ngit = false\n[secrets]\nbackend = \"file\"\nmaster_key = { file = \"../master.key\" }\n",
-    )
-    .unwrap();
-    let config = fronde_hub::config::load(&path).unwrap();
-    fronde_hub::private::prepare_data_dir(&config.data.dir).unwrap();
-    let db = fronde_db::open(&config.data.dir).await.unwrap();
-    let (send, mut cards) = tokio::sync::mpsc::unbounded_channel();
-    let store = fronde_requests::SecretStore::new(
-        fronde_db::master_key::Backends::file(dir.path().join("master.key")),
-        Arc::new(fronde_db::ephemeral::EphemeralSecrets::new()),
-    );
-    let requests =
-        fronde_requests::Requests::open_with(db.clone(), Arc::new(Cards(send)), Some(store))
-            .await
-            .unwrap();
-    let integrations = Arc::new(fronde::integrations::Shipped::new(&config, db.clone()).unwrap());
-    let hub = Arc::new(
-        fronde_hub::Hub::start(
-            config,
-            db,
-            vec![],
-            Some(requests.clone()),
-            Some(Arc::new(asks::Asks(requests.clone()))),
-            Some(integrations),
-        )
-        .await
-        .unwrap(),
-    );
-    let context = fronde_hub::tools::CallContext {
-        caller: fronde_requests::Caller::Thread(fronde_protocol::ThreadId::MAIN),
-        user: "alix".into(),
-        topic: "conversation".into(),
-        turn: Some(3),
-        cancelled: tokio_util::sync::CancellationToken::new(),
-    };
+    let (_dir, path, hub, requests, mut cards) = setup_bench().await;
+    let context = setup_context();
     let call = tokio::spawn({
         let hub = hub.clone();
         async move {
@@ -1074,6 +1036,124 @@ async fn setup_secret_never_appears() {
             .unwrap()
             .contains(r#"stored = "calendar_caldav""#)
     );
+
+    let scan = std::mem::take(&mut *scanner.0.lock().unwrap());
+    assert!(scan.lines > 0, "nothing was captured");
+    assert!(scan.leaked.is_empty(), "{:#?}", scan.leaked);
+    for want in &scan.wanted {
+        assert!(scan.seen.contains(want), "{want} is not in the log");
+    }
+}
+
+/// A Fronde whose chat can set up integrations, with its `fronde.toml` and the cards shown.
+async fn setup_bench() -> (
+    tempfile::TempDir,
+    PathBuf,
+    Arc<fronde_hub::Hub>,
+    Arc<fronde_requests::Requests>,
+    tokio::sync::mpsc::UnboundedReceiver<fronde_protocol::RequestId>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let etc = dir.path().join("etc");
+    std::fs::create_dir(&etc).unwrap();
+    let path = etc.join("fronde.toml");
+    std::fs::write(
+        &path,
+        "[server]\ntoken = { env = \"UNUSED\" }\n[data]\ndir = \"../data\"\ntimezone = \"Europe/Paris\"\nuser = \"alix\"\n[memory]\ngit = false\n[secrets]\nbackend = \"file\"\nmaster_key = { file = \"../master.key\" }\n",
+    )
+    .unwrap();
+    let config = fronde_hub::config::load(&path).unwrap();
+    fronde_hub::private::prepare_data_dir(&config.data.dir).unwrap();
+    let db = fronde_db::open(&config.data.dir).await.unwrap();
+    let (send, cards) = tokio::sync::mpsc::unbounded_channel();
+    let store = fronde_requests::SecretStore::new(
+        fronde_db::master_key::Backends::file(dir.path().join("master.key")),
+        Arc::new(fronde_db::ephemeral::EphemeralSecrets::new()),
+    );
+    let requests =
+        fronde_requests::Requests::open_with(db.clone(), Arc::new(Cards(send)), Some(store))
+            .await
+            .unwrap();
+    let integrations = Arc::new(fronde::integrations::Shipped::new(&config, db.clone()).unwrap());
+    let hub = Arc::new(
+        fronde_hub::Hub::start(
+            config,
+            db,
+            vec![],
+            Some(requests.clone()),
+            Some(Arc::new(asks::Asks(requests.clone()))),
+            Some(integrations),
+        )
+        .await
+        .unwrap(),
+    );
+    (dir, path, hub, requests, cards)
+}
+
+/// The main thread's agent, during its turn.
+fn setup_context() -> fronde_hub::tools::CallContext {
+    fronde_hub::tools::CallContext {
+        caller: fronde_requests::Caller::Thread(fronde_protocol::ThreadId::MAIN),
+        user: "alix".into(),
+        topic: "conversation".into(),
+        turn: Some(3),
+        cancelled: tokio_util::sync::CancellationToken::new(),
+    }
+}
+
+/// A line of `fronde.toml` that no longer parses, holding a secret written in plain, never
+/// reaches the agent nor the log when a setup finds the file broken: only its path and line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_config_line_never_appears() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    const WAIT: Duration = Duration::from_secs(30);
+    let _serial = SERIAL.lock().await;
+    let scanner = capture();
+    *scanner.0.lock().unwrap() = Scan {
+        secrets: vec![CONFIG_CANARY.to_owned()],
+        wanted: vec!["no longer loads".to_string()],
+        ..Scan::default()
+    };
+    let (_dir, path, hub, requests, mut cards) = setup_bench().await;
+    let context = setup_context();
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            hub.registry
+                .call_as(
+                    &context,
+                    "integrations_request_setup",
+                    json!({"integration": "echo"}),
+                )
+                .await
+        }
+    });
+    let card = timeout(WAIT, cards.recv()).await.unwrap().unwrap();
+    // The owner pastes a token without its quotes meanwhile: the file no longer parses.
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(&format!("\n[agent]\noauth_token = {CONFIG_CANARY}\n"));
+    std::fs::write(&path, &text).unwrap();
+    let admin = fronde_requests::User {
+        name: "alix".into(),
+        admin: true,
+    };
+    requests
+        .answer(
+            card,
+            fronde_protocol::Response::Form {
+                values: Default::default(),
+            },
+            &admin,
+        )
+        .await
+        .unwrap();
+    let out = timeout(WAIT, call).await.unwrap().unwrap();
+    assert!(out.is_error, "{}", out.to_text());
+    assert!(out.to_text().contains("fronde check"), "{}", out.to_text());
+    assert!(!out.to_text().contains(CONFIG_CANARY), "{}", out.to_text());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
 
     let scan = std::mem::take(&mut *scanner.0.lock().unwrap());
     assert!(scan.lines > 0, "nothing was captured");

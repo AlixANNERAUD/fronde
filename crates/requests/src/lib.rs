@@ -803,24 +803,41 @@ impl Requests {
 
     /// Keeps `value`, a secret an admin typed in a form the hub built (an integration's
     /// setup), sealed under `name` for the canonical `origin` only: refused when no secrets
-    /// are kept, or when `name` is stored for another origin. Where the master key was made,
-    /// when keeping it made one.
+    /// are kept, when `name` is stored for another origin, or when it is stored for `origin`
+    /// and the admin was not told it would be replaced (`replaces`): another card or
+    /// `fronde secret set` stored it meanwhile. Where the master key was made, when keeping it
+    /// made one.
     pub async fn keep_secret(
         &self,
         name: &str,
         origin: &str,
         value: &SecretString,
+        replaces: bool,
     ) -> anyhow::Result<Option<KeyPlace>> {
         let Some(store) = &self.secrets else {
             anyhow::bail!("this Fronde keeps no secret");
         };
         let _saving = self.saving.lock().await;
-        if let Some(other) = self.stored_origin(name).await?
-            && other != origin
-        {
-            anyhow::bail!("a secret {name} is already stored for another origin");
+        match self.stored_origin(name).await? {
+            Some(other) if other != origin => {
+                anyhow::bail!("a secret {name} is already stored for another origin");
+            }
+            Some(_) if !replaces => {
+                anyhow::bail!("a secret {name} was stored meanwhile; it is not replaced");
+            }
+            _ => {}
         }
         self.seal(store, name, origin, value).await
+    }
+
+    /// Removes the secret `name` stored for `origin`, if it is stored for it: what a setup cut
+    /// before it was written undoes of what it kept. True when one was removed.
+    pub async fn forget_secret(&self, name: &str, origin: &str) -> anyhow::Result<bool> {
+        let _saving = self.saving.lock().await;
+        if self.stored_origin(name).await?.as_deref() != Some(origin) {
+            return Ok(false);
+        }
+        fronde_db::secrets::remove(&self.db, fronde_db::secrets::SOURCES, name).await
     }
 
     /// Gives the answer `resolution` to request `row`, which no asker took, to the agent of the

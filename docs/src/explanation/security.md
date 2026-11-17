@@ -227,8 +227,8 @@ What it may change is narrow:
   agent's arguments, each value the agent suggested marked so on the card. The card is
   `admin_only`, refused in a turn a sub-agent's result started (as a secret card and a lasting
   permission are), refused to a sub-agent whatever its turn, refused outside the caller's turn,
-  and never offered to an outside MCP client, which `search_tools` does not tell of the
-  integrations. Only the threads check the turn, so the tool is served only with them.
+  and never offered to an outside MCP client; `search_tools` tells neither it nor a sub-agent of
+  the integrations. Only the threads check the turn, so the tool is served only with them.
 - **Secrets.** A password or token is typed in a secret field of that card. Such a field is
   accepted only in a card this tool builds: a request refuses one from `user_ask`, an elicitation
   or anyone else, and for anyone but an admin. The value goes from the page to the requests, then
@@ -246,13 +246,19 @@ What it may change is narrow:
   files the build ships: neither hashes pinned in the entry nor an approval in the database
   stand in for them), and again with the stored secrets before anything is written. Two setups
   of one integration never store over each other (a lock per integration from the first secret
-  stored to the entry added), and a call cut keeps nothing more.
-- **The file.** Read again before it is written: an entry of the same name added by hand
-  meanwhile is refused, and the new text must pass every check `config::load` makes, so that a
-  setup never leaves a Fronde that cannot start. Edited with `toml_edit`, keeping comments and
+  stored to the entry added, which a cut call stops waiting for), a name stored meanwhile is not
+  replaced unless the card announced it, and a call cut before the entry is written removes the
+  secrets it stored under new names. An integration started from a setup runs until Fronde stops
+  and is never offered nor started again meanwhile, even if its entry left the file.
+- **The file.** Read again before any secret is kept and again before it is written: an entry of
+  the same name added by hand meanwhile is refused, and the new text must pass every check of
+  `config::load`, so that a setup never leaves a Fronde that cannot start. A file that does not
+  load is reported to the agent without its content, which may hold a plain secret; the log
+  names only its path and line. Edited with `toml_edit`, keeping comments and
   order, replaced atomically through `fronde-fs` with its own mode (never wider), never written
   through a link; a hard link is detached by the rename. A change between the read and the
-  rename (inode, modification time, size) reads it again once, then refuses. When it cannot be
+  rename (inode, modification time, size) reads it again once, then refuses; an edit in place
+  that keeps the size within the timestamps' precision goes unnoticed. When it cannot be
   written (Docker's read-only `/config`), Fronde shows the entry to paste instead, which holds
   only stored names. Keep the configuration out of the agent's reach as before: the sandbox does
   not let it write the file, and a read-only mount is still the stronger guard.

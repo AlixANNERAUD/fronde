@@ -20,6 +20,29 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
+/// The `[[sources]]` entries Fronde knows of.
+struct Known {
+    /// The file's, as last read (the configuration's at the start).
+    file: Vec<SourceConfig>,
+    /// Those started since Fronde started: the configuration's, and those a setup added, the
+    /// file's or not (an entry the owner was given to paste, or removed by hand since). They
+    /// run until the next start, so they are never offered again meanwhile.
+    running: Vec<SourceConfig>,
+}
+
+impl Known {
+    /// The file's entries, and the running ones it does not have.
+    fn all(&self) -> Vec<SourceConfig> {
+        let mut all = self.file.clone();
+        for source in &self.running {
+            if !all.iter().any(|known| known.name() == source.name()) {
+                all.push(source.clone());
+            }
+        }
+        all
+    }
+}
+
 /// The components shipped with this build, found beside the binary or in the checkout it was
 /// built from, whose files are the ones the build approves.
 pub struct Shipped {
@@ -30,8 +53,8 @@ pub struct Shipped {
     /// Each shipped component, with its manifest and the hashes the build approves: read once,
     /// they do not change while Fronde runs.
     shipped: Vec<(Integration, Manifest, Hashes)>,
-    /// The `[[sources]]` entries: the configuration's, and those added since.
-    sources: Mutex<Vec<SourceConfig>>,
+    /// The `[[sources]]` entries known: the file's, and those running beside them.
+    known: Mutex<Known>,
     /// Held while an entry is added, so that two cards answered at once add it once.
     adding: tokio::sync::Mutex<()>,
     /// The engine new components run in, made at the first one.
@@ -85,7 +108,10 @@ impl Shipped {
             db,
             backends: config.master_key_backends()?,
             shipped,
-            sources: Mutex::new(config.sources.clone()),
+            known: Mutex::new(Known {
+                file: config.sources.clone(),
+                running: config.sources.clone(),
+            }),
             adding: tokio::sync::Mutex::default(),
             host: tokio::sync::OnceCell::new(),
             write: config_edit::write_atomic,
@@ -101,15 +127,17 @@ impl Shipped {
         self
     }
 
-    fn set_sources(&self, sources: Vec<SourceConfig>) {
-        *self.sources.lock().unwrap_or_else(PoisonError::into_inner) = sources;
+    fn known(&self) -> std::sync::MutexGuard<'_, Known> {
+        self.known.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The file's entries, as just read: those running beside them are kept.
+    fn set_file(&self, sources: Vec<SourceConfig>) {
+        self.known().file = sources;
     }
 
     fn sources(&self) -> Vec<SourceConfig> {
-        self.sources
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.known().all()
     }
 
     /// The checks a start of `entry` runs, with every other entry beside it.
@@ -261,6 +289,27 @@ impl Integrations for Shipped {
         Ok(())
     }
 
+    async fn check_file(&self, entry: &ComponentConfig) -> anyhow::Result<()> {
+        let Some(path) = self.config.path() else {
+            return Ok(());
+        };
+        let base = path.parent().unwrap_or(Path::new("/"));
+        match config_edit::check_component(path, base, entry) {
+            Ok(sources) => {
+                self.set_file(sources);
+                Ok(())
+            }
+            Err(NotAdded::Refused { error, sources }) => {
+                if let Some(sources) = sources {
+                    self.set_file(sources);
+                }
+                Err(error)
+            }
+            // Written by hand then: `add` gives the entry to paste.
+            Err(NotAdded::Unwritable(_)) => Ok(()),
+        }
+    }
+
     async fn add(&self, entry: &ComponentConfig, sources: &Supervisor) -> anyhow::Result<Written> {
         let _adding = self.adding.lock().await;
         if self
@@ -270,6 +319,9 @@ impl Integrations for Shipped {
         {
             bail!("a source named {} is already configured", entry.name);
         }
+        if sources.health().contains_key(&entry.name) {
+            bail!("a source named {} already runs", entry.name);
+        }
         let checks = self.checks(entry).await?;
         let written = match self.config.path() {
             Some(path) => {
@@ -278,12 +330,12 @@ impl Integrations for Shipped {
                     Ok(sources) => {
                         tracing::info!("{}: added to {}", entry.name, path.display());
                         // The file's entries, those added by hand since the start included.
-                        self.set_sources(sources);
+                        self.set_file(sources);
                         Written::File
                     }
                     Err(NotAdded::Refused { error, sources }) => {
                         if let Some(sources) = sources {
-                            self.set_sources(sources);
+                            self.set_file(sources);
                         }
                         return Err(error);
                     }
@@ -298,12 +350,9 @@ impl Integrations for Shipped {
             }
             None => Written::Snippet(config_edit::snippet(entry)?),
         };
-        if written != Written::File {
-            self.sources
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(SourceConfig::Component(entry.clone()));
-        }
+        self.known()
+            .running
+            .push(SourceConfig::Component(entry.clone()));
         let host = self
             .host
             .get_or_try_init(|| async { ComponentHost::new() })

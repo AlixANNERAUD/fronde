@@ -75,4 +75,8 @@ impl ThreadControl for Asks {
     async fn ask(&self, _: ThreadId, ask: Ask) -> Result<Option<Waiter>, ThreadError> {
         self.0.ask(ask).await.map(Some).map_err(ThreadError::Failed)
     }
+
+    async fn is_sub_agent(&self, _: ThreadId) -> bool {
+        false
+    }
 }

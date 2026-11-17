@@ -216,6 +216,9 @@ pub trait ThreadControl: Send + Sync {
     /// its card while that turn still runs, so that the turn's end cancels it before its own end
     /// is logged: `None`, with nothing asked, once that turn is over or ending.
     async fn ask(&self, caller: ThreadId, ask: Ask) -> Result<Option<Waiter>, ThreadError>;
+    /// Whether `thread` is a sub-agent's, another thread's agent having started it; an unknown
+    /// thread counts as one.
+    async fn is_sub_agent(&self, thread: ThreadId) -> bool;
 }
 
 #[derive(Deserialize, JsonSchema)]

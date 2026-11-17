@@ -1813,6 +1813,85 @@ mod secrets {
         );
     }
 
+    /// A setup keeps its secret under a name only as its card said: a new name, or one it
+    /// announced it replaces for that origin. A name stored meanwhile (another card, `fronde
+    /// secret set`), or for another origin, is refused and left as it is.
+    #[tokio::test]
+    async fn keep_secret_replaces_only_what_was_announced() {
+        let bench = bench().await;
+        let requests = &bench.requests;
+        let value = |text: &str| secrecy::SecretString::from(text.to_owned());
+        const ORIGIN: &str = "https://cloud.example";
+        requests
+            .keep_secret("calendar_caldav", ORIGIN, &value("first"), false)
+            .await
+            .unwrap();
+        // Stored meanwhile, not announced: refused.
+        let error = requests
+            .keep_secret("calendar_caldav", ORIGIN, &value("second"), false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("stored meanwhile"),
+            "{error:#}"
+        );
+        // Stored for another origin: refused, even announced.
+        for replaces in [false, true] {
+            assert!(
+                requests
+                    .keep_secret(
+                        "calendar_caldav",
+                        "https://evil.example",
+                        &value("x"),
+                        replaces
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let opened = |key_file: std::path::PathBuf, data: std::path::PathBuf| async move {
+            let db = fronde_db::open(&data).await.unwrap();
+            let sealed = fronde_db::secrets::load_sealed(&db, fronde_db::secrets::SOURCES)
+                .await
+                .unwrap();
+            let key = Backends::file(&key_file).load(&db).await.unwrap().unwrap();
+            sealed
+                .iter()
+                .map(|s| s.open(&key).unwrap().expose_secret().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            opened(bench.key_file.clone(), bench.data()).await,
+            ["first"]
+        );
+        // Announced for that origin: replaced.
+        requests
+            .keep_secret("calendar_caldav", ORIGIN, &value("second"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            opened(bench.key_file.clone(), bench.data()).await,
+            ["second"]
+        );
+        // Forgotten only for its own origin.
+        assert!(
+            !requests
+                .forget_secret("calendar_caldav", "https://evil.example")
+                .await
+                .unwrap()
+        );
+        assert!(
+            requests
+                .forget_secret("calendar_caldav", ORIGIN)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            requests.stored_origin("calendar_caldav").await.unwrap(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn a_stored_name_never_moves_to_another_origin() {
         let bench = bench().await;

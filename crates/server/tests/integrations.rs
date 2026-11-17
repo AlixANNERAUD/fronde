@@ -993,6 +993,8 @@ async fn an_entry_is_written_only_to_a_file_that_still_loads() {
         "{}",
         out.to_text()
     );
+    assert!(out.to_text().contains("fronde check"), "{}", out.to_text());
+    assert!(!out.to_text().contains("command"), "{}", out.to_text());
     assert_eq!(bench.config_text(), broken);
 }
 
@@ -1107,6 +1109,7 @@ async fn the_card_says_which_stored_secret_it_replaces() {
             "calendar_caldav",
             "https://cloud.example",
             &secrecy::SecretString::from("old-password"),
+            false,
         )
         .await
         .unwrap();
@@ -1420,4 +1423,190 @@ async fn no_setup_without_the_threads() {
         .await
         .to_text();
     assert!(!found.contains(r#""integration":"#), "{found}");
+}
+
+/// Fails the first write only, as a mount read-only at first would.
+fn read_only_once(path: &Path, text: &str, mode: u32) -> std::io::Result<()> {
+    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !FAILED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return read_only(path, text, mode);
+    }
+    fronde::config_edit::write_atomic(path, text, mode)
+}
+
+/// An integration running from an entry the owner was given to paste stays set up when
+/// another setup writes `fronde.toml` without it: it is never offered, nor started, twice.
+#[tokio::test]
+async fn an_entry_running_from_memory_is_never_set_up_twice() {
+    let mut bench = bench_writing(|_| {}, Some(read_only_once)).await;
+    let call = bench.call(context("alix"), json!({"integration": "echo"}));
+    let shown = bench.card().await;
+    bench
+        .requests
+        .answer(shown.id, confirmed(), &alix())
+        .await
+        .unwrap();
+    let out = result(call).await;
+    assert_eq!(out["result"]["config"], "not_written", "{out}");
+    let paste = bench.card().await;
+    assert!(fields(&paste.card).is_empty());
+    // The next setup writes the file, which has no echo entry.
+    let call = bench.call(context("alix"), calendar_prefill());
+    let shown = bench.card().await;
+    bench
+        .requests
+        .answer(shown.id, calendar_answer(EVENTS, REMINDERS, false), &alix())
+        .await
+        .unwrap();
+    let out = result(call).await;
+    assert_eq!(out["result"]["config"], "written", "{out}");
+    assert!(!bench.config_text().contains("name = \"echo\""));
+    // Echo still runs, and is offered no more.
+    assert!(
+        bench
+            .integrations
+            .available()
+            .iter()
+            .all(|i| i.name != "echo")
+    );
+    let again = output(bench.call(context("alix"), json!({"integration": "echo"}))).await;
+    assert!(
+        again.is_error && again.to_text().contains("no integration"),
+        "{}",
+        again.to_text()
+    );
+    // Nor started again under its name, whatever asks.
+    let entry = ComponentConfig {
+        name: "echo".into(),
+        path: fronde_hub::config::shipped_component("echo").unwrap(),
+        manifest: None,
+        sha256: None,
+        manifest_sha256: None,
+        allow: Vec::new(),
+        settings: Default::default(),
+        credentials: Vec::new(),
+    };
+    let error = bench
+        .integrations
+        .add(&entry, &bench.hub.sources)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("echo"), "{error:#}");
+}
+
+/// Holds every write until released, as a slow disk would: the setup writing holds its lock.
+fn held_write(path: &Path, text: &str, mode: u32) -> std::io::Result<()> {
+    let (lock, released) = &HELD;
+    let mut state = lock.lock().unwrap();
+    state.0 = true;
+    released.notify_all();
+    while !state.1 {
+        state = released.wait(state).unwrap();
+    }
+    drop(state);
+    fronde::config_edit::write_atomic(path, text, mode)
+}
+
+/// For [`held_write`]: (a write is held, the writes are released).
+static HELD: (std::sync::Mutex<(bool, bool)>, std::sync::Condvar) = (
+    std::sync::Mutex::new((false, false)),
+    std::sync::Condvar::new(),
+);
+
+/// A call cut while it waits for another setup of the same integration stops at once,
+/// keeping nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_cut_while_waiting_for_the_lock_stops() {
+    let mut bench = bench_writing(|_| {}, Some(held_write)).await;
+    let first = bench.call(context("alix"), json!({"integration": "echo"}));
+    let first_card = bench.card().await;
+    let second_context = context("alix");
+    let cut = second_context.cancelled.clone();
+    let second = bench.call(second_context, json!({"integration": "echo"}));
+    let second_card = bench.card().await;
+    bench
+        .requests
+        .answer(first_card.id, confirmed(), &alix())
+        .await
+        .unwrap();
+    // The first setup holds the lock, writing.
+    tokio::task::spawn_blocking(|| {
+        let (lock, held) = &HELD;
+        let mut state = lock.lock().unwrap();
+        while !state.0 {
+            state = held.wait(state).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    bench
+        .requests
+        .answer(second_card.id, confirmed(), &alix())
+        .await
+        .unwrap();
+    // Time to reach the lock, then the cut.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cut.cancel();
+    let out = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the cut call still waits for the lock")
+        .unwrap();
+    assert!(
+        out.is_error && out.to_text().contains("cut"),
+        "{}",
+        out.to_text()
+    );
+    {
+        let (lock, released) = &HELD;
+        lock.lock().unwrap().1 = true;
+        released.notify_all();
+    }
+    let out = result(first).await;
+    assert_eq!(out["result"]["status"], "set_up", "{out}");
+    assert_eq!(bench.config_text().matches("[[sources]]").count(), 1);
+}
+
+/// An entry of the same name added by hand while the card is open is found before any secret
+/// is stored: the secret stored under the name the card said it replaces keeps its value.
+#[tokio::test]
+async fn a_hand_added_entry_leaves_the_stored_secrets_alone() {
+    let mut bench = bench().await;
+    bench
+        .requests
+        .keep_secret(
+            "calendar_caldav",
+            "https://cloud.example",
+            &secrecy::SecretString::from("old-password"),
+            false,
+        )
+        .await
+        .unwrap();
+    let call = bench.call(context("alix"), calendar_prefill());
+    let shown = bench.card().await;
+    assert!(message(&shown.card).contains("remplace le secret"));
+    let by_hand = format!(
+        "{CONFIG}\n[[sources]]\nkind = \"mcp\"\nname = \"calendar\"\nurl = \"https://mcp.example\"\n"
+    );
+    std::fs::write(&bench.config, &by_hand).unwrap();
+    bench
+        .requests
+        .answer(shown.id, calendar_answer(EVENTS, REMINDERS, false), &alix())
+        .await
+        .unwrap();
+    let out = output(call).await;
+    assert!(
+        out.is_error
+            && out
+                .to_text()
+                .contains("already has a [[sources]] entry named calendar"),
+        "{}",
+        out.to_text()
+    );
+    assert_eq!(
+        stored(&bench, "calendar_caldav", "https://cloud.example")
+            .await
+            .as_deref(),
+        Some("old-password")
+    );
+    assert_eq!(bench.config_text(), by_hand);
 }

@@ -4,6 +4,7 @@ use crate::config::is_valid_name;
 use crate::integrations::Integrations;
 use crate::search::ToolIndex;
 use crate::source::Tool;
+use crate::threads::ThreadControl;
 use anyhow::bail;
 use async_trait::async_trait;
 use fronde_requests::Caller;
@@ -446,6 +447,8 @@ impl ToolHandler for UseTool {
 struct SearchTools {
     registry: std::sync::Weak<Registry>,
     integrations: Option<Arc<dyn Integrations>>,
+    /// Which threads are sub-agents', which are not told of the integrations.
+    threads: Option<Arc<dyn ThreadControl>>,
 }
 
 impl SearchTools {
@@ -503,25 +506,31 @@ impl ToolHandler for SearchTools {
         }
     }
 
-    /// Only a thread's agent may set an integration up: anyone else is not told of them.
+    /// Only the agent of a thread the owner talks to may set an integration up: anyone else (an
+    /// outside client, a sub-agent) is not told of them.
     async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
         match parse::<SearchArgs>(args) {
             Ok(a) => {
-                self.search(a, matches!(context.caller, Caller::Thread(_)))
-                    .await
+                let told = match (&context.caller, &self.threads) {
+                    (Caller::Thread(thread), Some(threads)) => !threads.is_sub_agent(*thread).await,
+                    _ => false,
+                };
+                self.search(a, told).await
             }
             Err(error) => error,
         }
     }
 }
 
-/// `search_tools` and `use_tool`, over `registry`. With `integrations`, `search_tools` also
-/// lists to a thread's agent the shipped components not set up yet that the need may be about
-/// (every one when no tool matches), each as an `integration` to set up with
-/// `integrations_request_setup`; an outside client is not told of them.
+/// `search_tools` and `use_tool`, over `registry`. With `integrations` and `threads`,
+/// `search_tools` also lists to the agent of a thread that is not a sub-agent's the shipped
+/// components not set up yet that the need may be about (every one when no tool matches), each
+/// as an `integration` to set up with `integrations_request_setup`; an outside client or a
+/// sub-agent is not told of them.
 pub fn meta_tools(
     registry: &Arc<Registry>,
     integrations: Option<Arc<dyn Integrations>>,
+    threads: Option<Arc<dyn ThreadControl>>,
 ) -> Vec<Tool> {
     let def = ToolDef {
         name: "search_tools".to_string(),
@@ -533,6 +542,7 @@ pub fn meta_tools(
     let h: Arc<dyn ToolHandler> = Arc::new(SearchTools {
         registry: Arc::downgrade(registry),
         integrations,
+        threads,
     });
     let search = (def, h);
     let def = ToolDef {

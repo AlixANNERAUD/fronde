@@ -72,7 +72,7 @@ impl Hub {
         // the threads check the turn that asks: without them, a turn a sub-agent's result
         // started would not be refused.
         let integrations = integrations.filter(|_| requests.is_some() && threads.is_some());
-        let mut own = meta_tools(&registry, integrations.clone());
+        let mut own = meta_tools(&registry, integrations.clone(), threads.clone());
         own.extend(memory_tools(memory.clone(), index, config.memory.git));
         // Upstream servers' forms go to the admin; the one user so far is the owner, an admin.
         let asking = requests.as_ref().map(|requests| {

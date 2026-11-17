@@ -133,6 +133,11 @@ pub trait Integrations: Send + Sync {
     /// `prepare` on `entry` as its start would, reading the stored secrets: nothing is written
     /// or started.
     async fn dry_run(&self, entry: &ComponentConfig) -> anyhow::Result<()>;
+    /// Whether `entry` could be added to the configuration file now, read again: no entry of
+    /// its name there, and the file passing every check of `config::load` with it. Nothing is
+    /// written; a file that cannot be written passes (its entry is pasted by hand). The error
+    /// never quotes the file.
+    async fn check_file(&self, entry: &ComponentConfig) -> anyhow::Result<()>;
     /// Adds `entry` to the configuration file, keeping what the file holds, or gives the entry
     /// to paste when the file cannot be written; then starts it under `sources`.
     async fn add(&self, entry: &ComponentConfig, sources: &Supervisor) -> anyhow::Result<Written>;
@@ -768,16 +773,45 @@ struct Shown {
     replaces: Vec<Planned>,
 }
 
-/// Why the call stops once it was cut, for nobody (the caller is gone) and the log.
-fn cut(stored: &[String]) -> Failed {
-    Failed(if stored.is_empty() {
+/// Why the call stops once it was cut, for nobody (the caller is gone) and the log: `undone`
+/// says what became of the secrets it had stored, when it had.
+fn cut(undone: &str) -> Failed {
+    Failed(if undone.is_empty() {
         "the call was cut before the integration was set up; nothing was kept or written".into()
     } else {
-        format!(
-            "the call was cut before the integration was added; its secrets stay stored ({}), the configuration is unchanged",
-            stored.join(", ")
-        )
+        format!("the call was cut before the integration was added; nothing was written; {undone}")
     })
+}
+
+/// Removes the secrets this setup stored under new names (`kept`), and says what is left: a
+/// secret it replaced keeps the value the admin typed, the one before is gone.
+async fn undo(setup: &Setup, kept: &[Planned]) -> String {
+    let mut replaced = Vec::new();
+    for planned in kept {
+        if planned.replaces {
+            replaced.push(planned.name.clone());
+            continue;
+        }
+        if let Err(error) = setup
+            .requests
+            .forget_secret(&planned.name, &planned.origin.to_string())
+            .await
+        {
+            tracing::error!(
+                "{TOOL}: cannot remove the secret {} it stored: {error:#}",
+                planned.name
+            );
+            replaced.push(planned.name.clone());
+        }
+    }
+    if replaced.is_empty() {
+        "no secret was kept".into()
+    } else {
+        format!(
+            "these stored secrets now hold what the owner typed: {}",
+            replaced.join(", ")
+        )
+    }
 }
 
 /// Whether `origin`'s host looks like this machine or its network: a loopback or private
@@ -921,39 +955,70 @@ async fn apply(
         .await?;
     }
     if context.cancelled.is_cancelled() {
-        return Err(cut(&[]));
+        return Err(cut(""));
     }
     // From the first secret stored to the entry added, no other setup of this integration
-    // runs: one set up meanwhile is refused here, before anything is stored over it.
-    let _setting_up = setup.setting_up.lock(name).await;
-    if !setup
-        .integrations
-        .available()
-        .iter()
-        .any(|available| available.name == *name)
+    // runs: one set up meanwhile is refused here, before anything is stored over it. A call
+    // cut while it waits stops there.
+    let _setting_up = tokio::select! {
+        biased;
+        () = context.cancelled.cancelled() => return Err(cut("")),
+        guard = setup.setting_up.lock(name) => guard,
+    };
+    if context.cancelled.is_cancelled() {
+        return Err(cut(""));
+    }
+    if setup.sources.health().contains_key(name.as_str())
+        || !setup
+            .integrations
+            .available()
+            .iter()
+            .any(|available| available.name == *name)
     {
         return Err(Failed(format!(
             "{name} was set up meanwhile, by another card; nothing was kept from this one"
         )));
     }
+    // The file as it is now, before any secret is stored: an entry of that name added by hand
+    // since the card was shown leaves every stored secret as it was.
+    setup
+        .integrations
+        .check_file(&entry)
+        .await
+        .map_err(|error| {
+            Failed(format!(
+                "{name} cannot be added to fronde.toml: {error:#}; nothing was kept"
+            ))
+        })?;
     if plan(setup, integration, &destinations).await? != planned {
         return Err(Failed(
             "the stored secrets changed while the card was open; nothing was kept, ask again"
                 .into(),
         ));
     }
-    let (credentials, new_key) = keep_secrets(setup, integration, &planned, &answer).await?;
+    let mut kept = Vec::new();
+    let keeping = keep_secrets(setup, integration, &planned, &answer, &mut kept).await;
+    drop(answer);
+    let (credentials, new_key) = match keeping {
+        Ok(keeping) => keeping,
+        Err(Failed(message)) => {
+            let undone = undo(setup, &kept).await;
+            return Err(Failed(format!("{message}; {undone}")));
+        }
+    };
     entry.credentials = credentials;
     let stored: Vec<String> = planned.iter().map(|p| p.name.clone()).collect();
-    drop(answer);
-    setup.integrations.dry_run(&entry).await.map_err(|error| {
-        Failed(format!(
-            "{name} cannot be set up as answered: {error:#}; its secrets stay stored ({}), the configuration is unchanged",
-            stored.join(", ")
-        ))
-    })?;
     if context.cancelled.is_cancelled() {
-        return Err(cut(&stored));
+        return Err(cut(&undo(setup, &kept).await));
+    }
+    if let Err(error) = setup.integrations.dry_run(&entry).await {
+        let undone = undo(setup, &kept).await;
+        return Err(Failed(format!(
+            "{name} cannot be set up as answered: {error:#}; the configuration is unchanged; {undone}"
+        )));
+    }
+    if context.cancelled.is_cancelled() {
+        return Err(cut(&undo(setup, &kept).await));
     }
     let written = setup
         .integrations
@@ -1111,13 +1176,15 @@ async fn plan(
     Ok(planned)
 }
 
-/// Seals each secret answered as `planned`, and returns the entry's credentials naming them, and
-/// where the master key was made, if keeping them made it.
+/// Seals each secret answered as `planned`, each one stored added to `kept`, and returns the
+/// entry's credentials naming them, and where the master key was made, if keeping them made
+/// it. A name stored meanwhile is not replaced unless the plan said so.
 async fn keep_secrets(
     setup: &Setup,
     integration: &Integration,
     planned: &[Planned],
     answer: &Answer,
+    kept: &mut Vec<Planned>,
 ) -> Result<(Vec<CredentialConfig>, Option<KeyPlace>), Failed> {
     for credential in &integration.credentials {
         if !answer.secrets.contains_key(&credential.name) {
@@ -1143,7 +1210,7 @@ async fn keep_secrets(
         let name = &planned.name;
         let made = setup
             .requests
-            .keep_secret(name, &planned.origin.to_string(), secret)
+            .keep_secret(name, &planned.origin.to_string(), secret, planned.replaces)
             .await
             .map_err(|error| {
                 tracing::error!("{TOOL}: cannot keep the secret {name}: {error:#}");
@@ -1151,6 +1218,7 @@ async fn keep_secrets(
                     "the secret {name} could not be kept; nothing was written to the configuration"
                 ))
             })?;
+        kept.push(planned.clone());
         new_key = new_key.or(made);
         let stored = Secret::Stored {
             stored: name.clone(),

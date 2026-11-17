@@ -116,15 +116,18 @@ pub enum NotAdded {
     Unwritable(anyhow::Error),
     /// Adding it would leave a configuration Fronde cannot start with (a source of that name
     /// added by hand meanwhile, a check of `config::load` that fails), or the file kept changing:
-    /// nothing is written, and pasting the entry would not do either. `sources` are the file's
-    /// entries, when it could be read.
+    /// nothing is written, and pasting the entry would not do either. `error` never quotes the
+    /// file, which may hold a secret written in plain. `sources` are the file's entries, when it
+    /// could be read.
     Refused {
         error: anyhow::Error,
         sources: Option<Vec<SourceConfig>>,
     },
 }
 
-/// What identifies the file's content as read: replaced or edited, it changes.
+/// What identifies the file's content as read: replaced or edited, it changes. An edit in
+/// place that keeps the size, within the granularity of the file system's timestamps, keeps
+/// it too: that one goes unnoticed.
 #[derive(Debug, PartialEq, Eq)]
 struct Stamp {
     #[cfg(unix)]
@@ -168,6 +171,108 @@ fn stamp(path: &Path) -> anyhow::Result<(Stamp, u32)> {
     ))
 }
 
+/// A refusal for a text of `path` that `config::load` would refuse: logged with the path and,
+/// for TOML that does not parse, the line, never the error itself, which quotes the file;
+/// `with_entry` when only the text with the new entry fails.
+fn not_loading(
+    path: &Path,
+    text: &str,
+    error: &anyhow::Error,
+    with_entry: bool,
+    sources: Option<Vec<SourceConfig>>,
+) -> NotAdded {
+    let line = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<toml::de::Error>())
+        .and_then(toml::de::Error::span)
+        .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
+    let at = line
+        .map(|line| format!(" at line {line}"))
+        .unwrap_or_default();
+    let what = if with_entry {
+        "would no longer load with the new entry"
+    } else {
+        "no longer loads"
+    };
+    tracing::warn!(
+        "{}{at} {what}: nothing was written; `fronde check` says why",
+        path.display()
+    );
+    let message = if with_entry {
+        format!(
+            "with the new entry, {} would no longer load; nothing was written; the owner can run `fronde check`",
+            path.display()
+        )
+    } else {
+        format!(
+            "{} no longer loads; nothing was written; the owner can run `fronde check`",
+            path.display()
+        )
+    };
+    NotAdded::Refused {
+        error: anyhow::anyhow!(message),
+        sources,
+    }
+}
+
+/// `fronde.toml` read and checked for `entry`, not written yet.
+struct Checked {
+    before: Stamp,
+    mode: u32,
+    /// The text with the entry.
+    new: String,
+    /// The file's entries, as it is.
+    current: Vec<SourceConfig>,
+    /// The file's entries, with the new one.
+    added: Vec<SourceConfig>,
+}
+
+/// Reads `path` and checks that `entry` can be added to it: no entry of that name, and the
+/// file, as it is and with the entry, passes every check of `config::load`.
+fn read_checked(path: &Path, base: &Path, entry: &ComponentConfig) -> Result<Checked, NotAdded> {
+    let unwritable = |error: anyhow::Error| NotAdded::Unwritable(error);
+    let (before, mode) = stamp(path).map_err(unwritable)?;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read {}", path.display()))
+        .map_err(unwritable)?;
+    let current = fronde_hub::config::load_str(&text, base)
+        .map_err(|error| not_loading(path, &text, &error, false, None))?
+        .sources;
+    if current.iter().any(|s| s.name() == entry.name) {
+        return Err(NotAdded::Refused {
+            error: anyhow::anyhow!(
+                "{} already has a [[sources]] entry named {}, added since Fronde started; nothing was written",
+                path.display(),
+                entry.name
+            ),
+            sources: Some(current),
+        });
+    }
+    let new = with_entry(&text, entry)
+        .with_context(|| format!("{}", path.display()))
+        .map_err(unwritable)?;
+    let added = fronde_hub::config::load_str(&new, base)
+        .map_err(|error| not_loading(path, &new, &error, true, Some(current.clone())))?
+        .sources;
+    Ok(Checked {
+        before,
+        mode,
+        new,
+        current,
+        added,
+    })
+}
+
+/// Whether `entry` could be added to the configuration file `path` now, as [`add_component`]
+/// would check it, without writing anything: the file's entries, when it reads.
+pub fn check_component(
+    path: &Path,
+    base: &Path,
+    entry: &ComponentConfig,
+) -> Result<Vec<SourceConfig>, NotAdded> {
+    read_checked(path, base, entry).map(|checked| checked.current)
+}
+
 /// Adds `entry` to the configuration file `path`, whose relative paths are read from `base`,
 /// and returns the file's `[[sources]]` entries with it.
 ///
@@ -176,56 +281,24 @@ fn stamp(path: &Path) -> anyhow::Result<(Stamp, u32)> {
 /// starts. The file is replaced atomically by a rename, keeping its mode: a hard link to it
 /// keeps the old content, detached. Just before the rename, the file's inode, modification time
 /// and size are compared with those read: a change (an edit meanwhile) reads it again, once,
-/// then refuses. An edit in the instant between that check and the rename is lost.
+/// then refuses. An edit in the instant between that check and the rename is lost, and so is
+/// one that keeps the size within the granularity of the file system's timestamps.
 pub fn add_component(
     path: &Path,
     base: &Path,
     entry: &ComponentConfig,
     write: Write,
 ) -> Result<Vec<SourceConfig>, NotAdded> {
-    let unwritable = |error: anyhow::Error| NotAdded::Unwritable(error);
     for _ in 0..2 {
-        let (before, mode) = stamp(path).map_err(unwritable)?;
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read {}", path.display()))
-            .map_err(unwritable)?;
-        let current =
-            fronde_hub::config::load_str(&text, base).map_err(|error| NotAdded::Refused {
-                error: error.context(format!(
-                    "{} no longer loads as it is; fix it first",
-                    path.display()
-                )),
-                sources: None,
-            })?;
-        if current.sources.iter().any(|s| s.name() == entry.name) {
-            return Err(NotAdded::Refused {
-                error: anyhow::anyhow!(
-                    "{} already has a [[sources]] entry named {}, added since Fronde started; nothing was written",
-                    path.display(),
-                    entry.name
-                ),
-                sources: Some(current.sources),
-            });
-        }
-        let new = with_entry(&text, entry)
-            .with_context(|| format!("{}", path.display()))
-            .map_err(unwritable)?;
-        let added =
-            fronde_hub::config::load_str(&new, base).map_err(|error| NotAdded::Refused {
-                error: error.context(format!(
-                    "with the new entry, {} would no longer load; nothing was written",
-                    path.display()
-                )),
-                sources: Some(current.sources.clone()),
-            })?;
-        let (now, _) = stamp(path).map_err(unwritable)?;
-        if now != before {
+        let checked = read_checked(path, base, entry)?;
+        let (now, _) = stamp(path).map_err(NotAdded::Unwritable)?;
+        if now != checked.before {
             continue;
         }
-        write(path, &new, mode)
+        write(path, &checked.new, checked.mode)
             .with_context(|| format!("cannot write {}", path.display()))
-            .map_err(unwritable)?;
-        return Ok(added.sources);
+            .map_err(NotAdded::Unwritable)?;
+        return Ok(checked.added);
     }
     Err(NotAdded::Refused {
         error: anyhow::anyhow!(

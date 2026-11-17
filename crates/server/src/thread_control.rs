@@ -182,4 +182,15 @@ impl ThreadControl for ThreadBridge {
     async fn ask(&self, caller: ThreadId, ask: Ask) -> Result<Option<Waiter>, ThreadError> {
         self.0.ask_during(caller, ask).await.map_err(hub_error)
     }
+
+    async fn is_sub_agent(&self, thread: ThreadId) -> bool {
+        match self.0.get(thread).await {
+            Ok(Some(row)) => row.parent.is_some(),
+            Ok(None) => true,
+            Err(error) => {
+                tracing::error!("cannot read thread {thread}: {error:#}");
+                true
+            }
+        }
+    }
 }

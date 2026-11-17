@@ -104,6 +104,11 @@ impl ThreadControl for Recording {
         self.record("ask");
         Ok(None)
     }
+
+    async fn is_sub_agent(&self, _: ThreadId) -> bool {
+        self.record("is_sub_agent");
+        false
+    }
 }
 
 async fn hub(dir: &std::path::Path, control: Arc<Recording>) -> Arc<Hub> {
