@@ -4,11 +4,13 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
+/// A configuration in `dir` whose master key is the file backend's, so that no test reaches the
+/// real keychain.
 fn config(dir: &std::path::Path, token: &str) -> fronde_hub::config::Config {
     let token_file = dir.join("token");
     fronde_hub::private::write(&token_file, token).unwrap();
     let toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n",
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n[secrets]\nbackend = \"file\"\nmaster_key = {{ file = {:?} }}\n",
         token_file.display().to_string(),
         dir.join("data").display().to_string(),
         dir.join("master.key").display().to_string()
@@ -247,7 +249,7 @@ async fn broken_component_is_skipped() {
     let base = config(dir.path(), TOKEN);
     let token_file = dir.path().join("token");
     let toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n{}{}",
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n[secrets]\nbackend = \"file\"\nmaster_key = {{ file = {:?} }}\n{}{}",
         token_file.display().to_string(),
         base.data.dir.display().to_string(),
         base.master_key_file().unwrap().display().to_string(),
@@ -704,6 +706,7 @@ async fn start_refuses_a_wrong_or_missing_master_key() {
 async fn start_refuses_a_locked_keychain_and_makes_no_other_key() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config(dir.path(), TOKEN);
+    config.secrets.backend = fronde_hub::config::KeyBackend::Auto;
     let keychain = fronde_db::master_key::FakeKeychain::new();
     config
         .secrets

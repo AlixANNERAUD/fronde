@@ -50,6 +50,7 @@ syn = { version = "2", features = ["full"] }
 tracing-log = "0.2"
 fronde-agent = { path = "../agent", features = ["testing"] }
 fronde-db = { path = "../db", features = ["testing"] }
+fronde-hub = { path = "../hub", features = ["testing"] }
 # An older schema for `fronde check`'s tests.
 fronde-migration = { path = "../migration" }
 sea-orm.workspace = true

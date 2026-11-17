@@ -766,6 +766,22 @@ fn master_key_is_only_a_file() {
     );
 }
 
+/// `[secrets]` takes only the keys it knows: a misspelt one is refused, not ignored.
+#[test]
+fn unknown_secrets_key_is_refused() {
+    for written in [
+        "backends = \"file\"",
+        "keychain = \"fronde\"",
+        "master_key_file = \"k\"",
+    ] {
+        let err = format!(
+            "{:#}",
+            load_str(&format!("{MIN}[secrets]\n{written}\n")).unwrap_err()
+        );
+        assert!(err.contains("unknown field"), "{written}: {err}");
+    }
+}
+
 /// `[secrets] backend` is `auto` by default, and names one backend otherwise; the key file is
 /// kept for the file backend whatever the choice.
 #[test]

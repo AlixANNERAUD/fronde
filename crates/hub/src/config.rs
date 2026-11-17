@@ -90,6 +90,8 @@ pub struct SecretsConfig {
     keychain: Option<fronde_db::master_key::Keychain>,
 }
 
+/// Test hooks, behind the `testing` feature that only dev-dependencies enable.
+#[cfg(feature = "testing")]
 impl SecretsConfig {
     /// Read systemd credentials from `dir` instead of `$CREDENTIALS_DIRECTORY`.
     pub fn set_credentials_dir(&mut self, dir: Option<PathBuf>) {

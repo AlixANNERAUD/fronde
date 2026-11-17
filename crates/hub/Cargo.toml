@@ -6,6 +6,11 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# Test hooks: a fake keychain and a credentials directory in `SecretsConfig`; only
+# dev-dependencies turn it on.
+testing = []
+
 [dependencies]
 anyhow.workspace = true
 fronde-db = { path = "../db" }
