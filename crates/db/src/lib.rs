@@ -93,6 +93,35 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<DatabaseConnection> {
     Ok(db)
 }
 
+/// Open `<data_dir>/fronde.db`, which must exist, to read only: no migration, no write, no file
+/// created or changed. For `fronde check`, which must decide what serving would without touching
+/// the database. The schema is the one the last Fronde to open it left: a table added since may
+/// be missing.
+pub async fn open_read_only(data_dir: &Path) -> anyhow::Result<DatabaseConnection> {
+    let file = path(data_dir);
+    let mut options = ConnectOptions::new(url(&file));
+    let filename = file.clone();
+    options
+        .max_connections(1)
+        .min_connections(0)
+        .connect_timeout(BUSY_TIMEOUT)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(move |options| {
+            options
+                .filename(&filename)
+                .read_only(true)
+                .create_if_missing(false)
+                .busy_timeout(BUSY_TIMEOUT)
+        });
+    Database::connect(options).await.with_context(|| {
+        format!(
+            "cannot read the database {}; check that it is a SQLite file the user running Fronde \
+             can read",
+            file.display()
+        )
+    })
+}
+
 /// Applies the pending migrations in one transaction. sea-orm-migration runs a SQLite migration
 /// outside any transaction unless it asks for one, so a failure between a migration's change and
 /// its record would leave a schema that every later start fails to migrate again.

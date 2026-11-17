@@ -47,6 +47,9 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 tracing-log = "0.2"
 fronde-agent = { path = "../agent", features = ["testing"] }
+# An older schema for `fronde check`'s tests.
+fronde-migration = { path = "../migration" }
+sea-orm.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 tempfile.workspace = true

@@ -110,16 +110,16 @@ Components get no filesystem, sockets, environment or arguments. Their HTTP goes
 that denies every origin not allowed for that component, does not follow redirects and does not
 let the component set `Authorization` or `Cookie`. An allowed name that resolves to a local
 address (loopback, private network, shared 100.64.0.0/10, link-local, cloud metadata, or any of
-those carried in IPv6) is refused too, unless that
-origin is allowed as local: a public name cannot be pointed at the host, its network or its
-cloud's metadata service. Origins are compared after the URL standard normalises them, the same
-way for the configuration and for each request: `http://0x7f.1`, `http://127.0.0.1:80` and
-`http://127.0.0.1` are one origin, as are `[0:0:0:0:0:0:0:1]` and `[::1]`. The connection goes
-to the host the gate matched, and the `Host` header names it, not the request's spelling of it.
-A request with a port that is not a number from 0 to 65535 has no origin and is denied. The host
-adds the credentials for an allowed origin itself, so a component never holds a secret it could leak elsewhere. Each call has a memory cap, a CPU budget
-and a timeout. What a component writes to its standard error goes to Fronde's log, as warnings
-under its name, at most 100 lines a call.
+those carried in IPv6) is refused too, unless that origin is allowed as local: a public name
+cannot be pointed at the host, its network or its cloud's metadata service. Origins are compared
+after the URL standard normalises them, the same way for the configuration and for each request:
+`http://0x7f.1`, `http://127.0.0.1:80` and `http://127.0.0.1` are one origin, as are
+`[0:0:0:0:0:0:0:1]` and `[::1]`. The connection goes to the host the gate matched, and the `Host`
+header names it, not the request's spelling of it. A request with a port that is not a number
+from 0 to 65535 has no origin and is denied. The host adds the credentials for an allowed origin
+itself, so a component never holds a secret it could leak elsewhere. Each call has a memory cap,
+a CPU budget and a timeout. What a component writes to its standard error goes to Fronde's log,
+as warnings under its name, at most 100 lines a call.
 
 A credential travels only over https, or over plain http to this machine (`localhost` exactly, a
 loopback address such as `127.0.0.1` or `::1`, or a loopback written as IPv4-mapped IPv6,
@@ -133,19 +133,27 @@ Docker, the same machine means the container: a CalDAV server on the Docker host
 plain http (`host.docker.internal`) does not get credentials, so use https there.
 
 A component asks and the configuration grants. Its manifest lists the origins and credentials it
-wants; its `[[sources]]` entry may grant only those, and never more (an origin or a credential
-the manifest does not ask for is refused). The grant is bound to the SHA-256 of the `.wasm` file
-and of the manifest. The `fronde` binary carries the hashes of the components built with it
-from this repository: an entry without hashes is approved only when its files are exactly those.
-Any other component needs both hashes written in its entry, which also pin a shipped one: after
-an update, the component is skipped until you read the new manifest and copy the new hashes from
+wants; its `[[sources]]` entry may grant only those, and never more (an origin or a credential the
+manifest does not ask for is refused). The grant is bound to the SHA-256 of the `.wasm` file and
+of the manifest. The `fronde` binary carries the hashes of the components built with it from this
+repository: an entry without hashes is approved only when its files are exactly those. Any other
+component needs both hashes written in its entry, which also pin a shipped one: after an update,
+the component is skipped until you read the new manifest and copy the new hashes from
 `fronde check`. An entry without hashes may also be approved by an approval stored in
 `fronde.db`, which names the source and both hashes: it approves only those files for that
 entry, and never overrides hashes written in an entry. Only the owner will store one, from the
-chat (planned); no tool writes them. A path never approves anything, and nothing in Fronde loads a component
-without going through that check: the loader takes only what the check returns, and the file is
-hashed again as it is compiled. No tool can grant or approve anything, so the
-agent cannot widen what a component reaches.
+chat (planned); no tool writes them. A path never approves anything, and nothing in Fronde loads
+a component without going through that check: the loader takes only what the check returns, and
+the file is hashed again as it is compiled. No tool can grant or approve anything.
+
+This makes `fronde.db` an approval authority, and a weaker one than the configuration. File
+modes keep other users out, but any process running as Fronde's user can write the database: the
+agent and the tools it runs included. Such a process can store an approval for files of its
+choice under an entry without hashes. Hashes pinned in the entry close that door, since they
+always win over stored approvals: pin every component in a `fronde.toml` that Fronde's user
+cannot write (owned by another user, or mounted read-only), and approval stays out of the agent's
+reach. Confining the agent away from the data directory, so that it cannot write `fronde.db` at
+all, is **planned**.
 
 A component's tools start with the prefixes its manifest declares, which no other source may
 use: a component cannot shadow the hub's tools or another source's. See
@@ -154,5 +162,6 @@ use: a component cannot shadow the hub's tools or another source's. See
 ## What is out of scope
 
 - Several users: there is one password and one conversation.
-- Encryption at rest: file modes keep other users out, but not someone with the disk. Protect the data directory with the machine's own means.
+- Encryption at rest: file modes keep other users out, but not someone with the disk. Protect
+  the data directory with the machine's own means.
 - TLS: put Fronde behind a reverse proxy for https. Built-in TLS is **planned** with federation.

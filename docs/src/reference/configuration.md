@@ -126,8 +126,9 @@ Paths are read from the configuration file's directory, like every relative path
   name, stored in `fronde.db`. Each such approval holds the source's name and both hashes, so it
   approves neither another entry nor changed files. The log says
   `approved: by the owner, stored in the database`. Fronde reads these approvals when it starts:
-  one stored later applies at the next start. Approving a component from the chat is planned;
-  nothing stores an approval yet.
+  one stored later applies at the next start, and one removed while Fronde runs keeps approving
+  until the next start, even when the supervisor restarts the component. Approving a component
+  from the chat is planned; nothing stores an approval yet.
 - Anything else is refused. A path never approves anything.
 
 `fronde check` prints both hashes of each component and which approval applied. For a component

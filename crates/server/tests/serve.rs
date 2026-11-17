@@ -374,15 +374,15 @@ fn check_refuses_a_password_over_plain_http_to_the_network() {
 
 /// A component approved in the database, as the owner's approval will store it: `fronde check`
 /// approves it as `serve` does, and creates no database where there was none.
-#[tokio::test]
-async fn check_reads_the_approvals_stored_in_the_database() {
-    let dir = tempfile::tempdir().unwrap();
-    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
-    let wasm = dir.path().join("calendar.wasm");
+/// A configuration with one calendar entry without hashes whose `.wasm` is not the shipped one:
+/// only a stored approval can approve it. Returns the configuration's path and the data directory.
+fn unshipped_calendar(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
+    let wasm = dir.join("calendar.wasm");
     std::fs::write(&wasm, b"not compiled by check").unwrap();
-    std::fs::copy(dist("calendar.toml"), dir.path().join("calendar.toml")).unwrap();
-    let data = dir.path().join("data");
-    let path = dir.path().join("fronde.toml");
+    std::fs::copy(dist("calendar.toml"), dir.join("calendar.toml")).unwrap();
+    let data = dir.join("data");
+    let path = dir.join("fronde.toml");
     std::fs::write(
         &path,
         format!(
@@ -395,13 +395,22 @@ async fn check_reads_the_approvals_stored_in_the_database() {
         ),
     )
     .unwrap();
-    let check = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
-            .args(["check", "--config"])
-            .arg(&path)
-            .output()
-            .unwrap()
-    };
+    (path, data)
+}
+
+fn run_check(config: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+        .args(["check", "--config"])
+        .arg(config)
+        .output()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn check_reads_the_approvals_stored_in_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = unshipped_calendar(dir.path());
+    let check = || run_check(&path);
 
     let out = check();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -434,6 +443,61 @@ async fn check_reads_the_approvals_stored_in_the_database() {
     assert!(
         stdout.contains("source calendar: approved: by the owner, stored in the database"),
         "{stdout}"
+    );
+}
+
+/// `fronde check` reads the database without migrating it: one an older Fronde left, without the
+/// approvals table, is left exactly as it was, and approves nothing, as serving would decide.
+#[tokio::test]
+async fn check_leaves_an_older_database_unchanged() {
+    use fronde_migration::{Migrator, MigratorTrait};
+    use sea_orm::ConnectionTrait;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = unshipped_calendar(dir.path());
+    fronde_hub::private::create_dir_all(&data).unwrap();
+    let file = fronde_db::path(&data);
+    fronde_hub::private::write(&file, b"").unwrap();
+    let older = sea_orm::Database::connect(format!("sqlite://{}?mode=rw", file.display()))
+        .await
+        .unwrap();
+    older
+        .execute_unprepared("PRAGMA journal_mode = WAL")
+        .await
+        .unwrap();
+    // Every migration before the approvals table.
+    let before_approvals = Migrator::migrations()
+        .iter()
+        .position(|m| m.name().ends_with("_approvals"))
+        .unwrap();
+    Migrator::up(&older, Some(before_approvals as u32))
+        .await
+        .unwrap();
+    let applied = Migrator::get_applied_migrations(&older)
+        .await
+        .unwrap()
+        .len();
+    older.close().await.unwrap();
+    let before = std::fs::read(&file).unwrap();
+
+    let out = run_check(&path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("source calendar: not approved yet"),
+        "{stderr}"
+    );
+
+    assert!(
+        std::fs::read(&file).unwrap() == before,
+        "check changed {}",
+        file.display()
+    );
+    let db = fronde_db::open_read_only(&data).await.unwrap();
+    assert!(!fronde_db::approvals::table_exists(&db).await.unwrap());
+    assert_eq!(
+        Migrator::get_applied_migrations(&db).await.unwrap().len(),
+        applied
     );
 }
 

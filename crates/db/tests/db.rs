@@ -287,16 +287,22 @@ async fn failed_migration_leaves_nothing_behind() {
     kv::set(&db, "s", "k", vec![1], None).await.unwrap();
 }
 
+/// A 64-character hexadecimal hash made of `c`, as `fronde check` prints them.
+fn hash(c: char) -> String {
+    c.to_string().repeat(64)
+}
+
 #[tokio::test]
 async fn approvals_are_kept_once_with_their_first_time() {
     let dir = tempfile::tempdir().unwrap();
     let db = fronde_db::open(dir.path()).await.unwrap();
+    let (aa, bb, cc) = (hash('a'), hash('b'), hash('c'));
     assert!(approvals::all(&db).await.unwrap().is_empty());
-    approvals::add(&db, "calendar", "aa", "bb").await.unwrap();
+    approvals::add(&db, "calendar", &aa, &bb).await.unwrap();
     let first = approvals::all(&db).await.unwrap();
-    approvals::add(&db, "calendar", "aa", "bb").await.unwrap();
+    approvals::add(&db, "calendar", &aa, &bb).await.unwrap();
     // Another build of the same source is another approval.
-    approvals::add(&db, "calendar", "cc", "bb").await.unwrap();
+    approvals::add(&db, "calendar", &cc, &bb).await.unwrap();
     let all = approvals::all(&db).await.unwrap();
     assert_eq!(all.len(), 2, "{all:?}");
     assert_eq!(all[0], first[0]);
@@ -306,6 +312,39 @@ async fn approvals_are_kept_once_with_their_first_time() {
             all[1].sha256.as_str(),
             all[1].manifest_sha256.as_str()
         ),
-        ("calendar", "cc", "bb")
+        ("calendar", cc.as_str(), bb.as_str())
     );
+}
+
+#[tokio::test]
+async fn approvals_refuse_what_is_not_a_sha256() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let good = hash('0');
+    let upper = "A".repeat(64);
+    let short = "a".repeat(63);
+    let long = "a".repeat(65);
+    let not_hex = format!("{}g", "a".repeat(63));
+    let spaced = format!(" {}", "a".repeat(63));
+    for bad in ["", upper.as_str(), &short, &long, &not_hex, &spaced] {
+        let err = approvals::add(&db, "calendar", bad, &good)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sha256") && err.contains("not a SHA-256"),
+            "{err}"
+        );
+        let err = approvals::add(&db, "calendar", &good, bad)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("manifest_sha256"), "{err}");
+    }
+    assert!(approvals::all(&db).await.unwrap().is_empty());
+    let digits = "0123456789abcdef".repeat(4);
+    approvals::add(&db, "calendar", &digits, &good)
+        .await
+        .unwrap();
+    assert_eq!(approvals::all(&db).await.unwrap().len(), 1);
 }

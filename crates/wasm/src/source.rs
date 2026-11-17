@@ -229,9 +229,9 @@ impl fmt::Display for NotApproved {
                  sha256 = \"{sha256}\" and manifest_sha256 = \"{manifest_sha256}\" to its \
                  [[sources]] entry"
             ),
-            NotApprovedReason::Changed { file, sha256 } => write!(
+            NotApprovedReason::Changed { file, sha256: now } => write!(
                 f,
-                "{} changed since it was approved (its sha256 is now {sha256}); read the manifest \
+                "{} changed since it was approved (its sha256 is now {now}); read the manifest \
                  {manifest} again, then update the hashes in its [[sources]] entry (`fronde \
                  check` prints them)",
                 file.display()
