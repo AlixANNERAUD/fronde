@@ -1,5 +1,6 @@
 //! ACP client: starts the agent, opens Fronde's session and runs prompt turns.
 
+use crate::confine::Confine;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
@@ -155,9 +156,30 @@ pub struct AgentClient {
 }
 
 impl AgentClient {
-    /// Start the agent process and open a session (resumed when possible).
+    /// Start the agent process, inheriting Fronde's environment, and open a session (resumed
+    /// when possible).
     pub async fn spawn(
         spec: &AgentSpec,
+        resume: Option<String>,
+        events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with(spec, None, resume, events).await
+    }
+
+    /// Start the agent through `fronde __confine`, which gives it only the environment and the
+    /// files the policy allows, and open a session (resumed when possible).
+    pub async fn spawn_confined(
+        spec: &AgentSpec,
+        confine: &Confine,
+        resume: Option<String>,
+        events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with(spec, Some(confine), resume, events).await
+    }
+
+    async fn spawn_with(
+        spec: &AgentSpec,
+        confine: Option<&Confine>,
         resume: Option<String>,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> anyhow::Result<Self> {
@@ -170,9 +192,17 @@ impl AgentClient {
         if !installed(program, &spec.env) {
             return Err(NotInstalled(program.clone()).into());
         }
-        let config = AcpAgentConfig::new(program)
-            .args(args.iter().cloned())
-            .envs(spec.env.iter().cloned());
+        let config = match confine {
+            None => AcpAgentConfig::new(program)
+                .args(args.iter().cloned())
+                .envs(spec.env.iter().cloned()),
+            Some(confine) => {
+                let helper = confine.command(spec)?;
+                AcpAgentConfig::new(helper.program)
+                    .args(helper.args)
+                    .envs(helper.env)
+            }
+        };
         let connection = Connection::start(AcpAgent::new(config), events)
             .await
             .with_context(|| format!("cannot start the agent ({command})"))?;

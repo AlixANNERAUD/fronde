@@ -8,7 +8,8 @@ owner, at home or on a server they control.
 Secrets never appear in the configuration file, in logs or in tool output. The file only names
 where each one is: `{ file = "…" }` or `{ env = "…" }`. The configuration can then be committed,
 shared or mounted read-only. `[agent] env` is written in plain text, so it is for settings only;
-the Claude token reaches the agent through Fronde's own environment.
+the Claude token reaches the agent through Fronde's own environment, as `CLAUDE_CODE_OAUTH_TOKEN`,
+one of the few variables the agent keeps (see [The agent's environment](#the-agents-environment)).
 
 A secret file must be mode 0600 and owned by the user running Fronde; otherwise Fronde refuses to
 read it. Setting `FRONDE_ALLOW_SHARED_SECRET_FILES=1` lifts the check for setups like Docker
@@ -63,7 +64,8 @@ place it can be kept (`[secrets] backend`, see
   data directory; Fronde moves it from there at the next start or `fronde secret` command, and
   stops if both places hold different keys.
 
-The key never comes from an environment variable: the agent inherits Fronde's environment.
+The key never comes from an environment variable, which the processes Fronde starts may inherit
+(an upstream MCP server's command does).
 
 With `backend = "auto"`, the default, the first key goes to a systemd credential when the service
 has one, since only an operator puts one there; else to the keychain; else, when there is no
@@ -137,8 +139,9 @@ Some plain copies remain:
 - The `Authorization` header Fronde gives its agent for `/mcp` is a plain string in the ACP
   request, and the agent process holds the token. That token is the assistant's own, not
   `server.token`: it is made at each start, never written anywhere, and dies with the process.
-- A `{ env = "…" }` value stays in Fronde's environment, and the agent inherits that environment
-  for now (an explicit agent environment is planned).
+- A `{ env = "…" }` value stays in Fronde's environment. The agent never gets it (see
+  [The agent's environment](#the-agents-environment)), but an upstream MCP server started from a
+  `command` inherits Fronde's whole environment.
 - A sign-in form's body, and each `/mcp` request's `Authorization` header, are read into buffers
   that are freed but not zeroed. The parsed password is zeroed after the compare.
 - A master key read from the keychain passes through libraries Fronde does not control, which
@@ -210,6 +213,29 @@ tools. It loads none of Claude Code's settings, so your plugins, MCP servers, ho
 rules on the same machine do not reach it. Its permission mode asks before acting, and any request
 it makes shows in the chat with *Autoriser* and *Refuser*. Adding a built-in tool beyond the two
 web ones is refused by the configuration check: widening it is a deliberate code change.
+
+### The agent's environment
+
+Fronde does not start the agent directly: it starts its own binary as `fronde __confine`, which
+prepares the process and then replaces itself with the agent, keeping the same process, pipes and
+process group. The agent does not inherit Fronde's environment. It keeps only an allow list:
+`PATH`, the locale and `TZ`, `CLAUDE_*` and `ANTHROPIC_*` (where the Claude token is), the proxy
+and CA certificate variables, and the names `[agent] env` sets. Fronde sets `HOME` to the agent's
+own home, `<data>/home`, and `TMPDIR` to `<data>/home/tmp`. Every other variable is dropped,
+among them `XDG_*` and `DBUS_*`, which point at your session's directories and buses,
+`CREDENTIALS_DIRECTORY`, where systemd puts the service's credentials, `SSH_AUTH_SOCK`, and every
+`{ env = "…" }` secret's variable, even one whose name the allow list matches. The helper reads
+the values from its environment; its command line, which any user can read, carries names and
+paths only.
+
+The agent has its own home rather than yours, so that it never reads or writes your
+`~/.claude`: a hook it wrote there would run in your own terminal. It signs in to Claude once in
+that home (see [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md)). The helper also
+raises the agent's OOM score to the maximum and lowers its priority, so that the kernel kills the
+agent first when memory runs out, and Fronde comes first for the CPU.
+
+This keeps Fronde's secrets out of the agent's environment. It does not confine what the agent
+can read or write: confining it to its own directories is **planned**.
 
 ## Requests
 

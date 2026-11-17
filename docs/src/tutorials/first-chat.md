@@ -9,8 +9,9 @@ spent compiling.
 - Linux or macOS with `git`.
 - [mise](https://mise.jdx.dev), which installs everything else at pinned versions: Rust, Node.js,
   the Dioxus CLI and Tailwind.
-- A Claude subscription, with [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-  signed in: `claude` must work in your terminal. Fronde uses that sign-in.
+- A Claude subscription and [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+  installed: `claude` must work in your terminal. Fronde's agent signs in once with it, in a home
+  of its own (step 5).
 
 ## 1. Build Fronde
 
@@ -63,7 +64,18 @@ The log says `listening on http://127.0.0.1:8484 (MCP at /mcp)`. Keep it running
 from the checkout: that is where it finds the interface's files. `mise exec` puts the adapter on
 the `PATH`, in case `init` did not find it.
 
-## 5. Sign in and chat
+## 5. Sign the agent in to Claude
+
+The agent has a home of its own in the data directory, which Fronde created at start, and does
+not use your `~/.claude`. Sign it in once, in another terminal:
+
+```sh
+HOME=~/.local/share/fronde/home claude
+```
+
+Type `/login`, follow the sign-in in your browser, then quit `claude`.
+
+## 6. Sign in and chat
 
 Open <http://127.0.0.1:8484>. You land on the sign-in page (*Connexion*). Type the password
 `fronde init` printed and press *Se connecter*.

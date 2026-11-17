@@ -2486,6 +2486,7 @@ dependencies = [
  "fronde-protocol",
  "fronde-requests",
  "futures",
+ "rustix",
  "sea-orm",
  "secrecy",
  "serde",

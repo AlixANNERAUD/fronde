@@ -17,7 +17,8 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use fronde_agent::acp::AgentSpec;
-use fronde_agent::assistant::{Assistant, Connector, process_connector};
+use fronde_agent::assistant::{Assistant, Connector, confined_connector, process_connector};
+use fronde_agent::confine::{Confine, KEEP_ENV, Policy};
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::{HubServer, McpCaller};
@@ -252,9 +253,46 @@ where
     }
 }
 
-/// Resolve secrets, start the hub and serve HTTP in the background.
+/// Resolve secrets, start the hub and serve HTTP in the background. The agent, when the chat
+/// runs, starts through this binary's `__confine` helper.
 pub async fn start(config: Config) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    start_with(config, process_connector(), &site_root()).await
+    let helper = std::env::current_exe()
+        .context("cannot find the fronde binary to start the agent through")?;
+    start_with_helper(config, &helper).await
+}
+
+/// [`start`], with `helper` as the `fronde` binary the agent starts through.
+pub async fn start_with_helper(
+    config: Config,
+    helper: &Path,
+) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let connector = match &config.web {
+        Some(_) => confined_connector(agent_confine(&config, helper)?),
+        None => process_connector(),
+    };
+    start_with(config, connector, &site_root()).await
+}
+
+/// How the agent is started through `helper`, the `fronde` binary: in `<data>/agent`, with its
+/// own home `<data>/home` (and `TMPDIR` in it), created here, and only the variables it needs
+/// from Fronde's environment, never a `{ env }` secret's.
+pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> {
+    let data = &config.data.dir;
+    fronde_hub::private::prepare_data_dir(data)?;
+    let home = data.join("home");
+    for dir in [data.join("agent"), home.clone(), home.join("tmp")] {
+        fronde_hub::private::create_dir_all(&dir)
+            .with_context(|| format!("cannot create the agent's directory {}", dir.display()))?;
+    }
+    Ok(Confine {
+        helper: helper.to_path_buf(),
+        home,
+        policy: Policy {
+            cwd: data.join("agent"),
+            keep_env: KEEP_ENV.map(str::to_owned).to_vec(),
+            drop_env: config.secret_env_names(),
+        },
+    })
 }
 
 /// [`start`], with Fronde reaching its agent through `connector` and the web interface's files in

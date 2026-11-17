@@ -17,6 +17,7 @@ and, separately, a key file.
 | `master-key.lock` | An empty file that two `fronde secret set` commands storing a first secret at once lock in turn, so that they make one master key. It holds nothing; deleting it while no command runs is harmless. |
 | `*.imported` | Files an earlier version kept the conversation in, once imported into the database (see below). Fronde no longer reads them: keep them as a backup or delete them. |
 | `agent/` | The agent's working directory. It starts empty. |
+| `home/` | The agent's home (`HOME`): Claude's sign-in and settings (`.claude.json`, `.claude/`), its sessions' transcripts, and `tmp/`, its `TMPDIR`. Your own `~/.claude` is never used. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
 
 Earlier versions kept the memory's search index in `index.sqlite`: Fronde deletes it at start.
 
@@ -60,5 +61,6 @@ stored secret (`fronde secret remove`).
 The memory files are plain Markdown: you can read and edit them by hand. An edit by hand is
 indexed at the next start, and committed with the next change Fronde makes.
 
-In the container image, `HOME` is `/data/home`, so the agent's `~/.claude` (its sign-in and
-session files) lives on the same volume.
+The agent's home is `home/` everywhere: natively, and in the container image, where `HOME` is
+`/data/home` already. Its `~/.claude` (its sign-in and session files) lives with the rest of the
+data.

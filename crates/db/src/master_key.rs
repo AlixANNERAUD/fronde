@@ -3,7 +3,7 @@
 //! the configuration file, never in the data directory, so that a backup of the data directory or
 //! a snapshot of its volume does not hold the key with the secrets it opens. Earlier versions kept
 //! the file in the data directory: [`migrate`] moves it. [`Backends`] picks the place and keeps
-//! it. The key never comes from the environment: the agent inherits Fronde's.
+//! it. The key never comes from the environment, which the processes Fronde starts may inherit.
 //!
 //! The key is written as one line, `fronde-key-v1:` followed by its 32 bytes in unpadded
 //! base64url, the same in a file, a keychain entry or a systemd credential, so that anything else

@@ -32,6 +32,41 @@ pub struct Config {
 }
 
 impl Config {
+    /// Every `{ env = "…" }` secret's variable: Fronde reads them from its own environment, and
+    /// the agent's never holds them.
+    pub fn secret_env_names(&self) -> Vec<String> {
+        self.secrets()
+            .filter_map(|secret| match secret {
+                Secret::Env { env } => Some(env.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn secrets(&self) -> impl Iterator<Item = &Secret> {
+        let sources = self.sources.iter().flat_map(|source| -> Vec<&Secret> {
+            match source {
+                SourceConfig::Mcp(m) => m.token.iter().collect(),
+                SourceConfig::Component(c) => c
+                    .credentials
+                    .iter()
+                    .flat_map(|credential| {
+                        credential
+                            .basic
+                            .as_ref()
+                            .map(|b| &b.password)
+                            .into_iter()
+                            .chain(credential.bearer.as_ref())
+                    })
+                    .collect(),
+            }
+        });
+        std::iter::once(&self.server.token)
+            .chain(self.web.as_ref().map(|web| &web.password))
+            .chain(self.secrets.master_key.as_ref())
+            .chain(sources)
+    }
+
     /// The master key file, which [`load`] always sets: `[secrets] master_key`, or `master.key`
     /// beside the configuration file, out of the data directory, so that a backup of the data
     /// directory does not hold the key with the secrets it opens.
@@ -76,8 +111,8 @@ pub struct SecretsConfig {
     /// Which backend holds the key; `auto` by default.
     #[serde(default)]
     pub backend: KeyBackend,
-    /// The file backend's key file. `{ file = "…" }` only: never `{ env }`, which the agent
-    /// inherits, nor `{ stored }`.
+    /// The file backend's key file. `{ file = "…" }` only: never `{ env }`, which every process
+    /// Fronde starts outside the agent's helper inherits, nor `{ stored }`.
     master_key: Option<Secret>,
     /// The key file, read from the configuration's directory when relative; [`load`] sets it.
     #[serde(skip)]
@@ -142,6 +177,7 @@ pub struct WebConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct AgentConfig {
     pub command: Vec<String>,
+    /// Variables the agent gets besides the few it keeps from Fronde's environment.
     pub env: BTreeMap<String, String>,
     /// Claude Code's own tools the agent gets besides the hub's; empty for none.
     pub builtin_tools: Vec<String>,
@@ -155,6 +191,14 @@ impl Default for AgentConfig {
             builtin_tools: SAFE_BUILTIN_TOOLS.map(str::to_string).to_vec(),
         }
     }
+}
+
+/// Variables `[agent] env` may not set: Fronde sets the agent's home and temporary directory,
+/// and the others point at the owner's session, its buses and the service's credentials.
+fn reserved_agent_variable(name: &str) -> bool {
+    matches!(name, "HOME" | "TMPDIR" | "CREDENTIALS_DIRECTORY")
+        || name.starts_with("XDG_")
+        || name.starts_with("DBUS_")
 }
 
 /// Built-in tools an assistant with no shell and no files may use: they read the web and touch
@@ -523,7 +567,8 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         Some(Secret::File { file }) => base.join(file).components().collect(),
         Some(_) => bail!(
             "[secrets] master_key must be {{ file = \"…\" }}: the master key never comes from \
-             the environment, which the agent inherits, nor from the store it opens"
+             the environment, which the processes Fronde starts may inherit, nor from the store it \
+             opens"
         ),
     });
     // Set by systemd, for this process only, when the unit loads credentials.
@@ -539,6 +584,15 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         }
     }
     check_sources(&config.sources)?;
+    for name in config.agent.env.keys() {
+        if reserved_agent_variable(name) {
+            bail!(
+                "[agent] env: {name} cannot be set here: Fronde gives the agent its own HOME and \
+                 TMPDIR in the data directory, and never passes XDG_*, DBUS_* or \
+                 CREDENTIALS_DIRECTORY, which point at your session; remove it"
+            );
+        }
+    }
     for tool in &config.agent.builtin_tools {
         if !SAFE_BUILTIN_TOOLS.contains(&tool.as_str()) {
             bail!(

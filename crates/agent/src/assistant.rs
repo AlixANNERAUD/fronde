@@ -1,6 +1,7 @@
 //! Fronde's conversation: one agent session, its turns recorded in the conversation log.
 
 use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
+use crate::confine::Confine;
 use crate::legacy;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use anyhow::{anyhow, bail};
@@ -52,6 +53,14 @@ pub fn process_connector() -> Connector {
     Arc::new(|spec: &AgentSpec, resume, events| {
         let spec = spec.clone();
         Box::pin(async move { AgentClient::spawn(&spec, resume, events).await })
+    })
+}
+
+/// Starts the agent process through `fronde __confine` with `AgentClient::spawn_confined`.
+pub fn confined_connector(confine: Confine) -> Connector {
+    Arc::new(move |spec: &AgentSpec, resume, events| {
+        let (spec, confine) = (spec.clone(), confine.clone());
+        Box::pin(async move { AgentClient::spawn_confined(&spec, &confine, resume, events).await })
     })
 }
 

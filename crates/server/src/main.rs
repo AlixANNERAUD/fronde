@@ -48,6 +48,16 @@ enum Command {
         #[command(subcommand)]
         action: SecretCommand,
     },
+    /// Internal: how Fronde starts its agent. Applies the policy to itself, then runs the command.
+    #[command(name = "__confine", hide = true)]
+    Confine {
+        /// The policy, as JSON: names and paths only, never a value.
+        #[arg(long)]
+        policy: String,
+        /// The agent's program and arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -229,14 +239,33 @@ async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
 /// keychain call stuck behind an unlock prompt cannot be cancelled: Fronde exits without it.
 const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The exit status of a helper that could not start the agent, as a shell reports a command it
+/// cannot run.
+const CANNOT_RUN: u8 = 127;
+
+/// `fronde __confine`: never returns when the agent starts, since the agent replaces it.
+fn confine(policy: &str, command: &[std::ffi::OsString]) -> ExitCode {
+    let started = fronde_agent::confine::Policy::from_arg(policy).and_then(|policy| {
+        let (program, args) = command.split_first().expect("clap requires the command");
+        fronde_agent::confine::run_helper(&policy, program, args)
+    });
+    let Err(error) = started;
+    eprintln!("fronde __confine: {error:#}");
+    ExitCode::from(CANNOT_RUN)
+}
+
 fn main() -> ExitCode {
+    let cli = Cli::parse();
+    // The helper runs single-threaded, before any logging, configuration or runtime.
+    if let Command::Confine { policy, command } = &cli.command {
+        return confine(policy, command);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
-    let cli = Cli::parse();
     // Built by hand rather than with `#[tokio::main]`, whose runtime waits on drop for every
     // blocking thread, however long.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -286,5 +315,6 @@ async fn run(command: &Command) -> anyhow::Result<ExitCode> {
             ServiceCommand::Status => fronde::service::status(),
         },
         Command::Secret { action } => secret(action).await,
+        Command::Confine { .. } => unreachable!("handled before the runtime starts"),
     }
 }

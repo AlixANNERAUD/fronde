@@ -819,3 +819,32 @@ fn master_key_needs_a_loaded_configuration() {
         std::path::Path::new("/k/master.key")
     );
 }
+
+#[test]
+fn agent_env_cannot_point_the_agent_at_the_session() {
+    for name in [
+        "HOME",
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "CREDENTIALS_DIRECTORY",
+    ] {
+        let error = load_str(&format!("{MIN}[agent]\nenv = {{ {name} = \"x\" }}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(name), "{error}");
+        assert!(error.contains("remove it"), "{error}");
+    }
+    load_str(&format!("{MIN}[agent]\nenv = {{ FOO = \"x\" }}\n")).unwrap();
+}
+
+#[test]
+fn secret_variables_are_listed() {
+    let c = load_str(&format!(
+        "{MIN}[web]\npassword = {{ file = \"pw\" }}\n\
+         [[sources]]\nkind = \"mcp\"\nname = \"up\"\nurl = \"https://mcp.example\"\n\
+         token = {{ env = \"UP_TOKEN\" }}\n"
+    ))
+    .unwrap();
+    assert_eq!(c.secret_env_names(), ["T", "UP_TOKEN"]);
+}

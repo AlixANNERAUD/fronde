@@ -7,6 +7,10 @@
 //! ```
 //!
 //! `FRONDE_LIVE_CLAUDE` optionally names the Claude Code to run instead of the adapter's own.
+//!
+//! The agent runs through `fronde __confine` with a fresh home in the test's data directory, so it
+//! signs in with `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), which it keeps from the
+//! environment.
 
 use fronde_protocol::{ClientMsg, Entry, Event, ServerMsg};
 use futures::{SinkExt, StreamExt};
@@ -119,7 +123,10 @@ async fn live_chat_with_claude() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (addr, _server) = fronde::start(config(dir.path(), &agent)).await.unwrap();
+    let helper = Path::new(env!("CARGO_BIN_EXE_fronde"));
+    let (addr, _server) = fronde::start_with_helper(config(dir.path(), &agent), helper)
+        .await
+        .unwrap();
     let cookie = sign_in(addr).await;
     let mut socket = open_chat(addr, &cookie).await;
 

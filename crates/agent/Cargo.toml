@@ -29,6 +29,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The `__confine` helper: the agent's priority.
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

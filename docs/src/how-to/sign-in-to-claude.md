@@ -1,13 +1,30 @@
 # Sign Fronde in to Claude
 
-Fronde's agent is Claude Code, run through its ACP adapter. It uses Claude Code's own sign-in and
-inherits Fronde's environment. It reads none of Claude Code's settings: your plugins, MCP servers,
-hooks and permission rules do not apply to it.
+Fronde's agent is Claude Code, run through its ACP adapter. It has its own home, `home/` in the
+data directory, and keeps its sign-in there: it never uses your `~/.claude`. It reads none of
+Claude Code's settings: your plugins, MCP servers, hooks and permission rules do not apply to it.
+Of Fronde's environment it keeps only a few variables, `CLAUDE_CODE_OAUTH_TOKEN` among them (see
+[Configuration](../reference/configuration.md#agent)).
 
 ## Native
 
-Nothing to do once `claude` works in your terminal: the adapter uses the sign-in kept in
-`~/.claude`.
+Sign the agent in once, in its own home. With the default data directory:
+
+```sh
+HOME=~/.local/share/fronde/home claude
+```
+
+Then type `/login` and follow the browser sign-in. Quit `claude` once it is done. Use your
+`[data] dir` followed by `/home` if you set one. Start Fronde once before, so that the directory
+exists.
+
+Alternatively, run `claude setup-token`, which prints a long-lived token, and give it to Fronde as
+the `CLAUDE_CODE_OAUTH_TOKEN` environment variable (for the service, through a systemd drop-in
+with `Environment=` or, better, a file only you can read with `EnvironmentFile=`).
+
+Versions of Fronde before the agent got its own home used your `~/.claude`. After the upgrade,
+the agent is signed out until you do the above, and the chat's agent session starts afresh: its
+history stays in the chat, but the agent no longer remembers the previous session.
 
 The adapter brings its own copy of Claude Code. To run the one you installed instead, set its path
 under `[agent]`:

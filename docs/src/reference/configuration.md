@@ -68,7 +68,7 @@ Optional.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `backend` | `"auto"`, `"systemd"`, `"keychain"` or `"file"` | `"auto"` | Where the master key of the [stored secrets](../how-to/store-a-secret.md) is kept. See below. |
-| `master_key` | `{ file = "…" }` | `master.key` beside the configuration file | The key file of the `file` backend, created (mode 0600) with the first secret. A relative path is read from the configuration file's directory. Only `{ file = "…" }`: the key never comes from an environment variable, which the agent inherits. |
+| `master_key` | `{ file = "…" }` | `master.key` beside the configuration file | The key file of the `file` backend, created (mode 0600) with the first secret. A relative path is read from the configuration file's directory. Only `{ file = "…" }`: the key never comes from an environment variable, which the processes Fronde starts, such as an upstream MCP server's command, inherit. |
 
 The backends:
 
@@ -280,7 +280,7 @@ started on the first message, and only when `[web]` is set.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `command` | array of strings | `["claude-agent-acp"]` | Program and arguments. A bare name is looked up on the `PATH`, which does not include `agent/node_modules/.bin` outside `mise exec`: use the adapter's full path (`fronde init` writes it when it finds it). `fronde check` warns when the program is not found. |
-| `env` | table of strings | `{}` | Extra environment variables, in plain text: never a secret. The agent also inherits Fronde's environment. |
+| `env` | table of strings | `{}` | Extra environment variables, in plain text: never a secret. The agent does not inherit Fronde's environment: it gets `PATH`, the locale (`LANG`, `LANGUAGE`, `LC_*`), `TZ`, `CLAUDE_*`, `ANTHROPIC_*`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in either case) and CA variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) when set, these, and `HOME` and `TMPDIR`, which Fronde sets to its own home (see [Data directory](data-directory.md)). Never a `{ env = "…" }` secret's variable, even one whose name matches. `HOME`, `TMPDIR`, `CREDENTIALS_DIRECTORY`, `XDG_*` and `DBUS_*` cannot be set here. |
 | `builtin_tools` | array of strings | `["WebSearch", "WebFetch"]` | Claude Code's own tools the agent may use besides the hub's. Only `WebSearch` and `WebFetch` are allowed; `[]` for none. |
 
 ```toml

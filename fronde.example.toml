@@ -78,8 +78,9 @@ password = { file = "/run/secrets/fronde_password" }
 # Set to true when the page is served over https.
 secure_cookie = false
 
-# Optional: the agent Fronde runs (ACP over stdio), started on the first message. It inherits
-# Fronde's environment, so CLAUDE_CODE_OAUTH_TOKEN goes there, never here.
+# Optional: the agent Fronde runs (ACP over stdio), started on the first message. It keeps only a
+# few variables of Fronde's environment, CLAUDE_CODE_OAUTH_TOKEN among them, which goes there,
+# never here.
 [agent]
 command = ["claude-agent-acp"]
 # Extra environment for the agent, in plain text: no secrets. For example, to run the installed

@@ -38,6 +38,10 @@ dump, ptrace or `/proc/<pid>/mem` read by another process of the same user can r
 (see [Security model](../explanation/security.md#core-dumps-and-other-processes)). Set
 `FRONDE_ALLOW_CORE_DUMPS=1` to skip this when debugging a crash.
 
+`fronde __confine` is internal: it is how `serve` starts its agent (see
+[Security model](../explanation/security.md#the-agents-environment)). It is not meant to be run by
+hand.
+
 ## `fronde check`
 
 Validates the configuration and exits. It parses the file, then reads every secret: the server
