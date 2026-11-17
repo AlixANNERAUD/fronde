@@ -372,6 +372,71 @@ fn check_refuses_a_password_over_plain_http_to_the_network() {
     );
 }
 
+/// A component approved in the database, as the owner's approval will store it: `fronde check`
+/// approves it as `serve` does, and creates no database where there was none.
+#[tokio::test]
+async fn check_reads_the_approvals_stored_in_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
+    let wasm = dir.path().join("calendar.wasm");
+    std::fs::write(&wasm, b"not compiled by check").unwrap();
+    std::fs::copy(dist("calendar.toml"), dir.path().join("calendar.toml")).unwrap();
+    let data = dir.path().join("data");
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+             [[sources]]\nkind = \"component\"\nname = \"calendar\"\npath = {:?}\n\
+             allow = [\"https://cloud.example\"]\n[sources.settings]\n\
+             events_url = \"https://cloud.example/e/\"\nreminders_url = \"https://cloud.example/r/\"\n",
+            data.display().to_string(),
+            wasm.display().to_string()
+        ),
+    )
+    .unwrap();
+    let check = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+            .args(["check", "--config"])
+            .arg(&path)
+            .output()
+            .unwrap()
+    };
+
+    let out = check();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("source calendar: not approved yet"),
+        "{stderr}"
+    );
+    assert!(!fronde_db::path(&data).exists());
+
+    let config = fronde_hub::config::load(&path).unwrap();
+    let fronde_hub::config::SourceConfig::Component(component) = &config.sources[0] else {
+        panic!("not a component")
+    };
+    let hashes = fronde_wasm::Hashes::of(component).unwrap();
+    let db = fronde_db::open(&data).await.unwrap();
+    fronde_db::approvals::add(&db, "calendar", &hashes.sha256, &hashes.manifest_sha256)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+
+    let out = check();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("source calendar: approved: by the owner, stored in the database"),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn check_approves_the_shipped_calendar_without_hashes() {
     // This binary was built after `mise run components`, from the same components/dist.

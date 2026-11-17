@@ -8,7 +8,8 @@
 //! becomes a tool error, never a hub failure. Its standard error goes to the hub's log.
 //!
 //! A `[[sources]]` entry of kind `component` becomes a [`ComponentSource`]: [`prepare`] checks it
-//! against the component's manifest and approval before the component loads.
+//! against the component's manifest and approval before the component loads, and refuses files
+//! nothing approves with a [`NotApproved`].
 
 mod api;
 mod dial;
@@ -25,7 +26,10 @@ pub use egress::{Allowed, Credential};
 pub use fronde_hub::origin::Origin;
 pub use host::{ComponentHost, Limits};
 pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, NetworkRule, World};
-pub use source::{Approval, Checks, ComponentSource, Hashes, Prepared, Shipped, prepare, shipped};
+pub use source::{
+    Approval, Approvals, Checks, ComponentSource, Hashes, NotApproved, NotApprovedReason, Prepared,
+    Shipped, Stored, prepare, shipped,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 pub use tool::LoadedComponent;

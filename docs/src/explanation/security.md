@@ -139,7 +139,10 @@ and of the manifest. The `fronde` binary carries the hashes of the components bu
 from this repository: an entry without hashes is approved only when its files are exactly those.
 Any other component needs both hashes written in its entry, which also pin a shipped one: after
 an update, the component is skipped until you read the new manifest and copy the new hashes from
-`fronde check`. A path never approves anything, and nothing in Fronde loads a component
+`fronde check`. An entry without hashes may also be approved by an approval stored in
+`fronde.db`, which names the source and both hashes: it approves only those files for that
+entry, and never overrides hashes written in an entry. Only the owner will store one, from the
+chat (planned); no tool writes them. A path never approves anything, and nothing in Fronde loads a component
 without going through that check: the loader takes only what the check returns, and the file is
 hashed again as it is compiled. No tool can grant or approve anything, so the
 agent cannot widen what a component reaches.

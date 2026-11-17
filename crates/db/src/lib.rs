@@ -2,6 +2,7 @@
 //! creates it private, sets it up and applies the migrations of `fronde-migration`; the tables
 //! are the entities of `fronde-entity`.
 
+pub mod approvals;
 pub mod kv;
 
 use anyhow::Context as _;

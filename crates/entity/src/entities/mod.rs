@@ -2,6 +2,7 @@
 
 pub mod prelude;
 
+pub mod approvals;
 pub mod kv;
 pub mod stream_entries;
 pub mod streams;

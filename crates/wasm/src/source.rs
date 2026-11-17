@@ -4,8 +4,9 @@
 //! The manifest asks; the configuration grants at most what it asks: each allowed origin and
 //! each credential must match a request of the manifest, and the settings must fit its schema.
 //! The approval is the SHA-256 of both files: either the hashes written in the entry, or, for an
-//! entry without them, those of a component shipped with this build of Fronde. A changed manifest
-//! or build is not loaded until it is approved again. A path never approves anything.
+//! entry without them, those of a component shipped with this build of Fronde or those the owner
+//! approved for this source (rows of `fronde.db`). Hashes in the entry always win. A changed
+//! manifest or build is not loaded until it is approved again. A path never approves anything.
 
 use crate::egress::{Allowed, Credential, Grants};
 use crate::manifest::{Injection, Manifest, NetworkRule, World};
@@ -19,7 +20,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `(name, sha256, manifest_sha256)` of each component in `components/dist` when this build was
 /// compiled (`build.rs`); empty if there was none.
@@ -83,6 +84,8 @@ pub enum Approval {
     Pinned,
     /// No hashes in its entry, and the files of this shipped component.
     Shipped { name: String },
+    /// No hashes in its entry, and an approval of these files for this source in the database.
+    Stored,
 }
 
 impl fmt::Display for Approval {
@@ -90,7 +93,53 @@ impl fmt::Display for Approval {
         match self {
             Self::Pinned => f.write_str("approved: pinned by the hashes in its entry"),
             Self::Shipped { name } => write!(f, "approved: shipped with this build ({name})"),
+            Self::Stored => f.write_str("approved: by the owner, stored in the database"),
         }
+    }
+}
+
+/// The owner's approval of a source's files, as stored in the database: it approves these files
+/// for this source only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub source: String,
+    pub hashes: Hashes,
+}
+
+/// The approvals of an entry without hashes: the components shipped with this build, and those
+/// stored in the database.
+#[derive(Debug, Clone, Default)]
+pub struct Approvals {
+    pub shipped: Vec<Shipped>,
+    pub stored: Vec<Stored>,
+}
+
+impl Approvals {
+    /// The components shipped with this build, and nothing stored.
+    pub fn shipped() -> Self {
+        Self {
+            shipped: shipped(),
+            stored: Vec::new(),
+        }
+    }
+
+    /// What approves the files of `source` whose hashes are `current`: a shipped component with
+    /// these files, whatever its entry's name, or else an approval stored for this source and
+    /// both hashes.
+    pub fn find(&self, source: &str, current: &Hashes) -> Option<Approval> {
+        if let Some(s) = self
+            .shipped
+            .iter()
+            .find(|s| s.sha256 == current.sha256 && s.manifest_sha256 == current.manifest_sha256)
+        {
+            return Some(Approval::Shipped {
+                name: s.name.clone(),
+            });
+        }
+        self.stored
+            .iter()
+            .any(|s| s.source == source && s.hashes == *current)
+            .then_some(Approval::Stored)
     }
 }
 
@@ -99,22 +148,99 @@ impl fmt::Display for Approval {
 pub struct Checks {
     /// The user's time zone, given to a component that declares a `timezone` setting left unset.
     pub timezone: String,
-    /// Components approved without hashes in their entry.
-    pub shipped: Vec<Shipped>,
+    /// What approves components without hashes in their entry.
+    pub approvals: Approvals,
     /// Every `[[sources]]` entry: a component's tool prefixes must stay clear of the others.
     pub sources: Vec<SourceConfig>,
 }
 
 impl Checks {
-    /// For the entries of `config`, with the components shipped with this build.
+    /// For the entries of `config`, with the components shipped with this build and no stored
+    /// approval.
     pub fn of(config: &Config) -> Self {
         Self {
             timezone: config.data.timezone.name().to_string(),
-            shipped: shipped(),
+            approvals: Approvals::shipped(),
             sources: config.sources.clone(),
         }
     }
+
+    /// [`Checks::of`], with the approvals stored in `db`, read now: [`prepare`] reads no
+    /// database, so an approval stored later applies at the next start.
+    pub async fn load(config: &Config, db: &fronde_db::DatabaseConnection) -> anyhow::Result<Self> {
+        let mut checks = Self::of(config);
+        checks.approvals.stored = fronde_db::approvals::all(db)
+            .await
+            .context("cannot read the component approvals in the database")?
+            .into_iter()
+            .map(|row| Stored {
+                source: row.source,
+                hashes: Hashes {
+                    sha256: row.sha256,
+                    manifest_sha256: row.manifest_sha256,
+                },
+            })
+            .collect();
+        Ok(checks)
+    }
 }
+
+/// Why a component's files are not approved: [`prepare`]'s error, under any context its callers
+/// add, with what a request to approve them needs to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotApproved {
+    /// The `[[sources]]` entry's name.
+    pub source: String,
+    /// The manifest to read before approving.
+    pub manifest: PathBuf,
+    /// The hashes of the files as they are now, which would approve them.
+    pub current: Hashes,
+    pub reason: NotApprovedReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotApprovedReason {
+    /// No hashes in the entry, and nothing approves these files.
+    Unknown,
+    /// Only one of `sha256` and `manifest_sha256` in the entry.
+    HalfPinned,
+    /// `file` no longer has the hash its entry pins; `sha256` is its hash now.
+    Changed { file: PathBuf, sha256: String },
+}
+
+impl fmt::Display for NotApproved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let manifest = self.manifest.display();
+        let Hashes {
+            sha256,
+            manifest_sha256,
+        } = &self.current;
+        match &self.reason {
+            NotApprovedReason::Unknown => write!(
+                f,
+                "not approved yet: these files are not a component shipped with this build of \
+                 Fronde. Read its manifest {manifest}, then add sha256 = \"{sha256}\" and \
+                 manifest_sha256 = \"{manifest_sha256}\" to its [[sources]] entry"
+            ),
+            NotApprovedReason::HalfPinned => write!(
+                f,
+                "not approved yet: set both sha256 and manifest_sha256, or neither for a \
+                 component shipped with this build. Read its manifest {manifest}, then add \
+                 sha256 = \"{sha256}\" and manifest_sha256 = \"{manifest_sha256}\" to its \
+                 [[sources]] entry"
+            ),
+            NotApprovedReason::Changed { file, sha256 } => write!(
+                f,
+                "{} changed since it was approved (its sha256 is now {sha256}); read the manifest \
+                 {manifest} again, then update the hashes in its [[sources]] entry (`fronde \
+                 check` prints them)",
+                file.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotApproved {}
 
 /// A component entry ready to load, and what approved it. Only [`prepare`] makes one, so that
 /// nothing loads a component without its approval or with more than its entry grants.
@@ -156,7 +282,12 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
         sha256: sha256_of(&config.path)?,
         manifest_sha256: sha256(text.as_bytes()),
     };
-    let approval = approve(config, &current, &manifest_path, &checks.shipped)?;
+    let approval = approve(
+        config,
+        current.clone(),
+        manifest_path.clone(),
+        &checks.approvals,
+    )?;
     let manifest = Manifest::parse(&text)
         .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
     let World::Tool = manifest.world;
@@ -247,53 +378,47 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
     })
 }
 
-/// Hashes in the entry pin it to those files; without any, the files must be those of a component
-/// shipped with this build.
+/// The only function that decides whether a component's files are approved. Hashes in the entry
+/// pin it to those files, whatever else approves them; without any, `approvals` must approve
+/// these files for this source. A refusal is a [`NotApproved`], the error's root.
 fn approve(
     config: &ComponentConfig,
-    current: &Hashes,
-    manifest_path: &Path,
-    shipped: &[Shipped],
+    current: Hashes,
+    manifest: PathBuf,
+    approvals: &Approvals,
 ) -> anyhow::Result<Approval> {
+    let refuse = |current: Hashes, reason| {
+        anyhow::Error::new(NotApproved {
+            source: config.name.clone(),
+            manifest: manifest.clone(),
+            current,
+            reason,
+        })
+    };
     let (sha256, manifest_sha256) = match (&config.sha256, &config.manifest_sha256) {
         (Some(sha256), Some(manifest_sha256)) => (sha256, manifest_sha256),
         (None, None) => {
-            if let Some(s) = shipped.iter().find(|s| {
-                s.sha256 == current.sha256 && s.manifest_sha256 == current.manifest_sha256
-            }) {
-                return Ok(Approval::Shipped {
-                    name: s.name.clone(),
-                });
-            }
-            bail!(
-                "not approved yet: these files are not a component shipped with this build of \
-                 Fronde. Read its manifest {}, then add sha256 = \"{}\" and manifest_sha256 = \
-                 \"{}\" to its [[sources]] entry",
-                manifest_path.display(),
-                current.sha256,
-                current.manifest_sha256
-            );
+            return approvals
+                .find(&config.name, &current)
+                .ok_or_else(|| refuse(current, NotApprovedReason::Unknown));
         }
-        _ => bail!(
-            "not approved yet: set both sha256 and manifest_sha256, or neither for a component \
-             shipped with this build. Read its manifest {}, then add sha256 = \"{}\" and \
-             manifest_sha256 = \"{}\" to its [[sources]] entry",
-            manifest_path.display(),
-            current.sha256,
-            current.manifest_sha256
-        ),
+        _ => return Err(refuse(current, NotApprovedReason::HalfPinned)),
     };
     for (file, approved, now) in [
         (config.path.as_path(), sha256, &current.sha256),
-        (manifest_path, manifest_sha256, &current.manifest_sha256),
+        (
+            manifest.as_path(),
+            manifest_sha256,
+            &current.manifest_sha256,
+        ),
     ] {
-        ensure!(
-            approved == now,
-            "{} changed since it was approved (its sha256 is now {now}); read the manifest {} \
-             again, then update the hashes in its [[sources]] entry (`fronde check` prints them)",
-            file.display(),
-            manifest_path.display()
-        );
+        if approved != now {
+            let reason = NotApprovedReason::Changed {
+                file: file.to_path_buf(),
+                sha256: now.clone(),
+            };
+            return Err(refuse(current.clone(), reason));
+        }
     }
     Ok(Approval::Pinned)
 }

@@ -35,10 +35,20 @@ async fn streams_migration_is_all_or_nothing() {
     let error = Migrator::up(&db, None).await.unwrap_err().to_string();
     assert!(error.contains("stream_entries"), "{error}");
     assert!(!has_table(&db, "streams").await, "the first table was kept");
-    assert_eq!(
-        Migrator::get_pending_migrations(&db).await.unwrap().len(),
-        1
-    );
+    // The failed migration was not recorded: it and every later one are still pending.
+    let pending: Vec<String> = Migrator::get_pending_migrations(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.name().to_string())
+        .collect();
+    let after_kv_and_fts: Vec<String> = Migrator::migrations()
+        .iter()
+        .skip(2)
+        .map(|m| m.name().to_string())
+        .collect();
+    assert_eq!(pending, after_kv_and_fts);
+    assert_eq!(pending[0], "m20261117_000003_streams");
 
     // Once the obstacle is gone, the same migration applies.
     db.execute_unprepared("DROP TABLE stream_entries")

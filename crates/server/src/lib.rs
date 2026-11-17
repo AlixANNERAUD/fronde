@@ -138,8 +138,12 @@ fn site_root() -> PathBuf {
     )
 }
 
-/// The configured components, sharing one engine; each is checked and loaded by the hub.
-fn component_sources(config: &Config) -> anyhow::Result<Vec<Arc<dyn ToolSource>>> {
+/// The configured components, sharing one engine; each is checked and loaded by the hub, against
+/// the approvals stored in `db` when Fronde started.
+async fn component_sources(
+    config: &Config,
+    db: &fronde_db::DatabaseConnection,
+) -> anyhow::Result<Vec<Arc<dyn ToolSource>>> {
     let entries: Vec<_> = config
         .sources
         .iter()
@@ -152,7 +156,7 @@ fn component_sources(config: &Config) -> anyhow::Result<Vec<Arc<dyn ToolSource>>
         return Ok(Vec::new());
     }
     let host = ComponentHost::new()?;
-    let checks = Checks::of(config);
+    let checks = Checks::load(config, db).await?;
     Ok(entries
         .into_iter()
         .map(|c| {
@@ -209,9 +213,9 @@ pub async fn start_with(
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
     let agent = config.agent.clone();
-    let components = component_sources(&config)?;
     fronde_hub::private::prepare_data_dir(&data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
+    let components = component_sources(&config, &db).await?;
     // The store creates its own table, `tower_sessions`, which the entities leave out.
     let sessions = SqliteStore::new(db.get_sqlite_connection_pool().clone());
     sessions.migrate().await.with_context(|| {

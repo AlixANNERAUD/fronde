@@ -45,7 +45,9 @@ token (at least 32 characters), the chat password (not empty), the upstream toke
 components' credentials. For each component it prints the SHA-256 of its `.wasm` file and of its
 manifest, then checks it as `serve` would before loading it (approval, grants within its
 manifest, settings, tool prefixes, credentials over https) and prints which approval applied:
-`approved: shipped with this build (calendar)` or `approved: pinned by the hashes in its entry`. It also checks that `[data] dir` can be created and written: it creates the
+`approved: shipped with this build (calendar)`, `approved: pinned by the hashes in its entry` or
+`approved: by the owner, stored in the database`. It reads the approvals stored in `fronde.db`
+when the data directory has one, as `serve` does at start, and never creates the database. It also checks that `[data] dir` can be created and written: it creates the
 directory (mode 0700), writes a probe file and removes it, and otherwise names the path and the
 fix (set `[data] dir` to a directory you own, such as `~/.local/share/fronde`). A `[server]
 listen` that is not an address is reported by the parse. When `[web]` is set and the agent

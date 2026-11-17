@@ -1,10 +1,11 @@
 //! A component's [[sources]] entry against its manifest and approval: what `prepare` grants or
 //! refuses, before anything is compiled.
 
+use anyhow::Context;
 use fronde_hub::config::ComponentConfig;
 use fronde_wasm::{
-    Approval, Checks, ComponentHost, ComponentSpec, Credential, Hashes, LoadedComponent, Shipped,
-    prepare,
+    Approval, Approvals, Checks, ComponentHost, ComponentSpec, Credential, Hashes, LoadedComponent,
+    NotApproved, NotApprovedReason, Shipped, Stored, prepare,
 };
 use secrecy::ExposeSecret;
 use std::collections::BTreeMap;
@@ -448,7 +449,7 @@ fn tool_prefixes_stay_clear_of_other_sources() {
         sources.extend(others);
         Checks {
             timezone: "UTC".into(),
-            shipped: vec![],
+            approvals: Approvals::default(),
             sources,
         }
     };
@@ -523,7 +524,10 @@ fn unpinned(dir: &Path, rest: &str) -> ComponentConfig {
 fn shipping(shipped: Vec<Shipped>) -> Checks {
     Checks {
         timezone: "UTC".into(),
-        shipped,
+        approvals: Approvals {
+            shipped,
+            stored: vec![],
+        },
         sources: vec![],
     }
 }
@@ -641,5 +645,305 @@ fn without_shipped_components_an_entry_needs_hashes() {
     assert!(
         e.contains("not approved yet: these files are not a component shipped"),
         "{e}"
+    );
+}
+
+/// `stored` as the only approvals.
+fn storing(stored: Vec<Stored>) -> Checks {
+    Checks {
+        timezone: "UTC".into(),
+        approvals: Approvals {
+            shipped: vec![],
+            stored,
+        },
+        sources: vec![],
+    }
+}
+
+fn stored_for(source: &str, hashes: &Hashes) -> Stored {
+    Stored {
+        source: source.into(),
+        hashes: hashes.clone(),
+    }
+}
+
+/// The reason `prepare` refused `config`, with the error itself.
+fn not_approved(config: &ComponentConfig, checks: &Checks) -> NotApproved {
+    let e = prepare(config, checks).unwrap_err();
+    e.downcast_ref::<NotApproved>()
+        .unwrap_or_else(|| panic!("not a NotApproved: {e:#}"))
+        .clone()
+}
+
+#[test]
+fn a_stored_approval_approves_these_files_for_this_source() {
+    let dir = calendar();
+    let config = unpinned(dir.path(), SETTINGS);
+    let hashes = Hashes::of(&config).unwrap();
+    let prepared = prepare(&config, &storing(vec![stored_for("c", &hashes)])).unwrap();
+    assert_eq!(*prepared.approval(), Approval::Stored);
+    assert_eq!(
+        prepared.approval().to_string(),
+        "approved: by the owner, stored in the database"
+    );
+    // The bytes compiled are still checked against the approved hash.
+    assert_eq!(prepared.sha256(), hashes.sha256);
+}
+
+#[test]
+fn a_stored_approval_of_other_files_is_refused() {
+    let dir = calendar();
+    let config = unpinned(dir.path(), SETTINGS);
+    let hashes = Hashes::of(&config).unwrap();
+    // Approved for an earlier build, or an earlier manifest, or half of each.
+    for stored in [
+        vec![stored_for(
+            "c",
+            &Hashes {
+                sha256: "0".repeat(64),
+                ..hashes.clone()
+            },
+        )],
+        vec![stored_for(
+            "c",
+            &Hashes {
+                manifest_sha256: "0".repeat(64),
+                ..hashes.clone()
+            },
+        )],
+        vec![
+            stored_for(
+                "c",
+                &Hashes {
+                    sha256: "0".repeat(64),
+                    ..hashes.clone()
+                },
+            ),
+            stored_for(
+                "c",
+                &Hashes {
+                    manifest_sha256: "0".repeat(64),
+                    ..hashes.clone()
+                },
+            ),
+        ],
+    ] {
+        let refusal = not_approved(&config, &storing(stored.clone()));
+        assert_eq!(refusal.reason, NotApprovedReason::Unknown, "{stored:?}");
+        assert_eq!(refusal.current, hashes);
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("not approved yet: these files are not a component shipped"),
+            "{refusal}"
+        );
+    }
+}
+
+#[test]
+fn a_stored_approval_approves_no_other_source() {
+    let dir = calendar();
+    let config = unpinned(dir.path(), SETTINGS);
+    let hashes = Hashes::of(&config).unwrap();
+    // The same files approved under another name, and no approval at all.
+    for stored in [vec![stored_for("agenda", &hashes)], vec![]] {
+        let refusal = not_approved(&config, &storing(stored));
+        assert_eq!(refusal.source, "c");
+        assert_eq!(refusal.reason, NotApprovedReason::Unknown);
+    }
+}
+
+#[test]
+fn hashes_in_the_entry_win_over_stored_approvals() {
+    let dir = calendar();
+    let hashes = Hashes::of(&unpinned(dir.path(), SETTINGS)).unwrap();
+    let checks = storing(vec![stored_for("c", &hashes)]);
+    // Pinned to an older build: refused, although these files are approved in the database.
+    let config = entry(
+        dir.path(),
+        &format!("sha256 = \"{}\"\n{SETTINGS}", "0".repeat(64)),
+    );
+    let refusal = not_approved(&config, &checks);
+    assert_eq!(
+        refusal.reason,
+        NotApprovedReason::Changed {
+            file: dir.path().join("c.wasm"),
+            sha256: hashes.sha256.clone()
+        }
+    );
+    // Half a pin is no pin, whatever the database approves.
+    let mut half = unpinned(dir.path(), SETTINGS);
+    half.manifest_sha256 = Some(hashes.manifest_sha256.clone());
+    assert_eq!(
+        not_approved(&half, &checks).reason,
+        NotApprovedReason::HalfPinned
+    );
+    // Pinned to these files: approved by the pin, not by the row.
+    assert_eq!(
+        *prepare(&entry(dir.path(), SETTINGS), &checks)
+            .unwrap()
+            .approval(),
+        Approval::Pinned
+    );
+}
+
+#[test]
+fn shipped_files_are_approved_as_shipped_even_when_stored() {
+    let dir = calendar();
+    let config = unpinned(dir.path(), SETTINGS);
+    let hashes = Hashes::of(&config).unwrap();
+    let checks = Checks {
+        timezone: "UTC".into(),
+        approvals: Approvals {
+            shipped: vec![shipped_as("calendar", &hashes)],
+            stored: vec![stored_for("c", &hashes)],
+        },
+        sources: vec![],
+    };
+    assert_eq!(
+        *prepare(&config, &checks).unwrap().approval(),
+        Approval::Shipped {
+            name: "calendar".into()
+        }
+    );
+}
+
+#[test]
+fn not_approved_is_typed() {
+    let dir = calendar();
+    let hashes = Hashes::of(&unpinned(dir.path(), SETTINGS)).unwrap();
+    let manifest = dir.path().join("c.toml");
+    let expect = |reason| NotApproved {
+        source: "c".into(),
+        manifest: manifest.clone(),
+        current: hashes.clone(),
+        reason,
+    };
+
+    let unknown = not_approved(&unpinned(dir.path(), SETTINGS), &storing(vec![]));
+    assert_eq!(unknown, expect(NotApprovedReason::Unknown));
+
+    let mut half = unpinned(dir.path(), SETTINGS);
+    half.sha256 = Some(hashes.sha256.clone());
+    assert_eq!(
+        not_approved(&half, &storing(vec![])),
+        expect(NotApprovedReason::HalfPinned)
+    );
+
+    let wasm = entry(
+        dir.path(),
+        &format!("sha256 = \"{}\"\n{SETTINGS}", "0".repeat(64)),
+    );
+    assert_eq!(
+        not_approved(&wasm, &storing(vec![])),
+        expect(NotApprovedReason::Changed {
+            file: dir.path().join("c.wasm"),
+            sha256: hashes.sha256.clone()
+        })
+    );
+
+    let toml = entry(
+        dir.path(),
+        &format!("manifest_sha256 = \"{}\"\n{SETTINGS}", "0".repeat(64)),
+    );
+    assert_eq!(
+        not_approved(&toml, &storing(vec![])),
+        expect(NotApprovedReason::Changed {
+            file: manifest.clone(),
+            sha256: hashes.manifest_sha256.clone()
+        })
+    );
+}
+
+#[test]
+fn downcast_through_context() {
+    let dir = calendar();
+    let config = unpinned(dir.path(), SETTINGS);
+    let e = prepare(&config, &storing(vec![]))
+        .context("source c")
+        .context("starting the hub")
+        .unwrap_err();
+    let refusal = e.downcast_ref::<NotApproved>().expect("NotApproved");
+    assert_eq!(refusal.reason, NotApprovedReason::Unknown);
+    assert_eq!(
+        format!("{e:#}"),
+        format!("starting the hub: source c: {refusal}")
+    );
+}
+
+/// The messages written out in full, as they were before the refusal had a type, so that the
+/// docs and the tests matching parts of them stay true.
+#[test]
+fn not_approved_displays_as_before() {
+    let refusal = |reason| NotApproved {
+        source: "calendar".into(),
+        manifest: "/c/calendar.toml".into(),
+        current: Hashes {
+            sha256: "aa".into(),
+            manifest_sha256: "bb".into(),
+        },
+        reason,
+    };
+    assert_eq!(
+        refusal(NotApprovedReason::Unknown).to_string(),
+        "not approved yet: these files are not a component shipped with this build of Fronde. \
+         Read its manifest /c/calendar.toml, then add sha256 = \"aa\" and manifest_sha256 = \
+         \"bb\" to its [[sources]] entry"
+    );
+    assert_eq!(
+        refusal(NotApprovedReason::HalfPinned).to_string(),
+        "not approved yet: set both sha256 and manifest_sha256, or neither for a component \
+         shipped with this build. Read its manifest /c/calendar.toml, then add sha256 = \"aa\" \
+         and manifest_sha256 = \"bb\" to its [[sources]] entry"
+    );
+    assert_eq!(
+        refusal(NotApprovedReason::Changed {
+            file: "/c/calendar.wasm".into(),
+            sha256: "aa".into()
+        })
+        .to_string(),
+        "/c/calendar.wasm changed since it was approved (its sha256 is now aa); read the \
+         manifest /c/calendar.toml again, then update the hashes in its [[sources]] entry \
+         (`fronde check` prints them)"
+    );
+}
+
+/// `Checks::load` reads the approvals stored in the database, bound to their source and hashes.
+#[tokio::test]
+async fn checks_load_reads_stored_approvals() {
+    let data = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(data.path()).await.unwrap();
+    let dir = calendar();
+    let component = unpinned(dir.path(), SETTINGS);
+    let hashes = Hashes::of(&component).unwrap();
+    let config: fronde_hub::config::Config = toml::from_str(&format!(
+        "[server]\ntoken = {{ env = \"FRONDE_UNUSED\" }}\n[data]\ndir = {:?}\ntimezone = \"UTC\"\n",
+        data.path().display().to_string()
+    ))
+    .unwrap();
+
+    let before = Checks::load(&config, &db).await.unwrap();
+    assert!(before.approvals.stored.is_empty());
+    assert_eq!(
+        not_approved(&component, &before).reason,
+        NotApprovedReason::Unknown
+    );
+
+    fronde_db::approvals::add(&db, "c", &hashes.sha256, &hashes.manifest_sha256)
+        .await
+        .unwrap();
+    fronde_db::approvals::add(&db, "agenda", &"0".repeat(64), &hashes.manifest_sha256)
+        .await
+        .unwrap();
+    // Approving the same files again changes nothing.
+    fronde_db::approvals::add(&db, "c", &hashes.sha256, &hashes.manifest_sha256)
+        .await
+        .unwrap();
+    let after = Checks::load(&config, &db).await.unwrap();
+    assert_eq!(after.approvals.stored.len(), 2);
+    assert_eq!(after.timezone, "UTC");
+    assert_eq!(
+        *prepare(&component, &after).unwrap().approval(),
+        Approval::Stored
     );
 }

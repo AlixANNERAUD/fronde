@@ -1,4 +1,4 @@
-use fronde_db::{BUSY_TIMEOUT, kv};
+use fronde_db::{BUSY_TIMEOUT, approvals, kv};
 use fronde_entity::kv as kv_rows;
 use fronde_migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait, Statement};
@@ -285,4 +285,27 @@ async fn failed_migration_leaves_nothing_behind() {
             .is_empty()
     );
     kv::set(&db, "s", "k", vec![1], None).await.unwrap();
+}
+
+#[tokio::test]
+async fn approvals_are_kept_once_with_their_first_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    assert!(approvals::all(&db).await.unwrap().is_empty());
+    approvals::add(&db, "calendar", "aa", "bb").await.unwrap();
+    let first = approvals::all(&db).await.unwrap();
+    approvals::add(&db, "calendar", "aa", "bb").await.unwrap();
+    // Another build of the same source is another approval.
+    approvals::add(&db, "calendar", "cc", "bb").await.unwrap();
+    let all = approvals::all(&db).await.unwrap();
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[0], first[0]);
+    assert_eq!(
+        (
+            all[1].source.as_str(),
+            all[1].sha256.as_str(),
+            all[1].manifest_sha256.as_str()
+        ),
+        ("calendar", "cc", "bb")
+    );
 }

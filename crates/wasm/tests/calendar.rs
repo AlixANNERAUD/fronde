@@ -5,7 +5,7 @@ use fronde_hub::config::ComponentConfig;
 use fronde_hub::source::Supervisor;
 use fronde_hub::tools::Registry;
 use fronde_wasm::{
-    Allowed, Approval, Checks, ComponentHost, ComponentSource, ComponentSpec, Hashes,
+    Allowed, Approval, Approvals, Checks, ComponentHost, ComponentSource, ComponentSpec, Hashes,
     LoadedComponent, prepare, shipped,
 };
 use serde_json::{Value, json};
@@ -48,7 +48,10 @@ async fn shipped_calendar_is_approved_loads_and_lists_its_tools() {
     .unwrap();
     let checks = Checks {
         timezone: "Europe/Paris".into(),
-        shipped: shipped(),
+        approvals: Approvals {
+            shipped: shipped(),
+            stored: vec![],
+        },
         sources: vec![],
     };
     let prepared = prepare(&config, &checks).unwrap();

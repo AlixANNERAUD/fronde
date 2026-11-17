@@ -83,11 +83,11 @@ fn warn_if_agent_missing(config: &fronde_hub::config::Config) {
     }
 }
 
-fn check(path: &std::path::Path) -> anyhow::Result<()> {
+async fn check(path: &std::path::Path) -> anyhow::Result<()> {
     let config = fronde_hub::config::load(path)?;
     fronde_hub::private::prepare_data_dir(&config.data.dir)?;
     warn_if_agent_missing(&config);
-    fronde::check::check(&config, &mut std::io::stdout())
+    fronde::check::check(&config, &mut std::io::stdout()).await
 }
 
 /// The adapter `mise run agent` installed in the current directory, as an absolute path.
@@ -159,7 +159,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result: anyhow::Result<ExitCode> = match &cli.command {
         Command::Init { config, force } => init(config, *force).map(|()| ExitCode::SUCCESS),
-        Command::Check { config } => check(config).map(|()| {
+        Command::Check { config } => check(config).await.map(|()| {
             println!("config OK");
             ExitCode::SUCCESS
         }),
