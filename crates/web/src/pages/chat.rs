@@ -106,6 +106,7 @@ fn RowView(item: Item, open: bool, on_send: EventHandler<Outgoing>) -> Element {
             from,
             status,
             refusal,
+            by,
         } => rsx! {
             RequestCard {
                 id,
@@ -113,6 +114,7 @@ fn RowView(item: Item, open: bool, on_send: EventHandler<Outgoing>) -> Element {
                 from,
                 status,
                 refusal,
+                by,
                 open,
                 on_send,
             }

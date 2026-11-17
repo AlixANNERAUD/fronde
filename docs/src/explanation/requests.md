@@ -48,8 +48,20 @@ admin only, for cards that grant something lasting; today the one user, the owne
 The hub knows who asks. Fronde's own assistant reaches `/mcp` with a token of its own, made at
 each start and kept in memory: its questions are tied to its running turn and headed *Question de
 Fronde*. Any other client uses `server.token`: its questions are headed with the name it gave when
-it connected, such as *Question de Codex*, so a card from an outside agent never passes for
-Fronde's own.
+it connected, quoted and marked as a client, such as *Question de « Codex » (client MCP)*, so a
+card from an outside agent never passes for Fronde's own. Only the token makes a caller the
+assistant: a client that calls itself `assistant` is still an outside client. Since a client
+chooses its name, the hub refuses to ask the user anything for one named *Fronde* or *assistant*
+(in any case), one whose name is longer than 40 characters, or one whose name holds a control
+character.
+
+A card's texts are capped so that it stays readable on a phone and small on the wire: a question
+at most 300 characters, a label 60, a description 200, a preview 4000. None may hold a control
+character (a preview may hold line breaks and tabs), nor a bidirectional control that would make
+it read as something else. Each refusal tells the agent how to fix its call. The chat's WebSocket
+takes messages of at most 64 KiB, and closes on a bigger one.
+
+A closed card says how it ended, and who answered when it was not you.
 
 ## Restarts and retries
 
@@ -71,7 +83,8 @@ table allows one pending request per caller and id). A new question never gets a
 Cards are built for a phone first: full width below 640 px, each option a row at least 44 px tall
 that you can tap anywhere, *Envoyer* and *Refuser* full width. A question with one answer is a
 radio group (arrow keys move the pick, as in any radio group); one with several answers is a list
-of boxes. *Autre…* reveals a text box, and *Ajouter une précision* a note. An option's preview
+of boxes. *Enter* sends the card, as in a form. *Autre…* reveals a text box, where the arrow keys
+move the caret, and *Ajouter une précision* a note. An option's preview
 shows under it on a phone and beside the options on a wider screen. Text from an agent is shown
 as text, never as HTML.
 

@@ -117,10 +117,13 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     /// The answer to [`ClientMsg::Hello`], before any entry. `log_id` changes when the log is
     /// started over, so a page can tell that what it shows is gone even when seqs overlap;
-    /// `last_seq` is the newest entry at that moment.
+    /// `last_seq` is the newest entry at that moment. `user`: whom the page is signed in as, so
+    /// a closed card can say who answered when it was someone else.
     Hello {
         log_id: String,
         last_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
     },
     Entry(Entry),
     /// The answer to the request `id` was refused, for this page only: the request did not
@@ -293,9 +296,21 @@ mod tests {
         let hello = ServerMsg::Hello {
             log_id: "0f3c".into(),
             last_seq: 12,
+            user: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(json, r#"{"type":"hello","log_id":"0f3c","last_seq":12}"#);
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), hello);
+        let hello = ServerMsg::Hello {
+            log_id: "0f3c".into(),
+            last_seq: 12,
+            user: Some("alix".into()),
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"hello","log_id":"0f3c","last_seq":12,"user":"alix"}"#
+        );
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), hello);
 
         let hello = ClientMsg::Hello {

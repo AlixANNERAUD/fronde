@@ -340,6 +340,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn outside_client_named_like_fronde_is_still_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = start_hub(dir.path()).await;
+        let (d, h) = crate::tools::typed_tool_with_context(
+            "test_whoami",
+            "Who calls.",
+            false,
+            |context: CallContext, _: serde_json::Value| async move {
+                ToolOutput::ok(serde_json::json!({
+                    "caller": context.caller.id(),
+                    "turn": context.turn,
+                }))
+            },
+        );
+        hub.registry.register(d, h).unwrap();
+        for name in ["assistant", "Fronde", "Assistant"] {
+            let (a, b) = tokio::io::duplex(1 << 16);
+            let server = HubServer::new(hub.clone());
+            tokio::spawn(async move {
+                let running = server.serve(a).await.unwrap();
+                let _ = running.waiting().await;
+            });
+            let mut info = rmcp::model::ClientConfig::default();
+            info.client_info = Implementation::new(name, "1.0");
+            let client = info.serve(b).await.unwrap();
+            let r = client
+                .call_tool(CallToolRequestParams::new("test_whoami"))
+                .await
+                .unwrap();
+            let text = match &r.content[0] {
+                rmcp::model::ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("{other:?}"),
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            // Only the assistant's token makes a caller the assistant, never a name.
+            assert_eq!(
+                value["result"],
+                serde_json::json!({"caller": format!("mcp:{name}"), "turn": null}),
+                "{name}"
+            );
+        }
+    }
+
     /// Records each request's end.
     #[derive(Default)]
     struct Closes(std::sync::Mutex<Vec<(u64, fronde_protocol::Outcome)>>);
@@ -383,7 +427,11 @@ mod tests {
         let requests = fronde_requests::Requests::open(db.clone(), closes.clone())
             .await
             .unwrap();
-        let hub = Arc::new(Hub::start(config, db, vec![], Some(requests)).await.unwrap());
+        let hub = Arc::new(
+            Hub::start(config, db, vec![], Some(requests))
+                .await
+                .unwrap(),
+        );
         let client = connect(hub).await;
         let args = serde_json::json!({"questions": [{
             "question": "Laquelle ?",

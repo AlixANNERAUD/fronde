@@ -63,6 +63,8 @@ pub enum Item {
         status: RequestStatus,
         /// Why the server refused this page's last answer, while the request is open.
         refusal: Option<String>,
+        /// Who answered, once closed, when it was not this page's user.
+        by: Option<String>,
     },
 }
 
@@ -96,6 +98,8 @@ pub struct Chat {
     log_id: Option<String>,
     /// Counts log resets.
     generation: u32,
+    /// Whom the page is signed in as, from the server's hello.
+    viewer: Option<String>,
 }
 
 impl Chat {
@@ -119,7 +123,11 @@ impl Chat {
     /// Takes in what the server sent.
     pub fn apply(&mut self, msg: &ServerMsg) {
         match msg {
-            ServerMsg::Hello { log_id, last_seq } => {
+            ServerMsg::Hello {
+                log_id,
+                last_seq,
+                user,
+            } => {
                 // Another log, or one shorter than what the page shows (deleted and started
                 // again): what the page shows is gone, the server replays the whole new log.
                 if self.log_id.as_deref().is_some_and(|known| known != log_id)
@@ -131,6 +139,7 @@ impl Chat {
                     };
                 }
                 self.log_id = Some(log_id.clone());
+                self.viewer = user.clone();
             }
             ServerMsg::Entry(entry) => self.apply_entry(entry.clone()),
             ServerMsg::Refused { id, reason } => {
@@ -248,18 +257,24 @@ impl Chat {
                     from,
                     status: RequestStatus::Open,
                     refusal: None,
+                    by: None,
                 },
             ),
-            Event::RequestClosed { id, outcome, .. } => {
+            Event::RequestClosed { id, outcome, by } => {
+                let someone_else = by.filter(|by| self.viewer.as_ref() != Some(by));
                 if let Some(row) = self.open_request(id) {
                     let Item::Request {
-                        status, refusal, ..
+                        status,
+                        refusal,
+                        by,
+                        ..
                     } = &mut row.item
                     else {
                         unreachable!("an open request row");
                     };
                     *status = RequestStatus::Closed(outcome);
                     *refusal = None;
+                    *by = someone_else;
                     row.version += 1;
                 }
             }
@@ -342,6 +357,7 @@ mod tests {
         ServerMsg::Hello {
             log_id: log_id.into(),
             last_seq,
+            user: None,
         }
     }
 
@@ -656,6 +672,41 @@ mod tests {
             request_status(&chat, 1),
             (RequestStatus::Closed(answered), None)
         );
+    }
+
+    #[test]
+    fn closed_request_names_who_answered_unless_the_viewer() {
+        let answered_by = |chat: &Chat, index: usize| match &chat.rows()[index].item {
+            Item::Request { by, .. } => by.clone(),
+            other => panic!("not a request: {other:?}"),
+        };
+        let closed = |seq, id, by: &str| {
+            entry(
+                seq,
+                Event::RequestClosed {
+                    id,
+                    outcome: Outcome::Declined,
+                    by: Some(by.into()),
+                },
+            )
+        };
+        let mut chat = Chat::default();
+        chat.apply(&ServerMsg::Hello {
+            log_id: "a".into(),
+            last_seq: 0,
+            user: Some("alix".into()),
+        });
+        apply_all(
+            &mut chat,
+            [
+                question(1, 1),
+                question(2, 2),
+                closed(3, 1, "alix"),
+                closed(4, 2, "sam"),
+            ],
+        );
+        assert_eq!(answered_by(&chat, 0), None, "the viewer answered");
+        assert_eq!(answered_by(&chat, 1), Some("sam".into()));
     }
 
     #[test]

@@ -32,8 +32,14 @@ pub async fn upgrade(
         });
     }
     renew(&session);
-    upgrade.on_upgrade(move |socket| chat(socket, web))
+    upgrade
+        .max_message_size(MAX_MESSAGE)
+        .on_upgrade(move |socket| chat(socket, web))
 }
+
+/// The largest message a page may send: a message to Fronde or a card's answer is far smaller,
+/// and anything bigger only costs the server memory. The socket closes on a bigger one.
+const MAX_MESSAGE: usize = 64 * 1024;
 
 /// The answer a page gives a permission entry of the log to allow it.
 const ALLOW_ONCE: &str = "allow_once";
@@ -79,6 +85,7 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>) {
                         let hello = ServerMsg::Hello {
                             log_id: log.log_id().to_owned(),
                             last_seq: newest,
+                            user: Some(web.user.clone()),
                         };
                         if send(&mut socket, &hello).await.is_err()
                             || replay(&mut socket, assistant, &mut last_sent).await.is_err()

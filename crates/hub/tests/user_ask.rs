@@ -184,6 +184,59 @@ async fn user_ask_validates_its_arguments() {
             json!({"questions": [{"question": "Laquelle ?", "header": "Appli"}]}),
             "invalid arguments at `questions[0]`",
         ),
+        (
+            json!({"questions": [{"question": "x".repeat(301), "header": "Appli", "options": [option("a"), option("b")]}]}),
+            "question 1: question has 301 characters; use at most 300, and put the details in the options' descriptions",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle ?", "header": "Appli", "options": [option(&"a".repeat(61)), option("b")]}]}),
+            "question 1, option 1: label has 61 characters; use at most 60, and put the details in description",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle ?", "header": "Appli", "options": [
+                {"label": "a", "description": "d".repeat(201)},
+                option("b"),
+            ]}]}),
+            "question 1, option 1: description has 201 characters; use at most 200",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle ?", "header": "Appli", "options": [
+                option("a"),
+                {"label": "b", "description": "B", "preview": "p".repeat(4001)},
+            ]}]}),
+            "question 1, option 2: preview has 4001 characters; use at most 4000",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle\u{7}?", "header": "Appli", "options": [option("a"), option("b")]}]}),
+            "question 1: question contains the control character U+0007; remove it (write it on one line",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle ?\nVite.", "header": "Appli", "options": [option("a"), option("b")]}]}),
+            "question 1: question contains the control character U+000A",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle ?", "header": "Ap\u{1b}pli", "options": [option("a"), option("b")]}]}),
+            "question 1: header contains the control character U+001B",
+        ),
+        (
+            // The card's own value for "Autre…" cannot be a label.
+            json!({"questions": [{"question": "Laquelle ?", "header": "Appli", "options": [option("\u{1f}autre"), option("b")]}]}),
+            "question 1, option 1: label contains the control character U+001F",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle ?", "header": "Appli", "options": [
+                {"label": "a", "description": "A\u{202e}", "preview": "ok"},
+                option("b"),
+            ]}]}),
+            "question 1, option 1: description contains the control character",
+        ),
+        (
+            json!({"questions": [{"question": "Laquelle ?", "header": "Appli", "options": [
+                {"label": "a", "description": "A", "preview": "ligne 1\n\tligne 2\u{0}"},
+                option("b"),
+            ]}]}),
+            "question 1, option 1: preview contains the control character U+0000; remove it (only line breaks and tabs are allowed)",
+        ),
     ];
     for (args, expected) in cases {
         let out = result(bench.ask(args.clone())).await;
@@ -392,4 +445,74 @@ async fn user_ask_reused_id_gets_no_old_answer() {
         result(second).await["result"],
         json!({"status": "cancelled"})
     );
+}
+
+#[tokio::test]
+async fn user_ask_preview_keeps_its_lines() {
+    let mut bench = bench().await;
+    let call = bench.ask(json!({"questions": [{
+        "question": "Quelle mise en page ?",
+        "header": "Page",
+        "options": [
+            {"label": "Deux colonnes", "description": "A et B", "preview": "| A | B |\n|\tC |"},
+            option("Une colonne"),
+        ],
+    }]}));
+    let (id, card, _) = bench.card().await;
+    let Card::Form { fields, .. } = &card;
+    let Field::Choice { options, .. } = &fields[0];
+    assert_eq!(options[0].preview.as_deref(), Some("| A | B |\n|\tC |"));
+    bench.requests.cancel(id).await.unwrap();
+    result(call).await;
+}
+
+#[tokio::test]
+async fn outside_client_names_are_checked() {
+    let mut bench = bench().await;
+    for (name, expected) in [
+        (
+            "Fronde",
+            "your MCP client's name \"Fronde\" is Fronde's own",
+        ),
+        ("fronde ", "is Fronde's own"),
+        ("ASSISTANT", "is Fronde's own"),
+        ("assistant", "is Fronde's own"),
+        (
+            "Un client au nom vraiment beaucoup trop long",
+            "your MCP client's name has 44 characters, too long for the card",
+        ),
+        ("Co\u{1f}dex", "control character U+001F"),
+    ] {
+        let context = CallContext {
+            caller: Caller::Mcp(name.into()),
+            turn: None,
+            ..context()
+        };
+        let out = bench
+            .registry
+            .call_as(&context, "user_ask", one_question())
+            .await;
+        assert!(out.is_error, "{name}: {}", out.to_text());
+        let text = out.value.as_str().unwrap();
+        assert!(text.contains(expected), "{name}: {text}");
+        assert!(
+            text.contains("connect with a clientInfo.name of 1 to 40 characters"),
+            "{text}"
+        );
+    }
+    assert!(bench.shown.try_recv().is_err(), "no card for any of them");
+
+    // A fair name asks, under that name.
+    let context = CallContext {
+        caller: Caller::Mcp("Codex".into()),
+        turn: None,
+        ..context()
+    };
+    let registry = bench.registry.clone();
+    let call =
+        tokio::spawn(async move { registry.call_as(&context, "user_ask", one_question()).await });
+    let (id, _, from) = bench.card().await;
+    assert_eq!(from.as_deref(), Some("Codex"));
+    bench.requests.cancel(id).await.unwrap();
+    result(call).await;
 }

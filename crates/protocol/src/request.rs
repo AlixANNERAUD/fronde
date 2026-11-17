@@ -173,6 +173,19 @@ pub fn check(card: &Card, response: &Response) -> Result<(), Invalid> {
             ..
         } = field;
         let answer = values.get(key);
+        // Before anything else: an optional question left unanswered may still carry a note.
+        let texts = answer
+            .into_iter()
+            .flat_map(|a| [&a.other, &a.note])
+            .flatten();
+        for text in texts {
+            if text.chars().count() > MAX_TEXT {
+                return Err(invalid(
+                    Some(key),
+                    format!("Texte trop long : {MAX_TEXT} caractères au plus."),
+                ));
+            }
+        }
         let picked = answer.map_or(0, |a| a.selected.len() + usize::from(a.other.is_some()));
         if picked == 0 {
             if *required {
@@ -212,14 +225,6 @@ pub fn check(card: &Card, response: &Response) -> Result<(), Invalid> {
         }
         if !*multi && picked > 1 {
             return Err(invalid(Some(key), "Une seule réponse possible."));
-        }
-        for text in [&answer.other, &answer.note].into_iter().flatten() {
-            if text.chars().count() > MAX_TEXT {
-                return Err(invalid(
-                    Some(key),
-                    format!("Texte trop long : {MAX_TEXT} caractères au plus."),
-                ));
-            }
         }
     }
     Ok(())
@@ -440,6 +445,18 @@ mod tests {
         let error = refused(&card, &values(&[("single", noted)]));
         assert_eq!(error.message, "Texte trop long : 2000 caractères au plus.");
         let error = refused(&card, &values(&[("single", answer(&[], Some(&long)))]));
+        assert_eq!(error.message, "Texte trop long : 2000 caractères au plus.");
+        // An optional question left unanswered: its note is checked all the same.
+        let mut only_a_note = answer(&[], None);
+        only_a_note.note = Some(long);
+        let error = refused(
+            &card,
+            &values(&[
+                ("single", answer(&["Seerr"], None)),
+                ("closed", only_a_note),
+            ]),
+        );
+        assert_eq!(error.key.as_deref(), Some("closed"));
         assert_eq!(error.message, "Texte trop long : 2000 caractères au plus.");
 
         let error = refused(

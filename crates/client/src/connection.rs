@@ -121,6 +121,7 @@ mod tests {
         chat.apply(&ServerMsg::Hello {
             log_id: "a".into(),
             last_seq: 0,
+            user: None,
         });
         assert_eq!(connection.state(), State::Open);
         assert_eq!(

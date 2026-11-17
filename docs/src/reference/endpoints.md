@@ -54,7 +54,8 @@ The pages, assets and forms carry:
 Without a session, it upgrades and closes at once with code `4401`, which the page reads as
 "sign in again": a refused upgrade would look like a network failure.
 
-Messages are JSON objects tagged by `type`.
+Messages are JSON objects tagged by `type`. A page's message is at most 64 KiB; a bigger one
+closes the socket.
 
 From the page:
 
@@ -69,7 +70,7 @@ From the server:
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
-| `hello` | `log_id`, `last_seq` | The answer to the page's `hello`, before any entry. |
+| `hello` | `log_id`, `last_seq`, `user` | The answer to the page's `hello`, before any entry. `user` is whom the page is signed in as: a closed card names who answered only when it was someone else. |
 | `entry` | `seq`, `at`, `event` | One numbered, timestamped event of the conversation: a user message, an assistant text chunk, a tool call, a permission request or answer, a request to the user (`request`: `id`, `card`, optional `from`) or its end (`request_closed`: `id`, `outcome`, optional `by`), the end of a turn, or a notice. |
 | `refused` | `id`, `reason` | The page's answer to the request `id` was refused, and the request did not change: it is not this user's, it is closed already, or the answer does not fit the card (`reason` says what to fix, in French). Sent to that page only; never logged. |
 

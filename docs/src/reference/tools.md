@@ -82,8 +82,12 @@ its `timeout_ms`. Otherwise the call opens a new request, or, while the request 
 still pending, fails with an error asking for a new `client_request_id`.
 
 A question from Fronde's own assistant is headed *Question de Fronde*; one from an outside client
-is headed with the name the client gave (`clientInfo.name`), such as *Question de Codex*. Never
-use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
+is headed with the name the client gave (`clientInfo.name`), quoted and marked, such as
+*Question de « Codex » (client MCP)*. An outside client named *Fronde* or *assistant* (in any
+case), with a name longer than 40 characters or holding a control character, gets an error asking
+it to connect under another name. Texts are capped: `question` at 300 characters, `label` at 60,
+`description` at 200, `preview` at 4000. None may hold a control character or a bidirectional
+control; only `preview` may hold line breaks and tabs. Never use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
 than the question's: Codex, for instance, gives up after `tool_timeout_sec` (60 s by default).
 A call the client cancels closes its card as cancelled, and so does the end of the assistant's
 turn, or *Stop*, for the questions that turn asked.

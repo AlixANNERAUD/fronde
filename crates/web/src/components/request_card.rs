@@ -27,7 +27,8 @@ use crate::{
     socket::Outgoing,
 };
 
-/// The value of the "Autre…" radio: a control character no label starts with.
+/// The value of the "Autre…" radio: it starts with a control character, which the server
+/// refuses in labels.
 const OTHER: &str = "\u{1f}autre";
 /// Full width on a phone, beside the conversation's margin from `sm:` up.
 const CARD_CLASS: &str = "w-full sm:max-w-[85%]";
@@ -52,6 +53,8 @@ pub fn RequestCard(
     from: Option<String>,
     status: RequestStatus,
     refusal: Option<String>,
+    /// Who answered, on a closed card, when it was not this page's user.
+    by: Option<String>,
     /// The socket is open: an answer can go out.
     open: bool,
     on_send: EventHandler<Outgoing>,
@@ -85,20 +88,29 @@ pub fn RequestCard(
                         p { class: "text-muted-foreground text-sm wrap-break-word", {question(field)} }
                     }
                 }
-                CardFooter { {closed_badge(&outcome)} }
+                CardFooter { class: "flex-wrap gap-2",
+                    {closed_badge(&outcome)}
+                    if let Some(by) = by {
+                        span { class: "text-muted-foreground text-xs", "par {by}" }
+                    }
+                }
             }
         },
     }
 }
 
-/// Who asks, as the card's header says it.
+/// Who asks, as the card's header says it. An outside client is quoted and marked as one: it
+/// chose its name, which must never read as Fronde's own.
 fn asker(from: Option<&str>, questions: usize) -> String {
     let what = if questions > 1 {
         "Questions"
     } else {
         "Question"
     };
-    format!("{what} de {}", from.unwrap_or("Fronde"))
+    match from {
+        None => format!("{what} de Fronde"),
+        Some(name) => format!("{what} de « {name} » (client MCP)"),
+    }
 }
 
 fn question(field: &Field) -> &str {
@@ -191,10 +203,10 @@ fn FormCard(
         fields: fields.clone(),
         submit: submit.clone(),
     };
-    let send = {
+    let send = use_callback({
         let radios = radios.clone();
         let fields = fields.clone();
-        move |_| {
+        move |()| {
             let values: Vec<String> = radios.iter().map(|radio| radio()).collect();
             let response = response(&fields, &values, &drafts.read());
             if let Err(error) = check(&card, &response) {
@@ -207,7 +219,7 @@ fn FormCard(
                 sent: Some(delivered),
             });
         }
-    };
+    });
     let decline = move |_| {
         invalid.set(None);
         on_send.call(Outgoing {
@@ -250,6 +262,7 @@ fn FormCard(
                         drafts,
                         error: error_for(field.key()),
                         disabled,
+                        on_submit: send,
                     }
                 }
                 if let Some(error) = card_error {
@@ -269,7 +282,7 @@ fn FormCard(
                     id: "r{id}-send",
                     class: BUTTON_CLASS,
                     disabled,
-                    onclick: send,
+                    onclick: move |_| send.call(()),
                     {submit.unwrap_or_else(|| "Envoyer".into())}
                 }
             }
@@ -289,6 +302,8 @@ fn ChoiceField(
     drafts: Signal<Vec<Draft>>,
     error: Option<String>,
     disabled: bool,
+    /// Enter in the options or in "Autre…": the card's "Envoyer".
+    on_submit: Callback<()>,
 ) -> Element {
     let Field::Choice {
         header,
@@ -332,7 +347,9 @@ fn ChoiceField(
     } else {
         radio() == OTHER
     };
-    // Arrow keys move the pick within a question with one answer, as in a native radio group.
+    // Arrow keys move the pick within a question with one answer, as in a native radio group;
+    // Enter sends the card, as in a form. The "Autre…" text box sits outside the options, so
+    // its own arrow keys move its caret.
     let values: Vec<String> = options
         .iter()
         .map(|option| option.label.clone())
@@ -343,7 +360,15 @@ fn ChoiceField(
         .chain(other.then(|| other_id.clone()))
         .collect();
     let on_key = move |event: KeyboardEvent| {
-        if multi || disabled {
+        if disabled || event.is_composing() {
+            return;
+        }
+        if event.key() == Key::Enter {
+            event.prevent_default();
+            on_submit.call(());
+            return;
+        }
+        if multi {
             return;
         }
         let step: isize = match event.key() {
@@ -425,7 +450,18 @@ fn ChoiceField(
                     }
                 }
             }
-            if other_open {
+        }
+    };
+    let other_text = rsx! {
+        if other && other_open {
+            // The box's keys bubble here, never to the options' arrow keys.
+            div {
+                onkeydown: move |event: KeyboardEvent| {
+                    if event.key() == Key::Enter && !event.is_composing() && !disabled {
+                        event.prevent_default();
+                        on_submit.call(());
+                    }
+                },
                 Input {
                     id: "{other_id}-text",
                     value: draft.other.clone(),
@@ -449,12 +485,15 @@ fn ChoiceField(
                 span { class: "wrap-break-word", "{question}" }
             }
             div { class: if previews { "grid gap-3 md:grid-cols-2" } else { "flex flex-col gap-3" },
-                div { id: "{prefix}-options", class: "flex flex-col gap-2", onkeydown: on_key,
-                    if multi {
-                        div { role: "group", class: "flex flex-col gap-2", {rows} }
-                    } else {
-                        RadioGroup { value: radio, class: "gap-2", {rows} }
+                div { class: "flex flex-col gap-2",
+                    div { id: "{prefix}-options", class: "flex flex-col gap-2", onkeydown: on_key,
+                        if multi {
+                            div { role: "group", class: "flex flex-col gap-2", {rows} }
+                        } else {
+                            RadioGroup { value: radio, class: "gap-2", {rows} }
+                        }
                     }
+                    {other_text}
                 }
                 if previews {
                     pre { class: "bg-muted hidden overflow-x-auto rounded-md p-3 font-mono text-xs md:block",
@@ -722,20 +761,40 @@ mod tests {
         }
 
         fn key(&mut self, element: &str, key: Key, code: Code) {
-            let data = SerializedKeyboardData::new(
-                key,
-                code,
-                Location::Standard,
-                false,
-                Modifiers::empty(),
-                false,
-            );
-            self.send(element, "keydown", data);
+            self.send(element, "keydown", keyboard(key, code));
+        }
+
+        /// A key pressed in `element`, which need not listen itself: the event bubbles up to
+        /// whoever does.
+        fn key_in(&mut self, element: &str, key: Key, code: Code) {
+            let id = *self
+                .ids
+                .get(element)
+                .unwrap_or_else(|| panic!("no element {element}:\n{}", self.html()));
+            let data: Rc<dyn std::any::Any> =
+                Rc::new(PlatformEventData::new(Box::new(keyboard(key, code))));
+            self.dom
+                .runtime()
+                .handle_event("keydown", Event::new(data, true), id);
+            let mut mutations = Mutations::default();
+            self.dom.render_immediate(&mut mutations);
+            self.absorb(mutations);
         }
 
         fn html(&self) -> String {
             dioxus_ssr::render(&self.dom)
         }
+    }
+
+    fn keyboard(key: Key, code: Code) -> SerializedKeyboardData {
+        SerializedKeyboardData::new(
+            key,
+            code,
+            Location::Standard,
+            false,
+            Modifiers::empty(),
+            false,
+        )
     }
 
     /// The opening tag of the element `id`.
@@ -813,7 +872,73 @@ mod tests {
             props(single()),
         );
         dom.rebuild_in_place();
-        assert!(dioxus_ssr::render(&dom).contains("Question de Codex"));
+        assert!(
+            dioxus_ssr::render(&dom).contains("Question de « Codex » (client MCP)"),
+            "{}",
+            dioxus_ssr::render(&dom)
+        );
+    }
+
+    /// The card, asked by `from`, rendered.
+    fn render_from(from: &str, status: RequestStatus, by: Option<&str>) -> String {
+        #[derive(Props, Clone, PartialEq)]
+        struct FromProps {
+            from: String,
+            status: RequestStatus,
+            by: Option<String>,
+        }
+        let mut dom = VirtualDom::new_with_props(
+            |props: FromProps| {
+                rsx! {
+                    RequestCard {
+                        id: ID,
+                        card: single(),
+                        from: Some(props.from),
+                        status: props.status,
+                        refusal: None,
+                        by: props.by,
+                        open: true,
+                        on_send: |_| {},
+                    }
+                }
+            },
+            FromProps {
+                from: from.into(),
+                status,
+                by: by.map(str::to_owned),
+            },
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn an_outside_client_never_reads_as_fronde() {
+        for name in ["Fronde", "fronde", "assistant"] {
+            for status in [
+                RequestStatus::Open,
+                RequestStatus::Closed(Outcome::Declined),
+            ] {
+                let page = render_from(name, status, None);
+                assert!(
+                    page.contains(&format!("Question de « {name} » (client MCP)")),
+                    "{page}"
+                );
+                assert!(!page.contains("Question de Fronde"), "{page}");
+            }
+        }
+    }
+
+    #[test]
+    fn closed_card_names_who_answered_when_someone_else_did() {
+        let answered = RequestStatus::Closed(Outcome::Answered {
+            summary: "Seerr".into(),
+        });
+        let page = render_from("Codex", answered.clone(), Some("Sam"));
+        assert!(page.contains("Réponse : Seerr"), "{page}");
+        assert!(page.contains("par Sam"), "{page}");
+        let page = render_from("Codex", answered, None);
+        assert!(!page.contains("par "), "{page}");
     }
 
     #[test]
@@ -993,9 +1118,47 @@ mod tests {
         // Other keys do nothing.
         card.key(options, Key::Character("a".into()), Code::KeyA);
         assert!(checked(&card.html(), "r7-q0-o1"));
-        // Enter on the focused send button is its click.
-        card.click("r7-send");
+        assert_eq!(sent(), []);
+        // Enter sends the card, as in a form.
+        card.key(options, Key::Enter, Code::Enter);
         assert_eq!(sent(), [answer(&["Seerr"], None, None)]);
+        assert!(disabled(&card.html(), "r7-send"));
+
+        // Several answers: Enter sends too, and arrow keys leave the boxes alone.
+        let mut card = Live::new(props(multi()));
+        card.click("r7-q0-o1");
+        card.key(options, Key::ArrowDown, Code::ArrowDown);
+        assert!(checked(&card.html(), "r7-q0-o1"));
+        card.key(options, Key::Enter, Code::Enter);
+        assert_eq!(sent(), [answer(&["Immich"], None, None)]);
+
+        // Nothing picked: Enter shows what is missing and sends nothing.
+        let mut card = Live::new(props(single()));
+        card.key(options, Key::Enter, Code::Enter);
+        assert_eq!(sent(), []);
+        assert!(card.html().contains("Réponds à cette question."));
+    }
+
+    #[test]
+    fn arrow_keys_in_other_move_the_caret_not_the_pick() {
+        let mut card = Live::new(props(single()));
+        card.click("r7-q0-other");
+        card.type_text("r7-q0-other-text", "Tandoor");
+        for (key, code) in [
+            (Key::ArrowLeft, Code::ArrowLeft),
+            (Key::ArrowRight, Code::ArrowRight),
+            (Key::ArrowUp, Code::ArrowUp),
+            (Key::ArrowDown, Code::ArrowDown),
+        ] {
+            card.key_in("r7-q0-other-text", key, code);
+            let page = card.html();
+            assert!(checked(&page, "r7-q0-other"), "{page}");
+            assert!(tag(&page, "r7-q0-other-text").is_some(), "{page}");
+        }
+        assert_eq!(sent(), []);
+        // Enter in the box sends the card.
+        card.key_in("r7-q0-other-text", Key::Enter, Code::Enter);
+        assert_eq!(sent(), [answer(&[], Some("Tandoor"), None)]);
     }
 
     #[test]

@@ -618,3 +618,19 @@ fn failed(error: anyhow::Error) -> Refusal {
     tracing::error!("cannot answer a request: {error:#}");
     Refusal::Failed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Caller;
+
+    #[test]
+    fn a_client_named_like_the_assistant_stays_a_client() {
+        for name in ["assistant", "Fronde", "source:x", ""] {
+            let caller = Caller::Mcp(name.into());
+            assert_eq!(Caller::parse(&caller.id()), caller, "{name}");
+            assert_eq!(caller.from(), Some(name));
+        }
+        assert_eq!(Caller::parse("assistant"), Caller::Assistant);
+        assert_eq!(Caller::Assistant.from(), None);
+    }
+}

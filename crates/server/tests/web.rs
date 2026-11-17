@@ -211,7 +211,9 @@ async fn hello(socket: &mut Socket, last_seq: u64, log_id: Option<&str>) -> (Str
     let log_id = log_id.map(str::to_owned);
     say(socket, ClientMsg::Hello { last_seq, log_id }).await;
     match next_message(socket).await {
-        ServerMsg::Hello { log_id, last_seq } => (log_id, last_seq),
+        ServerMsg::Hello {
+            log_id, last_seq, ..
+        } => (log_id, last_seq),
         other => panic!("expected the server's hello, got {other:?}"),
     }
 }
@@ -1172,6 +1174,68 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[tokio::test]
+async fn oversized_message_closes_the_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    // Just under the limit, with its JSON: an ordinary message.
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "x".repeat(60 * 1024),
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_entry(&mut socket).await.event,
+        Event::User { .. }
+    ));
+    // Over it: the server drops the connection without reading it as a message.
+    let huge = serde_json::to_string(&ClientMsg::Send {
+        text: "x".repeat(100 * 1024),
+    })
+    .unwrap();
+    let _ = timeout(WAIT, socket.send(Message::text(huge)))
+        .await
+        .unwrap();
+    let ended = timeout(WAIT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the socket stayed open");
+    // Only one user message reached the conversation.
+    let mut other = open_chat(addr, &cookie).await;
+    say(
+        &mut other,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+        },
+    )
+    .await;
+    let mut users = 0;
+    let (_, newest) = match next_message(&mut other).await {
+        ServerMsg::Hello {
+            log_id, last_seq, ..
+        } => (log_id, last_seq),
+        other => panic!("{other:?}"),
+    };
+    for _ in 0..newest {
+        if matches!(next_entry(&mut other).await.event, Event::User { .. }) {
+            users += 1;
+        }
+    }
+    assert_eq!(users, 1);
 }
 
 #[tokio::test]

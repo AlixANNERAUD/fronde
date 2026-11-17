@@ -141,8 +141,11 @@ encrypted: see above, and below.
 
 - **`/mcp`** needs a bearer token, compared in constant time: `server.token`, at least 32
   characters, for outside clients, or the assistant's own random token. Which one a call carries
-  tells the hub who asks, so a card an outside client opens is labelled with that client's name
-  and is never mistaken for Fronde's own question. `/mcp` skips the `Host` check against DNS
+  tells the hub who asks, so a card an outside client opens is labelled with that client's name,
+  quoted and marked, as in *Question de « Codex » (client MCP)*, and is never mistaken for
+  Fronde's own question. A client chooses its name, so the hub asks nothing for one named
+  *Fronde* or *assistant*, one with a name over 40 characters, or one whose name holds a control
+  character; a name is never what makes a caller the assistant, only its token is. `/mcp` skips the `Host` check against DNS
   rebinding: a page that rebinds a name to Fronde still cannot send a token.
 - **The chat** needs the password. A wrong one is answered after a second, and five in a row lock
   sign-in for a minute for everyone: there is a single password to guess, so the throttle is
