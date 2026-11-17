@@ -369,3 +369,63 @@ async fn stored_with(config: &fronde_hub::config::Config, name: &str) -> String 
     let row = sealed.iter().find(|s| s.name == name).unwrap();
     row.open(&key).unwrap().expose_secret().to_owned()
 }
+
+#[tokio::test]
+async fn the_agent_token_is_read_at_each_start() {
+    use fronde_hub::config::{CLAUDE_ORIGIN, Secret};
+    let dir = tempfile::tempdir().unwrap();
+    let config = fronde_hub::config::load(&config(dir.path())).unwrap();
+    fronde_hub::private::prepare_data_dir(&config.data.dir).unwrap();
+    let db = fronde_db::open(&config.data.dir).await.unwrap();
+    let backends = config.master_key_backends().unwrap();
+    let read = |secret: Secret| fronde::agent_oauth_token(secret, db.clone(), backends.clone());
+
+    // Stored for Claude's API: opened with the master key, again at each start.
+    let stored = read(Secret::Stored {
+        stored: "claude".into(),
+    });
+    let missing = stored().await.unwrap_err().to_string();
+    assert!(
+        missing.contains("fronde secret set claude --origin"),
+        "{missing}"
+    );
+    for value in ["first-token", "second-token"] {
+        fronde_db::secrets::store(
+            &db,
+            &backends,
+            fronde_db::secrets::SOURCES,
+            "claude",
+            CLAUDE_ORIGIN,
+            &value.to_owned().into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored().await.unwrap().expose_secret(), value);
+    }
+    // Stored for another origin, it is refused.
+    fronde_db::secrets::store(
+        &db,
+        &backends,
+        fronde_db::secrets::SOURCES,
+        "elsewhere",
+        "https://cloud.example",
+        &"x".to_owned().into(),
+    )
+    .await
+    .unwrap();
+    let error = read(Secret::Stored {
+        stored: "elsewhere".into(),
+    })()
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not Claude's API"), "{error}");
+
+    // A file, read again at each start.
+    let file = dir.path().join("claude-token");
+    fronde_hub::private::write(&file, "from-file\n").unwrap();
+    let from_file = read(Secret::File { file: file.clone() });
+    assert_eq!(from_file().await.unwrap().expose_secret(), "from-file");
+    fronde_hub::private::write(&file, "changed\n").unwrap();
+    assert_eq!(from_file().await.unwrap().expose_secret(), "changed");
+}

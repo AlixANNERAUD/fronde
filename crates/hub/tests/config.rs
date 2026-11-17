@@ -867,3 +867,43 @@ fn secret_variables_are_listed() {
     let base = c.path().unwrap().parent().unwrap();
     assert_eq!(c.secret_files(), [base.join("pw"), base.join("master.key")]);
 }
+
+#[test]
+fn the_agent_token_is_a_secret() {
+    use fronde_hub::config::Secret;
+    let c = load_str(&format!(
+        "{MIN}[agent]\noauth_token = {{ file = \"claude-token\" }}\n"
+    ))
+    .unwrap();
+    let base = c.path().unwrap().parent().unwrap().to_path_buf();
+    match &c.agent.oauth_token {
+        Some(Secret::File { file }) => assert_eq!(file, &base.join("claude-token")),
+        other => panic!("{other:?}"),
+    }
+    // Its file is protected like any secret's, and its variable never reaches the agent as is.
+    assert!(c.secret_files().contains(&base.join("claude-token")));
+    let c = load_str(&format!(
+        "{MIN}[agent]\noauth_token = {{ env = \"CLAUDE_TOKEN\" }}\n"
+    ))
+    .unwrap();
+    assert!(c.secret_env_names().contains(&"CLAUDE_TOKEN".to_owned()));
+    let c = load_str(&format!(
+        "{MIN}[agent]\noauth_token = {{ stored = \"claude\" }}\n"
+    ))
+    .unwrap();
+    assert!(matches!(&c.agent.oauth_token, Some(Secret::Stored { stored }) if stored == "claude"));
+    assert!(
+        load_str(&format!(
+            "{MIN}[agent]\noauth_token = {{ stored = \"no spaces\" }}\n"
+        ))
+        .is_err()
+    );
+    // Never the token itself in the configuration, nor the token twice.
+    assert!(load_str(&format!("{MIN}[agent]\noauth_token = \"sk-ant-oat\"\n")).is_err());
+    let error = load_str(&format!(
+        "{MIN}[agent]\noauth_token = {{ env = \"T\" }}\nenv = {{ CLAUDE_CODE_OAUTH_TOKEN = \"x\" }}\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("oauth_token"), "{error}");
+}

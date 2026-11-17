@@ -79,10 +79,13 @@ password = { file = "/run/secrets/fronde_password" }
 secure_cookie = false
 
 # Optional: the agent Fronde runs (ACP over stdio), started on the first message. It keeps only a
-# few variables of Fronde's environment, CLAUDE_CODE_OAUTH_TOKEN among them, which goes there,
-# never here.
+# few variables of Fronde's environment.
 [agent]
 command = ["claude-agent-acp"]
+# Its Claude sign-in: the token `claude setup-token` prints, run in your own home. A secret like
+# the others: { file = "…" }, { env = "…" } or { stored = "…" } (stored for
+# https://api.anthropic.com). Never run `claude` with HOME set to the agent's home.
+# oauth_token = { file = "claude-token" }
 # Extra environment for the agent, in plain text: no secrets. For example, to run the installed
 # Claude Code instead of the adapter's own:
 # env = { CLAUDE_CODE_EXECUTABLE = "/home/alix/.local/bin/claude" }

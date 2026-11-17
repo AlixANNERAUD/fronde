@@ -66,14 +66,29 @@ the `PATH`, in case `init` did not find it.
 
 ## 5. Sign the agent in to Claude
 
-The agent has a home of its own in the data directory, which Fronde created at start, and does
-not use your `~/.claude`. Sign it in once, in another terminal:
+The agent has a home of its own in the data directory and does not use your `~/.claude`. It signs
+in with a long-lived token. In another terminal, in your own home as usual, run:
 
 ```sh
-HOME=~/.local/share/fronde/home claude
+claude setup-token
 ```
 
-Type `/login`, follow the sign-in in your browser, then quit `claude`.
+Follow the sign-in in your browser; `claude` prints the token. Save it in a file only you can read,
+beside `fronde.toml`:
+
+```sh
+(umask 077; cat > claude-token)   # paste the token, press Enter, then Ctrl-D
+```
+
+Add it to `fronde.toml`, then restart `fronde serve`:
+
+```toml
+[agent]
+oauth_token = { file = "claude-token" }
+```
+
+Never run `claude` with `HOME` set to the agent's home to sign it in: the agent can write that
+home, and what it left there would run with your rights.
 
 ## 6. Sign in and chat
 

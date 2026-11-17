@@ -1,30 +1,52 @@
 # Sign Fronde in to Claude
 
 Fronde's agent is Claude Code, run through its ACP adapter. It has its own home, `home/` in the
-data directory, and keeps its sign-in there: it never uses your `~/.claude`. It reads none of
-Claude Code's settings: your plugins, MCP servers, hooks and permission rules do not apply to it.
-Of Fronde's environment it keeps only a few variables, `CLAUDE_CODE_OAUTH_TOKEN` among them (see
+data directory, and never uses your `~/.claude`. It reads none of Claude Code's settings: your
+plugins, MCP servers, hooks and permission rules do not apply to it. It signs in with a
+long-lived token, which you make once and give to Fronde as `[agent] oauth_token` (see
 [Configuration](../reference/configuration.md#agent)).
 
 ## Native
 
-Sign the agent in once, in its own home. With the default data directory:
+1. In your own terminal and home, as usual, run `claude setup-token`. It signs in to your
+   subscription in the browser and prints a long-lived token.
+2. Keep the token where Fronde reads secrets, in one of three ways:
+   - a file only you can read, beside `fronde.toml`:
 
-```sh
-HOME=~/.local/share/fronde/home claude
-```
+     ```sh
+     (umask 077; cat > claude-token)   # paste the token, press Enter, then Ctrl-D
+     ```
 
-Then type `/login` and follow the browser sign-in. Quit `claude` once it is done. Use your
-`[data] dir` followed by `/home` if you set one. Start Fronde once before, so that the directory
-exists.
+     ```toml
+     [agent]
+     oauth_token = { file = "claude-token" }
+     ```
 
-Alternatively, run `claude setup-token`, which prints a long-lived token, and give it to Fronde as
-the `CLAUDE_CODE_OAUTH_TOKEN` environment variable (for the service, through a systemd drop-in
-with `Environment=` or, better, a file only you can read with `EnvironmentFile=`).
+   - stored encrypted in `fronde.db`, for Claude's API, from that file or a pipe:
+
+     ```sh
+     fronde secret set claude --origin https://api.anthropic.com --config fronde.toml < claude-token
+     ```
+
+     ```toml
+     [agent]
+     oauth_token = { stored = "claude" }
+     ```
+
+   - an environment variable of the service, with `oauth_token = { env = "CLAUDE_TOKEN" }` (for a
+     systemd unit, through a file only you can read with `EnvironmentFile=`).
+3. Restart Fronde. It reads the token at each start of the agent, so a new token in the file or
+   the store applies from the next one.
+
+Do not sign the agent in by running `claude` with `HOME` set to its home (`/login` there). The
+agent can write its home: a hook, an `apiKeyHelper` or a `statusLine` it put in
+`.claude/settings.json`, or an MCP server it added to `.claude.json`, would run as you, outside
+its sandbox, the moment you start `claude` there. The token keeps you from ever running Claude
+Code in a directory the agent controls.
 
 Versions of Fronde before the agent got its own home used your `~/.claude`. After the upgrade,
-the agent is signed out until you do the above, and the chat's agent session starts afresh: its
-history stays in the chat, but the agent no longer remembers the previous session.
+the agent is signed out until you give it a token, and the chat's agent session starts afresh:
+its history stays in the chat, but the agent no longer remembers the previous session.
 
 The adapter brings its own copy of Claude Code. To run the one you installed instead, set its path
 under `[agent]`:
@@ -45,7 +67,10 @@ adapter's install, so `read` grants the directory the installed Claude Code live
    prints a long-lived token.
 2. Give it to the container as the `CLAUDE_CODE_OAUTH_TOKEN` environment variable, with
    `-e CLAUDE_CODE_OAUTH_TOKEN` as in [Run in Docker](run-in-docker.md), or through your
-   orchestrator's secrets.
+   orchestrator's secrets. The agent keeps that variable from Fronde's environment. To name it
+   as a secret instead, so that Fronde reads it at each start, set
+   `oauth_token = { env = "CLAUDE_CODE_OAUTH_TOKEN" }` under `[agent]`, or use a mounted file
+   with `{ file = "…" }`.
 
 Never put the token in `fronde.toml`: `[agent] env` is written in plain text and is meant for
 settings, not secrets.

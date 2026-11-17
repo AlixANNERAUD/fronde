@@ -139,6 +139,16 @@ pub struct HelperCommand {
 impl Confine {
     /// The helper's command line and environment for `spec`.
     pub fn command(&self, spec: &AgentSpec) -> anyhow::Result<HelperCommand> {
+        self.command_with(spec, Vec::new())
+    }
+
+    /// [`Confine::command`], with `secrets` added to the agent's environment: the hub's token
+    /// and Claude's, which win over Fronde's own variables of the same names.
+    pub fn command_with(
+        &self,
+        spec: &AgentSpec,
+        secrets: Vec<(String, String)>,
+    ) -> anyhow::Result<HelperCommand> {
         let (program, args) = spec
             .command
             .split_first()
@@ -151,6 +161,7 @@ impl Confine {
                 ("HOME".to_owned(), path_string(&self.home)?),
                 ("TMPDIR".to_owned(), path_string(&self.home.join("tmp"))?),
             ])
+            .chain(secrets)
             .collect();
         let mut policy = self.policy.clone();
         policy.cwd = spec.cwd.clone();
@@ -159,10 +170,10 @@ impl Confine {
                 policy.keep_env.push(name.clone());
             }
         }
-        // A secret's variable that `[agent] env` sets holds the configuration's value instead.
+        // A secret's variable that Fronde sets holds the value Fronde gives instead.
         policy
             .drop_env
-            .retain(|name| !spec.env.iter().any(|(set, _)| set == name));
+            .retain(|name| !env.iter().any(|(set, _)| set == name));
         // The helper is started with Fronde's environment, which the ACP crate cannot clear:
         // every variable the agent does not get is set empty, so that its value, a `{ env }`
         // secret's among them, never reaches the helper.
@@ -856,6 +867,7 @@ mod tests {
             cwd: PathBuf::from("/data/agent"),
             hub_url: "http://127.0.0.1:8484/mcp".into(),
             hub_token: SecretString::from("token-value-never-on-the-command-line"),
+            oauth_token: None,
             system_prompt: String::new(),
             builtin_tools: Vec::new(),
         }
@@ -901,6 +913,33 @@ mod tests {
             Policy::from_arg(&command.policy.to_arg()).unwrap(),
             command.policy
         );
+    }
+
+    #[test]
+    fn secrets_reach_the_agent_through_its_environment_only() {
+        let mut confine = confine(true);
+        // Fronde's `{ env }` secret of that name is dropped, but the value Fronde gives is kept.
+        confine
+            .policy
+            .drop_env
+            .push("CLAUDE_CODE_OAUTH_TOKEN".into());
+        let secrets = vec![
+            ("FRONDE_HUB_TOKEN".to_owned(), "hub-secret-value".to_owned()),
+            (
+                "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+                "oauth-secret-value".to_owned(),
+            ),
+        ];
+        let command = confine.command_with(&spec(Vec::new()), secrets).unwrap();
+        let line = command.args.join(" ");
+        assert!(!line.contains("secret-value"), "{line}");
+        for (name, value) in [
+            ("FRONDE_HUB_TOKEN", "hub-secret-value"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret-value"),
+        ] {
+            assert!(command.policy.keeps(name), "{name}");
+            assert!(command.env.contains(&(name.to_owned(), value.to_owned())));
+        }
     }
 
     #[test]

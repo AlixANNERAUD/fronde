@@ -91,6 +91,7 @@ impl Setup {
             cwd: self.data.join("agent"),
             hub_url: format!("http://127.0.0.1:{hub_port}/mcp"),
             hub_token: SecretString::from("unused"),
+            oauth_token: None,
             system_prompt: String::new(),
             builtin_tools: Vec::new(),
         }
@@ -845,7 +846,9 @@ fn rpc(
 }
 
 /// The real adapter, with its Claude Code, under the whole sandbox: it starts, and answers
-/// `initialize` and `session/new`. Signed out, as its home is new: a turn is `live.rs`'s.
+/// `initialize` and `session/new`. Signed out, as its home is new: a turn is `live.rs`'s. The
+/// session's MCP header names the hub's token by its variable, as Fronde sends it, and Claude
+/// Code expands it from the agent's environment: the stand-in hub receives the token itself.
 #[test]
 #[ignore = "needs the adapter from `mise run agent` in FRONDE_LIVE_AGENT"]
 fn real_adapter_starts_confined() {
@@ -853,8 +856,31 @@ fn real_adapter_starts_confined() {
     let adapter = std::env::var("FRONDE_LIVE_AGENT").expect("FRONDE_LIVE_AGENT");
     let setup = setup(&format!("command = [{adapter:?}]"));
     assert!(landlock(), "this kernel cannot confine the agent");
-    let spec = setup.spec(&[&adapter], &[]);
-    let helper = setup.confine.command(&spec).unwrap();
+    let hub = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hub_port = hub.local_addr().unwrap().port();
+    let (heard, authorization) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for stream in hub.incoming().map_while(Result::ok) {
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("authorization:") {
+                    let _ = heard.send(line[line.len() - value.len()..].trim().to_owned());
+                }
+                line.clear();
+            }
+            let _ = (&stream).write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n");
+        }
+    });
+    let spec = setup.spec_with_hub(&[&adapter], &[], hub_port);
+    let token = "hub-token-from-the-environment";
+    let secrets = vec![(
+        fronde_agent::acp::HUB_TOKEN_VAR.to_owned(),
+        token.to_owned(),
+    )];
+    let helper = setup.confine.command_with(&spec, secrets).unwrap();
+    assert!(!helper.args.join(" ").contains(token));
     let mut child = Command::new(&helper.program)
         .args(&helper.args)
         .envs(helper.env.iter().map(|(n, v)| (n.as_str(), v.as_str())))
@@ -889,9 +915,24 @@ fn real_adapter_starts_confined() {
         &lines,
         1,
         "session/new",
-        serde_json::json!({"cwd": setup.data.join("agent"), "mcpServers": []}),
+        serde_json::json!({
+            "cwd": setup.data.join("agent"),
+            "mcpServers": [{
+                "type": "http",
+                "name": "fronde",
+                "url": format!("http://127.0.0.1:{hub_port}/mcp"),
+                "headers": [{
+                    "name": "Authorization",
+                    "value": format!("Bearer ${{{}}}", fronde_agent::acp::HUB_TOKEN_VAR),
+                }],
+            }],
+        }),
     );
     assert!(session["result"]["sessionId"].is_string(), "{session}");
+    let header = authorization
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("Claude Code never reached the hub");
+    assert_eq!(header, format!("Bearer {token}"));
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();

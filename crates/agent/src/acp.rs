@@ -24,6 +24,29 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
 
+/// The variable that carries the hub's token to an agent Fronde starts, and that Claude Code
+/// expands in the session's MCP header: the header itself then holds no secret, since the
+/// adapter passes it to Claude Code on a command line, which every user can read.
+pub const HUB_TOKEN_VAR: &str = "FRONDE_HUB_TOKEN";
+
+/// The variable Claude Code reads its sign-in token from.
+pub const OAUTH_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The agent's Claude sign-in token, `[agent] oauth_token`: read again at each start, so that a
+/// token changed in its file or store applies at the next one.
+pub type OauthToken = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, anyhow::Result<SecretString>> + Send + Sync,
+>;
+
+/// An [`OauthToken`] from an async function.
+pub fn oauth_token<F, Fut>(read: F) -> OauthToken
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<SecretString>> + Send + 'static,
+{
+    Arc::new(move || Box::pin(read()))
+}
+
 /// How to start the agent and what its session gets.
 #[derive(Clone)]
 pub struct AgentSpec {
@@ -32,6 +55,8 @@ pub struct AgentSpec {
     pub cwd: PathBuf,
     pub hub_url: String,
     pub hub_token: SecretString,
+    /// Given to the agent as `CLAUDE_CODE_OAUTH_TOKEN` when set.
+    pub oauth_token: Option<OauthToken>,
     pub system_prompt: String,
     /// Claude Code's own tools the session gets besides the hub's, such as `WebSearch`.
     pub builtin_tools: Vec<String>,
@@ -45,6 +70,10 @@ impl fmt::Debug for AgentSpec {
             .field("cwd", &self.cwd)
             .field("hub_url", &self.hub_url)
             .field("hub_token", &"[REDACTED]")
+            .field(
+                "oauth_token",
+                &self.oauth_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("system_prompt", &self.system_prompt)
             .field("builtin_tools", &self.builtin_tools)
             .finish()
@@ -193,12 +222,21 @@ impl AgentClient {
         if !installed(program, &spec.env) {
             return Err(NotInstalled(program.clone()).into());
         }
+        // The secrets the agent gets, through its environment only: never on a command line.
+        let mut secrets = vec![(
+            HUB_TOKEN_VAR.to_owned(),
+            spec.hub_token.expose_secret().to_owned(),
+        )];
+        if let Some(read) = &spec.oauth_token {
+            let token = read().await.context("[agent] oauth_token")?;
+            secrets.push((OAUTH_TOKEN_VAR.to_owned(), token.expose_secret().to_owned()));
+        }
         let config = match confine {
             None => AcpAgentConfig::new(program)
                 .args(args.iter().cloned())
-                .envs(spec.env.iter().cloned()),
+                .envs(spec.env.iter().cloned().chain(secrets)),
             Some(confine) => {
-                let helper = confine.command(spec)?;
+                let helper = confine.command_with(spec, secrets)?;
                 AcpAgentConfig::new(helper.program)
                     .args(helper.args)
                     .envs(helper.env)
@@ -207,7 +245,8 @@ impl AgentClient {
         let connection = Connection::start(AcpAgent::new(config), events)
             .await
             .with_context(|| format!("cannot start the agent ({command})"))?;
-        connection.open_session(spec, resume).await
+        let header = format!("Bearer ${{{HUB_TOKEN_VAR}}}");
+        connection.open_session(spec, header, resume).await
     }
 
     /// Open a session (resumed when possible) with an agent reached through `transport`.
@@ -217,9 +256,11 @@ impl AgentClient {
         resume: Option<String>,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> anyhow::Result<Self> {
+        // In this process: the header may hold the token itself.
+        let header = format!("Bearer {}", spec.hub_token.expose_secret());
         Connection::start(transport, events)
             .await?
-            .open_session(spec, resume)
+            .open_session(spec, header, resume)
             .await
     }
 
@@ -452,9 +493,11 @@ impl Connection {
         })
     }
 
+    /// `authorization`: the value of the session's MCP header towards the hub.
     async fn open_session(
         self,
         spec: &AgentSpec,
+        authorization: String,
         resume: Option<String>,
     ) -> anyhow::Result<AgentClient> {
         let Self {
@@ -463,12 +506,10 @@ impl Connection {
             permissions,
             stop,
         } = self;
-        let hub = McpServer::Http(McpServerHttp::new("fronde", &spec.hub_url).headers(vec![
-            HttpHeader::new(
-                "Authorization",
-                format!("Bearer {}", spec.hub_token.expose_secret()),
-            ),
-        ]));
+        let hub = McpServer::Http(
+            McpServerHttp::new("fronde", &spec.hub_url)
+                .headers(vec![HttpHeader::new("Authorization", authorization)]),
+        );
         let system_prompt =
             (capabilities.system_prompt.is_some() && !spec.system_prompt.is_empty()).then(|| {
                 SystemPrompt::new(vec![ContentBlock::from(spec.system_prompt.as_str())])

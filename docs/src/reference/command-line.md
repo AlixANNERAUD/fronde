@@ -66,7 +66,8 @@ has no stored approval or secret, which is what `serve` would find after updatin
 this kernel, such as `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, device ioctls,
 signals and abstract sockets); seccomp: no Unix sockets but connected pairs, only IPv4, IPv6 and netlink route
 sockets, no io_uring`, followed by `the agent cannot start` on a kernel without Landlock or
-seccomp, and refuses a grant over Fronde's data or configuration
+seccomp, then, with `[agent] oauth_token`, `agent token: [agent] oauth_token, read` once it read a
+file or variable token (a stored one is named, and opened when the agent starts), and refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the
 agent's `agent/` and `home/` in the data directory for that. It also checks that `[data] dir` can
 be created and written:

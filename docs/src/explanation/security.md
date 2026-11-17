@@ -8,8 +8,8 @@ owner, at home or on a server they control.
 Secrets never appear in the configuration file, in logs or in tool output. The file only names
 where each one is: `{ file = "…" }` or `{ env = "…" }`. The configuration can then be committed,
 shared or mounted read-only. `[agent] env` is written in plain text, so it is for settings only;
-the Claude token reaches the agent through Fronde's own environment, as `CLAUDE_CODE_OAUTH_TOKEN`,
-one of the few variables the agent keeps (see [The agent's environment](#the-agents-environment)).
+the Claude token is `[agent] oauth_token`, a secret like the others, which Fronde gives the agent
+as `CLAUDE_CODE_OAUTH_TOKEN` (see [The agent's environment](#the-agents-environment)).
 
 A secret file must be mode 0600 and owned by the user running Fronde; otherwise Fronde refuses to
 read it. Setting `FRONDE_ALLOW_SHARED_SECRET_FILES=1` lifts the check for setups like Docker
@@ -262,9 +262,23 @@ among them `XDG_*` and `DBUS_*`, which point at your session's directories and b
 the values from its environment; its command line, which any user can read, carries names and
 paths only.
 
+Two secrets reach the agent, both through its environment, which only your user can read:
+
+- `[agent] oauth_token`, its Claude sign-in, as `CLAUDE_CODE_OAUTH_TOKEN`, read again at each
+  start;
+- the token it calls the hub's `/mcp` with, made at each start, as `FRONDE_HUB_TOKEN`. The ACP
+  adapter hands the session's MCP servers to Claude Code on its command line, which every user
+  of the machine can read in `/proc`, so the header Fronde sends holds only
+  `Bearer ${FRONDE_HUB_TOKEN}`, which Claude Code expands from its environment.
+
 The agent has its own home rather than yours, so that it never reads or writes your
-`~/.claude`: a hook it wrote there would run in your own terminal. It signs in to Claude once in
-that home (see [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md)). The helper also
+`~/.claude`: a hook it wrote there would run in your own terminal. For the same reason, never run
+`claude` yourself with `HOME` set to the agent's home, not even to sign it in: the agent can
+write that home, and a hook, an `apiKeyHelper` or a `statusLine` it put in
+`.claude/settings.json`, or an MCP server it added to `.claude.json`, would run with your rights,
+outside its sandbox. The agent signs in with a token instead, which you make with
+`claude setup-token` in your own home (see
+[Sign Fronde in to Claude](../how-to/sign-in-to-claude.md)). The helper also
 raises the agent's OOM score to the maximum and lowers its priority, so that the kernel kills the
 agent first when memory runs out, and Fronde comes first for the CPU.
 

@@ -460,6 +460,53 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
     })
 }
 
+/// `[agent] oauth_token`, read at each start of the agent: a file or a variable as any secret,
+/// or a secret stored for Claude's API, opened with the master key.
+pub fn agent_oauth_token(
+    token: fronde_hub::config::Secret,
+    db: fronde_db::DatabaseConnection,
+    backends: fronde_db::master_key::Backends,
+) -> fronde_agent::acp::OauthToken {
+    fronde_agent::acp::oauth_token(move || {
+        let (token, db, backends) = (token.clone(), db.clone(), backends.clone());
+        async move {
+            match token {
+                fronde_hub::config::Secret::Stored { stored } => {
+                    open_claude_token(&stored, &db, &backends).await
+                }
+                token => token.resolve(),
+            }
+        }
+    })
+}
+
+async fn open_claude_token(
+    name: &str,
+    db: &fronde_db::DatabaseConnection,
+    backends: &fronde_db::master_key::Backends,
+) -> anyhow::Result<SecretString> {
+    use fronde_hub::config::CLAUDE_ORIGIN;
+    let set = format!(
+        "store it with `claude setup-token`'s output on standard input: `fronde secret set \
+         {name} --origin {CLAUDE_ORIGIN} --config <your fronde.toml>`"
+    );
+    let sealed = fronde_db::secrets::load_sealed(db, fronde_db::secrets::SOURCES).await?;
+    let Some(sealed) = sealed.into_iter().find(|s| s.name == name) else {
+        anyhow::bail!("no secret named {name} is stored; {set}");
+    };
+    if sealed.origin != CLAUDE_ORIGIN {
+        anyhow::bail!(
+            "the stored secret {name} is for {}, not Claude's API; {set}",
+            sealed.origin
+        );
+    }
+    let key = backends
+        .load(db)
+        .await?
+        .context("no master key opens the stored secrets")?;
+    sealed.open(&key)
+}
+
 /// What the agent's sandbox covers on this kernel, for the start log and `fronde check`: the
 /// line, and whether the agent can start at all.
 pub fn sandbox_line(confine: &Confine, hub_port: u16) -> (String, bool) {
@@ -544,6 +591,9 @@ pub async fn start_with(
                 cwd,
                 hub_url: format!("http://{}/mcp", reachable(addr)),
                 hub_token: assistant_token.clone(),
+                oauth_token: agent
+                    .oauth_token
+                    .map(|token| agent_oauth_token(token, db.clone(), backends.clone())),
                 system_prompt: system_prompt(&user),
                 builtin_tools: agent.builtin_tools,
             };

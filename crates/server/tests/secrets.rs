@@ -142,8 +142,10 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// `expose_secret` is allowed only at these sites, each justified. A new use is added here on
 /// purpose and reviewed (AGENTS.md).
 const ALLOWED: &[(&str, usize)] = &[
-    // The ACP session's MCP header towards the hub.
-    ("crates/agent/src/acp.rs", 1),
+    // The hub's token: in the agent's environment for a spawned agent (its MCP header names the
+    // variable), in the header itself for an agent in this process; and the agent's Claude
+    // token, in its environment.
+    ("crates/agent/src/acp.rs", 3),
     // The master key: its bytes given to the cipher, and its one line written to the new key
     // file.
     ("crates/db/src/master_key.rs", 2),
@@ -313,6 +315,7 @@ fn no_secret_in_debug() {
         cwd: dir.path().to_path_buf(),
         hub_url: "http://127.0.0.1:8484/mcp".into(),
         hub_token: agent_canary.into(),
+        oauth_token: None,
         system_prompt: "You are Fronde.".into(),
         builtin_tools: Vec::new(),
     };

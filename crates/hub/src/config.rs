@@ -85,6 +85,7 @@ impl Config {
         std::iter::once(&self.server.token)
             .chain(self.web.as_ref().map(|web| &web.password))
             .chain(self.secrets.master_key.as_ref())
+            .chain(self.agent.oauth_token.as_ref())
             .chain(sources)
     }
 
@@ -212,7 +213,13 @@ pub struct AgentConfig {
     pub sandbox: bool,
     /// More directories the confined agent may read and run programs from.
     pub read: Vec<PathBuf>,
+    /// The token `claude setup-token` printed, given to the agent as `CLAUDE_CODE_OAUTH_TOKEN`
+    /// and read again at each start. A stored one must be stored for [`CLAUDE_ORIGIN`].
+    pub oauth_token: Option<Secret>,
 }
+
+/// The origin a stored `[agent] oauth_token` is stored for: Claude's API, which it opens.
+pub const CLAUDE_ORIGIN: &str = "https://api.anthropic.com";
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -222,6 +229,7 @@ impl Default for AgentConfig {
             builtin_tools: SAFE_BUILTIN_TOOLS.map(str::to_string).to_vec(),
             sandbox: true,
             read: Vec::new(),
+            oauth_token: None,
         }
     }
 }
@@ -628,6 +636,18 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
     }
     for dir in &mut config.agent.read {
         *dir = base.join(&*dir).components().collect();
+    }
+    if let Some(token) = &mut config.agent.oauth_token {
+        token.anchor(base);
+        if let Secret::Stored { stored } = token {
+            fronde_db::secrets::check_name(stored).context("[agent] oauth_token")?;
+        }
+        if config.agent.env.contains_key("CLAUDE_CODE_OAUTH_TOKEN") {
+            bail!(
+                "[agent] env sets CLAUDE_CODE_OAUTH_TOKEN and [agent] oauth_token gives it too; \
+                 keep oauth_token, and never write the token in fronde.toml"
+            );
+        }
     }
     config.path = Some(base.join(abs.file_name().unwrap_or_default()));
     for tool in &config.agent.builtin_tools {

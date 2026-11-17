@@ -31,6 +31,7 @@ fn spec() -> AgentSpec {
         cwd: "/srv/fronde/agent".into(),
         hub_url: "http://127.0.0.1:7878/mcp".into(),
         hub_token: "hub-token".into(),
+        oauth_token: None,
         system_prompt: "You are Fronde.".into(),
         builtin_tools: vec!["WebSearch".into(), "WebFetch".into()],
     }

@@ -9,8 +9,8 @@
 //! `FRONDE_LIVE_CLAUDE` optionally names the Claude Code to run instead of the adapter's own.
 //!
 //! The agent runs through `fronde __confine` with a fresh home in the test's data directory, so it
-//! signs in with `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), which it keeps from the
-//! environment.
+//! signs in with the token `claude setup-token` prints, in `CLAUDE_CODE_OAUTH_TOKEN`, which the
+//! configuration names as `[agent] oauth_token`.
 
 use fronde_protocol::{ClientMsg, Entry, Event, ServerMsg};
 use futures::{SinkExt, StreamExt};
@@ -38,7 +38,7 @@ fn config(dir: &Path, agent: &str) -> fronde_hub::config::Config {
         Err(_) => "{}".to_owned(),
     };
     let toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n[web]\npassword = {{ file = {:?} }}\n[agent]\ncommand = [{agent:?}]\nenv = {env}\n",
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n[web]\npassword = {{ file = {:?} }}\n[agent]\ncommand = [{agent:?}]\nenv = {env}\noauth_token = {{ env = \"CLAUDE_CODE_OAUTH_TOKEN\" }}\n",
         dir.join("token").display().to_string(),
         dir.join("data").display().to_string(),
         dir.join("master.key").display().to_string(),

@@ -69,6 +69,17 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
             "; the agent cannot start"
         };
         writeln!(out, "agent sandbox: {line}{warning}")?;
+        // A stored token is opened at each start of the agent, with the master key.
+        match &config.agent.oauth_token {
+            Some(fronde_hub::config::Secret::Stored { stored }) => {
+                writeln!(out, "agent token: the stored secret {stored}")?
+            }
+            Some(token) => {
+                token.resolve().context("[agent] oauth_token")?;
+                writeln!(out, "agent token: [agent] oauth_token, read")?
+            }
+            None => {}
+        }
     }
     if let Some(python) = &config.python {
         let host = fronde_wasm::ComponentHost::new()?;
