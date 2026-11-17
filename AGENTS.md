@@ -106,6 +106,8 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
 - Durable structured state lives in the one database, `fronde.db`, through SeaORM; raw SQL only
   for FTS5. A schema change is a new migration, never an edit of a pushed one, followed by
   `mise run entities`: entities are generated, never edited by hand.
+  The bundled SQLite is held at `libsqlite3-sys` 0.37 by sqlx-sqlite, so `deny.toml` ignores
+  RUSTSEC-2026-0459: drop that ignore as soon as a sqlx release accepts 0.39.
 - Secrets never appear in the configuration file, logs or tool output: `{ file = "…" }` or
   `{ env = "…" }` only.
 - Nothing read from an external source (web, email, document) is saved to memory automatically.

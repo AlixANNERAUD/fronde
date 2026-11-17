@@ -45,10 +45,17 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<DatabaseConnection> {
         )
     })?;
     for suffix in ["-wal", "-shm"] {
-        let sibling = PathBuf::from(format!("{}{suffix}", file.display()));
+        let mut sibling = file.clone().into_os_string();
+        sibling.push(suffix);
+        let sibling = PathBuf::from(sibling);
         if sibling.exists() {
-            fronde_fs::restrict_file(&sibling)
-                .with_context(|| format!("cannot restrict {}", sibling.display()))?;
+            fronde_fs::restrict_file(&sibling).with_context(|| {
+                format!(
+                    "cannot make {} private; it must belong to the user running Fronde (stop \
+                     Fronde, then fix its owner or remove it together with the database)",
+                    sibling.display()
+                )
+            })?;
         }
     }
 
