@@ -55,6 +55,47 @@ and Fronde never runs a CLI in a home its agent can write (see
 Until a provider's permission options are read, its profile offers no lasting option and none on
 a mode switch: a new provider never inherits Claude's lists.
 
+## Usage and quotas
+
+A subscription has two usage windows: one of 5 hours and one of a week. Fronde reads how much
+of each is used from what the Claude adapter already sends during a turn. It makes no request of
+its own for it: no call to an Anthropic endpoint, no `/usage` turn.
+
+What the adapter sends:
+
+- A **reading only when the limits change.** Claude Code emits a `rate_limit_event` when an API
+  response's rate-limit headers change (about once per percentage point); the adapter passes it
+  on in `_meta["_claude/rateLimit"]` of the next `usage_update`, maybe a later turn's. A turn
+  whose limits did not change brings no reading.
+- **One window, documented**: its kind (`five_hour`, `seven_day`, `seven_day_opus`,
+  `seven_day_sonnet`, `overage`, …), its status (`allowed`, `allowed_warning`, `rejected`), its
+  reset time, and its use as a fraction from 0 to 1, each of them optional.
+- **Both windows, undocumented**: Claude Code adds `unifiedWindows`, the 5-hour and weekly
+  windows at once. It is marked internal and may change with any release: Fronde reads it when
+  it is there and falls back on the documented window.
+- **Paid extra usage in use** (`isUsingOverage`), kept as an extra window marked as a warning.
+- **A turn refused for a limit**: the prompt fails with `errorKind: "rate_limit"` and the latest
+  reading, whose reset time says when turns run again.
+
+What it does not send, and Fronde does not make up:
+
+- **Nothing between turns.** Your use elsewhere (a terminal, claude.ai) shows only at Fronde's
+  next turn; each window carries the time it was read.
+- **No reading before Fronde's first turn**, and no plan, account or window length: the length
+  comes from the kind.
+- **Per-model weekly windows** only when one is the event's own window.
+
+Every field is checked and anything odd is left out: a use outside 0 to 1 by more than a few
+points (`42` would be a percentage) is dropped rather than rescaled, a value just past an edge is
+clamped, a reset time more than a year from the reading (milliseconds, say) is dropped, and a
+reading that does not parse never fails a turn. The log names the fields it left out, never the
+whole `_meta`. Once a window's reset time has passed, it reads as reset since the reading. Codex
+and Antigravity send no reading Fronde reads yet.
+
+Capturing the readings during turns and keeping them across restarts, showing them in the chat
+and in `fronde check`, and keeping a share of each window for your own turns by pausing
+background work, are **planned**.
+
 ## Why MCP for the tools
 
 Fronde's tools are not wired into one agent: the hub serves them over MCP, the protocol every

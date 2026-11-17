@@ -2,6 +2,7 @@
 
 pub mod request;
 pub mod text;
+pub mod usage;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

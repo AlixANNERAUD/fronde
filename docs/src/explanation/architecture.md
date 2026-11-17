@@ -72,7 +72,10 @@ goes in (`CLAUDE_CODE_OAUTH_TOKEN`), how the session's MCP header carries the hu
 (`Bearer ${FRONDE_HUB_TOKEN}`, which Claude Code expands from its environment), which permission
 options a card may offer (the lasting ones Fronde knows and those allowed on a mode switch, see
 [Permission cards](requests.md#permission-cards)), and what the sandbox grants for the program to
-run (the adapter's `node_modules`). Claude is the only provider; `[agent]` holds its settings.
+run (the adapter's `node_modules`), and where its agent says how much of the subscription is used
+(Claude's: the rate limit in a `usage_update`'s `_meta`, see
+[Usage and quotas](subscriptions.md#usage-and-quotas)). Claude is the only provider; `[agent]`
+holds its settings.
 Codex and Antigravity are planned (see [Why subscriptions and ACP](subscriptions.md#other-providers)).
 
 A thread may run on a chosen **model**, kept in its row; without one, the agent's default. Fronde

@@ -1,7 +1,8 @@
 //! What sets one agent provider apart from another over ACP, as data: how the session's MCP header
 //! carries the hub's token, what the session's `_meta` asks of the adapter, the mode a session
 //! is put in once open, the variable its sign-in token goes in, which permission options a card
-//! may offer, and where its program is installed for the sandbox to grant.
+//! may offer, where its program is installed for the sandbox to grant, and where its agent says
+//! how much of the subscription is used.
 //!
 //! Claude ([`Provider::CLAUDE`], through `@agentclientprotocol/claude-agent-acp`) is the only
 //! provider so far: `[agent]` holds its settings. Another one gets a profile of its own, started
@@ -9,6 +10,7 @@
 //! understand; what Codex and Antigravity would need is in the user guide
 //! (`explanation/subscriptions.md`).
 
+use crate::usage::UsageSource;
 use serde_json::json;
 
 /// Claude Code's own tool that asks the user questions: the adapter turns it into a form
@@ -35,6 +37,8 @@ pub struct Provider {
     pub permissions: PermissionRules,
     /// What the sandbox grants for the provider's program to run.
     pub install: Install,
+    /// Where its agent says how much of the subscription's windows is used.
+    pub usage: UsageSource,
 }
 
 /// How a spawned agent is told the hub's token in its session's MCP header. The token itself
@@ -153,10 +157,12 @@ impl Provider {
             lasting: Lasting::Claude,
         },
         install: Install::NodeModules,
+        usage: UsageSource::ClaudeRateLimitMeta,
     };
 
     /// A provider Fronde knows nothing of yet, the start of a new profile: no `_meta`, no mode
-    /// set, no sign-in variable, nothing lasting, nothing on a mode switch, a native binary.
+    /// set, no sign-in variable, nothing lasting, nothing on a mode switch, a native binary, no
+    /// usage reading.
     pub const fn bare(id: &'static str) -> Self {
         Self {
             id,
@@ -166,6 +172,7 @@ impl Provider {
             sign_in_env: None,
             permissions: PermissionRules::NONE,
             install: Install::Directory,
+            usage: UsageSource::None,
         }
     }
 
@@ -302,6 +309,7 @@ mod tests {
         assert_eq!(claude.mode_after_open, Some("default"));
         assert_eq!(claude.sign_in_env, Some("CLAUDE_CODE_OAUTH_TOKEN"));
         assert_eq!(claude.install, Install::NodeModules);
+        assert_eq!(claude.usage, UsageSource::ClaudeRateLimitMeta);
         let rules = claude.permissions;
         assert_eq!(rules.mode_switch_prefix, Some("exit-plan-"));
         assert_eq!(rules.mode_switch_options, ["exit-plan-default", "reject"]);
@@ -360,6 +368,7 @@ mod tests {
         assert_eq!(codex.mode_after_open, None);
         assert_eq!(codex.sign_in_env, None);
         assert_eq!(codex.install, Install::Directory);
+        assert_eq!(codex.usage, UsageSource::None);
     }
 
     #[test]
