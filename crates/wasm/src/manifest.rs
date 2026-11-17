@@ -5,9 +5,9 @@
 //! within what its manifest declares. Parsing is strict, so that a typo cannot widen a request.
 
 use crate::api::{self, Api};
-use crate::egress::Origin;
 use crate::host::Limits;
 use anyhow::{Context, bail, ensure};
+use fronde_hub::origin::Origin;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::path::Path;
@@ -277,7 +277,7 @@ impl NetworkRule {
         );
         let Some(wildcard) = s.find('*') else {
             let origin: Origin = s.parse()?;
-            check_public_name(s, &origin.host)?;
+            public_name(s, &origin)?;
             return Ok(Self::Origin(origin));
         };
         // Only `scheme://*.domain[:port]`: never all hosts, a wildcard scheme or port, or a
@@ -293,38 +293,36 @@ impl NetworkRule {
         let origin: Origin = format!("{}{}", &s[..scheme_end], &s[scheme_end + 2..])
             .parse()
             .with_context(|| format!("{s:?} is not scheme://*.domain[:port]"))?;
-        check_public_name(s, &origin.host)?;
+        let domain = public_name(s, &origin)?;
         ensure!(
-            origin.host.contains('.'),
+            domain.contains('.'),
             "{s:?}: a wildcard covers subdomains of a domain such as example.com, not of a \
              top-level domain"
         );
         Ok(Self::Subdomains {
-            https: origin.https,
-            domain: origin.host,
-            port: origin.port,
+            https: origin.is_https(),
+            domain: domain.to_string(),
+            port: origin.port(),
         })
     }
 }
 
 /// A manifest names public hosts: an address or a local name is the user's to allow, through a
-/// URL setting and an origin the configuration declares local.
-fn check_public_name(entry: &str, host: &str) -> anyhow::Result<()> {
+/// URL setting and an origin the configuration declares local. Returns the name.
+fn public_name<'a>(entry: &str, origin: &'a Origin) -> anyhow::Result<&'a str> {
+    let Some(host) = origin.domain() else {
+        bail!(
+            "{entry:?}: name a host, not an address; for a server of the user's, use a URL \
+             setting (\"{{{{ name }}}}\")"
+        );
+    };
     // A fully qualified name ("localhost.") is the same host.
-    let bare = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_end_matches('.');
-    ensure!(
-        bare.parse::<std::net::IpAddr>().is_err(),
-        "{entry:?}: name a host, not an address; for a server of the user's, use a URL setting \
-         (\"{{{{ name }}}}\")"
-    );
+    let bare = host.trim_end_matches('.');
     ensure!(
         bare != "localhost" && !bare.ends_with(".localhost"),
         "{entry:?}: localhost is the user's to allow; use a URL setting (\"{{{{ name }}}}\")"
     );
-    Ok(())
+    Ok(host)
 }
 
 impl CredentialRequest {

@@ -88,14 +88,14 @@ fn grants_what_the_manifest_asks() {
     assert_eq!(
         allowed,
         [
-            ("https://cloud.example:443".to_string(), false),
+            ("https://cloud.example".to_string(), false),
             ("https://tasks.example:8443".to_string(), true)
         ]
     );
     let [(origin, Credential::Basic { username, password })] = &spec.credentials[..] else {
         panic!("{:?}", spec.credentials)
     };
-    assert_eq!(origin.to_string(), "https://cloud.example:443");
+    assert_eq!(origin.to_string(), "https://cloud.example");
     assert_eq!(username, "alix");
     assert_eq!(*password, std::env::var("PATH").unwrap());
     // The host gives the user's time zone to a component that declares the setting.
@@ -196,7 +196,7 @@ fn grant_outside_the_manifest_refused() {
         let e = refused(&config);
         assert!(
             e.contains("which the manifest does not ask for")
-                && e.contains("https://cloud.example:443 from events_url"),
+                && e.contains("https://cloud.example from events_url"),
             "{e}"
         );
     }
@@ -238,7 +238,7 @@ fn credential_the_manifest_does_not_ask_for_refused() {
     );
     let e = refused(&config);
     assert!(
-        e.contains("asks for no bearer credential for https://cloud.example:443"),
+        e.contains("asks for no bearer credential for https://cloud.example"),
         "{e}"
     );
 }

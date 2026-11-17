@@ -21,7 +21,8 @@ mod tool;
 mod v0_1;
 
 pub use api::Api;
-pub use egress::{Allowed, Credential, Origin};
+pub use egress::{Allowed, Credential};
+pub use fronde_hub::origin::Origin;
 pub use host::{ComponentHost, Limits};
 pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, NetworkRule, World};
 pub use source::{Approval, Checks, ComponentSource, Hashes, Prepared, Shipped, prepare, shipped};

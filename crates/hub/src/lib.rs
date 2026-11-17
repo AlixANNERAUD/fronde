@@ -4,6 +4,7 @@ pub mod config;
 pub mod guide;
 pub mod mcp;
 pub mod memory;
+pub mod origin;
 pub mod private;
 pub mod search;
 pub mod source;

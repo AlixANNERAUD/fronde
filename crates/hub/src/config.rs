@@ -1,5 +1,6 @@
 //! Configuration: one strict TOML file, secrets referenced by file or environment variable.
 
+use crate::origin::{Locality, Origin};
 use anyhow::{Context, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -159,8 +160,7 @@ impl ComponentConfig {
 /// network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allow {
-    /// `scheme://host[:port]`, with no path.
-    pub origin: Url,
+    pub origin: Origin,
     /// Whether it may resolve to a local address (loopback, private, link-local).
     pub local: bool,
 }
@@ -172,7 +172,7 @@ impl<'de> Deserialize<'de> for Allow {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Table {
-            origin: String,
+            origin: Origin,
             #[serde(default)]
             local: bool,
         }
@@ -190,7 +190,7 @@ impl<'de> Deserialize<'de> for Allow {
 
             fn visit_str<E: de::Error>(self, s: &str) -> Result<Allow, E> {
                 Ok(Allow {
-                    origin: parse_origin(s).map_err(E::custom)?,
+                    origin: Origin::parse(s).map_err(E::custom)?,
                     local: false,
                 })
             }
@@ -198,7 +198,7 @@ impl<'de> Deserialize<'de> for Allow {
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Allow, A::Error> {
                 let t = Table::deserialize(MapAccessDeserializer::new(map))?;
                 Ok(Allow {
-                    origin: parse_origin(&t.origin).map_err(de::Error::custom)?,
+                    origin: t.origin,
                     local: t.local,
                 })
             }
@@ -212,8 +212,7 @@ impl<'de> Deserialize<'de> for Allow {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialConfig {
-    #[serde(deserialize_with = "origin")]
-    pub origin: Url,
+    pub origin: Origin,
     pub basic: Option<BasicCredential>,
     pub bearer: Option<Secret>,
 }
@@ -223,29 +222,6 @@ pub struct CredentialConfig {
 pub struct BasicCredential {
     pub username: String,
     pub password: Secret,
-}
-
-/// `scheme://host[:port]` over http or https, with nothing else.
-pub fn parse_origin(s: &str) -> anyhow::Result<Url> {
-    let url = Url::parse(s).with_context(|| format!("origin {s:?} is not a URL"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        bail!("origin {s:?}: the scheme must be http or https");
-    }
-    if url.host().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("origin {s:?} must be scheme://host[:port], with no path or user");
-    }
-    Ok(url)
-}
-
-fn origin<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
-    let s = String::deserialize(d)?;
-    parse_origin(&s).map_err(serde::de::Error::custom)
 }
 
 /// A secret is never written in the TOML: it points to a file or an environment variable.
@@ -447,23 +423,21 @@ fn calendar_source(old: &toml::Value) -> String {
         || "{ env = \"FRONDE_CALDAV_PASSWORD\" }".to_string(),
         toml::Value::to_string,
     );
-    let mut origins: Vec<Url> = Vec::new();
+    let mut origins: Vec<Origin> = Vec::new();
     for url in [&events, &reminders] {
         if let Ok(url) = Url::parse(url)
-            && let Ok(origin) = parse_origin(&url.origin().ascii_serialization())
+            && let Ok(origin) = Origin::of_url(&url)
             && !origins.contains(&origin)
         {
             origins.push(origin);
         }
     }
-    let shown = |o: &Url| o.as_str().trim_end_matches('/').to_string();
     let allow: Vec<String> = origins
         .iter()
-        .map(|o| {
-            if is_local_host(o) {
-                format!("{{ origin = \"{}\", local = true }}", shown(o))
-            } else {
-                format!("\"{}\"", shown(o))
+        .map(|o| match o.locality() {
+            Locality::Public => format!("\"{o}\""),
+            Locality::Loopback | Locality::Local => {
+                format!("{{ origin = \"{o}\", local = true }}")
             }
         })
         .collect();
@@ -486,7 +460,7 @@ fn calendar_source(old: &toml::Value) -> String {
         quoted(&reminders),
     );
     for origin in &origins {
-        if origin.scheme() == "http" && !is_loopback_host(origin) {
+        if !origin.carries_credentials() {
             entry.push_str(
                 "# Plain http: Fronde sends the password only over https or to this machine (in \
                  Docker, the container). Serve CalDAV over https.\n",
@@ -496,7 +470,7 @@ fn calendar_source(old: &toml::Value) -> String {
             "[[sources.credentials]]\n\
              origin = \"{}\"\n\
              basic = {{ username = {}, password = {password} }}\n",
-            shown(origin),
+            origin,
             quoted(&username),
         ));
     }
@@ -518,29 +492,6 @@ pub fn shipped_calendar() -> Option<PathBuf> {
         .flatten()
         .find(|p| p.is_file())
         .and_then(|p| p.canonicalize().ok())
-}
-
-fn is_loopback_host(origin: &Url) -> bool {
-    match origin.host() {
-        Some(url::Host::Domain(d)) => d == "localhost",
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
-}
-
-/// A host on this machine or a private network, as far as the URL alone tells.
-fn is_local_host(origin: &Url) -> bool {
-    match origin.host() {
-        Some(url::Host::Domain(d)) => {
-            d == "localhost" || !d.contains('.') || d.ends_with(".local") || d.ends_with(".lan")
-        }
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        Some(url::Host::Ipv6(ip)) => {
-            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
-        }
-        None => false,
-    }
 }
 
 fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
@@ -586,30 +537,26 @@ fn check_component(c: &ComponentConfig) -> anyhow::Result<()> {
     }
     let mut origins = Vec::new();
     for a in &c.allow {
-        let origin = a.origin.origin();
+        let origin = &a.origin;
         if origins.contains(&origin) {
-            bail!(
-                "source {name:?}: {} is in allow twice; list each origin once",
-                origin.ascii_serialization()
-            );
+            bail!("source {name:?}: {origin} is in allow twice; list each origin once");
         }
         origins.push(origin);
     }
     let mut credited = Vec::new();
     for credential in &c.credentials {
-        let origin = credential.origin.origin();
-        let shown = origin.ascii_serialization();
+        let origin = &credential.origin;
         if !origins.contains(&origin) {
             bail!(
-                "source {name:?}: the credential for {shown} is for an origin not in allow; add it to allow or remove the credential"
+                "source {name:?}: the credential for {origin} is for an origin not in allow; add it to allow or remove the credential"
             );
         }
         if credited.contains(&origin) {
-            bail!("source {name:?}: two credentials for {shown}; keep one");
+            bail!("source {name:?}: two credentials for {origin}; keep one");
         }
         if credential.basic.is_some() == credential.bearer.is_some() {
             bail!(
-                "source {name:?}: the credential for {shown} needs exactly one of basic or bearer"
+                "source {name:?}: the credential for {origin} needs exactly one of basic or bearer"
             );
         }
         credited.push(origin);

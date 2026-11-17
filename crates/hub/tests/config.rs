@@ -281,13 +281,14 @@ fn loads_a_component_source() {
     assert_eq!(c.path, dir.path().join("calendar.wasm"));
     assert_eq!(c.manifest_path(), dir.path().join("calendar.toml"));
     assert_eq!(
-        (c.allow[0].origin.as_str(), c.allow[0].local),
-        ("https://cloud.example/", false)
+        (c.allow[0].origin.to_string(), c.allow[0].local),
+        ("https://cloud.example".to_string(), false)
     );
     assert_eq!(
-        (c.allow[1].origin.as_str(), c.allow[1].local),
-        ("http://192.168.1.10:5232/", true)
+        (c.allow[1].origin.to_string(), c.allow[1].local),
+        ("http://192.168.1.10:5232".to_string(), true)
     );
+    assert_eq!(c.credentials[1].origin, c.allow[1].origin);
     assert_eq!(c.settings["events_url"], "https://cloud.example/e/");
     let basic = c.credentials[0].basic.as_ref().unwrap();
     assert_eq!(basic.username, "alix");
@@ -328,6 +329,30 @@ fn rejects_duplicate_allowed_origin() {
         "allow = [\"https://Cloud.example\", { origin = \"https://cloud.example:443\", local = true }]\n",
     ));
     assert!(e.contains("https://cloud.example is in allow twice"), "{e}");
+    // Addresses are normalised as requests' hosts are: these are one origin too.
+    for (a, b) in [
+        ("http://0x7f.1:5232", "http://127.0.0.1:5232"),
+        ("http://[0:0:0:0:0:0:0:1]", "http://[::1]:80"),
+    ] {
+        let e = refused(&component(&format!(
+            "allow = [{{ origin = {a:?}, local = true }}, {{ origin = {b:?}, local = true }}]\n"
+        )));
+        assert!(e.contains("is in allow twice"), "{a} and {b}: {e}");
+    }
+}
+
+#[test]
+fn credential_origin_matches_its_allowed_spelling() {
+    let c = load_str(&component(
+        "allow = [{ origin = \"http://0x7f.1:5232\", local = true }]\n\
+         [[sources.credentials]]\norigin = \"http://127.0.0.1:5232/\"\nbearer = { env = \"T\" }\n",
+    ))
+    .unwrap();
+    let [SourceConfig::Component(c)] = &c.sources[..] else {
+        panic!("{:?}", c.sources)
+    };
+    assert_eq!(c.allow[0].origin.to_string(), "http://127.0.0.1:5232");
+    assert_eq!(c.credentials[0].origin, c.allow[0].origin);
 }
 
 #[test]
@@ -422,6 +447,37 @@ fn the_calendar_migration_gives_a_working_entry() {
     );
     std::fs::write(&path, format!("{MIN}\n{entry}")).unwrap();
     fronde_hub::config::load(&path).unwrap();
+}
+
+#[test]
+fn the_calendar_migration_marks_local_servers() {
+    for (url, local) in [
+        // Shared address space (carrier-grade NAT, Tailscale).
+        ("http://100.64.0.1:5232/cal/", true),
+        ("http://100.127.255.254/cal/", true),
+        ("http://[::ffff:192.168.1.10]:5232/cal/", true),
+        ("http://[::ffff:100.64.0.1]/cal/", true),
+        ("http://[fd12::1]/cal/", true),
+        ("http://nas.lan:5232/cal/", true),
+        ("http://localhost:5232/cal/", true),
+        ("https://100.128.0.1/cal/", false),
+        ("https://cloud.example/cal/", false),
+    ] {
+        let entry = calendar_replacement(&format!(
+            "events_url = {url:?}\nreminders_url = {url:?}\nusername = \"a\"\n"
+        ));
+        assert_eq!(entry.contains("local = true }]"), local, "{url}: {entry}");
+    }
+    // Plain http to a mapped IPv6 loopback stays on this machine: no https warning.
+    let entry = calendar_replacement(
+        "events_url = \"http://[::ffff:127.0.0.1]:5232/c/\"\n\
+         reminders_url = \"http://[::ffff:127.0.0.1]:5232/r/\"\n",
+    );
+    assert!(
+        entry.contains("allow = [{ origin = \"http://[::ffff:7f00:1]:5232\", local = true }]"),
+        "{entry}"
+    );
+    assert!(!entry.contains("Serve CalDAV over https"), "{entry}");
 }
 
 #[test]

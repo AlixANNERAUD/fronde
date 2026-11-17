@@ -6,14 +6,13 @@ use crate::dial;
 use anyhow::{Context, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use fronde_hub::origin::Origin;
 use http::HeaderValue;
 use http::header::{AUTHORIZATION, COOKIE};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use std::fmt;
-use std::net::IpAddr;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -24,78 +23,6 @@ use wasmtime_wasi_http::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// `scheme://host[:port]`, compared on its parsed parts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Origin {
-    pub(crate) https: bool,
-    pub(crate) host: String,
-    pub(crate) port: u16,
-}
-
-impl Origin {
-    fn of(uri: &http::Uri) -> Option<Self> {
-        let https = match uri.scheme_str()? {
-            "https" => true,
-            "http" => false,
-            _ => return None,
-        };
-        // The connection goes to the raw authority: refuse user information rather than trust
-        // host() to agree with it.
-        if uri.authority()?.as_str().contains('@') {
-            return None;
-        }
-        let host = uri.host()?.to_ascii_lowercase();
-        let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-        Some(Self { https, host, port })
-    }
-
-    fn is_loopback(&self) -> bool {
-        self.host == "localhost"
-            || self
-                .host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    }
-}
-
-impl FromStr for Origin {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        let url = url::Url::parse(s).with_context(|| format!("origin {s:?} is not a URL"))?;
-        let https = match url.scheme() {
-            "https" => true,
-            "http" => false,
-            other => bail!("origin {s:?}: scheme {other:?} is not http or https"),
-        };
-        if !url.username().is_empty()
-            || url.password().is_some()
-            || url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            bail!("origin {s:?} must be scheme://host[:port], with no path or user");
-        }
-        let host = url
-            .host_str()
-            .with_context(|| format!("origin {s:?} has no host"))?
-            .to_string();
-        let port = url
-            .port_or_known_default()
-            .with_context(|| format!("origin {s:?} has no port"))?;
-        Ok(Self { https, host, port })
-    }
-}
-
-impl fmt::Display for Origin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let scheme = if self.https { "https" } else { "http" };
-        write!(f, "{scheme}://{}:{}", self.host, self.port)
-    }
-}
 
 /// A resolved secret the host sends to one origin.
 #[derive(Clone)]
@@ -168,7 +95,7 @@ impl Grants {
             let Some(grant) = grants.iter_mut().find(|g| g.origin == *origin) else {
                 bail!("credential for {origin}, which is not in the allowed origins");
             };
-            if !origin.https && !origin.is_loopback() {
+            if !origin.carries_credentials() {
                 bail!(
                     "credential for {origin} would travel unencrypted: use https (plain http is \
                      accepted only for localhost)"
@@ -179,9 +106,11 @@ impl Grants {
         Ok(Self(grants.into()))
     }
 
-    fn find(&self, uri: &http::Uri) -> Option<&Grant> {
-        let origin = Origin::of(uri)?;
-        self.0.iter().find(|g| g.origin == origin)
+    /// The grant for the request's origin, and that origin.
+    fn find(&self, uri: &http::Uri) -> Option<(&Grant, Origin)> {
+        let origin = Origin::of_request(uri)?;
+        let grant = self.0.iter().find(|g| g.origin == origin)?;
+        Some((grant, origin))
     }
 }
 
@@ -214,7 +143,7 @@ impl WasiHttpHooks for Egress {
                 )>,
             > + Send,
     > {
-        let Some(grant) = self.grants.find(request.uri()) else {
+        let Some((grant, origin)) = self.grants.find(request.uri()) else {
             warn_unlisted(&self.component, request.uri());
             // Read and discard the guest's body before refusing: dropping it would fail the
             // guest's write first, and the guest would report a reset connection, not the denial.
@@ -233,7 +162,7 @@ impl WasiHttpHooks for Egress {
         let local = grant.local;
         let component = self.component.clone();
         Box::new(async move {
-            let send = dial::send(request, CONNECT_TIMEOUT, local, &component);
+            let send = dial::send(request, &origin, CONNECT_TIMEOUT, local, &component);
             let (response, io) = tokio::time::timeout_at(deadline, send)
                 .await
                 .map_err(|_| Error::HttpResponseTimeout)??;
@@ -259,7 +188,7 @@ impl WasiHttpHooks for Egress {
 /// Tell the owner a request went to an origin the component may not reach. Only the origin is
 /// logged, never the path or query.
 fn warn_unlisted(component: &str, uri: &http::Uri) {
-    let origin = match Origin::of(uri) {
+    let origin = match Origin::of_request(uri) {
         Some(origin) => origin.to_string(),
         None => uri.scheme_str().zip(uri.host()).map_or_else(
             || "an invalid URL".to_string(),
@@ -334,26 +263,12 @@ mod tests {
         });
         assert!(
             log.contains(
-                "calendar: https://x.example:443 is not in its allow list; add it to the \
+                "calendar: https://x.example is not in its allow list; add it to the \
                  source's allow"
             ),
             "{log}"
         );
         assert!(!log.contains("s3cret") && !log.contains("/dav"), "{log}");
-    }
-
-    #[test]
-    fn origins_must_be_bare() {
-        for bad in [
-            "https://h.example/path",
-            "https://u:p@h.example",
-            "https://h.example?q",
-            "ftp://h.example",
-            "h.example",
-        ] {
-            assert!(bad.parse::<Origin>().is_err(), "{bad}");
-        }
-        assert!("https://h.example/".parse::<Origin>().is_ok());
     }
 
     #[test]
@@ -367,6 +282,12 @@ mod tests {
         assert!(!allowed(&g, "http://127.0.0.1/x"));
         assert!(!allowed(&g, "https://cal.example.evil.test/"));
         assert!(!allowed(&g, "https://evil.test/"));
+        // Another spelling of an allowed address is the same origin.
+        assert!(allowed(&g, "http://0x7f.1:8080/x"));
+        assert!(allowed(&g, "http://2130706433:8080/x"));
+        let g = grants(&["http://[::1]:9"]);
+        assert!(allowed(&g, "http://[0:0:0:0:0:0:0:1]:9/x"));
+        assert!(!allowed(&g, "http://[::2]:9/x"));
     }
 
     #[test]

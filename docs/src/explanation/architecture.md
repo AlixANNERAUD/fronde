@@ -58,7 +58,10 @@ and is tested natively.
 ## Wasm components
 
 `crates/wasm` runs WebAssembly components that bring tools, sandboxed and with a deny-by-default
-HTTP gate. Integrations with outside services are components, the CalDAV calendar first: each is
+HTTP gate. The gate's rules live in one place, `fronde_hub::origin`, shared by the configuration
+and the sandbox: the `Origin` type (scheme, normalised host, port), parsed once when the
+configuration loads and once per request, which addresses are local or never allowed, and which
+origins may carry credentials. Integrations with outside services are components, the CalDAV calendar first: each is
 a `.wasm` file with a manifest saying what it asks for, and a `[[sources]]` entry granting part
 of it, approved by the files' hashes: those in the entry, or those of the components the binary
 was built with (`crates/wasm/build.rs` hashes `components/dist`). See [Component interface](../reference/wit-interface.md)

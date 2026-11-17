@@ -13,6 +13,7 @@ async-trait.workspace = true
 backon.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+http.workspace = true
 rmcp.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true

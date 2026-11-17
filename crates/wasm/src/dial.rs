@@ -3,12 +3,12 @@
 //! addresses (the host, its private networks, cloud metadata) are refused unless the origin is
 //! allowed as local. TLS trusts the webpki roots, as wasmtime's own sender does.
 
-use http::uri::Scheme;
+use fronde_hub::origin::{Origin, is_local, is_never_allowed};
 use http::{Request, Response, Uri};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use std::future::poll_fn;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::sync::{Arc, LazyLock};
 use std::task::{Poll, ready};
@@ -21,70 +21,6 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use wasmtime_wasi_http::{Error, WasiBody};
 
-/// Cloud metadata services outside the ranges `is_local` already covers (most sit at
-/// 169.254.169.254, which is link-local).
-const METADATA: [IpAddr; 3] = [
-    // Azure WireServer.
-    IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16)),
-    // Alibaba Cloud.
-    IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
-    // AWS over IPv6.
-    IpAddr::V6(Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
-];
-
-/// An address of the host itself or of its networks: loopback, unspecified (which reaches the
-/// host), private (10/8, 172.16/12, 192.168/16, fc00::/7), shared (100.64/10), link-local (where
-/// most metadata services are) and other metadata addresses. IPv4 carried in IPv6 counts as
-/// itself.
-pub(crate) fn is_local(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || a == 0
-                || (a == 100 && (64..128).contains(&b))
-                || METADATA.contains(&ip)
-        }
-        IpAddr::V6(v6) => match embedded_ipv4(v6) {
-            Some(v4) => is_local(IpAddr::V4(v4)),
-            None => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unicast_link_local()
-                    || v6.is_unique_local()
-                    || METADATA.contains(&ip)
-            }
-        },
-    }
-}
-
-/// Addresses no origin may reach, not even one allowed as local: link-local (169.254.0.0/16,
-/// fe80::/10) and cloud metadata. No CalDAV server lives there.
-pub(crate) fn is_never_allowed(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_link_local() || METADATA.contains(&ip),
-        IpAddr::V6(v6) => match embedded_ipv4(v6) {
-            Some(v4) => is_never_allowed(IpAddr::V4(v4)),
-            None => v6.is_unicast_link_local() || METADATA.contains(&ip),
-        },
-    }
-}
-
-/// The IPv4 address an IPv6 one stands for: mapped (`::ffff:a.b.c.d`), compatible
-/// (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`).
-fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
-    let o = v6.octets();
-    match v6.segments() {
-        [0, 0, 0, 0, 0, 0xffff | 0, _, _] | [0x64, 0xff9b, 0, 0, 0, 0, _, _] => {
-            Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
-        }
-        [0x2002, ..] => Some(Ipv4Addr::new(o[2], o[3], o[4], o[5])),
-        _ => None,
-    }
-}
-
 trait Stream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Stream for T {}
 
@@ -93,27 +29,22 @@ type Sent = (
     Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
 );
 
-/// Connect to the request's origin and send it. Returns the response and the connection's
+/// Connect to `origin`, the request's as the gate parsed it, and send the request. Returns the response and the connection's
 /// remaining work, which ends with the response body. `connect_timeout` covers the lookup, the
 /// connection, TLS and the HTTP handshake together.
 pub(crate) async fn send(
     mut request: Request<WasiBody>,
+    origin: &Origin,
     connect_timeout: Duration,
     local: bool,
     component: &str,
 ) -> Result<Sent, Error> {
     let deadline = Instant::now() + connect_timeout;
-    let uri = request.uri();
-    let https = uri.scheme() == Some(&Scheme::HTTPS);
-    let host = uri
-        .host()
-        .ok_or(Error::HttpRequestUriInvalid)?
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-    // Only the origin is logged: never a path or query, which may carry secrets.
-    let origin = format!("{}://{host}:{port}", if https { "https" } else { "http" });
+    // The host the gate matched, not the request's raw spelling of it, is the one resolved, so
+    // that the address checked is the address of the origin allowed. Only the origin is logged:
+    // never a path or query, which may carry secrets.
+    let host = origin.bare_host();
+    let port = origin.port();
 
     let addresses: Vec<SocketAddr> =
         timeout_at(deadline, tokio::net::lookup_host((host.as_str(), port)))
@@ -143,7 +74,7 @@ pub(crate) async fn send(
         .await
         .map_err(|_| Error::ConnectionTimeout)?
         .map_err(Error::Connect)?;
-    let stream: Box<dyn Stream> = if https {
+    let stream: Box<dyn Stream> = if origin.is_https() {
         let name = ServerName::try_from(host).map_err(|_| Error::HttpRequestUriInvalid)?;
         let tls = timeout_at(deadline, tls()?.connect(name, tcp))
             .await
@@ -223,80 +154,6 @@ fn tls() -> Result<&'static TlsConnector, Error> {
 pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn local_addresses() {
-        for local in [
-            "127.0.0.1",
-            "127.1.2.3",
-            "0.0.0.0",
-            "10.0.0.2",
-            "172.16.0.1",
-            "172.31.255.255",
-            "192.168.1.10",
-            "100.64.0.1",
-            "100.127.255.254",
-            "169.254.169.254",
-            "169.254.170.2",
-            "100.100.100.200",
-            "168.63.129.16",
-            "::1",
-            "::",
-            "fe80::1",
-            "fc00::1",
-            "fd12:3456::1",
-            "fd00:ec2::254",
-            "::ffff:127.0.0.1",
-            "::ffff:169.254.169.254",
-            "::127.0.0.1",
-            "::10.0.0.1",
-            "64:ff9b::7f00:1",
-            "64:ff9b::a9fe:a9fe",
-            "2002:7f00:1::",
-            "2002:c0a8:101::1",
-        ] {
-            assert!(is_local(local.parse().unwrap()), "{local}");
-        }
-        for remote in [
-            "8.8.8.8",
-            "172.32.0.1",
-            "172.15.255.255",
-            "100.128.0.1",
-            "100.63.255.255",
-            "2001:db8::1",
-            "2606:4700::1111",
-            "::ffff:8.8.8.8",
-            "64:ff9b::808:808",
-            "2002:808:808::1",
-        ] {
-            assert!(!is_local(remote.parse().unwrap()), "{remote}");
-        }
-    }
-
-    #[test]
-    fn never_allowed_addresses() {
-        for ip in [
-            "169.254.0.1",
-            "169.254.169.254",
-            "fe80::1",
-            "::ffff:169.254.169.254",
-            "100.100.100.200",
-            "168.63.129.16",
-            "fd00:ec2::254",
-        ] {
-            assert!(is_never_allowed(ip.parse().unwrap()), "{ip}");
-        }
-        for ip in [
-            "127.0.0.1",
-            "192.168.1.10",
-            "10.0.0.2",
-            "::1",
-            "fd12::1",
-            "8.8.8.8",
-        ] {
-            assert!(!is_never_allowed(ip.parse().unwrap()), "{ip}");
-        }
-    }
-
     /// Runs `f` and returns what it logged.
     pub(crate) fn logged(f: impl FnOnce()) -> String {
         use std::sync::Mutex;
@@ -337,10 +194,9 @@ pub(crate) mod tests {
                         .boxed_unsync(),
                 )
                 .unwrap();
-            refused = matches!(
-                runtime.block_on(send(request, Duration::from_secs(2), local, "calendar")),
-                Err(Error::DestinationIpProhibited)
-            );
+            let origin = Origin::of_request(request.uri()).unwrap();
+            let sent = send(request, &origin, Duration::from_secs(2), local, "calendar");
+            refused = matches!(runtime.block_on(sent), Err(Error::DestinationIpProhibited));
         });
         (refused, log)
     }
@@ -364,7 +220,10 @@ pub(crate) mod tests {
     fn link_local_is_refused_even_as_local() {
         let (refused, log) = refusal("http://169.254.169.254/latest", true);
         assert!(refused);
-        assert!(log.contains("calendar: http://169.254.169.254:80"), "{log}");
+        assert!(
+            log.contains("calendar: http://169.254.169.254 resolves"),
+            "{log}"
+        );
         assert!(log.contains("link-local or metadata"), "{log}");
         assert!(!log.contains("/latest"), "{log}");
     }

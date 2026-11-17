@@ -62,15 +62,20 @@ become a lasting memory.
 Components get no filesystem, sockets, environment or arguments. Their HTTP goes through a gate
 that denies every origin not allowed for that component, does not follow redirects and does not
 let the component set `Authorization` or `Cookie`. An allowed name that resolves to a local
-address (loopback, private network, link-local, cloud metadata) is refused too, unless that
+address (loopback, private network, shared 100.64.0.0/10, link-local, cloud metadata, or any of
+those carried in IPv6) is refused too, unless that
 origin is allowed as local: a public name cannot be pointed at the host, its network or its
-cloud's metadata service. The host adds the credentials for an allowed origin itself, so a
+cloud's metadata service. Origins are compared after the URL standard normalises them, the same
+way for the configuration and for each request: `http://0x7f.1`, `http://127.0.0.1:80` and
+`http://127.0.0.1` are one origin, as are `[0:0:0:0:0:0:0:1]` and `[::1]`, and the connection goes
+to the host the gate matched, not to the request's spelling of it. The host adds the credentials for an allowed origin itself, so a
 component never holds a secret it could leak elsewhere. Each call has a memory cap, a CPU budget
 and a timeout. What a component writes to its standard error goes to Fronde's log, as warnings
 under its name, at most 100 lines a call.
 
-A credential travels only over https, or over plain http to this machine (`localhost`,
-`127.0.0.1`, `::1`). A CalDAV server on the local network served over plain http must move to
+A credential travels only over https, or over plain http to this machine (`localhost`, a
+loopback address such as `127.0.0.1` or `::1`, or a loopback written as IPv4-mapped IPv6,
+`::ffff:127.0.0.1`). A CalDAV server on the local network served over plain http must move to
 https, or Fronde must run on the same machine, for the component to send it a password. In
 Docker, the same machine means the container: a CalDAV server on the Docker host reached over
 plain http (`host.docker.internal`) does not get credentials, so use https there.

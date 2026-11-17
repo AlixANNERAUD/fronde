@@ -7,12 +7,13 @@
 //! entry without them, those of a component shipped with this build of Fronde. A changed manifest
 //! or build is not loaded until it is approved again. A path never approves anything.
 
-use crate::egress::{Allowed, Credential, Grants, Origin};
+use crate::egress::{Allowed, Credential, Grants};
 use crate::manifest::{Injection, Manifest, NetworkRule, World};
 use crate::{ComponentHost, ComponentSpec, LoadedComponent};
 use anyhow::{Context, bail, ensure};
 use async_trait::async_trait;
 use fronde_hub::config::{ComponentConfig, Config, RESERVED_TOOL_PREFIXES, SourceConfig};
+use fronde_hub::origin::{Origin, is_local};
 use fronde_hub::source::{Session, ToolSource};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -157,7 +158,7 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
 
     let mut allow = Vec::new();
     for a in &config.allow {
-        let origin: Origin = a.origin.as_str().parse()?;
+        let origin = a.origin.clone();
         ensure!(
             manifest
                 .network
@@ -166,14 +167,7 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
             "allow has {origin}, which the manifest does not ask for (it asks for {})",
             asked(&manifest.network, &settings)
         );
-        if !a.local
-            && origin
-                .host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(crate::dial::is_local)
-        {
+        if !a.local && origin.ip().is_some_and(is_local) {
             bail!(
                 "allow has {origin}, a local address, which is refused unless allowed as local: \
                  write it as {{ origin = \"{origin}\", local = true }}"
@@ -187,7 +181,7 @@ pub fn prepare(config: &ComponentConfig, checks: &Checks) -> anyhow::Result<Prep
 
     let mut credentials = Vec::new();
     for c in &config.credentials {
-        let origin: Origin = c.origin.as_str().parse()?;
+        let origin = c.origin.clone();
         let (injection, kind) = match (&c.basic, &c.bearer) {
             (Some(_), None) => (Injection::Basic, "basic"),
             (None, Some(_)) => (Injection::Bearer, "bearer"),
@@ -320,8 +314,7 @@ fn check_namespace(
 
 /// The origin of a URL setting.
 fn origin_of(url: &str) -> Option<Origin> {
-    let url = url::Url::parse(url).ok()?;
-    url.origin().ascii_serialization().parse().ok()
+    Origin::of_url(&url::Url::parse(url).ok()?).ok()
 }
 
 /// Whether the manifest's `rule` asks for `origin`.
@@ -333,11 +326,11 @@ fn covers(rule: &NetworkRule, origin: &Origin, settings: &BTreeMap<String, Strin
             domain,
             port,
         } => {
-            origin.https == *https
-                && origin.port == *port
+            origin.is_https() == *https
+                && origin.port() == *port
                 && origin
-                    .host
-                    .strip_suffix(domain.as_str())
+                    .domain()
+                    .and_then(|host| host.strip_suffix(domain.as_str()))
                     .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.'))
         }
         NetworkRule::Setting(name) => settings
