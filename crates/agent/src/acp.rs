@@ -5,11 +5,11 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, ContentChunk, HttpHeader, Implementation, InitializeRequest,
-    McpServer, McpServerHttp, NewSessionRequest, PermissionOption, PermissionOptionKind,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionCapabilities, SessionId,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason, SystemPrompt,
-    SystemPromptMode, ToolCallStatus,
+    McpServer, McpServerHttp, NewSessionRequest, PermissionOption, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SessionCapabilities, SessionId, SessionNotification, SessionUpdate,
+    SetSessionModeRequest, StopReason, SystemPrompt, SystemPromptMode, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ErrorCode};
 use anyhow::{Context, anyhow};
@@ -19,8 +19,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
 
@@ -81,7 +80,7 @@ impl fmt::Debug for AgentSpec {
 }
 
 /// What the agent does during a turn.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     Text(String),
     ToolStarted {
@@ -92,15 +91,62 @@ pub enum AgentEvent {
         id: String,
         ok: bool,
     },
-    PermissionAsked {
-        id: u64,
-        title: String,
-    },
-    /// The request was dropped unanswered: the turn was cancelled or ended.
-    PermissionClosed {
-        id: u64,
-    },
+    /// The agent asks to use a tool and waits for [`PermissionAsk::reply`].
+    Permission(Box<PermissionAsk>),
 }
+
+/// A permission request from the agent.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PermissionAsk {
+    /// The tool call, as the agent last described it: what its earlier updates said, with what
+    /// the request says over it.
+    pub tool_call: ToolCallUpdateFields,
+    pub options: Vec<PermissionOption>,
+    pub reply: Arc<Reply>,
+}
+
+/// Where the answer to a permission request goes: the first answer is the one the agent gets.
+/// Dropped unanswered, the agent gets `Cancelled`; so does a request still open when its turn
+/// is stopped or ends.
+pub struct Reply(Mutex<Option<oneshot::Sender<RequestPermissionOutcome>>>);
+
+impl Reply {
+    fn new() -> (Arc<Self>, oneshot::Receiver<RequestPermissionOutcome>) {
+        let (sender, receiver) = oneshot::channel();
+        (Arc::new(Self(Mutex::new(Some(sender)))), receiver)
+    }
+
+    /// Answers the agent; false if it was already answered.
+    pub fn send(&self, outcome: RequestPermissionOutcome) -> bool {
+        let sender = lock(&self.0).take();
+        // The agent may already have given up on the request: answered all the same.
+        sender.is_some_and(|sender| {
+            let _ = sender.send(outcome);
+            true
+        })
+    }
+
+    pub fn is_answered(&self) -> bool {
+        lock(&self.0).is_none()
+    }
+}
+
+impl fmt::Debug for Reply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reply")
+            .field("answered", &self.is_answered())
+            .finish()
+    }
+}
+
+/// Two replies are equal only if they are the same.
+impl PartialEq for Reply {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Reply {}
 
 /// Why a turn ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,43 +339,13 @@ impl AgentClient {
             .context("cannot reach the agent to cancel the turn")?;
         Ok(())
     }
-
-    /// Answer the permission request `id` announced by `AgentEvent::PermissionAsked`.
-    pub fn answer_permission(&self, id: u64, allow: bool) -> anyhow::Result<()> {
-        let pending = self
-            .permissions
-            .state()
-            .pending
-            .remove(&id)
-            .with_context(|| {
-                format!("no pending permission request {id}: it was already answered or cancelled")
-            })?;
-        let kind = if allow {
-            PermissionOptionKind::AllowOnce
-        } else {
-            PermissionOptionKind::RejectOnce
-        };
-        // Without a one-time option, cancelling is the answer that grants nothing lasting.
-        let outcome = pending
-            .options
-            .iter()
-            .find(|option| option.kind == kind)
-            .map_or(RequestPermissionOutcome::Cancelled, |option| {
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                    option.option_id.clone(),
-                ))
-            });
-        // The turn may have ended meanwhile; then nobody waits for the answer.
-        let _ = pending.reply.send(outcome);
-        Ok(())
-    }
 }
 
-/// Permission requests waiting for a human answer.
+/// The ACP side of permission requests: the tool calls they are about, and the turn's
+/// requests not answered yet, which a cancel or the end of the turn cancels. The answer itself
+/// comes from whoever handles [`AgentEvent::Permission`].
 struct Permissions {
-    last_id: AtomicU64,
     state: Mutex<PermissionState>,
-    events: mpsc::UnboundedSender<AgentEvent>,
 }
 
 #[derive(Default)]
@@ -337,66 +353,111 @@ struct PermissionState {
     /// Set from `cancel` until the turn ends: requests crossing the cancel on the wire are
     /// refused at once. Cleared again when the next turn starts.
     cancelling: bool,
-    pending: HashMap<u64, PendingPermission>,
-}
-
-struct PendingPermission {
-    options: Vec<PermissionOption>,
-    reply: oneshot::Sender<RequestPermissionOutcome>,
+    /// Weak, so that a request dropped unanswered is cancelled at once.
+    open: Vec<Weak<Reply>>,
+    /// The turn's tool calls not finished yet, as their updates described them, by id: a
+    /// permission request carries only part of its tool call.
+    tools: HashMap<String, ToolCallUpdateFields>,
 }
 
 impl Permissions {
-    fn new(events: mpsc::UnboundedSender<AgentEvent>) -> Self {
+    fn new() -> Self {
         Self {
-            last_id: AtomicU64::new(0),
             state: Mutex::default(),
-            events,
         }
     }
 
     fn state(&self) -> MutexGuard<'_, PermissionState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
-    /// Registers a request and announces it; `None` when the turn is being cancelled.
+    /// Remembers what a tool call update says of its call.
+    fn track(&self, update: &SessionUpdate) {
+        let update = match update {
+            SessionUpdate::ToolCall(call) => ToolCallUpdate::from(call.clone()),
+            SessionUpdate::ToolCallUpdate(update) => update.clone(),
+            _ => return,
+        };
+        let mut state = self.state();
+        let id = update.tool_call_id.0.to_string();
+        if finished(update.fields.status).is_some() {
+            state.tools.remove(&id);
+            return;
+        }
+        merge(state.tools.entry(id).or_default(), update.fields);
+    }
+
+    /// The request as the assistant handles it, and where its answer arrives; `None` when the
+    /// turn is being cancelled.
     fn ask(
         &self,
-        options: Vec<PermissionOption>,
-        title: String,
-    ) -> Option<oneshot::Receiver<RequestPermissionOutcome>> {
+        request: RequestPermissionRequest,
+    ) -> Option<(PermissionAsk, oneshot::Receiver<RequestPermissionOutcome>)> {
         let mut state = self.state();
         if state.cancelling {
             return None;
         }
-        let (reply, answer) = oneshot::channel();
-        let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = request.tool_call.tool_call_id.0.to_string();
+        let mut tool_call = state.tools.get(&id).cloned().unwrap_or_default();
+        merge(&mut tool_call, request.tool_call.fields);
+        let (reply, answer) = Reply::new();
         state
-            .pending
-            .insert(id, PendingPermission { options, reply });
-        // Announced under the lock so a close of this id can never be sent before it.
-        let _ = self.events.send(AgentEvent::PermissionAsked { id, title });
-        Some(answer)
+            .open
+            .retain(|open| open.upgrade().is_some_and(|open| !open.is_answered()));
+        state.open.push(Arc::downgrade(&reply));
+        let ask = PermissionAsk {
+            tool_call,
+            options: request.options,
+            reply,
+        };
+        Some((ask, answer))
     }
 
     fn cancel(&self) {
         let mut state = self.state();
         state.cancelling = true;
-        self.close_pending(&mut state);
+        close_open(&mut state);
     }
 
     fn end_turn(&self) {
         let mut state = self.state();
         state.cancelling = false;
-        self.close_pending(&mut state);
+        state.tools.clear();
+        close_open(&mut state);
     }
+}
 
-    fn close_pending(&self, state: &mut PermissionState) {
-        for (id, pending) in state.pending.drain() {
-            // The agent may already have given up on this request.
-            let _ = pending.reply.send(RequestPermissionOutcome::Cancelled);
-            let _ = self.events.send(AgentEvent::PermissionClosed { id });
-        }
+fn close_open(state: &mut PermissionState) {
+    for reply in state.open.drain(..).filter_map(|reply| reply.upgrade()) {
+        reply.send(RequestPermissionOutcome::Cancelled);
     }
+}
+
+/// Applies the fields an update sets over those known: ACP updates replace what they name.
+fn merge(known: &mut ToolCallUpdateFields, update: ToolCallUpdateFields) {
+    let ToolCallUpdateFields {
+        kind,
+        status,
+        title,
+        name,
+        content,
+        locations,
+        raw_input,
+        raw_output,
+        ..
+    } = update;
+    known.kind = kind.or(known.kind);
+    known.status = status.or(known.status);
+    known.title = title.or(known.title.take());
+    known.name = name.or(known.name.take());
+    known.content = content.or(known.content.take());
+    known.locations = locations.or(known.locations.take());
+    known.raw_input = raw_input.or(known.raw_input.take());
+    known.raw_output = raw_output.or(known.raw_output.take());
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// An initialized connection without a session yet.
@@ -412,16 +473,20 @@ impl Connection {
         transport: impl ConnectTo<Client> + 'static,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> anyhow::Result<Self> {
-        let permissions = Arc::new(Permissions::new(events.clone()));
+        let permissions = Arc::new(Permissions::new());
         let builder = Client
             .v1()
             .on_receive_notification(
-                async move |notification: SessionNotification, _cx| {
-                    for event in events_from(notification.update) {
-                        // A closed receiver only means nobody is listening any more.
-                        let _ = events.send(event);
+                {
+                    let (permissions, events) = (permissions.clone(), events.clone());
+                    async move |notification: SessionNotification, _cx| {
+                        permissions.track(&notification.update);
+                        for event in events_from(notification.update) {
+                            // A closed receiver only means nobody is listening any more.
+                            let _ = events.send(event);
+                        }
+                        Ok(())
                     }
-                    Ok(())
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
@@ -429,16 +494,14 @@ impl Connection {
                 {
                     let permissions = permissions.clone();
                     async move |request: RequestPermissionRequest, responder, cx| {
-                        let title = request
-                            .tool_call
-                            .fields
-                            .title
-                            .unwrap_or_else(|| "permission".to_owned());
-                        let Some(answer) = permissions.ask(request.options, title) else {
+                        let Some((ask, answer)) = permissions.ask(request) else {
                             return responder.respond(RequestPermissionResponse::new(
                                 RequestPermissionOutcome::Cancelled,
                             ));
                         };
+                        // Sent in order with the agent's updates, so that the card follows the
+                        // tool call it is about. Nobody listening drops the reply: cancelled.
+                        let _ = events.send(AgentEvent::Permission(Box::new(ask)));
                         // Waiting for the human inside the handler would block the dispatch
                         // loop, and with it every other message from the agent.
                         cx.spawn(async move {

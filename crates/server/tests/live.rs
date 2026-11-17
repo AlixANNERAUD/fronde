@@ -12,7 +12,7 @@
 //! signs in with the token `claude setup-token` prints, in `CLAUDE_CODE_OAUTH_TOKEN`, which the
 //! configuration names as `[agent] oauth_token`.
 
-use fronde_protocol::{ClientMsg, Entry, Event, ServerMsg};
+use fronde_protocol::{Card, ClientMsg, Entry, Event, ServerMsg};
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{CONTENT_TYPE, SET_COOKIE};
 use std::net::SocketAddr;
@@ -98,7 +98,11 @@ async fn turn(socket: &mut Socket, text: &str) -> Vec<Event> {
                 continue;
             };
             eprintln!("{}", serde_json::to_string(&event).unwrap());
-            if let Event::Permission { title, .. } = &event {
+            if let Event::Request {
+                card: Card::Permission { title, .. },
+                ..
+            } = &event
+            {
                 panic!("the agent asked for a permission: {title}");
             }
             let ended = matches!(event, Event::TurnEnded { .. });

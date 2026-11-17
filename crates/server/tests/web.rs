@@ -410,6 +410,7 @@ async fn ws_send_runs_a_turn() {
         ]
     );
 
+    // An answer to no active request is refused, to this page only.
     say(
         &mut socket,
         ClientMsg::Answer {
@@ -421,9 +422,10 @@ async fn ws_send_runs_a_turn() {
     )
     .await;
     assert_eq!(
-        next_entry(&mut socket).await.event,
-        Event::Notice {
-            text: "Cette demande n'est plus active.".into()
+        next_message(&mut socket).await,
+        ServerMsg::Refused {
+            id: 99,
+            reason: "Cette demande n'existe pas.".into()
         }
     );
 
@@ -1532,4 +1534,122 @@ async fn answer_over_websocket_reaches_the_waiter() {
             ),
         ]
     );
+}
+
+#[tokio::test]
+async fn permission_card_over_websocket() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        ask_permission: true,
+        ..FakeScript::default()
+    });
+    let addr = start_with(config(dir.path(), true), connector, &site(dir.path())).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Mon agenda ?".into(),
+        },
+    )
+    .await;
+    // The agent's permission request is a card of the conversation, from Fronde.
+    let (id, card) = loop {
+        if let Event::Request { id, card, from } = next_entry(&mut socket).await.event {
+            assert_eq!(from, None);
+            break (id, card);
+        }
+    };
+    let fronde_protocol::Card::Permission { title, options, .. } = card else {
+        panic!("not a permission card: {card:?}");
+    };
+    assert_eq!(title, "Lire l'agenda");
+    let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
+    assert_eq!(ids, ["allow-once", "allow-with-updates", "reject"]);
+
+    let mut phone = open_chat(addr, &cookie).await;
+    hello(&mut phone, 0, None).await;
+    let allow = Response::Permission {
+        choice: "allow-once".into(),
+    };
+    say(
+        &mut socket,
+        ClientMsg::Answer {
+            id,
+            response: allow.clone(),
+        },
+    )
+    .await;
+    let turn: Vec<Event> = until_turn_ended(&mut socket)
+        .await
+        .into_iter()
+        .map(|entry| entry.event)
+        .collect();
+    assert_eq!(
+        turn,
+        [
+            Event::RequestClosed {
+                id,
+                outcome: fronde_protocol::Outcome::Answered {
+                    summary: "Autoriser une fois".into()
+                },
+                by: Some("Alix".into()),
+            },
+            // Allowed: the agent ended its turn itself.
+            Event::TurnEnded {
+                outcome: TurnOutcome::Done
+            },
+        ]
+    );
+    // The second page answers too late.
+    say(
+        &mut phone,
+        ClientMsg::Answer {
+            id,
+            response: Response::Permission {
+                choice: "reject".into(),
+            },
+        },
+    )
+    .await;
+    loop {
+        match next_message(&mut phone).await {
+            ServerMsg::Refused {
+                id: refused,
+                reason,
+            } => {
+                assert_eq!(refused, id);
+                assert_eq!(reason, "Cette demande est déjà close.");
+                break;
+            }
+            ServerMsg::Entry(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // The audit trail.
+    let db = database(dir.path()).await;
+    let pool = db.get_sqlite_connection_pool();
+    // The asker and the kind of card, the turn, how it ended and who answered.
+    let rows: Vec<(String, Option<i64>, String, Option<String>)> = sqlx::query_as(
+        "SELECT caller || '/' || kind, turn, status, answered_by FROM requests ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [(
+            "assistant/permission".into(),
+            Some(1),
+            "answered".into(),
+            Some("Alix".into()),
+        )]
+    );
+    let answers: Vec<Option<String>> = sqlx::query_scalar("SELECT response FROM requests")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(answers, [Some(serde_json::to_string(&allow).unwrap())]);
 }

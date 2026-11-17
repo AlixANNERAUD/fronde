@@ -7,3 +7,4 @@ pub mod confine;
 pub mod fake;
 pub mod legacy;
 pub mod log;
+pub mod permission;

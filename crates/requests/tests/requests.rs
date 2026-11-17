@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use fronde_entity::requests;
-use fronde_protocol::{Card, ChoiceAnswer, ChoiceOption, Field, Outcome, RequestId, Response};
+use fronde_protocol::{
+    Card, ChoiceAnswer, ChoiceOption, Field, Outcome, PermissionChoice, PermissionKind, RequestId,
+    Response,
+};
 use fronde_requests::{Ask, Caller, Journal, Refusal, Requests, Resolution, Reused, User};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, EntityTrait};
 use std::sync::{Arc, Mutex};
@@ -676,6 +679,95 @@ async fn pending_request_survives_a_restart() {
     requests.answer(id, pick("Mealie"), &alix()).await.unwrap();
     assert_eq!(row(dir.path(), id).await.status, "answered");
     assert!(matches!(journal.shown()[0], Shown::Closed { .. }));
+}
+
+fn permission() -> Card {
+    Card::Permission {
+        title: "Lire l'agenda".into(),
+        tool: None,
+        body: None,
+        options: vec![
+            PermissionChoice {
+                id: "allow-once".into(),
+                kind: PermissionKind::AllowOnce,
+                detail: None,
+            },
+            PermissionChoice {
+                id: "reject".into(),
+                kind: PermissionKind::RejectOnce,
+                detail: None,
+            },
+        ],
+    }
+}
+
+#[tokio::test]
+async fn restart_expires_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, _) = open(dir.path()).await;
+    let question = requests.ask(ask()).await.unwrap().id();
+    let mut asked = ask();
+    asked.card = permission();
+    let permission = requests.ask(asked).await.unwrap().id();
+    drop(requests);
+
+    // The agent's call that waited on the permission is gone with the process: no answer can
+    // reach it any more. A question stays answerable.
+    let (requests, journal) = open(dir.path()).await;
+    assert_eq!(row(dir.path(), permission).await.status, "expired");
+    assert_eq!(
+        journal.shown(),
+        [Shown::Closed {
+            id: permission,
+            outcome: Outcome::Expired,
+            by: None
+        }]
+    );
+    let allow = Response::Permission {
+        choice: "allow-once".into(),
+    };
+    assert_eq!(
+        requests.answer(permission, allow, &alix()).await,
+        Err(Refusal::Closed)
+    );
+    assert_eq!(row(dir.path(), question).await.status, "pending");
+    requests
+        .answer(question, pick("Mealie"), &alix())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn permission_answer_is_one_of_its_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, _) = open(dir.path()).await;
+    let mut asked = ask();
+    asked.card = permission();
+    let waiter = requests.ask(asked).await.unwrap();
+    let id = waiter.id();
+    let refused = requests
+        .answer(
+            id,
+            Response::Permission {
+                choice: "allow_always".into(),
+            },
+            &alix(),
+        )
+        .await;
+    assert!(matches!(refused, Err(Refusal::Invalid(_))), "{refused:?}");
+    assert_eq!(row(dir.path(), id).await.status, "pending");
+    let allow = Response::Permission {
+        choice: "allow-once".into(),
+    };
+    requests.answer(id, allow.clone(), &alix()).await.unwrap();
+    assert_eq!(resolved(waiter).await, Resolution::Answered(allow));
+    let saved = row(dir.path(), id).await;
+    assert_eq!(saved.kind, "permission");
+    assert_eq!(saved.answered_by.as_deref(), Some("alix"));
+    assert_eq!(
+        saved.response,
+        Some(serde_json::json!({"type": "permission", "choice": "allow-once"}))
+    );
 }
 
 #[tokio::test]

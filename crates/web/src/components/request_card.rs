@@ -1,14 +1,15 @@
-//! A request's card: questions with options, or one secret, answered once from any page. The
-//! page checks the answer with the server's own rules before sending it; the server stays the
-//! judge. A secret is typed in a masked box, emptied once sent, and never shown again.
+//! A request's card: the agent's permission to use a tool, questions with options, or one
+//! secret, answered once from any page. The page checks the answer with the server's own rules
+//! before sending it; the server stays the judge. A secret is typed in a masked box, emptied once
+//! sent, and never shown again.
 
 use dioxus::html::Key;
 use dioxus::prelude::*;
 use fronde_client::RequestStatus;
 use fronde_protocol::request::check;
 use fronde_protocol::{
-    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, Invalid, Keep, KeyPlace, Outcome, Remember,
-    RequestId, Response, SecretValue,
+    Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, Invalid, Keep, KeyPlace, Outcome,
+    PermissionChoice, Remember, RequestId, Response, SecretValue, ToolKind,
 };
 use std::collections::BTreeMap;
 
@@ -37,6 +38,8 @@ const OTHER: &str = "\u{1f}autre";
 const CARD_CLASS: &str = "w-full sm:max-w-[85%]";
 /// Tap targets of at least 44 px on a phone.
 const BUTTON_CLASS: &str = "h-11 w-full sm:h-9 sm:w-auto";
+/// How many lines of a permission's body show before the rest is folded away.
+const BODY_LINES: usize = 6;
 
 /// What the user did with one question so far.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -66,6 +69,27 @@ pub fn RequestCard(
     on_send: EventHandler<Outgoing>,
 ) -> Element {
     let (message, fields, submit) = match card {
+        Card::Permission {
+            title,
+            tool,
+            body,
+            options,
+        } => {
+            return rsx! {
+                PermissionCard {
+                    id,
+                    title,
+                    tool,
+                    body,
+                    options,
+                    status,
+                    refusal,
+                    by,
+                    open,
+                    on_send,
+                }
+            };
+        }
         Card::Form {
             message,
             fields,
@@ -129,6 +153,148 @@ pub fn RequestCard(
                     }
                 }
             }
+        },
+    }
+}
+
+/// The agent asks to use a tool: what it would do, then one button per option it offers,
+/// labelled by kind, its own words for the option under the button. Its texts are shown as
+/// text, never markup; the server already capped them and replaced hidden characters.
+#[component]
+fn PermissionCard(
+    id: RequestId,
+    title: String,
+    tool: Option<ToolKind>,
+    body: Option<String>,
+    options: Vec<PermissionChoice>,
+    status: RequestStatus,
+    refusal: Option<String>,
+    by: Option<String>,
+    open: bool,
+    on_send: EventHandler<Outgoing>,
+) -> Element {
+    let mut sent = use_signal(|| false);
+    let delivered = use_callback(move |()| sent.set(true));
+    // Sent: wait for the server to close the card, unless it refused the answer.
+    let disabled = !open || sent() && refusal.is_none();
+    let header = rsx! {
+        CardHeader {
+            CardDescription { class: "flex flex-wrap items-center gap-2 text-xs font-medium",
+                "Fronde demande l'autorisation"
+                if let Some(tool) = tool {
+                    Badge { variant: BadgeVariant::Outline, size: BadgeSize::Sm, {tool.label()} }
+                }
+            }
+        }
+    };
+    let content = rsx! {
+        p { class: "text-sm font-medium wrap-break-word", "{title}" }
+        if let Some(body) = &body {
+            {permission_body(id, body)}
+        }
+    };
+    match status {
+        RequestStatus::Closed(outcome) => rsx! {
+            CardBox { size: CardSize::Sm, class: CARD_CLASS,
+                {header}
+                CardContent { class: "flex flex-col gap-2", {content} }
+                CardFooter { class: "flex-wrap gap-2",
+                    {permission_badge(&outcome)}
+                    if let Some(by) = by {
+                        span { class: "text-muted-foreground text-xs", "par {by}" }
+                    }
+                }
+            }
+        },
+        RequestStatus::Open => rsx! {
+            CardBox { size: CardSize::Sm, class: CARD_CLASS,
+                {header}
+                CardContent { class: "flex flex-col gap-2",
+                    {content}
+                    if let Some(refusal) = refusal {
+                        FieldError { "{refusal}" }
+                    }
+                }
+                CardFooter { class: "flex-col items-stretch gap-2 sm:flex-row sm:flex-wrap sm:items-start sm:justify-end",
+                    for (index , option) in options.into_iter().enumerate() {
+                        div { key: "{index}", class: "flex flex-col gap-1",
+                            Button {
+                                id: "r{id}-o{index}",
+                                variant: if option.kind.allows() { ButtonVariant::Default } else { ButtonVariant::Outline },
+                                class: BUTTON_CLASS,
+                                disabled,
+                                onclick: {
+                                    let choice = option.id.clone();
+                                    move |_| {
+                                        on_send.call(Outgoing {
+                                            message: ClientMsg::Answer {
+                                                id,
+                                                response: Response::Permission {
+                                                    choice: choice.clone(),
+                                                },
+                                            },
+                                            sent: Some(delivered),
+                                        })
+                                    }
+                                },
+                                {option.kind.label()}
+                            }
+                            if let Some(detail) = &option.detail {
+                                p { class: "text-muted-foreground max-w-xs text-xs wrap-break-word",
+                                    "« {detail} »"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// What the tool would do, in monospace: its first lines, the rest folded away.
+fn permission_body(id: RequestId, body: &str) -> Element {
+    const PRE: &str = "bg-muted max-h-96 overflow-auto rounded-md p-2 font-mono text-xs whitespace-pre-wrap wrap-break-word";
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= BODY_LINES {
+        return rsx! {
+            pre { id: "r{id}-body", class: PRE, "{body}" }
+        };
+    }
+    let head = format!("{}\n…", lines[..BODY_LINES].join("\n"));
+    let count = lines.len();
+    // The first lines stand for the whole while folded; open, the whole replaces them.
+    rsx! {
+        details { id: "r{id}-body", class: "group",
+            summary { class: "cursor-pointer list-none",
+                pre { class: "{PRE} group-open:hidden", "{head}" }
+                span { class: "text-muted-foreground inline-flex min-h-11 items-center text-xs sm:min-h-0 sm:py-1",
+                    "Afficher tout ({count} lignes)"
+                }
+            }
+            pre { class: PRE, "{body}" }
+        }
+    }
+}
+
+/// How a permission card ended: the option chosen, or why none was.
+fn permission_badge(outcome: &Outcome) -> Element {
+    match outcome {
+        Outcome::Answered { summary } => rsx! {
+            Badge { class: "whitespace-normal", "{summary}" }
+        },
+        Outcome::Declined => rsx! {
+            Badge { variant: BadgeVariant::Destructive, "Refusée" }
+        },
+        // No answer means no: the agent was refused.
+        Outcome::Expired => rsx! {
+            Badge { variant: BadgeVariant::Muted, "Expirée, refusée" }
+        },
+        Outcome::Cancelled => rsx! {
+            Badge { variant: BadgeVariant::Muted, "Annulée" }
+        },
+        Outcome::Saved { .. } => rsx! {
+            Badge { "Répondu" }
         },
     }
 }
@@ -910,6 +1076,7 @@ mod tests {
     };
 
     use super::*;
+    use fronde_protocol::PermissionKind;
 
     const ID: RequestId = 7;
 
@@ -1780,5 +1947,172 @@ mod tests {
             page.contains("Secret demandé par « Fronde » (client MCP)"),
             "{page}"
         );
+    }
+
+    fn permission(body: Option<&str>) -> Card {
+        let choice = |id: &str, kind, detail: Option<&str>| PermissionChoice {
+            id: id.into(),
+            kind,
+            detail: detail.map(str::to_owned),
+        };
+        Card::Permission {
+            title: "Lancer <b>git status</b>".into(),
+            tool: Some(ToolKind::Execute),
+            body: body.map(str::to_owned),
+            options: vec![
+                choice("allow-once", PermissionKind::AllowOnce, None),
+                choice(
+                    "allow-with-updates",
+                    PermissionKind::AllowAlways,
+                    Some("Yes, and don't ask again for git status commands"),
+                ),
+                choice("reject", PermissionKind::RejectOnce, None),
+            ],
+        }
+    }
+
+    fn button_texts(html: &str) -> Vec<String> {
+        html.split("<button")
+            .skip(1)
+            .map(|rest| {
+                let inner = rest.split_once('>').unwrap().1;
+                inner.split("</button>").next().unwrap().trim().to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn permission_card_shows_the_tool_call_and_the_agents_options() {
+        let page = render(props(permission(Some("$ git status"))));
+        assert!(page.contains("Fronde demande l&#39;autorisation"), "{page}");
+        assert!(page.contains("Commande"), "{page}");
+        // The agent's text is text, never markup.
+        assert!(
+            page.contains("Lancer &#60;b&#62;git status&#60;/b&#62;"),
+            "{page}"
+        );
+        assert!(!page.contains("<b>"), "{page}");
+        let body = tag(&page, "r7-body").expect("the body");
+        assert!(body.starts_with("<pre"), "{body}");
+        assert!(page.contains("$ git status"), "{page}");
+        // One button per option, in the agent's order, named by kind; its words under it.
+        assert_eq!(
+            button_texts(&page),
+            ["Autoriser une fois", "Toujours autoriser", "Refuser"]
+        );
+        assert!(
+            page.contains("« Yes, and don&#39;t ask again for git status commands »"),
+            "{page}"
+        );
+        for button in ["r7-o0", "r7-o1", "r7-o2"] {
+            assert!(!disabled(&page, button), "{button}");
+            let class = class_of(&page, button);
+            for part in ["h-11", "w-full", "sm:h-9", "sm:w-auto"] {
+                assert!(class.contains(part), "{button}: {class}");
+            }
+        }
+        // Without a body or a kind, neither shows.
+        let bare = Card::Permission {
+            title: "Lire".into(),
+            tool: None,
+            body: None,
+            options: vec![PermissionChoice {
+                id: "allow-once".into(),
+                kind: PermissionKind::AllowOnce,
+                detail: None,
+            }],
+        };
+        let page = render(props(bare));
+        assert!(tag(&page, "r7-body").is_none(), "{page}");
+        assert!(!page.contains("Commande"), "{page}");
+    }
+
+    #[test]
+    fn permission_buttons_send_the_chosen_option() {
+        for (button, choice) in [
+            ("r7-o0", "allow-once"),
+            ("r7-o1", "allow-with-updates"),
+            ("r7-o2", "reject"),
+        ] {
+            let mut card = Live::new(props(permission(None)));
+            card.click(button);
+            assert_eq!(
+                sent(),
+                [ClientMsg::Answer {
+                    id: ID,
+                    response: Response::Permission {
+                        choice: choice.into()
+                    }
+                }],
+                "{button}"
+            );
+            // Sent once: the card waits for the server to close it.
+            let page = card.html();
+            for other in ["r7-o0", "r7-o1", "r7-o2"] {
+                assert!(disabled(&page, other), "{button} then {other}");
+            }
+        }
+    }
+
+    #[test]
+    fn permission_card_follows_the_socket_and_closes() {
+        // Nothing goes out while the socket is closed.
+        let page = render(HarnessProps {
+            open: false,
+            ..props(permission(None))
+        });
+        for button in ["r7-o0", "r7-o1", "r7-o2"] {
+            assert!(disabled(&page, button), "{button}");
+        }
+        // A refused answer says why, and the user may answer again.
+        let page = render(HarnessProps {
+            refusal: Some("Cette demande ne t'est pas adressée.".into()),
+            ..props(permission(None))
+        });
+        assert!(
+            page.contains("Cette demande ne t&#39;est pas adressée."),
+            "{page}"
+        );
+        assert!(!disabled(&page, "r7-o0"));
+
+        let cases = [
+            (
+                Outcome::Answered {
+                    summary: "Toujours autoriser".into(),
+                },
+                "Toujours autoriser",
+            ),
+            (Outcome::Declined, "Refusée"),
+            (Outcome::Expired, "Expirée, refusée"),
+            (Outcome::Cancelled, "Annulée"),
+        ];
+        for (outcome, text) in cases {
+            let page = render(HarnessProps {
+                status: RequestStatus::Closed(outcome),
+                ..props(permission(Some("$ git status")))
+            });
+            assert!(page.contains(text), "{text}: {page}");
+            assert!(page.contains("git status"), "{page}");
+            assert!(!page.contains("<button"), "{page}");
+        }
+    }
+
+    #[test]
+    fn long_permission_body_is_folded_after_six_lines() {
+        let lines: Vec<String> = (1..=10).map(|n| format!("ligne {n}")).collect();
+        let page = render(props(permission(Some(&lines.join("\n")))));
+        let body = tag(&page, "r7-body").expect("the body");
+        assert!(body.starts_with("<details"), "{body}");
+        assert!(page.contains("Afficher tout (10 lignes)"), "{page}");
+        // Folded, the first six lines stand for the rest.
+        let head = page
+            .split("<pre")
+            .find(|pre| pre.contains("group-open:hidden"))
+            .expect("the folded lines");
+        let head = head.split("</pre>").next().unwrap();
+        assert!(head.contains("ligne 6\n…"), "{head}");
+        assert!(!head.contains("ligne 7"), "{head}");
+        // The whole body is there to unfold.
+        assert!(page.contains("ligne 10"), "{page}");
     }
 }

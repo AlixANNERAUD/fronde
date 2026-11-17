@@ -1,8 +1,9 @@
 use agent_client_protocol::v1::schema::{
     ContentBlock, McpServer, RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate,
-    SystemPromptMode, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    SystemPromptMode, ToolCall, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
-use fronde_agent::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
+use fronde_agent::acp::{AgentClient, AgentEvent, AgentSpec, Failure, PermissionAsk, TurnEnd};
 use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use serde_json::json;
 use std::path::PathBuf;
@@ -57,16 +58,16 @@ async fn prompt(client: &AgentClient, text: &str) -> TurnEnd {
         .expect("prompt failed")
 }
 
-/// Waits for the next permission request and returns its id.
-async fn permission_asked(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> u64 {
+/// Waits for the next permission request and returns it.
+async fn permission_asked(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> PermissionAsk {
     loop {
         let event = timeout(WAIT, rx.recv())
             .await
             .expect("no permission request")
             .expect("event channel closed");
-        if let AgentEvent::PermissionAsked { id, title } = event {
-            assert_eq!(title, "Lire l'agenda");
-            return id;
+        if let AgentEvent::Permission(ask) = event {
+            assert_eq!(ask.tool_call.title.as_deref(), Some("Lire l'agenda"));
+            return *ask;
         }
     }
 }
@@ -217,8 +218,8 @@ async fn permission_round_trip() {
         let client = client.clone();
         async move { client.prompt("Mon agenda ?").await }
     });
-    let id = permission_asked(&mut rx).await;
-    client.answer_permission(id, true).expect("answer allow");
+    let first = permission_asked(&mut rx).await;
+    assert!(first.reply.send(selected("allow-once")), "answer allow");
     let end = timeout(WAIT, turn).await.expect("turn timed out");
     assert_eq!(end.expect("turn panicked").expect("prompt"), TurnEnd::Done);
 
@@ -227,10 +228,8 @@ async fn permission_round_trip() {
         async move { client.prompt("Encore ?").await }
     });
     let second = permission_asked(&mut rx).await;
-    assert_ne!(second, id);
-    client
-        .answer_permission(second, false)
-        .expect("answer deny");
+    assert_ne!(second.reply, first.reply);
+    assert!(second.reply.send(selected("reject")), "answer deny");
     let end = timeout(WAIT, turn).await.expect("turn timed out");
     assert_eq!(end.expect("turn panicked").expect("prompt"), TurnEnd::Done);
 
@@ -238,10 +237,82 @@ async fn permission_round_trip() {
         handle.record().permission_outcomes,
         vec![selected("allow-once"), selected("reject")]
     );
-    let error = client
-        .answer_permission(id, true)
-        .expect_err("an answered permission cannot be answered again");
-    assert!(error.to_string().contains(&id.to_string()), "{error}");
+    assert!(
+        !first.reply.send(selected("allow-once")),
+        "an answered permission cannot be answered again"
+    );
+    // The agent's own options, as it offered them.
+    let ids: Vec<String> = first
+        .options
+        .iter()
+        .map(|option| option.option_id.0.to_string())
+        .collect();
+    assert_eq!(ids, ["allow-once", "allow-with-updates", "reject"]);
+}
+
+#[tokio::test]
+async fn permission_carries_what_the_tool_call_said_before() {
+    let script = FakeScript {
+        updates: vec![
+            SessionUpdate::ToolCall(
+                ToolCall::new("tool-1", "Lire")
+                    .kind(ToolKind::Read)
+                    .locations(vec![ToolCallLocation::new("/home/alix/agenda.ics")]),
+            ),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "tool-1",
+                ToolCallUpdateFields::new().raw_input(json!({"path": "/home/alix/agenda.ics"})),
+            )),
+        ],
+        ask_permission: true,
+        ..FakeScript::default()
+    };
+    let (client, _handle, mut rx) = connect(script, None).await;
+    let client = Arc::new(client);
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Mon agenda ?").await }
+    });
+
+    let ask = permission_asked(&mut rx).await;
+    // The request's own title wins over the earlier one; the rest comes from the updates.
+    assert_eq!(ask.tool_call.kind, Some(ToolKind::Read));
+    assert_eq!(
+        ask.tool_call.locations,
+        Some(vec![ToolCallLocation::new("/home/alix/agenda.ics")])
+    );
+    assert_eq!(
+        ask.tool_call.raw_input,
+        Some(json!({"path": "/home/alix/agenda.ics"}))
+    );
+    assert!(ask.reply.send(selected("allow-once")));
+    let end = timeout(WAIT, turn).await.expect("turn timed out");
+    assert_eq!(end.expect("turn panicked").expect("prompt"), TurnEnd::Done);
+}
+
+#[tokio::test]
+async fn dropped_permission_is_cancelled() {
+    let script = FakeScript {
+        ask_permission: true,
+        ..FakeScript::default()
+    };
+    let (client, handle, mut rx) = connect(script, None).await;
+    let client = Arc::new(client);
+    let turn = tokio::spawn({
+        let client = client.clone();
+        async move { client.prompt("Mon agenda ?").await }
+    });
+    // Whoever handles the request gives up on it without an answer.
+    drop(permission_asked(&mut rx).await);
+    let end = timeout(WAIT, turn).await.expect("turn timed out");
+    assert_eq!(
+        end.expect("turn panicked").expect("prompt"),
+        TurnEnd::Cancelled
+    );
+    assert_eq!(
+        handle.record().permission_outcomes,
+        vec![RequestPermissionOutcome::Cancelled]
+    );
 }
 
 #[tokio::test]
@@ -257,7 +328,7 @@ async fn cancel_resolves_pending_permission() {
         let client = client.clone();
         async move { client.prompt("Mon agenda ?").await }
     });
-    permission_asked(&mut rx).await;
+    let ask = permission_asked(&mut rx).await;
     client.cancel().expect("cancel");
     let end = timeout(WAIT, turn).await.expect("turn timed out");
     assert_eq!(
@@ -270,6 +341,10 @@ async fn cancel_resolves_pending_permission() {
     assert_eq!(
         record.permission_outcomes,
         vec![RequestPermissionOutcome::Cancelled]
+    );
+    assert!(
+        !ask.reply.send(selected("allow-once")),
+        "a cancelled permission cannot be answered"
     );
 }
 
@@ -432,17 +507,15 @@ async fn stale_permissions_are_closed_at_turn_end() {
     assert_eq!(prompt(&client, "Mon agenda ?").await, TurnEnd::Done);
 
     let events = drain(&mut rx);
-    let [
-        AgentEvent::PermissionAsked { id, .. },
-        AgentEvent::PermissionClosed { id: closed },
-    ] = events.as_slice()
-    else {
-        panic!("expected the permission to be asked then closed, got {events:?}");
+    let [AgentEvent::Permission(ask)] = events.as_slice() else {
+        panic!("expected the permission to be asked, got {events:?}");
     };
-    assert_eq!(closed, id);
-    client
-        .answer_permission(*id, true)
-        .expect_err("a closed permission cannot be answered");
+    // Closed with its turn.
+    assert!(ask.reply.is_answered());
+    assert!(
+        !ask.reply.send(selected("allow-once")),
+        "a closed permission cannot be answered"
+    );
     timeout(WAIT, async {
         while handle.record().permission_outcomes.is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -509,8 +582,8 @@ async fn cancel_between_turns_does_not_reach_the_next_turn() {
         let client = client.clone();
         async move { client.prompt("Mon agenda ?").await }
     });
-    let id = permission_asked(&mut rx).await;
-    client.answer_permission(id, true).expect("answer allow");
+    let ask = permission_asked(&mut rx).await;
+    assert!(ask.reply.send(selected("allow-once")), "answer allow");
     let end = timeout(WAIT, turn).await.expect("turn timed out");
     assert_eq!(end.expect("turn panicked").expect("prompt"), TurnEnd::Done);
     assert_eq!(

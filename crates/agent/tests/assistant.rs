@@ -6,6 +6,8 @@ use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::{Assistant, Connector, SESSION, TOPIC, process_connector};
 use fronde_agent::fake::{FAKE_SESSION_ID, FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::{Event, ToolState, TurnOutcome};
+use fronde_protocol::{Card, Outcome, PermissionChoice, PermissionKind, RequestId, Response};
+use fronde_requests::{Refusal, Requests, User};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +18,6 @@ use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(10);
 const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-la.";
-const GONE: &str = "Cette demande n'est plus active.";
 const FRESH: &str = "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
 const NOT_INSTALLED: &str = "Impossible de démarrer l'agent : lance `mise run agent` ou indique son chemin dans [agent] command.";
@@ -37,15 +38,44 @@ fn spec() -> AgentSpec {
     }
 }
 
-/// Fake agents started by a connector, one per connection.
+/// Fake agents started by a connector, one per connection, and the requests the assistant
+/// shows their permissions through.
 #[derive(Default)]
 struct Fakes {
     handles: Mutex<Vec<FakeHandle>>,
+    requests: Mutex<Option<Arc<Requests>>>,
 }
 
 impl Fakes {
     fn handles(&self) -> Vec<FakeHandle> {
         self.handles.lock().unwrap().clone()
+    }
+
+    fn requests(&self) -> Arc<Requests> {
+        self.requests.lock().unwrap().clone().expect("no requests")
+    }
+
+    /// Answers the request `id` as Alix, choosing the agent's option `choice`.
+    async fn choose(&self, id: RequestId, choice: &str) -> Result<(), Refusal> {
+        let response = Response::Permission {
+            choice: choice.into(),
+        };
+        self.requests().answer(id, response, &alix()).await
+    }
+
+    async fn allow(&self, id: RequestId) -> Result<(), Refusal> {
+        self.choose(id, "allow-once").await
+    }
+
+    async fn reject(&self, id: RequestId) -> Result<(), Refusal> {
+        self.choose(id, "reject").await
+    }
+}
+
+fn alix() -> User {
+    User {
+        name: "alix".into(),
+        admin: true,
     }
 }
 
@@ -71,8 +101,19 @@ fn fake_connector(script: FakeScript, gate: Option<Arc<Notify>>) -> (Connector, 
 }
 
 async fn open(dir: &Path, script: FakeScript) -> (Arc<Assistant>, Arc<Fakes>) {
+    open_for(dir, script, alix()).await
+}
+
+/// The assistant with its requests, for `owner`.
+async fn open_for(dir: &Path, script: FakeScript, owner: User) -> (Arc<Assistant>, Arc<Fakes>) {
     let (connector, fakes) = fake_connector(script, None);
     let assistant = open_with(dir, spec(), connector).await;
+    let db = fronde_db::open(dir).await.expect("database");
+    let requests = Requests::open(db, assistant.clone())
+        .await
+        .expect("requests");
+    assistant.set_requests(&requests, owner);
+    *fakes.requests.lock().unwrap() = Some(requests);
     (assistant, fakes)
 }
 
@@ -125,21 +166,25 @@ async fn wait_for_turns(assistant: &Assistant, count: usize) -> Vec<Event> {
     .await
 }
 
-/// Waits for a permission request and returns its id.
+/// Waits for a permission card and returns its request's id.
 async fn wait_for_permission(assistant: &Assistant) -> u64 {
-    let events = wait_until(assistant, |events| {
-        events
-            .iter()
-            .any(|event| matches!(event, Event::Permission { .. }))
-    })
-    .await;
-    events
-        .iter()
-        .find_map(|event| match event {
-            Event::Permission { id, .. } => Some(*id),
-            _ => None,
-        })
-        .unwrap()
+    let events = wait_until(assistant, |events| events.iter().any(is_permission)).await;
+    events.iter().find_map(permission_id).unwrap()
+}
+
+fn is_permission(event: &Event) -> bool {
+    permission_id(event).is_some()
+}
+
+fn permission_id(event: &Event) -> Option<u64> {
+    match event {
+        Event::Request {
+            id,
+            card: Card::Permission { .. },
+            ..
+        } => Some(*id),
+        _ => None,
+    }
 }
 
 fn user(text: &str) -> Event {
@@ -154,15 +199,55 @@ fn ended(outcome: TurnOutcome) -> Event {
     Event::TurnEnded { outcome }
 }
 
-fn permission(id: u64) -> Event {
-    Event::Permission {
-        id,
+/// The card of the fake agent's permission request, for an admin.
+fn permission_card() -> Card {
+    let choice = |id: &str, kind, detail: Option<&str>| PermissionChoice {
+        id: id.into(),
+        kind,
+        detail: detail.map(str::to_owned),
+    };
+    Card::Permission {
         title: "Lire l'agenda".into(),
+        tool: None,
+        body: None,
+        options: vec![
+            choice("allow-once", PermissionKind::AllowOnce, None),
+            choice("allow-with-updates", PermissionKind::AllowAlways, None),
+            choice("reject", PermissionKind::RejectOnce, None),
+        ],
     }
 }
 
+fn permission(id: u64) -> Event {
+    Event::Request {
+        id,
+        card: permission_card(),
+        from: None,
+    }
+}
+
+/// The permission `id` closed with `outcome`, by Alix when she answered.
+fn closed(id: u64, outcome: Outcome) -> Event {
+    let by = matches!(outcome, Outcome::Answered { .. }).then(|| "alix".to_owned());
+    Event::RequestClosed { id, outcome, by }
+}
+
 fn answered(id: u64, allowed: bool) -> Event {
-    Event::PermissionAnswered { id, allowed }
+    let summary = if allowed {
+        "Autoriser une fois"
+    } else {
+        "Refuser"
+    };
+    closed(
+        id,
+        Outcome::Answered {
+            summary: summary.into(),
+        },
+    )
+}
+
+fn selected(id: &str) -> RequestPermissionOutcome {
+    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id.to_owned()))
 }
 
 fn asking() -> FakeScript {
@@ -232,7 +317,7 @@ async fn second_prompt_during_turn_is_refused() {
     assistant.send("Mon agenda ?".into()).await;
     assistant.send("Et demain ?".into()).await;
     let id = wait_for_permission(&assistant).await;
-    assistant.answer(id, true).await;
+    fakes.allow(id).await.unwrap();
     let events = wait_for_turns(&assistant, 1).await;
 
     assert!(events.contains(&notice(BUSY)), "{events:?}");
@@ -242,7 +327,7 @@ async fn second_prompt_during_turn_is_refused() {
     // Once the turn is over, the next message goes through.
     assistant.send("Et demain ?".into()).await;
     let id = wait_for_permission_after(&assistant, id).await;
-    assistant.answer(id, false).await;
+    fakes.reject(id).await.unwrap();
     let events = wait_for_turns(&assistant, 2).await;
     assert!(events.contains(&user("Et demain ?")), "{events:?}");
 }
@@ -287,21 +372,14 @@ async fn send_right_after_turn_ended_is_accepted() {
     wait_for_turns(&assistant, TURNS).await;
 }
 
-/// Waits for a permission request other than `previous`.
+/// Waits for a permission card other than `previous`.
 async fn wait_for_permission_after(assistant: &Assistant, previous: u64) -> u64 {
+    let other = |event: &Event| permission_id(event).filter(|id| *id != previous);
     let events = wait_until(assistant, |events| {
-        events
-            .iter()
-            .any(|event| matches!(event, Event::Permission { id, .. } if *id != previous))
+        events.iter().any(|e| other(e).is_some())
     })
     .await;
-    events
-        .iter()
-        .find_map(|event| match event {
-            Event::Permission { id, .. } if *id != previous => Some(*id),
-            _ => None,
-        })
-        .unwrap()
+    events.iter().find_map(other).unwrap()
 }
 
 #[tokio::test]
@@ -441,54 +519,49 @@ async fn permission_answer_is_logged() {
 
     assistant.send("Mon agenda ?".into()).await;
     let id = wait_for_permission(&assistant).await;
-    assistant.answer(id, true).await;
+    fakes.allow(id).await.unwrap();
     wait_for_turns(&assistant, 1).await;
-    assistant.answer(id, true).await;
+    // The first answer wins; a second one is refused, and the log does not change.
+    assert_eq!(fakes.allow(id).await, Err(Refusal::Closed));
 
     assert_eq!(
         events(&assistant),
         vec![
             user("Mon agenda ?"),
-            permission(2),
-            answered(2, true),
+            permission(id),
+            answered(id, true),
             ended(TurnOutcome::Done),
-            notice(GONE),
         ]
     );
     assert_eq!(
         fakes.handles()[0].record().permission_outcomes,
-        vec![RequestPermissionOutcome::Selected(
-            SelectedPermissionOutcome::new("allow-once")
-        )]
+        vec![selected("allow-once")]
     );
 }
 
 #[tokio::test]
 async fn permission_ids_stay_unique_across_connections() {
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, _fakes) = open(dir.path(), asking()).await;
+    let (assistant, fakes) = open(dir.path(), asking()).await;
     assistant.send("Mon agenda ?".into()).await;
     let first = wait_for_permission(&assistant).await;
-    assistant.answer(first, true).await;
+    fakes.allow(first).await.unwrap();
     wait_for_turns(&assistant, 1).await;
-    drop(assistant);
+    drop((assistant, fakes));
 
-    // After a restart the agent numbers its requests from 1 again; the log's ids go on.
+    // After a restart the agent numbers its requests from 1 again; the requests' ids go on.
     let (assistant, fakes) = open(dir.path(), asking()).await;
     assistant.send("Et demain ?".into()).await;
     let second = wait_for_permission_after(&assistant, first).await;
     assert!(second > first, "{second} after {first}");
-    assistant.answer(first, true).await;
-    assistant.answer(second, false).await;
+    assert_eq!(fakes.allow(first).await, Err(Refusal::Closed));
+    fakes.reject(second).await.unwrap();
     let events = wait_for_turns(&assistant, 2).await;
 
-    assert_eq!(events.iter().filter(|e| **e == notice(GONE)).count(), 1);
     assert!(events.contains(&answered(second, false)), "{events:?}");
     assert_eq!(
         fakes.handles()[0].record().permission_outcomes,
-        vec![RequestPermissionOutcome::Selected(
-            SelectedPermissionOutcome::new("reject")
-        )]
+        vec![selected("reject")]
     );
 }
 
@@ -498,7 +571,7 @@ async fn cancel_ends_the_turn() {
     let (assistant, fakes) = open(dir.path(), asking()).await;
 
     assistant.send("Mon agenda ?".into()).await;
-    wait_for_permission(&assistant).await;
+    let id = wait_for_permission(&assistant).await;
     assistant.cancel().await;
     wait_for_turns(&assistant, 1).await;
     // Idle: nothing to cancel.
@@ -508,12 +581,18 @@ async fn cancel_ends_the_turn() {
         events(&assistant),
         vec![
             user("Mon agenda ?"),
-            permission(2),
-            answered(2, false),
+            permission(id),
+            closed(id, Outcome::Cancelled),
             ended(TurnOutcome::Cancelled),
         ]
     );
-    assert_eq!(fakes.handles()[0].record().cancels, 1);
+    let record = fakes.handles()[0].record();
+    assert_eq!(record.cancels, 1);
+    assert_eq!(
+        record.permission_outcomes,
+        vec![RequestPermissionOutcome::Cancelled]
+    );
+    assert_eq!(fakes.allow(id).await, Err(Refusal::Closed));
 }
 
 #[tokio::test]
@@ -598,21 +677,35 @@ async fn stale_permission_is_closed_in_the_log() {
         leave_permission_pending: true,
         ..asking()
     };
-    let (assistant, _fakes) = open(dir.path(), script).await;
+    let (assistant, fakes) = open(dir.path(), script).await;
 
     assistant.send("Mon agenda ?".into()).await;
-    wait_for_turns(&assistant, 1).await;
-    assistant.answer(2, true).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    let id = events
+        .iter()
+        .find_map(permission_id)
+        .expect("no permission card");
+    assert_eq!(fakes.allow(id).await, Err(Refusal::Closed));
 
     assert_eq!(
-        events(&assistant),
+        events,
         vec![
             user("Mon agenda ?"),
-            permission(2),
-            answered(2, false),
+            permission(id),
+            closed(id, Outcome::Cancelled),
             ended(TurnOutcome::Done),
-            notice(GONE),
         ]
+    );
+    timeout(WAIT, async {
+        while fakes.handles()[0].record().permission_outcomes.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the agent never got an answer");
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![RequestPermissionOutcome::Cancelled]
     );
 }
 
@@ -624,26 +717,23 @@ async fn permission_that_cannot_be_saved_is_denied() {
     sea_orm::ConnectionTrait::execute_unprepared(
         &db,
         "CREATE TRIGGER refuse BEFORE INSERT ON stream_entries \
-         WHEN json_extract(NEW.event, '$.type') = 'permission' \
+         WHEN json_extract(NEW.event, '$.type') = 'request' \
          BEGIN SELECT RAISE(ABORT, 'disk full'); END",
     )
     .await
     .unwrap();
 
     assistant.send("Mon agenda ?".into()).await;
-    wait_for_turns(&assistant, 1).await;
-    // The request was never shown: an answer naming its would-be id finds nothing pending.
-    assistant.answer(2, true).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    // The request was never shown: an answer naming it finds nothing pending.
+    assert!(!events.iter().any(is_permission), "{events:?}");
+    assert_eq!(fakes.allow(1).await, Err(Refusal::Closed));
 
-    assert_eq!(
-        events(&assistant),
-        vec![user("Mon agenda ?"), ended(TurnOutcome::Done), notice(GONE)]
-    );
+    assert_eq!(events.first(), Some(&user("Mon agenda ?")));
+    assert_eq!(events.last(), Some(&ended(TurnOutcome::Done)));
     assert_eq!(
         fakes.handles()[0].record().permission_outcomes,
-        vec![RequestPermissionOutcome::Selected(
-            SelectedPermissionOutcome::new("reject")
-        )]
+        vec![selected("reject")]
     );
 }
 
@@ -815,19 +905,18 @@ async fn open_imports_the_files_from_before_fronde() {
 
 #[tokio::test]
 async fn requests_are_shown_in_the_conversation() {
-    use fronde_protocol::{Card, ChoiceAnswer, ChoiceOption, Field, Outcome, Response};
-    use fronde_requests::{Ask, Caller, Requests, Resolution, User};
+    use fronde_protocol::{ChoiceAnswer, ChoiceOption, Field};
+    use fronde_requests::{Ask, Caller, Resolution};
 
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, _fakes) = open(dir.path(), asking()).await;
+    let (assistant, fakes) = open(dir.path(), asking()).await;
     assert_eq!(assistant.current_turn().await, None);
     assistant.send("Mon agenda ?".into()).await;
     let permission = wait_for_permission(&assistant).await;
     // The turn runs while the agent waits for the permission.
     assert_eq!(assistant.current_turn().await, Some(1));
 
-    let db = fronde_db::open(dir.path()).await.unwrap();
-    let requests = Requests::open(db, assistant.clone()).await.unwrap();
+    let requests = fakes.requests();
     let option = |label: &str| ChoiceOption {
         label: label.into(),
         description: None,
@@ -871,14 +960,13 @@ async fn requests_are_shown_in_the_conversation() {
         )]
         .into(),
     };
-    let alix = User {
-        name: "alix".into(),
-        admin: true,
-    };
-    requests.answer(id, response.clone(), &alix).await.unwrap();
+    requests
+        .answer(id, response.clone(), &alix())
+        .await
+        .unwrap();
     assert_eq!(waiter.wait().await, Resolution::Answered(response));
 
-    assistant.answer(permission, true).await;
+    fakes.allow(permission).await.unwrap();
     let events = wait_for_turns(&assistant, 1).await;
     assert_eq!(
         events[2..4],
@@ -928,17 +1016,10 @@ fn question_card() -> fronde_protocol::Card {
 /// permission; returns the waiter.
 async fn ask_during_a_turn(
     dir: &Path,
-) -> (
-    Arc<Assistant>,
-    Arc<fronde_requests::Requests>,
-    fronde_requests::Waiter,
-    u64,
-) {
-    use fronde_requests::{Ask, Caller, Requests};
-    let (assistant, _fakes) = open(dir, asking()).await;
-    let db = fronde_db::open(dir).await.unwrap();
-    let requests = Requests::open(db, assistant.clone()).await.unwrap();
-    assistant.set_requests(&requests);
+) -> (Arc<Assistant>, Arc<Fakes>, fronde_requests::Waiter, u64) {
+    use fronde_requests::{Ask, Caller};
+    let (assistant, fakes) = open(dir, asking()).await;
+    let requests = fakes.requests();
     assistant.send("Mon agenda ?".into()).await;
     let permission = wait_for_permission(&assistant).await;
     let waiter = requests
@@ -954,15 +1035,14 @@ async fn ask_during_a_turn(
         })
         .await
         .unwrap();
-    (assistant, requests, waiter, permission)
+    (assistant, fakes, waiter, permission)
 }
 
 #[tokio::test]
 async fn stop_cancels_the_turns_open_requests() {
-    use fronde_protocol::Outcome;
     use fronde_requests::Resolution;
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, _requests, waiter, _) = ask_during_a_turn(dir.path()).await;
+    let (assistant, _fakes, waiter, _) = ask_during_a_turn(dir.path()).await;
     let id = waiter.id();
     assistant.cancel().await;
     assert_eq!(
@@ -982,13 +1062,12 @@ async fn stop_cancels_the_turns_open_requests() {
 
 #[tokio::test]
 async fn turn_end_cancels_the_requests_left_open() {
-    use fronde_protocol::Outcome;
     use fronde_requests::Resolution;
     let dir = tempfile::tempdir().unwrap();
-    let (assistant, _requests, waiter, permission) = ask_during_a_turn(dir.path()).await;
+    let (assistant, fakes, waiter, permission) = ask_during_a_turn(dir.path()).await;
     let id = waiter.id();
     // The agent goes on without the answer and ends its turn.
-    assistant.answer(permission, true).await;
+    fakes.allow(permission).await.unwrap();
     assert_eq!(
         timeout(WAIT, waiter.wait()).await.unwrap(),
         Resolution::Cancelled
@@ -1010,4 +1089,239 @@ async fn turn_end_cancels_the_requests_left_open() {
         .position(|event| matches!(event, Event::TurnEnded { .. }))
         .unwrap();
     assert!(closed < ended_at, "{events:?}");
+}
+
+/// The card of the permission `id`, once shown.
+async fn shown_card(assistant: &Assistant, id: u64) -> Card {
+    events(assistant)
+        .into_iter()
+        .find_map(|event| match event {
+            Event::Request {
+                id: shown, card, ..
+            } if shown == id => Some(card),
+            _ => None,
+        })
+        .expect("the card")
+}
+
+#[tokio::test]
+async fn permission_options_follow_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), asking()).await;
+    let mut previous = 0;
+    for (turn, choice) in ["allow-once", "allow-with-updates", "reject"]
+        .into_iter()
+        .enumerate()
+    {
+        assistant.send(format!("Tour {turn}")).await;
+        let newer = |event: &Event| permission_id(event).filter(|id| *id > previous);
+        let shown = wait_until(&assistant, |events| {
+            events.iter().any(|e| newer(e).is_some())
+        });
+        let id = shown.await.iter().find_map(newer).unwrap();
+        assert_eq!(shown_card(&assistant, id).await, permission_card());
+        fakes.choose(id, choice).await.unwrap();
+        wait_for_turns(&assistant, turn + 1).await;
+        previous = id;
+    }
+    // Each choice reached the agent as the option it offered.
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![
+            selected("allow-once"),
+            selected("allow-with-updates"),
+            selected("reject")
+        ]
+    );
+    // Each card closed with the option chosen, by whom.
+    let summaries: Vec<String> = events(&assistant)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::RequestClosed {
+                outcome: Outcome::Answered { summary },
+                by: Some(by),
+                ..
+            } if by == "alix" => Some(summary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        summaries,
+        ["Autoriser une fois", "Toujours autoriser", "Refuser"]
+    );
+}
+
+#[tokio::test]
+async fn always_hidden_for_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = User {
+        name: "sam".into(),
+        admin: false,
+    };
+    let (assistant, fakes) = open_for(dir.path(), asking(), sam.clone()).await;
+    assistant.send("Mon agenda ?".into()).await;
+    let id = wait_for_permission(&assistant).await;
+    let Card::Permission { options, .. } = shown_card(&assistant, id).await else {
+        unreachable!()
+    };
+    let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
+    assert_eq!(ids, ["allow-once", "reject"]);
+    // Not offered, so not accepted either.
+    let always = Response::Permission {
+        choice: "allow-with-updates".into(),
+    };
+    let refused = fakes.requests().answer(id, always, &sam).await;
+    assert!(matches!(refused, Err(Refusal::Invalid(_))), "{refused:?}");
+    let allow = Response::Permission {
+        choice: "allow-once".into(),
+    };
+    fakes.requests().answer(id, allow, &sam).await.unwrap();
+    wait_for_turns(&assistant, 1).await;
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![selected("allow-once")]
+    );
+}
+
+#[tokio::test]
+async fn permission_from_another_user_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), asking()).await;
+    assistant.send("Mon agenda ?".into()).await;
+    let id = wait_for_permission(&assistant).await;
+    let sam = User {
+        name: "sam".into(),
+        admin: true,
+    };
+    let allow = Response::Permission {
+        choice: "allow-once".into(),
+    };
+    assert_eq!(
+        fakes.requests().answer(id, allow, &sam).await,
+        Err(Refusal::NotYours)
+    );
+    // Still Alix's to answer, and the agent still waits.
+    assert!(fakes.handles()[0].record().permission_outcomes.is_empty());
+    fakes.reject(id).await.unwrap();
+    // A second answer is refused: the first one won.
+    assert_eq!(fakes.allow(id).await, Err(Refusal::Closed));
+    wait_for_turns(&assistant, 1).await;
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![selected("reject")]
+    );
+}
+
+#[tokio::test]
+async fn permission_expiry_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), asking()).await;
+    // Real time: the database's own timeouts would fire at once on a paused clock.
+    assistant.set_permission_timeout(Duration::from_millis(200));
+    assistant.send("Mon agenda ?".into()).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    let id = events.iter().find_map(permission_id).unwrap();
+
+    assert_eq!(
+        events,
+        vec![
+            user("Mon agenda ?"),
+            permission(id),
+            closed(id, Outcome::Expired),
+            ended(TurnOutcome::Done),
+        ]
+    );
+    // No answer means no.
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![selected("reject")]
+    );
+    assert_eq!(fakes.allow(id).await, Err(Refusal::Closed));
+}
+
+#[tokio::test]
+async fn permission_expires_after_thirty_minutes_by_default() {
+    assert_eq!(
+        fronde_agent::permission::PERMISSION_TIMEOUT,
+        Duration::from_secs(30 * 60)
+    );
+}
+
+#[tokio::test]
+async fn cancel_closes_the_turns_requests() {
+    use fronde_requests::Resolution;
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes, waiter, permission) = ask_during_a_turn(dir.path()).await;
+    let question = waiter.id();
+    assistant.cancel().await;
+    assert_eq!(
+        timeout(WAIT, waiter.wait()).await.unwrap(),
+        Resolution::Cancelled
+    );
+    let events = wait_for_turns(&assistant, 1).await;
+    // Both the agent's permission and the question are cancelled before the turn ends.
+    let ended_at = events.len() - 1;
+    for id in [permission, question] {
+        let at = events
+            .iter()
+            .position(|event| *event == closed(id, Outcome::Cancelled))
+            .unwrap_or_else(|| panic!("{id} not cancelled: {events:?}"));
+        assert!(at < ended_at, "{events:?}");
+    }
+    assert_eq!(events[ended_at], ended(TurnOutcome::Cancelled));
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![RequestPermissionOutcome::Cancelled]
+    );
+    assert_eq!(fakes.allow(permission).await, Err(Refusal::Closed));
+}
+
+#[tokio::test]
+async fn plan_body_is_shown() {
+    use agent_client_protocol::v1::schema::{ToolCallContent, ToolKind};
+    let dir = tempfile::tempdir().unwrap();
+    // The agent described the tool call before asking: its kind and its plan.
+    let script = FakeScript {
+        updates: vec![SessionUpdate::ToolCall(
+            ToolCall::new("tool-1", "Prêt à coder ?")
+                .kind(ToolKind::SwitchMode)
+                .content(vec![ToolCallContent::from(
+                    "1. Lire l'agenda\n2. Ajouter le rendez-vous",
+                )]),
+        )],
+        ..asking()
+    };
+    let (assistant, fakes) = open(dir.path(), script).await;
+    assistant.send("Planifie".into()).await;
+    let id = wait_for_permission(&assistant).await;
+    let Card::Permission {
+        title, tool, body, ..
+    } = shown_card(&assistant, id).await
+    else {
+        unreachable!()
+    };
+    // The request's own title, over the earlier one.
+    assert_eq!(title, "Lire l'agenda");
+    assert_eq!(tool, Some(fronde_protocol::ToolKind::SwitchMode));
+    assert_eq!(
+        body.as_deref(),
+        Some("1. Lire l'agenda\n2. Ajouter le rendez-vous")
+    );
+    fakes.allow(id).await.unwrap();
+    wait_for_turns(&assistant, 1).await;
+}
+
+#[tokio::test]
+async fn permission_without_requests_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, fakes) = fake_connector(asking(), None);
+    let assistant = open_with(dir.path(), spec(), connector).await;
+    assistant.send("Mon agenda ?".into()).await;
+    let events = wait_for_turns(&assistant, 1).await;
+    // Nobody could answer a card that cannot be shown.
+    assert!(!events.iter().any(is_permission), "{events:?}");
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![selected("reject")]
+    );
 }

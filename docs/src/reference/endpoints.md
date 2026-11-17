@@ -64,14 +64,14 @@ From the page:
 | `hello` | `last_seq`, optional `log_id` | Start streaming: the entries after `last_seq`, then live ones. A different `log_id` gets the whole log. |
 | `send` | `text` | A message to Fronde. Refused with a notice while a turn runs. |
 | `cancel` | | Stop the running turn, and cancel the requests it asked that are still open. |
-| `answer` | `id`, `response` | Answer the request `id`. `response` is tagged by `type`: `form` with `values` (each question's key to `{ "selected": [labels], "other"?, "note"? }`), `decline`, or `permission` with `choice` (`allow_once` or `reject_once`) for a permission request of the agent. The first answer wins. |
+| `answer` | `id`, `response` | Answer the request `id`. `response` is tagged by `type`: `form` with `values` (each question's key to `{ "selected": [labels], "other"?, "note"? }`), `decline`, or `permission` with `choice`, the id of one of a permission card's options. The first answer wins. |
 
 From the server:
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `hello` | `log_id`, `last_seq`, `user` | The answer to the page's `hello`, before any entry. `user` is whom the page is signed in as: a closed card names who answered only when it was someone else. |
-| `entry` | `seq`, `at`, `event` | One numbered, timestamped event of the conversation: a user message, an assistant text chunk, a tool call, a permission request or answer, a request to the user (`request`: `id`, `card`, optional `from`) or its end (`request_closed`: `id`, `outcome`, optional `by`), the end of a turn, or a notice. |
+| `entry` | `seq`, `at`, `event` | One numbered, timestamped event of the conversation: a user message, an assistant text chunk, a tool call, a permission request or answer from before permissions were cards (kept so old logs replay), a request to the user (`request`: `id`, `card` of kind `permission`, `form` or `secret`, optional `from`) or its end (`request_closed`: `id`, `outcome`, optional `by`), the end of a turn, or a notice. |
 | `refused` | `id`, `reason` | The page's answer to the request `id` was refused, and the request did not change: it is not this user's, it is closed already, or the answer does not fit the card (`reason` says what to fix, in French). Sent to that page only; never logged. |
 
 When the socket drops, the page reconnects after 1 second, doubling the wait up to 30 seconds,

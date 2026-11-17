@@ -20,8 +20,8 @@ A request ends in one of four ways:
 | Status | When | The card says |
 | --- | --- | --- |
 | `answered` | You sent an answer | *Réponse : …*, or for a secret where it was kept |
-| `declined` | You pressed *Refuser* | *Refusée* |
-| `expired` | Its time ran out | *Expirée* |
+| `declined` | You pressed *Refuser* on a question or secret card | *Refusée* |
+| `expired` | Its time ran out | *Expirée* (*Expirée, refusée* for a permission) |
 | `cancelled` | The asker gave up (its tool call was cancelled), the assistant's turn that asked ended or was stopped, or the request could not be shown | *Annulée* |
 
 The row is closed before the one who asked is told, and a closed request never reopens. Every
@@ -63,6 +63,40 @@ takes messages of at most 64 KiB, and closes on a bigger one.
 
 A closed card says how it ended, and who answered when it was not you.
 
+## Permission cards
+
+Fronde's assistant asks before it acts: each time the agent asks to use a tool (ACP's
+`session/request_permission`), Fronde writes a `permission` request and shows its card, headed
+*Fronde demande l'autorisation*. The card shows:
+
+- the tool call's title, in one line of at most 200 characters, and its kind (*Lecture*,
+  *Modification*, *Commande*, *Accès web*…);
+- what it would do, in monospace: the command, the files and the address it names, its text (a
+  plan), and for each file it would change a summary such as `notes.md : -1 +3 ligne(s)`, at
+  most 4000 characters, folded after six lines;
+- one button per option the agent offers, in its order, named by kind (*Autoriser une fois*,
+  *Toujours autoriser*, *Refuser*, *Toujours refuser*), with the agent's own words for the option
+  under the button when they say more, such as what *always* covers.
+
+All of these texts come from the agent, which may have read them from a web page. Fronde caps
+them and replaces every control and bidirectional character with `�` before the card is written,
+so a command cannot hide its end behind a right-to-left override or an escape sequence, and the
+page shows them as text, never markup. Options that last (`allow_always`, `reject_always`) are
+shown only to an admin; the server refuses any option the card does not offer.
+
+The answer is the same `answer` message as any card's, checked by the same code, and the first
+one wins. The agent then gets the option chosen. It gets a refusal (the agent's *reject once*, or
+a cancel if it offered none) when the card expires after **30 minutes** or is declined: no answer
+means no. It gets a cancel when you press *Stop* or the turn ends: both close the turn's open
+cards. A permission still pending when Fronde stops expires at the next start, since the agent's
+call that waited on it is gone with the agent's process.
+
+*Toujours autoriser* is the agent's own option, and Fronde passes it on without keeping anything.
+With Claude Code, it adds an allow rule to the running agent process: it lasts until that process
+stops (Fronde restarts, or a turn the agent never ended stops it), and is never loaded again,
+since Fronde's sessions load no Claude Code settings. Fronde itself never remembers a grant: the
+next agent process asks again.
+
 ## Secret cards
 
 `user_secret` asks for one secret on a card of its own, never in a question card. The card shows
@@ -93,9 +127,9 @@ the same thing, so a guess learns nothing. No tool takes one yet (see
 
 ## Restarts and retries
 
-The table is the source of truth. After a restart, a request whose time ran out expires; one
-whose card never reached the conversation, because Fronde stopped in between, is shown then; the
-others stay answerable. A tool call that is retried with the same `client_request_id` joins the
+The table is the source of truth. After a restart, a request whose time ran out expires, and so
+does a pending permission; one whose card never reached the conversation, because Fronde stopped
+in between, is shown then; the others stay answerable. A tool call that is retried with the same `client_request_id` joins the
 request it started instead of showing a second card. Secrets kept for a conversation do not
 survive a restart: they live in memory only. A secret card still pending after a restart stays
 answerable.
@@ -141,8 +175,6 @@ These use the same requests and cards, and are **not built yet**:
 
 - **Tools that take a `secret_ref`**: integration setup from the chat, and commands that read a
   secret from a file in threads that have a shell.
-- **Permissions**: the agent's requests to use a tool become cards too, expiring after 30 minutes
-  with a refusal. Until then they keep their own card, answered with the same `answer` message.
 - **Elicitations**: forms that Claude's `AskUserQuestion` and upstream MCP servers send, shown as
   cards; an upstream server's go to the admin.
 - **Late answers**: an answer to a question whose asker is gone (after a restart, or a tool call

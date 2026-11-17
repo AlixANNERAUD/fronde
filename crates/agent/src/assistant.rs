@@ -1,14 +1,15 @@
 //! Fronde's conversation: one agent session, its turns recorded in the conversation log.
 
-use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, TurnEnd};
+use crate::acp::{AgentClient, AgentEvent, AgentSpec, Failure, PermissionAsk, TurnEnd};
 use crate::confine::Confine;
 use crate::legacy;
 use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
+use crate::permission;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use fronde_db::DatabaseConnection;
 use fronde_protocol::{Card, Outcome, RequestId};
-use fronde_requests::{Journal, Requests};
+use fronde_requests::{Ask, Caller, Journal, Requests, User};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,7 +20,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-la.";
-const NOT_ACTIVE: &str = "Cette demande n'est plus active.";
 const NEW_CONVERSATION: &str =
     "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
@@ -71,14 +71,14 @@ pub struct Assistant {
     log: ConversationLog,
     db: DatabaseConnection,
     session: Mutex<Option<Session>>,
-    /// Permission requests shown in the log and not answered yet, by their id in the log: the
-    /// client that asked and its own id for the request.
-    pending: Mutex<HashMap<u64, (Weak<AgentClient>, u64)>>,
     /// The running turn; `None` when idle.
     turn: tokio::sync::Mutex<Option<Turn>>,
-    /// The requests a turn may ask, cancelled when it ends or is stopped. Weak: they hold the
-    /// assistant as their journal.
-    requests: OnceLock<Weak<Requests>>,
+    /// The requests a turn asks through, the agent's permissions among them, cancelled when it
+    /// ends or is stopped, and the user they are for. Weak: they hold the assistant as their
+    /// journal.
+    requests: OnceLock<(Weak<Requests>, User)>,
+    /// How long a permission card waits for an answer.
+    permission_timeout: Mutex<Duration>,
 }
 
 struct Turn {
@@ -121,9 +121,9 @@ impl Assistant {
             log,
             db,
             session: Mutex::new(None),
-            pending: Mutex::default(),
             turn: tokio::sync::Mutex::new(None),
             requests: OnceLock::new(),
+            permission_timeout: Mutex::new(permission::PERMISSION_TIMEOUT),
         });
         // A turn the server stopped in the middle of would otherwise run forever on the pages.
         let last_turn =
@@ -156,12 +156,23 @@ impl Assistant {
         &self.log
     }
 
-    /// The requests the assistant's turns ask through: a turn that ends or is stopped cancels
-    /// those still pending. Set once.
-    pub fn set_requests(&self, requests: &Arc<Requests>) {
-        if self.requests.set(Arc::downgrade(requests)).is_err() {
+    /// The requests the assistant's turns ask through, for `owner`: the agent's permissions
+    /// become cards there, and a turn that ends or is stopped cancels those still pending. Set
+    /// once; until then, every permission is refused.
+    pub fn set_requests(&self, requests: &Arc<Requests>, owner: User) {
+        if self
+            .requests
+            .set((Arc::downgrade(requests), owner))
+            .is_err()
+        {
             tracing::warn!("the assistant's requests were already set");
         }
+    }
+
+    /// How long a permission card waits for an answer before the agent is refused:
+    /// [`permission::PERMISSION_TIMEOUT`] unless changed here.
+    pub fn set_permission_timeout(&self, timeout: Duration) {
+        *lock(&self.permission_timeout) = timeout;
     }
 
     /// Logs the message and runs the turn in the background; refused while a turn runs.
@@ -226,7 +237,7 @@ impl Assistant {
 
     /// Cancels the pending requests of the turn whose user message is `seq`.
     async fn cancel_requests(&self, seq: Option<u64>) {
-        let requests = self.requests.get().and_then(Weak::upgrade);
+        let requests = self.requests();
         if let (Some(seq), Some(requests)) = (seq, requests)
             && let Err(error) = requests.cancel_turn(TOPIC, seq).await
         {
@@ -240,24 +251,62 @@ impl Assistant {
         self.turn.lock().await.as_ref().and_then(|turn| turn.seq)
     }
 
-    /// Answers the permission request `id` shown in the log.
-    pub async fn answer(&self, id: u64, allow: bool) {
-        let asked = lock(&self.pending).remove(&id);
-        let Some((client, request)) =
-            asked.and_then(|(client, request)| Some((client.upgrade()?, request)))
-        else {
-            self.append(Event::Notice {
-                text: NOT_ACTIVE.into(),
+    fn requests(&self) -> Option<Arc<Requests>> {
+        self.requests
+            .get()
+            .and_then(|(requests, _)| requests.upgrade())
+    }
+
+    /// Shows the agent's permission request as a card of the running turn, and answers the
+    /// agent once the card is answered, expires (a refusal), or is cancelled with its turn.
+    /// Refused at once when it cannot be shown: nobody could answer it.
+    async fn ask_permission(&self, ask: PermissionAsk) {
+        let PermissionAsk {
+            tool_call,
+            options,
+            reply,
+        } = ask;
+        let deny = || {
+            reply.send(permission::denial(&options));
+        };
+        let (Some(requests), Some((_, owner))) = (self.requests(), self.requests.get()) else {
+            tracing::warn!("a permission request came with no requests to show it: refused");
+            return deny();
+        };
+        // Only a turn's request is cancelled with its turn; there is none to tie it to.
+        let Some(turn) = self.current_turn().await else {
+            tracing::warn!("a permission request came outside a turn: refused");
+            return deny();
+        };
+        let Some(card) = permission::card(&tool_call, &options, owner.admin) else {
+            tracing::warn!("a permission request offered nothing the card can show: refused");
+            return deny();
+        };
+        let timeout = *lock(&self.permission_timeout);
+        let asked = requests
+            .ask(Ask {
+                topic: TOPIC.into(),
+                turn: Some(turn),
+                caller: Caller::Assistant,
+                client_request_id: None,
+                card,
+                for_user: owner.name.clone(),
+                admin_only: false,
+                timeout,
             })
             .await;
-            return;
+        let waiter = match asked {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                tracing::error!("cannot show the permission request, refusing it: {error:#}");
+                return deny();
+            }
         };
-        // Logged first so the answer precedes whatever the agent does next.
-        self.append(Event::PermissionAnswered { id, allowed: allow })
-            .await;
-        if let Err(error) = client.answer_permission(request, allow) {
-            tracing::warn!("the answer came too late: {error:#}");
-        }
+        // Waiting here would hold up the agent's next events.
+        tokio::spawn(async move {
+            let resolution = waiter.wait().await;
+            reply.send(permission::outcome(&resolution, &options));
+        });
     }
 
     async fn run_turn(
@@ -334,7 +383,7 @@ impl Assistant {
         let (flushes, flush_requests) = mpsc::unbounded_channel();
         tokio::spawn(record_events(
             Arc::downgrade(self),
-            Recorder::new(Arc::downgrade(&client)),
+            Recorder::default(),
             agent_events,
             flush_requests,
         ));
@@ -380,57 +429,9 @@ impl Assistant {
                     ToolState::Failed
                 },
             },
-            AgentEvent::PermissionAsked { id: request, title } => {
-                // The agent numbers its requests from 1 on each connection: the log's id is the
-                // entry's seq. It is pending before the entry is broadcast, so an answer to it
-                // finds it. Lock order: log, then pending.
-                let client = recorder.client.clone();
-                let mut numbered = None;
-                let asked = self
-                    .log
-                    .append_with(|id| {
-                        numbered = Some(id);
-                        lock(&self.pending).insert(id, (client, request));
-                        Event::Permission { id, title }
-                    })
-                    .await;
-                match asked {
-                    Ok(entry) => {
-                        recorder.permissions.insert(request, entry.seq);
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            "cannot write the conversation log, denying the permission: {error:#}"
-                        );
-                        // Nobody can answer a request the log does not show: refuse it now
-                        // rather than leave the agent waiting and the next entry's seq naming it.
-                        if let Some(id) = numbered {
-                            lock(&self.pending).remove(&id);
-                            // A save that reported an error may still have landed, and the
-                            // log shows the request: close it there too.
-                            if self.log.since(id - 1).first().is_some_and(|e| e.seq == id) {
-                                self.append(Event::PermissionAnswered { id, allowed: false })
-                                    .await;
-                            }
-                        }
-                        if let Some(client) = recorder.client.upgrade()
-                            && let Err(error) = client.answer_permission(request, false)
-                        {
-                            tracing::warn!("cannot deny the permission: {error:#}");
-                        }
-                    }
-                }
+            AgentEvent::Permission(ask) => {
+                self.ask_permission(*ask).await;
                 return;
-            }
-            AgentEvent::PermissionClosed { id: request } => {
-                let Some(id) = recorder.permissions.remove(&request) else {
-                    return;
-                };
-                // Already logged as answered when the answer raced the end of the turn.
-                if lock(&self.pending).remove(&id).is_none() {
-                    return;
-                }
-                Event::PermissionAnswered { id, allowed: false }
             }
         };
         self.append(event).await;
@@ -448,21 +449,9 @@ impl Assistant {
 }
 
 /// What recording one connection's events remembers.
+#[derive(Default)]
 struct Recorder {
-    client: Weak<AgentClient>,
     tool_titles: HashMap<String, String>,
-    /// The log's id of each permission request, by the agent's id.
-    permissions: HashMap<u64, u64>,
-}
-
-impl Recorder {
-    fn new(client: Weak<AgentClient>) -> Self {
-        Self {
-            client,
-            tool_titles: HashMap::new(),
-            permissions: HashMap::new(),
-        }
-    }
 }
 
 /// Logs the agent's events for the lifetime of its client and answers flush requests.

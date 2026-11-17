@@ -17,10 +17,31 @@ pub const MAX_TEXT: usize = 2000;
 /// under the chat's largest message.
 pub const MAX_SECRET: usize = 16 * 1024;
 
+/// The longest title of a permission card, in characters.
+pub const MAX_PERMISSION_TITLE: usize = 200;
+
+/// The longest body of a permission card (what the tool would do), in characters.
+pub const MAX_PERMISSION_BODY: usize = 4000;
+
 /// What a request's card shows. Never a secret.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Card {
+    /// The agent asks to use a tool. Its texts come from the agent: one line of at most
+    /// [`MAX_PERMISSION_TITLE`] characters, a body of at most [`MAX_PERMISSION_BODY`], neither
+    /// with a control or bidirectional character.
+    Permission {
+        /// What the tool would do, in one line.
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<ToolKind>,
+        /// What the tool would do, in detail: the command, the files, a summary of the changes,
+        /// a plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        /// The agent's own options, in its order.
+        options: Vec<PermissionChoice>,
+    },
     /// Questions to answer together, then sent at once.
     Form {
         /// Shown above the fields; empty when the fields say it all.
@@ -54,8 +75,86 @@ impl Card {
     /// The card's kind, as stored with its request.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::Permission { .. } => "permission",
             Self::Form { .. } => "form",
             Self::Secret { .. } => "secret",
+        }
+    }
+}
+
+/// One option of a permission card.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PermissionChoice {
+    /// The agent's id for the option: what the answer names.
+    pub id: String,
+    pub kind: PermissionKind,
+    /// The agent's own words for the option, when they say more than its kind, such as what
+    /// "always" covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// What a permission option grants, as ACP names it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+impl PermissionKind {
+    /// The button's label: the card names options by kind, whatever the agent calls them.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "Autoriser une fois",
+            Self::AllowAlways => "Toujours autoriser",
+            Self::RejectOnce => "Refuser",
+            Self::RejectAlways => "Toujours refuser",
+        }
+    }
+
+    pub fn allows(self) -> bool {
+        matches!(self, Self::AllowOnce | Self::AllowAlways)
+    }
+
+    /// A lasting grant or refusal, which only an admin is offered.
+    pub fn lasts(self) -> bool {
+        matches!(self, Self::AllowAlways | Self::RejectAlways)
+    }
+}
+
+/// What kind of tool a permission card is about, as ACP names it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    #[serde(other)]
+    Other,
+}
+
+impl ToolKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Read => "Lecture",
+            Self::Edit => "Modification",
+            Self::Delete => "Suppression",
+            Self::Move => "Déplacement",
+            Self::Search => "Recherche",
+            Self::Execute => "Commande",
+            Self::Think => "Réflexion",
+            Self::Fetch => "Accès web",
+            Self::SwitchMode => "Changement de mode",
+            Self::Other => "Outil",
         }
     }
 }
@@ -187,8 +286,7 @@ pub enum Response {
     Form {
         values: BTreeMap<String, ChoiceAnswer>,
     },
-    /// One of a permission request's options. Until permissions are requests, it answers a
-    /// [`crate::Event::Permission`] by its id, with `allow_once` or `reject_once`.
+    /// One of a [`Card::Permission`]'s options, by its id.
     Permission { choice: String },
     /// The secret a [`Card::Secret`] asks for, and how long to keep it.
     Secret { value: SecretValue, keep: Keep },
@@ -251,13 +349,20 @@ fn invalid(key: Option<&str>, message: impl Into<String>) -> Invalid {
     }
 }
 
-/// Checks that `response` answers `card`: for a form, known fields only, offered options only,
-/// one pick for a single choice, required fields answered, free text non-empty and short
-/// enough; for a secret, a value of at most [`MAX_SECRET`] bytes, kept only where the card
-/// offers it. A decline answers any card.
+/// Checks that `response` answers `card`: for a permission, one of its options; for a form,
+/// known fields only, offered options only, one pick for a single choice, required fields
+/// answered, free text non-empty and short enough; for a secret, a value of at most
+/// [`MAX_SECRET`] bytes, kept only where the card offers it. A decline answers any card.
 pub fn check(card: &Card, response: &Response) -> Result<(), Invalid> {
     match (card, response) {
         (_, Response::Decline) => Ok(()),
+        (Card::Permission { options, .. }, Response::Permission { choice }) => {
+            if options.iter().any(|option| option.id == *choice) {
+                Ok(())
+            } else {
+                Err(invalid(None, "Ce choix n'est pas proposé."))
+            }
+        }
         (Card::Form { fields, .. }, Response::Form { values }) => check_form(fields, values),
         (Card::Secret { remember, .. }, Response::Secret { value, keep }) => {
             check_secret(remember.as_ref(), value, *keep)
@@ -370,7 +475,8 @@ fn check_form(fields: &[Field], values: &BTreeMap<String, ChoiceAnswer>) -> Resu
 }
 
 /// A short account of an answer, for the closed card and the audit trail: the picked labels
-/// and "Autre" texts, field after field. Notes are left out.
+/// and "Autre" texts, field after field, notes left out; for a permission, the chosen option's
+/// label.
 pub fn summary(card: &Card, response: &Response) -> String {
     match (card, response) {
         // A secret is never summed up, not even by its length.
@@ -390,8 +496,13 @@ pub fn summary(card: &Card, response: &Response) -> String {
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join(" ; "),
+        (Card::Permission { options, .. }, Response::Permission { choice }) => options
+            .iter()
+            .find(|option| option.id == *choice)
+            .map_or_else(|| choice.clone(), |option| option.kind.label().to_owned()),
         (_, Response::Permission { choice }) => choice.clone(),
-        (_, Response::Decline) => String::new(),
+        // `check` refuses a form's answers to a permission.
+        (Card::Permission { .. }, Response::Form { .. }) | (_, Response::Decline) => String::new(),
     }
 }
 
@@ -721,6 +832,85 @@ mod tests {
         );
         // Nor does any summary show one.
         assert_eq!(summary(&card, &secret("s3cret", Keep::Conversation)), "");
+    }
+
+    fn permission_card() -> Card {
+        Card::Permission {
+            title: "Lire ~/notes.md".into(),
+            tool: Some(ToolKind::Read),
+            body: Some("~/notes.md".into()),
+            options: vec![
+                PermissionChoice {
+                    id: "allow-once".into(),
+                    kind: PermissionKind::AllowOnce,
+                    detail: None,
+                },
+                PermissionChoice {
+                    id: "allow-with-updates".into(),
+                    kind: PermissionKind::AllowAlways,
+                    detail: Some("Yes, and don't ask again for notes.md".into()),
+                },
+                PermissionChoice {
+                    id: "reject".into(),
+                    kind: PermissionKind::RejectOnce,
+                    detail: None,
+                },
+            ],
+        }
+    }
+
+    fn pick(choice: &str) -> Response {
+        Response::Permission {
+            choice: choice.into(),
+        }
+    }
+
+    #[test]
+    fn permission_card_and_answer_json_shape() {
+        let card = permission_card();
+        let json = serde_json::to_string(&card).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"permission","title":"Lire ~/notes.md","tool":"read","body":"~/notes.md","options":[{"id":"allow-once","kind":"allow_once"},{"id":"allow-with-updates","kind":"allow_always","detail":"Yes, and don't ask again for notes.md"},{"id":"reject","kind":"reject_once"}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Card>(&json).unwrap(), card);
+        assert_eq!(card.kind(), "permission");
+        // A kind of tool this version does not know reads as a tool.
+        let unknown = json.replace(r#""read""#, r#""teleport""#);
+        let Card::Permission { tool, .. } = serde_json::from_str(&unknown).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(tool, Some(ToolKind::Other));
+        assert_eq!(
+            serde_json::to_string(&pick("reject")).unwrap(),
+            r#"{"type":"permission","choice":"reject"}"#
+        );
+    }
+
+    #[test]
+    fn permission_answer_rules() {
+        let card = permission_card();
+        for choice in ["allow-once", "allow-with-updates", "reject"] {
+            assert_eq!(check(&card, &pick(choice)), Ok(()), "{choice}");
+        }
+        assert_eq!(check(&card, &Response::Decline), Ok(()));
+        // Only the agent's own options, by id, never by label or kind.
+        for choice in ["allow_once", "Autoriser une fois", "", "reject_always"] {
+            let error = refused(&card, &pick(choice));
+            assert_eq!(error.message, "Ce choix n'est pas proposé.", "{choice}");
+        }
+        let error = refused(&card, &values(&[("q1", answer(&["Mealie"], None))]));
+        assert_eq!(
+            error.message,
+            "Cette réponse ne correspond pas à la demande."
+        );
+        assert_eq!(summary(&card, &pick("reject")), "Refuser");
+        assert_eq!(
+            summary(&card, &pick("allow-with-updates")),
+            "Toujours autoriser"
+        );
+        assert!(PermissionKind::AllowAlways.lasts() && PermissionKind::RejectAlways.lasts());
+        assert!(!PermissionKind::AllowOnce.lasts() && !PermissionKind::RejectOnce.allows());
     }
 
     #[test]

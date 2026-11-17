@@ -601,7 +601,12 @@ pub async fn start_with(
             let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
             let requests =
                 Requests::open_with(db.clone(), assistant.clone(), Some(secrets)).await?;
-            assistant.set_requests(&requests);
+            // The one user so far is the owner, an admin.
+            let owner = fronde_requests::User {
+                name: user.clone(),
+                admin: true,
+            };
+            assistant.set_requests(&requests, owner);
             Some((
                 assistant,
                 assistant_token,

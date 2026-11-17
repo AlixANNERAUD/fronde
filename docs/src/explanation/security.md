@@ -245,7 +245,13 @@ Fronde's agent has no shell and no files. Its session turns off Claude Code's bu
 except `WebSearch` and `WebFetch`, which only read the web, and allows only those and the hub's
 tools. It loads none of Claude Code's settings, so your plugins, MCP servers, hooks and permission
 rules on the same machine do not reach it. Its permission mode asks before acting, and any request
-it makes shows in the chat with *Autoriser* and *Refuser*. Adding a built-in tool beyond the two
+it makes is a permission card in the chat (see
+[Requests and cards](requests.md#permission-cards)): only the user it is for answers it, and only
+an admin is offered an option that lasts; a card left unanswered refuses after 30 minutes, and
+*Stop* or the end of the turn cancels it. The card's texts come from the agent, so they are capped
+and stripped of control and bidirectional characters, which could otherwise make a command read
+as another. *Toujours autoriser* lasts only as long as the agent's process: Fronde keeps no grant,
+and the agent loads no settings where one could persist. Adding a built-in tool beyond the two
 web ones is refused by the configuration check: widening it is a deliberate code change.
 
 ### The agent's environment

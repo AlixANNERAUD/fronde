@@ -41,6 +41,8 @@ const EXPIRED: &str = "expired";
 const CANCELLED: &str = "cancelled";
 /// The kind of a secret card's row, whose answer is where the secret was kept.
 const SECRET: &str = "secret";
+/// The kind of a permission card's row: it lives only as long as the agent's call it guards.
+const PERMISSION: &str = "permission";
 /// How long an asker waits past its request's expiry for the timer to close it, before it
 /// gives up on the timer: a database that failed to close the request must not leave the asker
 /// waiting forever.
@@ -294,8 +296,9 @@ pub struct Requests {
 
 impl Requests {
     /// Opens the requests stored in `db`, shown by `journal`. Pending requests whose time is up
-    /// expire; those never announced (a crash between their row and their entry) are announced;
-    /// the others get their timer again.
+    /// expire, and so do pending permissions: the agent's call that waited on one is gone with
+    /// the process that held it. Those never announced (a crash between their row and their
+    /// entry) are announced; the others get their timer again.
     pub async fn open(
         db: DatabaseConnection,
         journal: Arc<dyn Journal>,
@@ -325,6 +328,13 @@ impl Requests {
             .await
             .context("cannot read the pending requests")?;
         for row in pending {
+            if row.kind == PERMISSION {
+                let id = row_id(&row)?;
+                if let Err(error) = requests.expire(id).await {
+                    tracing::error!("cannot expire permission request {id}: {error:#}");
+                }
+                continue;
+            }
             // One row this version cannot show must not keep Fronde from starting.
             if let Err(error) = requests.reopen(&row).await {
                 tracing::error!("cannot reopen request {}, cancelling it: {error:#}", row.id);

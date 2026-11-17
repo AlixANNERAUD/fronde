@@ -42,9 +42,6 @@ pub async fn upgrade(
 /// and anything bigger only costs the server memory. The socket closes on a bigger one.
 const MAX_MESSAGE: usize = 64 * 1024;
 
-/// The answer a page gives a permission entry of the log to allow it.
-const ALLOW_ONCE: &str = "allow_once";
-
 /// True when `Origin` names the host the request was sent to.
 fn same_origin(headers: &HeaderMap) -> bool {
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
@@ -100,11 +97,6 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>) {
                     }
                     Ok(ClientMsg::Send { text }) => assistant.send(text).await,
                     Ok(ClientMsg::Cancel) => assistant.cancel().await,
-                    // Until the agent's permissions are requests, they answer the log's
-                    // permission entries; anything but an allow refuses.
-                    Ok(ClientMsg::Answer { id, response: fronde_protocol::Response::Permission { choice } }) => {
-                        assistant.answer(id, choice == ALLOW_ONCE).await;
-                    }
                     Ok(ClientMsg::Answer { id, response }) => {
                         // A refusal is for this page alone: the request did not change.
                         if let Err(refusal) = web.requests.answer(id, response, &user).await {

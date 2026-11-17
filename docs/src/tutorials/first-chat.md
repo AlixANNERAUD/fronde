@@ -98,7 +98,9 @@ Open <http://127.0.0.1:8484>. You land on the sign-in page (*Connexion*). Type t
 Write a first message, for example *Retiens que je préfère le thé au café*, and send it. The
 first message starts the agent, which takes a few seconds. Then the answer streams in, and the
 tool Fronde uses to save the fact shows as a card while it runs. Press *Stop* to end a turn
-early.
+early. Should the agent ever want a tool it was not given up front, a card *Fronde demande
+l'autorisation* shows what it would do, with *Autoriser une fois* and *Refuser*; left unanswered,
+it refuses after 30 minutes.
 
 Now look at `~/.local/share/fronde/memory/MEMORY.md`: the fact is there, as one line. Ask *Qu'est-ce que je
 préfère boire ?*, now or after a restart: the hub hands its core memory to every agent that

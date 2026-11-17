@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 use fronde_client::{Chat, Item, PermissionStatus, ToolStatus};
-use fronde_protocol::{ClientMsg, Response};
+use fronde_protocol::ClientMsg;
 
 use crate::{
     components::icons::{ArrowUp, Check, LogOut, Square, Wrench, X},
@@ -94,8 +94,8 @@ fn RowView(item: Item, open: bool, admin: bool, on_send: EventHandler<Outgoing>)
         Item::Tool { title, status, .. } => rsx! {
             ToolLine { title, status }
         },
-        Item::Permission { id, title, status } => rsx! {
-            PermissionCard { id, title, status, open, on_send }
+        Item::Permission { title, status, .. } => rsx! {
+            LegacyPermissionCard { title, status }
         },
         Item::Notice { text } => rsx! {
             p { class: "text-muted-foreground px-4 text-center text-xs", "{text}" }
@@ -149,49 +149,18 @@ fn ToolLine(title: String, status: ToolStatus) -> Element {
     }
 }
 
-/// A request to use a tool: answerable while its turn runs and the socket is open, once.
+/// A permission request from before permissions were request cards, as an old log shows it.
+/// It cannot be answered any more: the agent's call it guarded is gone.
 #[component]
-fn PermissionCard(
-    id: u64,
-    title: String,
-    status: PermissionStatus,
-    open: bool,
-    on_send: EventHandler<Outgoing>,
-) -> Element {
-    // Answered: the card changes when the server logs the answer.
-    let mut sent = use_signal(|| false);
-    let answered = use_callback(move |()| sent.set(true));
-    let disabled = sent() || !open;
-    let answer = move |allow: bool| {
-        let choice = if allow { "allow_once" } else { "reject_once" };
-        on_send.call(Outgoing {
-            message: ClientMsg::Answer {
-                id,
-                response: Response::Permission {
-                    choice: choice.into(),
-                },
-            },
-            sent: Some(answered),
-        });
-    };
-    let footer = match status {
-        PermissionStatus::Open => rsx! {
-            Button { size: ButtonSize::Sm, disabled, onclick: move |_| answer(true), "Autoriser" }
-            Button {
-                variant: ButtonVariant::Outline,
-                size: ButtonSize::Sm,
-                disabled,
-                onclick: move |_| answer(false),
-                "Refuser"
-            }
-        },
+fn LegacyPermissionCard(title: String, status: PermissionStatus) -> Element {
+    let badge = match status {
         PermissionStatus::Answered { allowed: true } => rsx! {
             Badge { "Autorisé" }
         },
         PermissionStatus::Answered { allowed: false } => rsx! {
             Badge { variant: BadgeVariant::Destructive, "Refusé" }
         },
-        PermissionStatus::Expired => rsx! {
+        PermissionStatus::Open | PermissionStatus::Expired => rsx! {
             Badge { variant: BadgeVariant::Muted, "Expirée" }
         },
     };
@@ -203,7 +172,7 @@ fn PermissionCard(
             CardContent {
                 p { class: "text-sm wrap-break-word", "{title}" }
             }
-            CardFooter { {footer} }
+            CardFooter { {badge} }
         }
     }
 }
@@ -471,18 +440,46 @@ mod tests {
         assert!(page.contains("Réponse interrompue."), "{page}");
     }
 
+    const PERMISSION_REQUEST: &str = r#"{"type":"request","id":2,"card":{"kind":"permission","title":"Écrire dans la mémoire","options":[{"id":"allow-once","kind":"allow_once"},{"id":"reject","kind":"reject_once"}]}}"#;
+
     #[test]
     fn permission_card_disabled_after_turn() {
-        let running = chat(&[USER, PERMISSION]);
+        // A permission is a request card: answerable while the socket is open.
+        let running = chat(&[USER, PERMISSION_REQUEST]);
         let page = render(running.clone(), Status::Open);
         assert!(page.contains("Écrire dans la mémoire"), "{page}");
-        assert_eq!(button(&page, "Autoriser"), Some(false), "{page}");
+        assert_eq!(button(&page, "Autoriser une fois"), Some(false), "{page}");
         assert_eq!(button(&page, "Refuser"), Some(false), "{page}");
 
         // Nothing can be answered while the socket is closed.
         let page = render(running, Status::Reconnecting);
-        assert_eq!(button(&page, "Autoriser"), Some(true), "{page}");
+        assert_eq!(button(&page, "Autoriser une fois"), Some(true), "{page}");
         assert_eq!(button(&page, "Refuser"), Some(true), "{page}");
+
+        // Once the server closed it, it is closed for good; the turn's end alone does not
+        // close it: the server cancels it then.
+        let page = render(chat(&[USER, PERMISSION_REQUEST, ENDED]), Status::Open);
+        assert_eq!(button(&page, "Refuser"), Some(false), "{page}");
+        let cancelled = r#"{"type":"request_closed","id":2,"outcome":{"type":"cancelled"}}"#;
+        let page = render(
+            chat(&[USER, PERMISSION_REQUEST, cancelled, ENDED]),
+            Status::Open,
+        );
+        assert!(page.contains("Écrire dans la mémoire"), "{page}");
+        assert_eq!(button(&page, "Autoriser une fois"), None, "{page}");
+        assert_eq!(button(&page, "Refuser"), None, "{page}");
+        assert!(page.contains("Annulée"), "{page}");
+    }
+
+    #[test]
+    fn legacy_permission_entries_replay_without_buttons() {
+        // An old log's permission, even while its turn seems to run: nothing answers it now.
+        let running = chat(&[USER, PERMISSION]);
+        let page = render(running, Status::Open);
+        assert!(page.contains("Écrire dans la mémoire"), "{page}");
+        assert_eq!(button(&page, "Autoriser"), None, "{page}");
+        assert_eq!(button(&page, "Refuser"), None, "{page}");
+        assert!(page.contains("Expirée"), "{page}");
 
         // Once its turn ended, the request is closed for good.
         let page = render(chat(&[USER, PERMISSION, ENDED]), Status::Open);

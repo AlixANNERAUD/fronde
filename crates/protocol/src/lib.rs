@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use request::{
-    Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Keep, KeyPlace, Outcome, Remember, RequestId,
-    Response, SecretValue,
+    Card, ChoiceAnswer, ChoiceOption, Field, Invalid, Keep, KeyPlace, Outcome, PermissionChoice,
+    PermissionKind, Remember, RequestId, Response, SecretValue, ToolKind,
 };
 
 /// State of a tool call shown in the conversation.
@@ -46,12 +46,13 @@ pub enum Event {
         title: String,
         state: ToolState,
     },
-    /// `id` is the seq of this entry: unique for the life of the log, whatever the agent's own
-    /// numbering. The page answers with it, with [`Response::Permission`].
+    /// A permission request from before permissions were requests: kept so that old logs
+    /// replay, never written any more. `id` is the seq of this entry.
     Permission {
         id: u64,
         title: String,
     },
+    /// How a [`Event::Permission`] was answered; never written any more either.
     PermissionAnswered {
         id: u64,
         allowed: bool,
