@@ -18,7 +18,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
 chrono = "0.4"
 chrono-tz = "0.10"
 fronde-component = { version = "0.1", path = "../../crates/component-sdk" }

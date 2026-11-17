@@ -1,6 +1,5 @@
 //! Events and reminders <-> iCalendar. Times are stored in UTC; input and output use the user's zone.
 
-use crate::raw;
 use anyhow::{anyhow, bail};
 use calcard::common::PartialDateTime;
 use calcard::icalendar::timezone::TzResolver;
@@ -168,6 +167,13 @@ fn calendar_with(component: ICalendarComponent) -> ICalendar {
     }
 }
 
+/// The text with folded lines joined, and every line ending as `\n`.
+fn unfold(ics: &str) -> String {
+    ics.replace("\r\n", "\n")
+        .replace("\n ", "")
+        .replace("\n\t", "")
+}
+
 /// `uid` as it appears in iCalendar text.
 fn escape_text(uid: &str) -> String {
     let mut out = String::with_capacity(uid.len());
@@ -190,7 +196,7 @@ pub fn has_uid(ics: &str, uid: &str) -> bool {
     if uid.is_empty() {
         return false;
     }
-    let unfolded = raw::unfold(ics);
+    let unfolded = unfold(ics);
     let escaped = escape_text(uid);
     if !unfolded.contains(uid) && !unfolded.contains(&escaped) {
         return false;
@@ -424,7 +430,7 @@ pub fn update_event_ics(original: &str, old: &Event, new: &Event) -> anyhow::Res
             None => remove_property(comp, &ICalendarProperty::Description),
         }
     }
-    raw::write(cal, original)
+    Ok(cal.to_string())
 }
 
 /// The stored task text with only the fields that changed rewritten.
@@ -469,7 +475,7 @@ pub fn update_reminder_ics(
             remove_property(comp, &ICalendarProperty::Completed);
         }
     }
-    raw::write(cal, original)
+    Ok(cal.to_string())
 }
 
 /// Parse a date or time given by an agent: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM" (local) or RFC 3339.
@@ -930,10 +936,7 @@ END:VCALENDAR\r\n";
             matches!(trigger, Some(ICalendarValue::Duration(d)) if d.to_string() == "-PT15M"),
             "{trigger:?}"
         );
-        assert!(
-            raw::unfold(&out).lines().any(|l| l == "TRIGGER:-PT15M"),
-            "{out}"
-        );
+        assert!(unfold(&out).lines().any(|l| l == "TRIGGER:-PT15M"), "{out}");
     }
 
     #[test]
@@ -1000,7 +1003,7 @@ END:VCALENDAR\r\n";
     /// Content lines as text, with what may change on a write undone: folding, CRLF, parameter
     /// order and quoting, and the order of RRULE parts (calcard writes them in its own order).
     fn normalised(ics: &str) -> Vec<String> {
-        raw::unfold(ics)
+        unfold(ics)
             .lines()
             .filter(|l| !l.is_empty())
             .map(|line| {
@@ -1109,7 +1112,7 @@ END:VCALENDAR\r\n";
 
     /// The line of `out` with this name whose parameters include all of `params`, unfolded.
     fn raw_line(out: &str, name: &str, params: &[&str]) -> Vec<String> {
-        raw::unfold(out)
+        unfold(out)
             .lines()
             .filter(|l| {
                 l.split([':', ';']).next() == Some(name)
@@ -1196,25 +1199,37 @@ END:VCALENDAR\r\n";
         );
     }
 
+    /// calcard 0.3.14 decoded base64 without `VALUE=BINARY` and dropped `ENCODING`, so this edit
+    /// was refused. The fork keeps the bytes and the encoding, and adds the `VALUE=BINARY` that
+    /// RFC 5545 requires on ATTACH.
     #[test]
-    fn edit_refuses_base64_without_value_binary() {
-        let attach = "ATTACH;ENCODING=BASE64;FMTTYPE=text/plain:SGVsbG8=";
-        let original = fixture("rich.ics").replace(
-            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
-            &format!("{attach}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
-        );
-        let old = parse_events(&original, Paris).unwrap().remove(0);
-        let new = Event {
-            title: "Autre".into(),
-            ..old.clone()
+    fn edit_keeps_base64_without_value_binary() {
+        let out = edit_rich_with("ATTACH;ENCODING=BASE64;FMTTYPE=text/plain:SGVsbG8=");
+        let [line] = &raw_line(&out, "ATTACH", &[])[..] else {
+            panic!("one attachment in\n{out}")
         };
-        let e = update_event_ics(&original, &old, &new)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("ATTACH holds inline data Fronde cannot keep exactly")
-                && e.contains("calendar app"),
-            "{e}"
+        assert_eq!(
+            normalised(line),
+            normalised("ATTACH;ENCODING=BASE64;FMTTYPE=text/plain;VALUE=BINARY:SGVsbG8="),
+        );
+        assert!(!out.contains(":Hello"), "{out}");
+    }
+
+    /// Text sent base64 or quoted-printable encoded is written back as the same text, without the
+    /// transfer encoding; text that does not decode is kept raw, with its parameters.
+    #[test]
+    fn edit_keeps_text_sent_in_a_transfer_encoding() {
+        let out = edit_rich_with(
+            "X-A;ENCODING=BASE64:SGVsbG8=\r\n\
+             X-B;ENCODING=QUOTED-PRINTABLE;CHARSET=ISO-8859-1:caf=E9\r\n\
+             X-C;ENCODING=BASE64:6Q==",
+        );
+        assert_eq!(raw_line(&out, "X-A", &[]), ["X-A:Hello"], "{out}");
+        assert_eq!(raw_line(&out, "X-B", &[]), ["X-B:café"], "{out}");
+        assert_eq!(
+            raw_line(&out, "X-C", &[]),
+            ["X-C;ENCODING=BASE64:6Q=="],
+            "{out}"
         );
     }
 
@@ -1270,29 +1285,12 @@ END:VCALENDAR\r\n";
             // A charset, and a percent-encoded payload, in a data: URI.
             "ATTACH:data:text/plain;charset=utf-8;base64,SGVsbG8=",
             "ATTACH:data:text/plain,Hello%2C%20world",
+            // Not base64: kept raw, with its parameters.
+            "ATTACH;ENCODING=BASE64;VALUE=BINARY:not*base64",
         ] {
             let out = edit_rich_with(attach);
             assert_eq!(raw_line(&out, "ATTACH", &[]), [attach], "{out}");
         }
-    }
-
-    #[test]
-    fn edit_refuses_attachments_it_cannot_keep_exactly() {
-        // Not base64: the parser keeps the payload as text.
-        let attach = "ATTACH;ENCODING=BASE64;VALUE=BINARY:not*base64";
-        let original = fixture("rich.ics").replace(
-            "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
-            &format!("{attach}\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
-        );
-        let old = parse_events(&original, Paris).unwrap().remove(0);
-        let new = Event {
-            title: "Autre".into(),
-            ..old.clone()
-        };
-        let e = update_event_ics(&original, &old, &new)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("calendar app"), "{attach}: {e}");
     }
 
     #[test]
@@ -1354,7 +1352,7 @@ END:VCALENDAR\r\n";
             ..old.clone()
         };
         let out = update_event_ics(&original, &old, &new).unwrap();
-        let summaries: Vec<_> = raw::unfold(&out)
+        let summaries: Vec<_> = unfold(&out)
             .lines()
             .filter(|l| l.starts_with("SUMMARY"))
             .map(str::to_string)

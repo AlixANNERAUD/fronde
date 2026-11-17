@@ -102,9 +102,10 @@ since Fronde sends the password over plain http only to this machine.
 - Recurring events and tasks show in lists, but Fronde does not change or delete them: it says to
   do it in your calendar app.
 - Edits keep every property and parameter Fronde does not model (alarms, attendees, time zones,
-  attachments, custom fields), though line wrapping, parameter order or quoting may change. An
-  item with an inline attachment in a form Fronde cannot write back exactly is not edited: it
-  says to do it in your calendar app.
+  attachments, custom fields), though line wrapping, parameter order or quoting may change.
+  Inline attachments and links are written back as they were read; an attachment sent as base64
+  without `VALUE=BINARY` gains it, and text sent base64 or quoted-printable encoded comes back as
+  the same text, unencoded.
 - Fronde does not notify you of reminders itself: your task app does, from the due time.
 - An item no tool can read is left out of lists, with a `skipping unreadable event` warning in
   the log.

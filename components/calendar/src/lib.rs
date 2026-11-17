@@ -8,7 +8,6 @@
 pub mod backend;
 pub mod caldav;
 pub mod ics;
-mod raw;
 pub mod tools;
 
 #[cfg(test)]
