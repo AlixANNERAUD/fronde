@@ -319,9 +319,11 @@ impl Assistant {
                 // entry's seq. It is pending before the entry is broadcast, so an answer to it
                 // finds it. Lock order: log, then pending.
                 let client = recorder.client.clone();
+                let mut numbered = None;
                 let asked = self
                     .log
                     .append_with(|id| {
+                        numbered = Some(id);
                         lock(&self.pending).insert(id, (client, request));
                         Event::Permission { id, title }
                     })
@@ -331,7 +333,25 @@ impl Assistant {
                         recorder.permissions.insert(request, entry.seq);
                     }
                     Err(error) => {
-                        tracing::error!("cannot write the conversation log: {error:#}");
+                        tracing::error!(
+                            "cannot write the conversation log, denying the permission: {error:#}"
+                        );
+                        // Nobody can answer a request the log does not show: refuse it now
+                        // rather than leave the agent waiting and the next entry's seq naming it.
+                        if let Some(id) = numbered {
+                            lock(&self.pending).remove(&id);
+                            // A save that reported an error may still have landed, and the
+                            // log shows the request: close it there too.
+                            if self.log.since(id - 1).first().is_some_and(|e| e.seq == id) {
+                                self.append(Event::PermissionAnswered { id, allowed: false })
+                                    .await;
+                            }
+                        }
+                        if let Some(client) = recorder.client.upgrade()
+                            && let Err(error) = client.answer_permission(request, false)
+                        {
+                            tracing::warn!("cannot deny the permission: {error:#}");
+                        }
                     }
                 }
                 return;

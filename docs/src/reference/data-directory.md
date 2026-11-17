@@ -22,12 +22,15 @@ conversation yet, Fronde imports them at start, in one transaction, then renames
 `*.imported`. If the import fails, nothing is imported, the files stay as they are and the next
 start tries again. A line of the log that is not a conversation entry stops the import: the error
 names the file and the line; fix or delete that line, then start Fronde again. A last line cut
-short by a crash was never shown and is skipped.
+short by a crash was never shown and is skipped. If a crash came between the import and the
+renames, the next start finishes the renames of the files the database already holds; any other
+such file left beside an existing conversation is not imported, and a warning names it.
 
 To start a new conversation, stop Fronde, delete `fronde.db`, `fronde.db-wal` and `fronde.db-shm`,
 and start it again. This also drops the memory's search index, rebuilt at the start, signs
 every browser out and forgets the component approvals stored there (hashes in the configuration
-stay). Fronde never imports a `*.imported` file again. A command that starts
+stay). Fronde never imports a `*.imported` file again, but it imports a `conversation.jsonl`
+or `agent.session` (or `jarvis.*`) still there: delete those too. A command that starts
 a new conversation without touching the rest is planned.
 
 To back up, stop Fronde, then copy the whole directory. A copy taken while Fronde runs can be

@@ -46,14 +46,8 @@ pub async fn import(
     if log_file.is_none() && session_file.is_none() {
         return Ok(());
     }
-    if stream_exists(db, topic).await? {
-        for file in log_file.iter().chain(&session_file) {
-            tracing::warn!(
-                "{} was not imported: the database already holds the conversation; move or \
-                 delete the file",
-                file.display()
-            );
-        }
+    if let Some(stream) = find_stream(db, topic).await? {
+        finish_or_warn(db, data_dir, &stream, log_file, session_file, session).await;
         return Ok(());
     }
 
@@ -114,7 +108,57 @@ pub async fn import(
     for file in log_file.iter().chain(&session_file) {
         mark_imported(file);
     }
+    sync_dir(data_dir);
     Ok(())
+}
+
+/// Legacy files found while the stream exists. Those the database already holds (the import
+/// committed, then a crash came before their rename) get the rename they missed; any other is
+/// left alone with a warning, since deleting `fronde.db` would import it into a new conversation.
+async fn finish_or_warn(
+    db: &DatabaseConnection,
+    data_dir: &Path,
+    stream: &streams::Model,
+    log_file: Option<PathBuf>,
+    session_file: Option<PathBuf>,
+    session: (&str, &str),
+) {
+    let log_done = log_file
+        .as_ref()
+        .is_some_and(|file| read_log_id(file).as_deref() == Some(stream.log_id.as_str()));
+    let session_done = log_done
+        || match &session_file {
+            Some(file) => {
+                let stored = fronde_db::kv::get(db, session.0, session.1)
+                    .await
+                    .ok()
+                    .flatten();
+                let found = read_session(file).ok().flatten();
+                found.is_some_and(|id| stored.as_deref() == Some(id.as_bytes()))
+            }
+            None => false,
+        };
+    let mut renamed = false;
+    for (file, done) in [(log_file, log_done), (session_file, session_done)] {
+        let Some(file) = file else { continue };
+        if done {
+            tracing::info!(
+                "{} is already in the database; finishing its rename",
+                file.display()
+            );
+            mark_imported(&file);
+            renamed = true;
+        } else {
+            tracing::warn!(
+                "{} was not imported: the database already holds the conversation; move or \
+                 delete the file",
+                file.display()
+            );
+        }
+    }
+    if renamed {
+        sync_dir(data_dir);
+    }
 }
 
 fn first_existing(dir: &Path, names: &[&str]) -> Option<PathBuf> {
@@ -124,12 +168,36 @@ fn first_existing(dir: &Path, names: &[&str]) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-async fn stream_exists<C: sea_orm::ConnectionTrait>(db: &C, topic: &str) -> anyhow::Result<bool> {
-    Ok(streams::Entity::find_by_id(topic)
+async fn find_stream<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    topic: &str,
+) -> anyhow::Result<Option<streams::Model>> {
+    streams::Entity::find_by_id(topic)
         .one(db)
         .await
-        .context("cannot read the conversation from the database")?
-        .is_some())
+        .context("cannot read the conversation from the database")
+}
+
+async fn stream_exists<C: sea_orm::ConnectionTrait>(db: &C, topic: &str) -> anyhow::Result<bool> {
+    Ok(find_stream(db, topic).await?.is_some())
+}
+
+/// The log id in the log file's first line, if it has one.
+fn read_log_id(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut first).ok()?;
+    serde_json::from_str::<Header>(&first)
+        .ok()
+        .map(|h| h.log_id)
+}
+
+/// Makes the renames in `dir` durable. A failure is only a warning: a rename lost in a crash
+/// is finished at the next start.
+fn sync_dir(dir: &Path) {
+    if let Err(error) = std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+        tracing::warn!("cannot sync {}: {error}", dir.display());
+    }
 }
 
 /// The log id in the header, if any, and the entries. A line cut short by a crash mid-write was
@@ -514,5 +582,89 @@ mod tests {
         );
         assert_eq!(session(&db).await, Some(b"s-1".to_vec()));
         assert!(!path.exists());
+    }
+
+    fn imported_name(file: &Path) -> PathBuf {
+        let mut name = file.as_os_str().to_owned();
+        name.push(IMPORTED);
+        PathBuf::from(name)
+    }
+
+    #[tokio::test]
+    async fn a_rename_lost_in_a_crash_is_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log_file, session_file) = (
+            dir.path().join("conversation.jsonl"),
+            dir.path().join("agent.session"),
+        );
+        let text = format!("{}\n{}\n", header("old-log"), line(1, "a"));
+        std::fs::write(&log_file, &text).unwrap();
+        std::fs::write(&session_file, "s-1\n").unwrap();
+        let (db, log) = open(dir.path()).await.unwrap();
+        drop(log);
+        db.close().await.unwrap();
+
+        // The import committed, then the crash came before both renames.
+        std::fs::rename(imported_name(&log_file), &log_file).unwrap();
+        std::fs::rename(imported_name(&session_file), &session_file).unwrap();
+        let (db, log) = open(dir.path()).await.unwrap();
+        assert_eq!(texts(&log), [(1, "a".into())], "nothing imported twice");
+        assert!(!log_file.exists() && !session_file.exists());
+        assert_eq!(
+            std::fs::read_to_string(imported_name(&log_file)).unwrap(),
+            text
+        );
+        assert_eq!(
+            std::fs::read_to_string(imported_name(&session_file)).unwrap(),
+            "s-1\n"
+        );
+        drop(log);
+        db.close().await.unwrap();
+
+        // The crash came between the two renames: the session file, held by the database, is
+        // finished alone.
+        std::fs::rename(imported_name(&session_file), &session_file).unwrap();
+        let (db, _log) = open(dir.path()).await.unwrap();
+        assert!(!session_file.exists());
+        assert!(imported_name(&session_file).exists());
+        assert_eq!(session(&db).await, Some(b"s-1".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn files_of_another_conversation_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log_file, session_file) = (
+            dir.path().join("conversation.jsonl"),
+            dir.path().join("agent.session"),
+        );
+        std::fs::write(
+            &log_file,
+            format!("{}\n{}\n", header("old-log"), line(1, "a")),
+        )
+        .unwrap();
+        std::fs::write(&session_file, "s-1").unwrap();
+        let (db, log) = open(dir.path()).await.unwrap();
+        drop(log);
+        db.close().await.unwrap();
+
+        for (log_text, session_text) in [
+            (format!("{}\n{}\n", header("other"), line(1, "x")), "s-2"),
+            // No header: nothing ties the log to the stream.
+            (line(1, "a") + "\n", "s-2"),
+        ] {
+            std::fs::write(&log_file, &log_text).unwrap();
+            std::fs::write(&session_file, session_text).unwrap();
+            let (db, log) = open(dir.path()).await.unwrap();
+            assert_eq!(log.log_id(), "old-log");
+            assert_eq!(texts(&log), [(1, "a".into())]);
+            assert_eq!(session(&db).await, Some(b"s-1".to_vec()));
+            assert_eq!(std::fs::read_to_string(&log_file).unwrap(), log_text);
+            assert_eq!(
+                std::fs::read_to_string(&session_file).unwrap(),
+                session_text
+            );
+            drop(log);
+            db.close().await.unwrap();
+        }
     }
 }

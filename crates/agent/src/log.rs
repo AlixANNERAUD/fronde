@@ -56,20 +56,7 @@ impl ConversationLog {
             .context("cannot read the conversation from the database")?;
         let entries = rows
             .into_iter()
-            .map(|row| {
-                let event = serde_json::from_value(row.event).with_context(|| {
-                    format!(
-                        "entry {} of the conversation is not readable by this version of \
-                         Fronde; run the version that wrote it, or restore a backup",
-                        row.seq
-                    )
-                })?;
-                Ok(Entry {
-                    seq: u64::try_from(row.seq).context("negative seq in the conversation")?,
-                    at: row.at,
-                    event,
-                })
-            })
+            .map(row_entry)
             .collect::<anyhow::Result<Vec<_>>>()?;
         let (live, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
@@ -109,9 +96,10 @@ impl ConversationLog {
         // entry saved but missing from the mirror, whose last seq numbers the next entry.
         tokio::spawn(async move {
             let _writer = writer;
-            save(&db, &topic, &entry)
-                .await
-                .context("cannot save the conversation entry in the database")?;
+            if let Err(error) = save(&db, &topic, &entry).await {
+                catch_up(&db, &topic, &mirror).await;
+                return Err(error.context("cannot save the conversation entry in the database"));
+            }
             // Sent only once committed: a page never shows an entry a crash could lose.
             mirror.publish(entry.clone());
             Ok(entry)
@@ -134,6 +122,54 @@ impl ConversationLog {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Entry> {
         self.mirror.live.subscribe()
+    }
+}
+
+fn row_entry(row: stream_entries::Model) -> anyhow::Result<Entry> {
+    let event = serde_json::from_value(row.event).with_context(|| {
+        format!(
+            "entry {} of the conversation is not readable by this version of Fronde; run the \
+             version that wrote it, or restore a backup",
+            row.seq
+        )
+    })?;
+    Ok(Entry {
+        seq: u64::try_from(row.seq).context("negative seq in the conversation")?,
+        at: row.at,
+        event,
+    })
+}
+
+/// After a failed save, publishes the entries the database holds past the mirror's last. A
+/// commit can report an error and still land: without this, its seq would make every later
+/// append fail on the primary key.
+async fn catch_up(db: &DatabaseConnection, topic: &str, mirror: &Mirror) {
+    let last = mirror.entries().last().map_or(0, |entry| entry.seq);
+    let landed = async {
+        stream_entries::Entity::find()
+            .filter(stream_entries::Column::Topic.eq(topic))
+            .filter(stream_entries::Column::Seq.gt(i64::try_from(last)?))
+            .order_by_asc(stream_entries::Column::Seq)
+            .all(db)
+            .await?
+            .into_iter()
+            .map(row_entry)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+    .await;
+    match landed {
+        Ok(entries) => {
+            for entry in entries {
+                tracing::warn!(
+                    seq = entry.seq,
+                    "a conversation entry reported as not saved is in the database"
+                );
+                mirror.publish(entry);
+            }
+        }
+        Err(error) => {
+            tracing::warn!("cannot read the conversation back after a failed save: {error:#}");
+        }
     }
 }
 
@@ -450,5 +486,33 @@ mod tests {
         db.execute_unprepared("DROP TRIGGER refuse").await.unwrap();
         assert_eq!(log.append(user("c")).await.unwrap().seq, 2);
         assert_eq!(saved_seqs(&db).await, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn an_entry_saved_despite_an_error_does_not_block_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db(dir.path()).await;
+        let log = ConversationLog::open(&db, TOPIC).await.unwrap();
+        log.append(user("a")).await.unwrap();
+        let mut live = log.subscribe();
+        // An append whose commit reported an error but landed: the row is there, the mirror
+        // does not know it.
+        let landed = Entry {
+            seq: 2,
+            at: Utc::now(),
+            event: user("landed"),
+        };
+        save(&db, TOPIC, &landed).await.unwrap();
+        assert_eq!(log.last_seq(), 1);
+
+        let error = format!("{:#}", log.append(user("b")).await.unwrap_err());
+        assert!(error.contains("cannot save"), "{error}");
+        assert_eq!(log.last_seq(), 2, "the mirror caught up with the database");
+        assert_eq!(live.try_recv().unwrap().event, user("landed"));
+
+        assert_eq!(log.append(user("c")).await.unwrap().seq, 3);
+        assert_eq!(saved_seqs(&db).await, [1, 2, 3]);
+        let seqs: Vec<u64> = log.since(0).iter().map(|entry| entry.seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
     }
 }

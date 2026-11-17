@@ -544,8 +544,10 @@ async fn stop_frees_a_turn_the_agent_never_ends() {
         wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), searching, ended(TurnOutcome::Cancelled)]
     );
+    // About 1 s of the grace period was left. The bound is loose for a loaded test machine yet
+    // well under the 10 s a grace period started over would take.
     assert!(
-        resumed.elapsed() < Duration::from_secs(2),
+        resumed.elapsed() < Duration::from_secs(5),
         "{:?}",
         resumed.elapsed()
     );
@@ -610,6 +612,37 @@ async fn stale_permission_is_closed_in_the_log() {
             ended(TurnOutcome::Done),
             notice(GONE),
         ]
+    );
+}
+
+#[tokio::test]
+async fn permission_that_cannot_be_saved_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let (assistant, fakes) = open(dir.path(), asking()).await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    sea_orm::ConnectionTrait::execute_unprepared(
+        &db,
+        "CREATE TRIGGER refuse BEFORE INSERT ON stream_entries \
+         WHEN json_extract(NEW.event, '$.type') = 'permission' \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .await
+    .unwrap();
+
+    assistant.send("Mon agenda ?".into()).await;
+    wait_for_turns(&assistant, 1).await;
+    // The request was never shown: an answer naming its would-be id finds nothing pending.
+    assistant.answer(2, true).await;
+
+    assert_eq!(
+        events(&assistant),
+        vec![user("Mon agenda ?"), ended(TurnOutcome::Done), notice(GONE)]
+    );
+    assert_eq!(
+        fakes.handles()[0].record().permission_outcomes,
+        vec![RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new("reject")
+        )]
     );
 }
 
@@ -700,8 +733,10 @@ async fn connect_timeout_ends_the_turn() {
         wait_for_turns(&assistant, 1).await,
         vec![user("Salut"), notice(NO_START), ended(TurnOutcome::Error)]
     );
+    // About 1 s of the timeout was left. The bound is loose for a loaded test machine yet well
+    // under the 60 s a timeout started over would take.
     assert!(
-        resumed.elapsed() < Duration::from_secs(2),
+        resumed.elapsed() < Duration::from_secs(5),
         "{:?}",
         resumed.elapsed()
     );
