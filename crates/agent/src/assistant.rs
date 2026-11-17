@@ -508,9 +508,10 @@ impl Assistant {
                     TurnOutcome::Error
                 }
             };
-            // Nobody waits for the answers any more, and their cards close before the turn. A
-            // request coming in meanwhile (a background task of the agent's) finds the turn
-            // over rather than one whose requests were already cancelled.
+            // Nobody waits for the answers any more, and their cards close before the turn: a
+            // card being shown holds the lock taken here, and is cancelled below. A request
+            // coming in later (a background task of the agent's) finds the turn over rather than
+            // one whose requests were already cancelled.
             if let Some(turn) = self.turn.lock().await.as_mut() {
                 turn.ending = true;
             }
@@ -750,8 +751,8 @@ impl Assistant {
 
     /// Shows `card` as a request of the running turn and answers `reply` with what `answer`
     /// makes of the request's end, or with `refusal` at once when it cannot be shown: nobody
-    /// could answer it. A request outside a turn, or whose turn ends while it is shown, is never
-    /// left open: only a turn's request is cancelled with its turn.
+    /// could answer it. A request outside a turn, or once its turn is ending, is refused: only a
+    /// turn's request is cancelled with its turn, and its card closes before the turn's end.
     async fn ask_in_turn<T: Unanswered + Send + 'static>(
         &self,
         what: &'static str,
@@ -766,7 +767,16 @@ impl Assistant {
             reply.send(refusal);
             return;
         };
-        let Some(turn) = self.current_turn().await else {
+        // The turn stays locked until the card is shown: a turn that ends or is stopped meanwhile
+        // marks itself ending under this lock, so it waits for the card and cancels it with its
+        // other requests, before its end is logged.
+        let running = self.turn.lock().await;
+        let Some(turn) = running
+            .as_ref()
+            .filter(|turn| !turn.ending)
+            .and_then(|turn| turn.seq)
+        else {
+            drop(running);
             tracing::warn!("a {what} request came outside a turn: refused");
             reply.send(refusal);
             return;
@@ -785,6 +795,7 @@ impl Assistant {
                 tied: true,
             })
             .await;
+        drop(running);
         let waiter = match asked {
             Ok(waiter) => waiter,
             Err(error) => {
@@ -794,15 +805,6 @@ impl Assistant {
             }
         };
         let id = waiter.id();
-        // The turn may have ended while the card was being shown, after its requests were
-        // cancelled: this one must not outlive it.
-        if self.current_turn().await != Some(turn) {
-            if let Err(error) = requests.cancel(id).await {
-                tracing::error!("cannot cancel {what} request {id}: {error:#}");
-            }
-            reply.send(T::unanswered());
-            return;
-        }
         // Waiting here would hold up the agent's next events.
         tokio::spawn(async move {
             tokio::select! {

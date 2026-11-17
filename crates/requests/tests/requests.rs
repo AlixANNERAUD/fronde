@@ -8,8 +8,10 @@ use fronde_requests::{
     Ask, Caller, Journal, Refusal, Requests, Resolution, Reused, ThreadId, User,
 };
 use sea_orm::{ActiveValue::Set, ConnectionTrait, EntityTrait};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 const TOPIC: &str = "conversation";
 const WAIT: Duration = Duration::from_secs(10);
@@ -34,6 +36,9 @@ struct FakeJournal {
     /// Who asked each request announced, in order.
     callers: Mutex<Vec<Caller>>,
     refuse: Mutex<bool>,
+    /// When set, showing an end waits for this notify, `holding` set meanwhile.
+    hold_close: Mutex<Option<Arc<Notify>>>,
+    holding: AtomicBool,
 }
 
 impl FakeJournal {
@@ -72,6 +77,11 @@ impl Journal for FakeJournal {
         outcome: &Outcome,
         by: Option<&str>,
     ) -> anyhow::Result<()> {
+        let hold = self.hold_close.lock().unwrap().clone();
+        if let Some(gate) = hold {
+            self.holding.store(true, Ordering::SeqCst);
+            gate.notified().await;
+        }
         self.shown.lock().unwrap().push(Shown::Closed {
             id,
             outcome: outcome.clone(),
@@ -655,6 +665,50 @@ async fn cancel_turn_cancels_only_that_turn() {
         "already closed"
     );
     assert_eq!(resolved(second).await, Resolution::Cancelled);
+}
+
+#[tokio::test]
+async fn cancel_turn_returns_once_an_end_shown_elsewhere_is_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let id = requests.ask(ask()).await.unwrap().id();
+    let gate = Arc::new(Notify::new());
+    *journal.hold_close.lock().unwrap() = Some(gate.clone());
+
+    // An answer closes the request, then is slow to show its end.
+    let answering = tokio::spawn({
+        let requests = requests.clone();
+        async move { requests.answer(id, pick("Seerr"), &alix()).await }
+    });
+    tokio::time::timeout(WAIT, async {
+        while !journal.holding.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the answer never showed its end");
+    let cancelling = tokio::spawn({
+        let (requests, journal) = (requests.clone(), journal.clone());
+        async move {
+            let cancelled = requests.cancel_turn(TOPIC, 1).await.unwrap();
+            (cancelled, journal.shown())
+        }
+    });
+    // Time enough for `cancel_turn` to return, were it not waiting for the end.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    gate.notify_one();
+
+    let (cancelled, shown) = tokio::time::timeout(WAIT, cancelling)
+        .await
+        .unwrap()
+        .unwrap();
+    // The answer won; its end was shown before `cancel_turn` returned, so before the turn's.
+    assert_eq!(cancelled, 0);
+    assert!(
+        matches!(shown.last(), Some(Shown::Closed { id: closed, outcome: Outcome::Answered { .. }, .. }) if *closed == id),
+        "{shown:?}"
+    );
+    assert_eq!(answering.await.unwrap(), Ok(()));
 }
 
 #[tokio::test]

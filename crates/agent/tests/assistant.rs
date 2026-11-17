@@ -641,13 +641,28 @@ async fn stop_frees_a_turn_the_agent_never_ends() {
 
     assistant.send("Salut".into()).await;
     wait_until(&assistant, |events| events.contains(&searching)).await;
-    // The clock is paused only while nothing is written: a paused clock jumps to the next timer
-    // whenever the runtime waits, and the database is written by a thread of its own.
+    // A paused clock jumps to the next timer whenever the runtime waits, and the database is
+    // read and written on SQLite's own thread: under load a jump during `cancel`'s read would
+    // fire the grace period (and the pool's acquire timeout) at once. A blocking task in
+    // flight keeps the paused clock still, so it moves only by `advance`.
     tokio::time::pause();
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    let held = tokio::task::spawn_blocking(move || frozen.recv().ok());
     assistant.cancel().await;
+    // The grace period starts when the cancel goes out, on the clock still at the pause.
+    let started = Instant::now();
+    while fakes.handles()[0].record().cancels == 0 {
+        assert!(
+            started.elapsed() < WAIT,
+            "the cancel never reached the agent"
+        );
+        tokio::task::yield_now().await;
+    }
     // The agent gets a grace period to end the turn itself.
-    tokio::time::sleep(Duration::from_secs(9)).await;
+    tokio::time::advance(Duration::from_secs(9)).await;
     assert_eq!(events(&assistant), vec![user("Salut"), searching.clone()]);
+    drop(thaw);
+    held.await.unwrap();
     tokio::time::resume();
     let resumed = Instant::now();
 

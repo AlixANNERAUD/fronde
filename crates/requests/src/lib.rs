@@ -324,6 +324,9 @@ pub struct Requests {
     /// Held while a secret is kept and its request closed, so that two pages answering at once
     /// never both keep one.
     saving: tokio::sync::Mutex<()>,
+    /// Held from a request's move out of pending until its end is shown, so that
+    /// [`Requests::cancel_turn`] can wait for the ends other calls are showing.
+    closing: tokio::sync::Mutex<()>,
     this: Weak<Self>,
 }
 
@@ -352,6 +355,7 @@ impl Requests {
             waiters: Mutex::default(),
             secrets,
             saving: tokio::sync::Mutex::default(),
+            closing: tokio::sync::Mutex::default(),
             this: this.clone(),
         });
         requests.expire_due().await?;
@@ -720,7 +724,9 @@ impl Requests {
             .await
     }
 
-    /// Cancels the pending requests of `turn` in `topic`; returns how many.
+    /// Cancels the pending requests of `turn` in `topic`; returns how many. Once it returns,
+    /// the end of every request of the turn is shown, whoever closed it: the turn's own end
+    /// may follow.
     pub async fn cancel_turn(&self, topic: &str, turn: u64) -> anyhow::Result<usize> {
         let rows = requests::Entity::find()
             .filter(requests::Column::Status.eq(PENDING))
@@ -732,6 +738,9 @@ impl Requests {
         for row in rows {
             cancelled += usize::from(self.cancel(row_id(&row)?).await?);
         }
+        // A request an answer, an expiry or another cancel closed before the read above may not
+        // show its end yet: that close holds the lock until it does.
+        drop(self.closing.lock().await);
         Ok(cancelled)
     }
 
@@ -799,6 +808,7 @@ impl Requests {
         outcome: Outcome,
         by: Option<&str>,
     ) -> anyhow::Result<bool> {
+        let _closing = self.closing.lock().await;
         let Some(row) = self.find(id).await? else {
             return Ok(false);
         };
