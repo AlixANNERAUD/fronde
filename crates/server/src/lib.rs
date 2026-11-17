@@ -86,6 +86,19 @@ fn is_silenced(target: &str) -> bool {
         .any(|silenced| target.starts_with(silenced))
 }
 
+/// Says that `FRONDE_KEYCHAIN=off` keeps the platform's keychain out of reach: set by mise and
+/// `.cargo/config.toml` for tests and development, it would put a deployed Fronde's first master
+/// key in a file without a word.
+pub fn warn_if_keychain_off() {
+    if fronde_db::master_key::Keychain::switched_off() {
+        tracing::warn!(
+            "FRONDE_KEYCHAIN=off: the platform's keychain is not used, so [secrets] backend = \
+             \"auto\" keeps a new master key in a file; it is meant for tests and development, \
+             unset it otherwise"
+        );
+    }
+}
+
 /// How often expired web sessions and key-value entries are deleted.
 const PURGE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// How long a background task that panicked waits before it starts again.
@@ -611,6 +624,7 @@ pub async fn start_with(
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
     let agent = config.agent.clone();
+    warn_if_keychain_off();
     let backends = config.master_key_backends()?;
     fronde_hub::private::prepare_data_dir(&data_dir)?;
     // A key an earlier version kept in the data directory moves to the configured key file.
@@ -919,6 +933,26 @@ mod tests {
         }
         assert!(is_silenced("tungstenite") && is_silenced("tokio_tungstenite::compat"));
         assert!(!is_silenced("fronde::ws") && !is_silenced("axum::extract::ws"));
+    }
+
+    #[test]
+    fn a_keychain_switched_off_is_said_at_start() {
+        assert!(
+            fronde_db::master_key::Keychain::switched_off(),
+            "tests run with FRONDE_KEYCHAIN=off, from mise.toml or .cargo/config.toml"
+        );
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, warn_if_keychain_off);
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("FRONDE_KEYCHAIN=off"), "{text}");
     }
 
     #[test]

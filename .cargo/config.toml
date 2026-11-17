@@ -1,0 +1,5 @@
+[env]
+# Tests and development runs never reach this machine's keychain, even when Cargo runs without
+# mise (an IDE's test button): with it off, `[secrets] backend = "auto"` keeps a master key in a
+# file. mise.toml sets it too. A deployed Fronde does not get this variable.
+FRONDE_KEYCHAIN = "off"

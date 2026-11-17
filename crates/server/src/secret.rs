@@ -62,6 +62,7 @@ pub async fn set(
     secrets::check_name(name)?;
     let origin = Origin::parse(origin)?.to_string();
     let db = open(config).await?;
+    crate::warn_if_keychain_off();
     let backends = config.master_key_backends()?;
     let (key, created) =
         secrets::store(&db, &backends, secrets::SOURCES, name, &origin, value).await?;

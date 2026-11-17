@@ -110,9 +110,10 @@ the data directory by an earlier version is moved to this file at the next start
 Moving the key from one backend to another (`fronde secret move-key`) is **planned**.
 
 With the environment variable `FRONDE_KEYCHAIN=off`, Fronde behaves as if the machine had no
-keychain: `auto` keeps a first key in the file, and `backend = "keychain"` fails as it would
-without one. The repository's `mise.toml` sets it, so that tests and `mise run dev` never reach
-the keychain of the machine they run on. A Fronde started by systemd or Docker does not get it.
+keychain: `auto` keeps a first key in the file, and `backend = "keychain"` fails with an error
+that names the variable. Fronde warns at start while it is set. The repository's `mise.toml` and
+`.cargo/config.toml` set it, so that tests and `mise run dev` never reach the keychain of the
+machine they run on. A Fronde started by systemd or Docker does not get it.
 
 ## `[memory]`
 
@@ -336,5 +337,5 @@ tasks = "none"
 | --- | --- |
 | `FRONDE_SITE_ROOT` | Directory of the built web interface. Default `target/dx/fronde-web/release/web/public`, relative to the working directory. |
 | `RUST_LOG` | Log filter, such as `debug` or `fronde_hub=debug`. Default `info`. The WebSocket library's targets (`tungstenite`, `tokio_tungstenite`) stay off whatever it says: they would log the chat's messages, secrets typed in a card included. |
-| `FRONDE_KEYCHAIN` | `off` makes the platform's keychain absent, for tests and development (see [`[secrets]`](#secrets-1)). |
+| `FRONDE_KEYCHAIN` | `off` makes the platform's keychain absent, for tests and development (see [`[secrets]`](#secrets-1)); Fronde warns at start while it is set. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Read by the agent, not by Fronde: the token from `claude setup-token`, kept from Fronde's environment when `[agent] oauth_token` is not set. Prefer `oauth_token`. |

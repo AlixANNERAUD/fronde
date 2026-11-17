@@ -109,11 +109,12 @@ lost Landlock does not pass silently. `real_adapter_starts_confined`, in the sam
 real adapter under the sandbox; it is ignored, and runs with `FRONDE_LIVE_AGENT` set as above and
 `--test confine`.
 
-Tests and development runs never reach your keychain either: `mise.toml` sets
-`FRONDE_KEYCHAIN=off`, which makes Fronde act as if the machine had none, so a master key made by
-a test or by `mise run dev` goes to a file. Run Cargo through `mise exec` or a mise task to get
-it; a bare `cargo` outside mise does not set it. Tests of the keychain backend use the fake
-keychain (`fronde-db`'s `testing` feature), never the real one.
+Tests and development runs never reach your keychain either: `mise.toml` and
+`.cargo/config.toml` set `FRONDE_KEYCHAIN=off`, which makes Fronde act as if the machine had none,
+so a master key made by a test or by `mise run dev` goes to a file. The Cargo setting covers a
+bare `cargo test` too, from an IDE's test button for instance. `fronde serve` and `fronde secret
+set` warn when it is set, and a keychain error names it. Tests of the keychain backend use the
+fake keychain (`fronde-db`'s `testing` feature), never the real one.
 
 ## Documentation
 

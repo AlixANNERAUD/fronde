@@ -100,10 +100,17 @@ impl Keychain {
         Self::platform_unless(data_dir, std::env::var_os(SWITCH).as_deref())
     }
 
+    /// Whether [`SWITCH`] turns the platform's keychain off in this process.
+    pub fn switched_off() -> bool {
+        is_off(std::env::var_os(SWITCH).as_deref())
+    }
+
     /// [`Keychain::platform`], with `switch` the value of [`SWITCH`].
     fn platform_unless(data_dir: &Path, switch: Option<&std::ffi::OsStr>) -> Self {
-        if switch.is_some_and(|value| value.eq_ignore_ascii_case("off")) {
-            return Self::none();
+        if is_off(switch) {
+            return Self::absent(
+                "no keychain is used here: FRONDE_KEYCHAIN is off; unset it to use the platform's keychain",
+            );
         }
         static CALLS: OnceLock<Arc<Semaphore>> = OnceLock::new();
         Self {
@@ -132,12 +139,13 @@ impl Keychain {
 
     /// No keychain at all: every call says so.
     pub fn none() -> Self {
+        Self::absent("no keychain is used here")
+    }
+
+    /// No keychain, for the reason `why`, which every call gives.
+    fn absent(why: &'static str) -> Self {
         Self {
-            open: Arc::new(|| {
-                Err(Error::NotSupportedByStore(
-                    "no keychain is used here".to_owned(),
-                ))
-            }),
+            open: Arc::new(move || Err(Error::NotSupportedByStore(why.to_owned()))),
             kind: "none",
             data_dir: PathBuf::new(),
             calls: Arc::new(Semaphore::new(1)),
@@ -277,8 +285,11 @@ fn classify(e: Error) -> KeychainError {
             KeychainError::Locked(format!("is locked or refuses access ({why})"))
         }
         Error::PlatformFailure(why) => KeychainError::Absent(format!("cannot be reached ({why})")),
-        Error::NoDefaultStore | Error::NotSupportedByStore(_) => {
+        Error::NoDefaultStore => {
             KeychainError::Absent("is not available on this system".to_owned())
+        }
+        Error::NotSupportedByStore(why) => {
+            KeychainError::Absent(format!("is not available on this system ({why})"))
         }
         Error::BadEncoding(mut bytes) | Error::BadDataFormat(mut bytes, _) => {
             bytes.zeroize();
@@ -288,6 +299,11 @@ fn classify(e: Error) -> KeychainError {
         }
         other => KeychainError::Failed(anyhow::anyhow!("the keychain refused the call: {other}")),
     }
+}
+
+/// Whether `switch`, the value of [`SWITCH`], turns the platform's keychain off.
+fn is_off(switch: Option<&std::ffi::OsStr>) -> bool {
+    switch.is_some_and(|value| value.eq_ignore_ascii_case("off"))
 }
 
 /// `master-key@` and the first 8 bytes, in hex, of the SHA-256 of the data directory's path,
@@ -574,11 +590,19 @@ mod tests {
                     .await
                     .map(drop),
             ] {
-                assert!(matches!(result, Err(KeychainError::Absent(_))), "{off}");
+                let Err(KeychainError::Absent(why)) = result else {
+                    panic!("{off}: not absent");
+                };
+                // Whoever meets it learns what turned the keychain off.
+                assert!(why.contains("FRONDE_KEYCHAIN is off"), "{off}: {why}");
+                let error = KeychainError::Absent(why).into_anyhow(&keychain.to_string());
+                assert!(error.to_string().contains("FRONDE_KEYCHAIN"), "{error}");
             }
+            assert!(is_off(Some(OsStr::new(off))));
         }
         // Anything else leaves the platform's keychain in place, untouched by this test.
         for other in [None, Some(OsStr::new("on")), Some(OsStr::new(""))] {
+            assert!(!is_off(other));
             let keychain = Keychain::platform_unless(dir, other);
             assert_eq!(keychain.kind, PLATFORM_KIND, "{other:?}");
             assert_eq!(keychain.data_dir(), Some(dir));
