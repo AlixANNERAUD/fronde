@@ -470,6 +470,7 @@ mod tests {
             Event::WakesHeld {
                 count,
                 returned: false,
+                reason: Default::default(),
             },
         )
     }
@@ -569,6 +570,7 @@ mod tests {
                 Event::WakesHeld {
                     count: 2,
                     returned: true,
+                    reason: Default::default(),
                 },
             ),
             entry(

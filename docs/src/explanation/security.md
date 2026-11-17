@@ -455,7 +455,9 @@ thread's first message, with its own directories, its own sandbox and its own hu
   file), and may not ask for a secret. The sub-agent turns it starts or sends get the same
   limits, their agents restarted the same way. It may start and resend sub-agents, whose results
   wake the thread again; `wakes_without_owner` ends such a chain, holding the next results for
-  the owner's message, and the owner's Stop holds those waiting too. Archiving a thread retires every thread under
+  the owner's message, and the owner's Stop holds those waiting too. Past the owner's reserve of
+  the subscription (`[threads] reserve`), read from Fronde's own usage readings, no sub-agent
+  starts or gets a message and every result is held the same way. Archiving a thread retires every thread under
   it: each agent's token is revoked at once, and nothing under it is woken or delegates again;
   an archive and a sub-agent's start or message are serialised, so one never slips past the
   other.

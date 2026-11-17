@@ -117,9 +117,16 @@ idle_stop = "10m"
 # Sub-agents: what an agent may start in the background, on your subscription's quota.
 max_depth = 1
 children_running = 3
+# The share of each subscription window (5 hours, weekly) kept for you: past 100% minus this,
+# no sub-agent starts or gets a message, and their results wait for your next message.
+# "0%" turns it off.
+reserve = "30%"
+# Only when no usage reading decides (none yet, or reserve = "0%"): sub-agents started in
+# 24 hours, all threads together.
 children_per_day = 30
 children_kept = 200
-# Turns of sub-agents threads start in 24 hours: each threads_start and threads_send.
+# Likewise only without a usage reading: turns of sub-agents threads start in 24 hours, each
+# threads_start and threads_send.
 child_turns_per_day = 100
 # Also caps a turn that a sub-agent's result woke.
 child_turn_timeout = "30m"

@@ -95,8 +95,10 @@ reading that does not parse never fails a turn. The log names the fields it left
 whole `_meta`. Once a window's reset time has passed, it reads as reset since the reading. Codex
 and Antigravity send no reading Fronde reads yet.
 
-Showing the windows in the chat and in `fronde check`, and keeping a share of each window for
-your own turns by pausing background work, are **planned**.
+Fronde keeps a share of each window for your own turns: past `[threads] reserve` (30 % by
+default), sub-agents are neither started nor sent messages, and their results wait for your next
+message (see [What background work may spend](threads.md#what-background-work-may-spend)).
+Showing the windows in the chat and in `fronde check` is **planned**.
 
 ## Why MCP for the tools
 

@@ -35,7 +35,7 @@ impl ThreadControl for Recording {
         Ok(())
     }
 
-    async fn providers(&self) -> Result<Vec<ProviderModels>, ThreadError> {
+    async fn providers(&self, _caller: ThreadId) -> Result<Vec<ProviderModels>, ThreadError> {
         self.record("providers");
         Ok(Vec::new())
     }

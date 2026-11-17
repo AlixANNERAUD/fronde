@@ -47,9 +47,10 @@ pub(crate) use children::Handoff;
 pub use children::{
     ChildEnd, ChildTask, DEFAULT_CHILD_TURN_TIMEOUT, DEFAULT_CHILD_TURNS_PER_DAY,
     DEFAULT_CHILDREN_KEPT, DEFAULT_CHILDREN_PER_DAY, DEFAULT_CHILDREN_RUNNING, DEFAULT_MAX_DEPTH,
-    DEFAULT_WAKES_WITHOUT_OWNER, Delegation, Limits, MAX_LISTED, Pause, StartedChild, TurnResult,
-    final_answer, may_access,
+    DEFAULT_RESERVE, DEFAULT_WAKES_WITHOUT_OWNER, Delegation, Limits, MAX_LISTED, Pause,
+    StartedChild, TurnResult, final_answer, may_access,
 };
+pub use fronde_protocol::usage::Background;
 
 /// Where the agent's session id was kept before threads: the key-value table's scope and key.
 /// Read once, then moved to thread 1's row.
@@ -481,6 +482,7 @@ impl Threads {
             handoff: handoff.clone(),
             registry: registry.clone(),
             limits: budget.limits,
+            account: crate::usage::account_of(&owner.name, spec.provider.id),
         };
         let (main, _) = Assistant::open(
             ThreadId::MAIN,
@@ -619,6 +621,7 @@ impl Threads {
             handoff: self.children.handoff.clone(),
             registry: self.registry.clone(),
             limits: self.limits(),
+            account: Self::account(&row),
         };
         // Only a thread's sub-agent wakes its parent.
         let parent = match row.started_by {
@@ -647,6 +650,13 @@ impl Threads {
 
     /// How thread `row`'s agent starts: the main thread's spec, with another thread's own
     /// directories and scope name, and a sub-agent's own system prompt.
+    /// The subscription account thread `row`'s turns spend: its usage readings, the owner's
+    /// reserve and the daily counts are that account's. The one lookup from a thread to its
+    /// account.
+    pub fn account(row: &ThreadRow) -> String {
+        crate::usage::account_of(&row.owner, &row.provider)
+    }
+
     fn spec_for(&self, row: &ThreadRow) -> AgentSpec {
         let id = row.id;
         if id == ThreadId::MAIN {

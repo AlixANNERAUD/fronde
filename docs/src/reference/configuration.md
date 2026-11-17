@@ -355,9 +355,10 @@ Optional. Each conversation (thread) has its own agent process, started on its f
 | `idle_stop` | duration | `"10m"` | How long an agent is kept after its turn ends without a new message (`"90s"`, `"1h 30m"`). It then stops, freeing its place and revoking its hub token; the next message starts it again and resumes its session. |
 | `max_depth` | integer, 0 to 3 | `1` | How deep a thread may be and still start sub-agents. Your threads are at depth 0, their sub-agents at 1: with `1`, your threads may delegate and their sub-agents may not; with `2`, a sub-agent may start sub-agents of its own, which may not; `0` turns sub-agents off. Past it, `threads_start` and `threads_send` are hidden and refused. |
 | `children_running` | integer, 1 to 1000 | `3` | How many sub-agents one thread may have in a turn at once, those waiting for an agent included. It bounds how much work one agent can set going in parallel, and the queue behind the pool's slots (`max_running`): the sub-agents of every thread share them. |
-| `children_per_day` | integer, 1 to 1000 | `30` | How many sub-agents all threads together may start in the last 24 hours, counted from the database; archiving one frees no place. It bounds how many tasks an agent can start in the background over a day. |
+| `reserve` | percentage, `"0%"` to `"100%"` | `"30%"` | The share of each subscription window (5 hours, and weekly for all models) kept for you. Once a window's use reaches `100%` minus it (70 % by default), as the provider's latest reading says, `threads_start` and `threads_send` are refused, even from a turn you started, naming the window, its use, this setting and the reset time, and sub-agents' results wait for your next message instead of waking their thread. Your own messages always run, and turns already running go on. While a reading decides, `children_per_day` and `child_turns_per_day` do not apply; `"0%"` turns the reserve off and leaves them. See [Threads and sub-agents](../explanation/threads.md#what-background-work-may-spend). |
+| `children_per_day` | integer, 1 to 1000 | `30` | How many sub-agents all threads together may start in the last 24 hours, counted from the database; archiving one frees no place. It bounds how many tasks an agent can start in the background over a day. It applies only when no usage reading decides (see `reserve`). |
 | `children_kept` | integer, 1 to 1000 | `200` | How many sub-agents one thread may keep not archived. Only a guard against clutter in the thread list; archiving a sub-agent frees its place. |
-| `child_turns_per_day` | integer, 1 to 1000 | `100` | How many turns of sub-agents all threads together may start in the last 24 hours, counted from the threads' streams: each sub-agent's task and each `threads_send`. It bounds how much an agent can keep sub-agents working over a day, whether it starts new ones or sends messages to the same. |
+| `child_turns_per_day` | integer, 1 to 1000 | `100` | How many turns of sub-agents all threads together may start in the last 24 hours, counted from the threads' streams: each sub-agent's task and each `threads_send`. It bounds how much an agent can keep sub-agents working over a day, whether it starts new ones or sends messages to the same. It applies only when no usage reading decides (see `reserve`). |
 | `child_turn_timeout` | duration, at most `"24h"` | `"30m"` | How long one turn of a sub-agent may run once its agent has it (the wait for an agent slot does not count). Past it the turn is stopped as Stop does, with the notice « Délai dépassé » in the sub-agent's thread, and its parent is told it ended `cancelled`. A turn of yours that a sub-agent's result woke is capped the same way; the turns your messages start are not. |
 | `wakes_without_owner` | integer, 1 to 1000 | `10` | How many turns a thread may be woken by its sub-agents' results since your last message in it. The results that come next are held: the thread says how many wait, and your next message carries them to the agent and starts the count again. It ends a chain of wakes that a sub-agent's answer could keep going without you. |
 
@@ -369,8 +370,8 @@ The limits on sub-agents are there for your subscription's quota. A sub-agent sp
 the background, without you in the loop, and an agent may be steered by what it reads (a web page,
 a mail: a prompt injection) into starting many. Fronde enforces them whatever the agent is told;
 each refusal names the setting to change. Together they bound that spending; they do not make it
-nothing. They count tasks and minutes, not the quota itself: a
-budget read from the provider's usage windows is **planned** to replace them (see
+nothing. `reserve` reads the quota itself, from the provider's usage windows; the daily counts
+stand in for it when no reading decides (see
 [Threads and sub-agents](../explanation/threads.md#limits)).
 
 ```toml
@@ -379,6 +380,7 @@ max_running = 3
 idle_stop = "10m"
 max_depth = 1
 children_running = 3
+reserve = "30%"
 children_per_day = 30
 children_kept = 200
 child_turns_per_day = 100

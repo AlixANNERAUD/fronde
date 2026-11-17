@@ -4,6 +4,7 @@ pub mod chat;
 pub mod connection;
 pub mod threads;
 pub mod tray;
+pub mod usage;
 
 pub use chat::{Chat, Item, PermissionStatus, RequestStatus, Row, ToolStatus};
 pub use connection::{Action, Connection, State};

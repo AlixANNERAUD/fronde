@@ -162,12 +162,15 @@ within them, an agent can still spend a share of your quota you did not ask for.
   parallel, and the queue behind the agent pool.
 - **Agents at once** (`max_running`). Sub-agents share the pool's slots but one with every other
   thread you did not start, so a thread you talk to always gets one.
-- **Per day** (`children_per_day`, 30). How many sub-agents all threads together may start in 24
-  hours, archived ones included: an agent that keeps starting short tasks is stopped there, even
-  if no more than 3 run at a time.
-- **Turns per day** (`child_turns_per_day`, 100). How many turns of sub-agents all threads
-  together may start in 24 hours: each sub-agent's task and each `threads_send`. An agent that
-  keeps one sub-agent busy with message after message is stopped there.
+- **Your reserve** (`reserve`, 30 %). The share of each subscription window kept for you (see
+  [What background work may spend](#what-background-work-may-spend)).
+- **Per day** (`children_per_day`, 30), only when no usage reading decides. How many sub-agents
+  all threads together may start in 24 hours, archived ones included: an agent that keeps
+  starting short tasks is stopped there, even if no more than 3 run at a time.
+- **Turns per day** (`child_turns_per_day`, 100), only when no usage reading decides. How many
+  turns of sub-agents all threads together may start in 24 hours: each sub-agent's task and each
+  `threads_send`. An agent that keeps one sub-agent busy with message after message is stopped
+  there.
 - **Time per turn** (`child_turn_timeout`, 30 minutes, at most 24 hours). A sub-agent's turn that
   runs longer, once its agent has it, is stopped as Stop does, with « Délai dépassé » in its
   thread; its parent is woken with the outcome `cancelled`. A stuck or looping sub-agent ends
@@ -184,9 +187,37 @@ within them, an agent can still spend a share of your quota you did not ask for.
 - **Retries.** A call retried in the same turn with the same `client_request_id` joins the
   sub-agent the first one started, so that a lost reply does not start two.
 
-These limits count tasks and minutes, not tokens. A budget read from the provider's own usage
-windows, refusing or holding back background work above a share of your quota, is **planned**
-(task U1 of the threads plan); it will replace the counts.
+### What background work may spend
+
+Background work is what runs without your message: a sub-agent started (`threads_start`), a
+message sent to one (`threads_send`), and a turn a sub-agent's result wakes. Fronde reads how much
+of your subscription's 5-hour and weekly windows is used (see
+[Usage and quotas](subscriptions.md#usage-and-quotas)) and keeps `reserve` of each for you,
+30 % by default. From its own latest reading, never from what an agent says:
+
+- **Paused** when the 5-hour or the weekly window is used at the line (`100%` minus `reserve`) or
+  above, is refused by the provider, or warns without saying how much is used, or when paid extra
+  usage is being spent. Then `threads_start` and `threads_send` are refused, even from a turn you
+  started (a page or a mail the agent read in your turn can steer it too; the agent can still do
+  the task itself, in your turn), naming the window, its use, the setting and the reset time.
+  Sub-agents' results are held, as past the wake budget: the thread says « 1 résultat de
+  sous-agent gardé pour ton prochain message : réserve de quota atteinte (5 h : 72 %) », and your
+  next message carries them, even once the window has reset. Your own messages always run;
+  turns already running go on, within `child_turn_timeout`, and so do sub-agents already waiting
+  for an agent.
+- **Allowed** when both windows have a use below the line: the daily counts do not apply.
+- **Unknown** when no reading decides: none yet (a reading comes only with a turn), only one of
+  the two windows read, a window without a percentage, a window whose reset time has passed since
+  it was read (what was used since is not known), or `reserve = "0%"`. Then `children_per_day`
+  and `child_turns_per_day` apply, as the safety net.
+
+The other limits (depth, at once, kept, time per turn, wakes without you) always apply: they
+bound concurrency, clutter, loops and time, not the quota. `threads_list` tells an agent whether
+background work may run before it tries.
+
+Readings, the reserve and the daily counts belong to a subscription account. Today each provider
+has one, the one Fronde signs in with, which every thread uses; an account per person is
+**planned**, each person's threads then spending their own.
 
 ## Stopping
 

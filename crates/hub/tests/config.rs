@@ -983,6 +983,7 @@ fn threads_default_and_parse() {
             child_turns_per_day: 100,
             child_turn_timeout: Duration::from_secs(30 * 60),
             wakes_without_owner: 10,
+            reserve: fronde_hub::config::Percent(30),
         }
     );
     let threads = |table: &str| {
@@ -1045,6 +1046,40 @@ fn threads_default_and_parse() {
         example.agent.limits,
         fronde_hub::config::AgentLimits::default()
     );
+}
+
+#[test]
+fn reserve_parses_and_refuses_bad_values() {
+    use fronde_hub::config::Percent;
+    let reserve = |value: &str| {
+        load_str(&format!("{MIN}\n[threads]\nreserve = {value}\n")).map(|c| c.threads.reserve)
+    };
+    for (value, expected) in [
+        ("\"30%\"", 30),
+        ("\"0%\"", 0),
+        ("\"100%\"", 100),
+        ("\"5 %\"", 5),
+    ] {
+        assert_eq!(reserve(value).unwrap(), Percent(expected), "{value}");
+    }
+    assert_eq!(Percent(30).to_string(), "30%");
+    for bad in [
+        "\"30\"",
+        "\"-1%\"",
+        "\"101%\"",
+        "\"abc\"",
+        "\"%\"",
+        "\"30.5%\"",
+        "\"1000%\"",
+        "30",
+        "0.3",
+    ] {
+        let error = format!("{:#}", reserve(bad).unwrap_err());
+        assert!(
+            error.contains("reserve: expected a percentage from \"0%\" to \"100%\""),
+            "{bad}: {error}"
+        );
+    }
 }
 
 #[test]

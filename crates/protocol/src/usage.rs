@@ -33,6 +33,129 @@ impl ProviderUsage {
     }
 }
 
+/// The windows the owner's reserve guards: the 5-hour one and the weekly one, all models.
+pub const GUARDED: [WindowKind; 2] = [WindowKind::Session, WindowKind::Weekly];
+
+/// Whether background work (sub-agents started or sent a message, wake turns) may spend a
+/// provider's subscription now, under the owner's reserve: `[threads] reserve`, the share of
+/// each guarded window kept for the owner. See [`ProviderUsage::background`].
+#[derive(Clone, PartialEq, Debug)]
+pub enum Background {
+    /// Every guarded window has a fresh percentage below the line; `headroom` is the smallest
+    /// distance to it, as a fraction.
+    Allowed { headroom: f64 },
+    /// A window says the line is reached: background work waits.
+    Paused(Pause),
+    /// No reading decides: none yet, a guarded window missing, without a percentage or reset
+    /// since it was read, or the reserve is off (`0%`). The daily counts apply.
+    Unknown,
+}
+
+/// The window that pauses background work, as it was read.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Pause {
+    pub window: WindowKind,
+    pub used: Option<f64>,
+    pub status: Option<LimitStatus>,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+impl Pause {
+    /// Its use in whole percent, when the provider gave one.
+    pub fn used_percent(&self) -> Option<u8> {
+        self.used.map(percent)
+    }
+}
+
+/// `used`, a fraction from 0 to 1, in whole percent.
+pub fn percent(used: f64) -> u8 {
+    // Within 0..=100 once clamped: the cast loses nothing.
+    (used * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+/// The line of a reserve of `reserve` percent: the fraction of a window background work may
+/// use.
+pub fn line(reserve: u8) -> f64 {
+    1.0 - f64::from(reserve.min(100)) / 100.0
+}
+
+/// [`ProviderUsage::background`] of `usage`, [`Background::Unknown`] without a reading.
+pub fn background(usage: Option<&ProviderUsage>, reserve: u8, now: DateTime<Utc>) -> Background {
+    usage.map_or(Background::Unknown, |usage| usage.background(reserve, now))
+}
+
+impl ProviderUsage {
+    /// Whether background work may spend this provider's windows at `now`, keeping `reserve`
+    /// percent of each guarded window ([`GUARDED`]) for the owner. Read with [`Window::now`]:
+    ///
+    /// - [`Background::Paused`] when a guarded window is `rejected`, its use is at the line or
+    ///   above, or it is `warning` without a percentage (the provider says it is close; how
+    ///   close is not known), or when paid extra usage is being spent (`extra` in `warning`).
+    ///   Of several, the one that resets last, one without a reset time first;
+    /// - [`Background::Allowed`] when every guarded window has a percentage below the line;
+    /// - [`Background::Unknown`] otherwise: a guarded window not read, read without a
+    ///   percentage, or reset since it was read (what was used since is not known), and always
+    ///   with a reserve of 0.
+    pub fn background(&self, reserve: u8, now: DateTime<Utc>) -> Background {
+        if reserve == 0 {
+            return Background::Unknown;
+        }
+        let line = line(reserve);
+        let windows: Vec<Window> = self.windows.iter().map(|window| window.now(now)).collect();
+        let pauses = |window: &Window| {
+            if window.reset_since_reading {
+                return false;
+            }
+            match window.kind {
+                WindowKind::Session | WindowKind::Weekly => {
+                    window.status == Some(LimitStatus::Rejected)
+                        || window.used.is_some_and(|used| used >= line)
+                        || (window.status == Some(LimitStatus::Warning) && window.used.is_none())
+                }
+                WindowKind::Extra => window.status == Some(LimitStatus::Warning),
+                WindowKind::WeeklyModel(_) | WindowKind::Other(_) => false,
+            }
+        };
+        // The pause that lasts longest: no reset time, then the latest.
+        let pause = windows
+            .iter()
+            .filter(|window| pauses(window))
+            .max_by_key(|window| window.resets_at.map_or(i64::MAX, |at| at.timestamp()));
+        if let Some(window) = pause {
+            return Background::Paused(Pause {
+                window: window.kind.clone(),
+                used: window.used,
+                status: window.status,
+                resets_at: window.resets_at,
+            });
+        }
+        let mut headroom = f64::INFINITY;
+        for kind in &GUARDED {
+            let Some(window) = windows.iter().find(|window| &window.kind == kind) else {
+                return Background::Unknown;
+            };
+            match window.used {
+                Some(used) if !window.reset_since_reading => headroom = headroom.min(line - used),
+                _ => return Background::Unknown,
+            }
+        }
+        Background::Allowed { headroom }
+    }
+}
+
+impl WindowKind {
+    /// The window's name in a sentence, in English: `5-hour window`, `weekly window`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Session => "5-hour window".to_owned(),
+            Self::Weekly => "weekly window".to_owned(),
+            Self::WeeklyModel(model) => format!("weekly {model} window"),
+            Self::Extra => "paid extra usage".to_owned(),
+            Self::Other(id) => format!("{id} window"),
+        }
+    }
+}
+
 /// One usage window of a subscription, as last read.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Window {
@@ -253,6 +376,182 @@ mod tests {
             ..window
         };
         assert_eq!(unknown.now(at(1_000_000)), unknown);
+    }
+
+    fn reading(windows: Vec<Window>) -> ProviderUsage {
+        ProviderUsage {
+            provider: "claude".into(),
+            known_since: at(1_000),
+            windows,
+        }
+    }
+
+    fn guarded(kind: WindowKind, used: Option<f64>, status: Option<LimitStatus>) -> Window {
+        Window {
+            kind,
+            used,
+            status,
+            resets_at: Some(at(10_000)),
+            as_of: at(1_000),
+            reset_since_reading: false,
+        }
+    }
+
+    fn both(session: f64, weekly: f64) -> ProviderUsage {
+        reading(vec![
+            guarded(
+                WindowKind::Session,
+                Some(session),
+                Some(LimitStatus::Allowed),
+            ),
+            guarded(WindowKind::Weekly, Some(weekly), Some(LimitStatus::Allowed)),
+        ])
+    }
+
+    #[test]
+    fn background_pauses_at_the_line_of_either_window() {
+        let now = at(2_000);
+        match both(0.42, 0.18).background(30, now) {
+            Background::Allowed { headroom } => assert!((headroom - 0.28).abs() < 1e-9),
+            other => panic!("{other:?}"),
+        }
+        for (session, weekly, kind) in [
+            (0.70, 0.10, WindowKind::Session),
+            (0.10, 0.85, WindowKind::Weekly),
+        ] {
+            let Background::Paused(pause) = both(session, weekly).background(30, now) else {
+                panic!("{session} {weekly}");
+            };
+            assert_eq!(pause.window, kind);
+            assert_eq!(pause.resets_at, Some(at(10_000)));
+        }
+        assert_eq!(
+            both(0.72, 0.1).background(30, now),
+            Background::Paused(Pause {
+                window: WindowKind::Session,
+                used: Some(0.72),
+                status: Some(LimitStatus::Allowed),
+                resets_at: Some(at(10_000)),
+            })
+        );
+        // Another reserve, another line.
+        assert!(matches!(
+            both(0.72, 0.1).background(20, now),
+            Background::Allowed { .. }
+        ));
+        assert!(matches!(
+            both(0.01, 0.0).background(100, now),
+            Background::Paused(_)
+        ));
+    }
+
+    #[test]
+    fn warning_without_percentage_pauses() {
+        let usage = reading(vec![
+            guarded(WindowKind::Session, None, Some(LimitStatus::Warning)),
+            guarded(WindowKind::Weekly, Some(0.1), None),
+        ]);
+        let Background::Paused(pause) = usage.background(30, at(2_000)) else {
+            panic!();
+        };
+        assert_eq!((pause.window, pause.used), (WindowKind::Session, None));
+        // So does a rejected window, whatever its percentage says.
+        let usage = reading(vec![
+            guarded(WindowKind::Session, Some(0.1), None),
+            guarded(WindowKind::Weekly, Some(0.2), Some(LimitStatus::Rejected)),
+        ]);
+        assert!(matches!(
+            usage.background(30, at(2_000)),
+            Background::Paused(Pause {
+                window: WindowKind::Weekly,
+                ..
+            })
+        ));
+        // A warning with a percentage below the line is judged by the percentage.
+        let usage = reading(vec![
+            guarded(WindowKind::Session, Some(0.5), Some(LimitStatus::Warning)),
+            guarded(WindowKind::Weekly, Some(0.2), None),
+        ]);
+        assert!(matches!(
+            usage.background(30, at(2_000)),
+            Background::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn overage_in_use_pauses() {
+        let mut usage = both(0.1, 0.1);
+        usage.windows.push(Window {
+            kind: WindowKind::Extra,
+            used: None,
+            status: Some(LimitStatus::Warning),
+            resets_at: None,
+            as_of: at(1_000),
+            reset_since_reading: false,
+        });
+        assert!(matches!(
+            usage.background(30, at(2_000)),
+            Background::Paused(Pause {
+                window: WindowKind::Extra,
+                resets_at: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reset_time_ends_the_pause() {
+        let usage = both(0.9, 0.1);
+        assert!(matches!(
+            usage.background(30, at(9_999)),
+            Background::Paused(_)
+        ));
+        // Reset since the reading: what was used since is not known, so the counts decide.
+        assert_eq!(usage.background(30, at(10_000)), Background::Unknown);
+    }
+
+    #[test]
+    fn nothing_decides_without_a_full_reading() {
+        let now = at(2_000);
+        assert_eq!(background(None, 30, now), Background::Unknown);
+        // The weekly window was never read.
+        let session_only = reading(vec![guarded(
+            WindowKind::Session,
+            Some(0.1),
+            Some(LimitStatus::Allowed),
+        )]);
+        assert_eq!(session_only.background(30, now), Background::Unknown);
+        // A status that tells nothing, and no percentage.
+        let bare = reading(vec![
+            guarded(WindowKind::Session, None, Some(LimitStatus::Allowed)),
+            guarded(WindowKind::Weekly, Some(0.1), None),
+        ]);
+        assert_eq!(bare.background(30, now), Background::Unknown);
+        // A model's own weekly window does not count.
+        let mut usage = both(0.1, 0.1);
+        usage.windows.push(guarded(
+            WindowKind::WeeklyModel("opus".into()),
+            Some(0.99),
+            Some(LimitStatus::Rejected),
+        ));
+        assert!(matches!(
+            usage.background(30, now),
+            Background::Allowed { .. }
+        ));
+    }
+
+    #[test]
+    fn reserve_zero_is_off() {
+        let usage = both(1.0, 1.0);
+        assert_eq!(usage.background(0, at(2_000)), Background::Unknown);
+    }
+
+    #[test]
+    fn percent_rounds_within_bounds() {
+        assert_eq!(percent(0.724), 72);
+        assert_eq!(percent(0.726), 73);
+        assert_eq!(percent(1.03), 100);
+        assert_eq!(percent(-0.02), 0);
     }
 
     #[test]

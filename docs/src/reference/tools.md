@@ -340,7 +340,7 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
 | `threads_start` | `task`, `title` (optional, at most 80 characters), `provider` (optional), `model` (optional), `wait` (default `false`), `timeout_secs` (1 to 3600, default 600), `client_request_id` (optional, 1 to 128 characters) | Starts a sub-agent whose only context is `task`, and returns `{ thread, title, status }`; with `wait`, its answer. Without, its answer wakes you when it ends. |
 | `threads_send` | `thread`, `text`, `wait`, `timeout_secs` | Sends a sub-agent a new message, as a new turn; refused while it is in a turn. |
 | `threads_read` | `thread`, `after` (default 0), `limit` (1 to 50, default 20), `max_chars` (100 to 8000, default 4000) | Reads a sub-agent's thread, oldest first: its messages (`user`), its answers (`assistant`, a turn's text together), Fronde's notices (`notice`), each turn's end (`turn_ended`, with its `outcome`) and, in a thread that has sub-agents of its own, each of their results that woke it (`child_ended`, with its `thread` and `outcome`, its answer as `text`). Each item has its `seq`; a text longer than `max_chars` is cut and marked `truncated`, and a page holds at most 32000 characters of text (one item at least). When there is more, `next_after` is the `after` of the next page. |
-| `threads_list` | none | The sub-agents you started, newest first (at most 50, `more` counting the rest), each with its `thread`, `title`, `status`, `provider` and `model`, `waiting_for_user` when cards wait in it, `archived` when it is; and `providers`: each provider a sub-agent may run on, with the models its agent offered when it last started. |
+| `threads_list` | none | The sub-agents you started, newest first (at most 50, `more` counting the rest), each with its `thread`, `title`, `status`, `provider` and `model`, `waiting_for_user` when cards wait in it, `archived` when it is; and `providers`: each provider a sub-agent may run on, with the models its agent offered when it last started, and `background`: `allowed`, `paused until <time>` (past your reserve: `threads_start` and `threads_send` are refused) or `unknown` (no usage reading decides; the daily counts apply). |
 | `threads_cancel` | `thread`, `reason` (optional, one line, at most 200 characters) | Stops a sub-agent's running turn, its pending cards, the wakes waiting for it, and the same in every sub-agent under it, deepest first; `reason` is shown in its thread. The turns stopped wake nobody. A finished turn keeps its result. Returns whether it was in a turn. |
 
 - **Who.** A thread's agent is known by its token only; nothing in a call names the caller. It
@@ -356,11 +356,18 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
   any thread under an archived one.
 - **Limits.** By default a thread has at most 3 sub-agents in a turn at once, those waiting for
   an agent included (`children_running`), and keeps at most 200 not archived (`children_kept`);
-  all threads together start at most 30 in 24 hours (`children_per_day`) and at most 100 turns
-  of sub-agents, each task and each `threads_send` (`child_turns_per_day`); a sub-agent's turn,
-  and a turn a result woke, stops after 30 minutes (`child_turn_timeout`). Past one,
-  `threads_start` (and `threads_send` for the first and the turns) is refused with a message
-  naming the `[threads]` setting (see [Configuration](configuration.md#threads)).
+  a sub-agent's turn, and a turn a result woke, stops after 30 minutes (`child_turn_timeout`).
+  Past one, `threads_start` (and `threads_send` for the first) is refused with a message naming
+  the `[threads]` setting (see [Configuration](configuration.md#threads)).
+- **Your reserve.** Once the 5-hour or the weekly window of the subscription is used past
+  `100%` minus `[threads] reserve` (70 % by default), `threads_start` and `threads_send` are
+  refused, whichever turn calls them: « the owner's reserve of the 5-hour window is reached
+  (72 % used, 30 % kept for the owner, the setting [threads] reserve); it resets at 2026-11-17
+  16:40 UTC; sub-agents can neither start nor get messages until then: do the task yourself or
+  tell the user ». Only when no usage reading decides do the daily counts apply instead: all
+  threads together start at most 30 sub-agents in 24 hours (`children_per_day`) and at most 100
+  turns of sub-agents, each task and each `threads_send` (`child_turns_per_day`) (see
+  [What background work may spend](../explanation/threads.md#what-background-work-may-spend)).
 - **Provider and model.** `provider` is one of `threads_list`'s (only `claude` today; `codex` and
   `gemini` are refused as planned). `model` is one of the models the provider's agent offered,
   as `threads_list` shows them; another is refused with the list. Without them, the parent's
@@ -383,8 +390,8 @@ start sub-agents and follow them; see [Threads and sub-agents](../explanation/th
   `Read more with threads_read (thread <id>).`, the title quoted and escaped on one line. A wake
   waits for the running turn, wakes run in order, a thread archived or under an archived one is
   not woken, and a result reaches the thread at most once, a restart included. After
-  `wakes_without_owner` woken turns since the user's last message, or after the user's Stop while
-  results waited, the results are held and come with the user's next message, before its text,
+  `wakes_without_owner` woken turns since the user's last message, after the user's Stop while
+  results waited, or once the user's reserve of the subscription is reached, the results are held and come with the user's next message, before its text,
   as data. A woken turn may use `threads_start` and `threads_send` (what they return wakes it
   again, within that budget), but not `user_secret`, which refuses it; its cards name the
   sub-agent, and so do those of the sub-agent turns it starts or sends, which get the same limits

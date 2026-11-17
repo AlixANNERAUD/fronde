@@ -17,7 +17,10 @@ use agent_client_protocol::v1::schema::CreateElicitationResponse;
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
-use fronde_protocol::{Card, Outcome, PermissionKind, RequestId, ThreadStatus, WokenBy};
+use fronde_protocol::usage::Background;
+use fronde_protocol::{
+    Card, HoldReason, Outcome, PermissionKind, RequestId, ThreadStatus, WokenBy,
+};
 use fronde_requests::{Ask, Caller, LateAnswer, Requests, Resolution, User, Waiter};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -98,6 +101,8 @@ pub(crate) struct Shared {
     pub(crate) registry: Registry,
     /// What threads may do with sub-agents: the wake budget and the wake turns' time cap.
     pub(crate) limits: Limits,
+    /// The subscription account the thread's turns spend ([`crate::usage::account_of`]).
+    pub(crate) account: String,
 }
 
 pub struct Assistant {
@@ -138,6 +143,8 @@ pub struct Assistant {
     turn_timeout: Mutex<Option<Duration>>,
     /// The wake budget and the wake turns' time cap.
     limits: Limits,
+    /// The subscription account its turns spend, whose reserve holds its wakes.
+    account: String,
     /// Where its turns stand, for the thread list.
     activity: Mutex<Activity>,
     /// Told when [`Assistant::status`] changes.
@@ -291,6 +298,7 @@ impl Assistant {
             handoff,
             registry,
             limits,
+            account,
         } = shared;
         let log = ConversationLog::open(&db, &topic).await?;
         let assistant = Arc::new(Self {
@@ -313,6 +321,7 @@ impl Assistant {
             elicitation_timeout: Mutex::new(fronde_requests::elicitation::DEFAULT_TIMEOUT),
             turn_timeout: Mutex::new(turn_timeout),
             limits,
+            account,
             activity: Mutex::new(Activity::default()),
             changes,
             handoff,
@@ -360,7 +369,9 @@ impl Assistant {
                 ..
             }) => {
                 let count = queue.hold(Some(wake));
-                assistant.append(held_entry(count, false)).await;
+                assistant
+                    .append(held_entry(count, false, HoldReason::Budget))
+                    .await;
             }
             // A turn the server stopped in the middle of would otherwise run forever on the
             // pages. Its end opens the next wake waiting.
@@ -387,12 +398,28 @@ impl Assistant {
                 if queue.holds(budget) || !late.is_empty() {
                     if !queue.waiting.is_empty() {
                         let count = queue.hold(None);
-                        assistant.append(held_entry(count, false)).await;
+                        assistant
+                            .append(held_entry(count, false, HoldReason::Budget))
+                            .await;
                     }
                 } else {
                     resume = queue.waiting.pop_front().map(|wake| (wake, after));
                 }
             }
+        }
+        // Past the owner's reserve, the wake that would run now is held for the owner's next
+        // message, with those waiting after it.
+        if !archived
+            && resume.is_some()
+            && let Some(reason) = assistant.reserve_hold()
+            && let Some((wake, _)) = resume.take()
+        {
+            let count = queue.hold(Some(wake));
+            tracing::info!(
+                "thread {thread}: past the owner's reserve, {count} sub-agent result(s) wait for \
+                 the next message"
+            );
+            assistant.append(held_entry(count, false, reason)).await;
         }
         if archived {
             // An archived thread is not woken: each wake ends as soon as its turn opens.
@@ -740,9 +767,12 @@ impl Assistant {
             queue.hold_at_end |= unsure;
             return true;
         }
+        // Past the owner's reserve, held as past the wake budget: until the owner's next message.
+        let reserve = self.reserve_hold();
+        let reason = reserve.clone().unwrap_or_default();
         let held = {
             let mut queue = lock(&self.wakes);
-            if unsure || queue.holds(self.limits.wakes_without_owner) {
+            if unsure || reserve.is_some() || queue.holds(self.limits.wakes_without_owner) {
                 queue.held.push(wake);
                 Some(queue.hold(None))
             } else {
@@ -757,7 +787,7 @@ impl Assistant {
                 "thread {}: a sub-agent's result is held for the next message ({count} held)",
                 self.thread
             );
-            self.append(held_entry(count, false)).await;
+            self.append(held_entry(count, false, reason)).await;
         }
         true
     }
@@ -779,6 +809,21 @@ impl Assistant {
             ),
         }
         self.append(event).await;
+    }
+
+    /// Why a sub-agent's result is held now rather than wake this thread, if the owner's reserve
+    /// of the thread's account is reached ([`Limits::reserve`]); `None` when background work
+    /// may run or no reading decides (then only the wake budget holds results).
+    fn reserve_hold(&self) -> Option<HoldReason> {
+        let book = self.spec.usage.as_ref()?;
+        let usage = book.get(&self.account);
+        match fronde_protocol::usage::background(usage.as_ref(), self.limits.reserve, Utc::now()) {
+            Background::Paused(pause) => Some(HoldReason::Reserve {
+                used: pause.used_percent(),
+                window: pause.window,
+            }),
+            Background::Allowed { .. } | Background::Unknown => None,
+        }
     }
 
     /// Whether this thread, or a thread above it, is archived, as far as the registry tells.
@@ -875,6 +920,14 @@ impl Assistant {
             // Stopped with its tree, or archived: the wakes waiting end with it.
             let dropping = quiet || self.archived.load(Ordering::SeqCst);
             if !dropping {
+                // Past the owner's reserve, the results waiting are held, as past the wake
+                // budget: under the turn's lock, from Fronde's own book.
+                let reserve = self.reserve_hold();
+                let reason = match (reserve.clone(), stopped) {
+                    (Some(reserve), _) => reserve,
+                    (None, true) => HoldReason::Stopped,
+                    (None, false) => HoldReason::Budget,
+                };
                 // Before the turn's end, as `wakes::replay` reads it: the end then opens no wake.
                 // A late answer of the owner's goes next, as the owner's message, which carries
                 // the results held.
@@ -887,6 +940,7 @@ impl Assistant {
                     let returned = if delivered { Vec::new() } else { carried };
                     let hold_waiting = stopped
                         || late
+                        || reserve.is_some()
                         || queue.hold_at_end
                         || queue.holds(self.limits.wakes_without_owner);
                     queue.hold_at_end = false;
@@ -899,7 +953,7 @@ impl Assistant {
                         "thread {}: {count} sub-agent result(s) held for the next message",
                         self.thread
                     );
-                    self.append(held_entry(count, again)).await;
+                    self.append(held_entry(count, again, reason)).await;
                 }
             }
             let end = self.append_seq(Event::TurnEnded { outcome }).await;
@@ -1707,12 +1761,13 @@ fn late_prompt(answers: &[LateAnswer]) -> String {
     )
 }
 
-/// The entry saying that `count` sub-agents' results wait for the next message; `returned`
-/// when the last message's prompt never went out, its results held again.
-fn held_entry(count: usize, returned: bool) -> Event {
+/// The entry saying that `count` sub-agents' results wait for the next message, for `reason`;
+/// `returned` when the last message's prompt never went out, its results held again.
+fn held_entry(count: usize, returned: bool, reason: HoldReason) -> Event {
     Event::WakesHeld {
         count: u32::try_from(count).unwrap_or(u32::MAX),
         returned,
+        reason,
     }
 }
 

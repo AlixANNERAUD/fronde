@@ -20,7 +20,7 @@ impl ThreadControl for Asks {
         Err(ThreadError::Refused("no sub-agents here".into()))
     }
 
-    async fn providers(&self) -> Result<Vec<ProviderModels>, ThreadError> {
+    async fn providers(&self, _: ThreadId) -> Result<Vec<ProviderModels>, ThreadError> {
         Ok(Vec::new())
     }
 

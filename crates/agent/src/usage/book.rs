@@ -17,7 +17,9 @@ fn scope(provider: &str) -> String {
     format!("provider/{provider}")
 }
 
-/// The latest windows read for each provider, from every agent process: a window replaces the
+/// The latest windows read for each subscription account, from every agent process, keyed by
+/// the account's id ([`super::account_of`]): today a provider has one account, whose id is the
+/// provider's, so the key is the provider's id and the `kv` scope `provider/<id>`. A window replaces the
 /// one of its kind only when it is newer (see [`UsageBook::record`]). Each change is written to
 /// the database by a task of the book's own, so that a slow write never holds an agent's
 /// messages; a failed write is logged, and the reading stays in memory.

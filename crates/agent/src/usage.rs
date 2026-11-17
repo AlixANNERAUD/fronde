@@ -21,6 +21,16 @@ use serde_json::{Map, Value};
 use std::fmt;
 use std::sync::Arc;
 
+/// The subscription account a thread's turns spend, from the thread's owner and provider: the
+/// key of its usage readings in the [`UsageBook`], of the owner's reserve and of the daily
+/// counts that stand in for it. Today a provider has one account, whose id is the provider's
+/// (`claude`), so readings stored before accounts still read; per-person accounts replace this
+/// one function.
+pub fn account_of(owner: &str, provider: &str) -> String {
+    let _ = owner;
+    provider.to_owned()
+}
+
 /// The key of the Claude adapter's `_meta` that holds the CLI's latest `rate_limit_info`.
 pub const CLAUDE_RATE_LIMIT: &str = "_claude/rateLimit";
 
@@ -335,7 +345,9 @@ where
 }
 
 /// What one agent connection does with the readings it receives: read them with its provider's
-/// [`UsageSource`] and record them in the book, if it has one.
+/// [`UsageSource`] and record them in the book, if it has one, under the account the agent
+/// signs in with: today its provider's one account, whose id is the provider's
+/// ([`account_of`]).
 #[derive(Clone)]
 pub(crate) struct Capture {
     provider: &'static str,

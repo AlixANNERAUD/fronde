@@ -259,8 +259,9 @@ impl Default for AgentLimits {
 
 /// `[threads]`: how many agent processes run at once, how long an idle one is kept, and how far
 /// sub-agents may go. The limits on sub-agents bound what an agent, a prompt-injected one
-/// included, may spend of the subscription's quota in the background; a budget read from the
-/// quota itself is planned to replace the counts.
+/// included, may spend of the subscription's quota in the background: `reserve` keeps a share of
+/// each subscription window for the owner, read from the provider's usage readings, and the
+/// daily counts apply only when no reading decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ThreadsConfig {
@@ -298,6 +299,40 @@ pub struct ThreadsConfig {
     /// the owner's in between; later results wait for the owner's next message.
     #[serde(deserialize_with = "wakes_without_owner")]
     pub wakes_without_owner: usize,
+    /// The share of each subscription window (5 hours, weekly) kept for the owner: once a
+    /// window's use reaches `100% - reserve`, sub-agents are neither started nor sent messages,
+    /// and their results wait for the owner's next message. `"0%"` turns it off.
+    pub reserve: Percent,
+}
+
+/// A percentage from `"0%"` to `"100%"`, written with its sign: `"30%"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Percent(pub u8);
+
+impl std::fmt::Display for Percent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}%", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Percent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let expected = || {
+            serde::de::Error::custom(
+                "reserve: expected a percentage from \"0%\" to \"100%\", such as \"30%\"",
+            )
+        };
+        let text = String::deserialize(d).map_err(|_| expected())?;
+        let digits = text
+            .strip_suffix('%')
+            .map(str::trim_end)
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(expected)?;
+        match digits.parse::<u8>() {
+            Ok(value) if value <= 100 => Ok(Self(value)),
+            _ => Err(expected()),
+        }
+    }
 }
 
 /// The longest `[threads] child_turn_timeout` allowed.
@@ -321,6 +356,7 @@ impl Default for ThreadsConfig {
             child_turns_per_day: 100,
             child_turn_timeout: std::time::Duration::from_secs(30 * 60),
             wakes_without_owner: 10,
+            reserve: Percent(30),
         }
     }
 }

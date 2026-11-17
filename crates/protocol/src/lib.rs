@@ -13,6 +13,31 @@ pub use request::{
     TextFormat, ToolKind,
 };
 
+/// Why sub-agents' results wait for the owner's next message ([`Event::WakesHeld`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldReason {
+    /// `[threads] wakes_without_owner` wake turns ran since the owner's last message, a
+    /// result's thread could not be checked, or a message's prompt never went out.
+    #[default]
+    Budget,
+    /// The owner stopped the turn while results waited.
+    Stopped,
+    /// The owner's reserve of a subscription window is reached (`[threads] reserve`): `window`,
+    /// and its use in percent when the provider gave one.
+    Reserve {
+        window: usage::WindowKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        used: Option<u8>,
+    },
+}
+
+impl HoldReason {
+    pub fn is_budget(&self) -> bool {
+        *self == Self::Budget
+    }
+}
+
 /// State of a tool call shown in the conversation.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -125,15 +150,20 @@ pub enum Event {
         child_ended: u64,
     },
     /// Sub-agents' results wait for the owner's next message instead of waking the thread:
-    /// `count` of them, since the owner stopped the turn or since
-    /// `[threads] wakes_without_owner` turns were woken without the owner. That message
-    /// carries them to the agent. Logged in the parent's stream.
+    /// `count` of them, since the owner stopped the turn, since
+    /// `[threads] wakes_without_owner` turns were woken without the owner, or since the owner's
+    /// reserve of the subscription was reached (`reason`). That message carries them to the
+    /// agent. Logged in the parent's stream.
     WakesHeld {
         count: u32,
         /// The message logged last never reached the agent (its agent did not start): the
         /// results it carried are held again, first.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         returned: bool,
+        /// Why they are held; an entry from before reasons were kept reads as
+        /// [`HoldReason::Budget`].
+        #[serde(default, skip_serializing_if = "HoldReason::is_budget")]
+        reason: HoldReason,
     },
     /// The owner answered one of the thread's cards once nobody waited for it, while a turn
     /// ran: the answer waits for that turn's end, then goes to the agent as the owner's
@@ -785,6 +815,7 @@ mod tests {
         let held = Event::WakesHeld {
             count: 2,
             returned: false,
+            reason: HoldReason::Budget,
         };
         let json = serde_json::to_string(&held).unwrap();
         assert_eq!(json, r#"{"type":"wakes_held","count":2}"#);
@@ -792,10 +823,36 @@ mod tests {
         let again = Event::WakesHeld {
             count: 2,
             returned: true,
+            reason: HoldReason::Budget,
         };
         let json = serde_json::to_string(&again).unwrap();
         assert_eq!(json, r#"{"type":"wakes_held","count":2,"returned":true}"#);
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), again);
+        let stopped = Event::WakesHeld {
+            count: 1,
+            returned: false,
+            reason: HoldReason::Stopped,
+        };
+        let json = serde_json::to_string(&stopped).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"wakes_held","count":1,"reason":"stopped"}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), stopped);
+        let reserve = Event::WakesHeld {
+            count: 1,
+            returned: false,
+            reason: HoldReason::Reserve {
+                window: usage::WindowKind::Session,
+                used: Some(72),
+            },
+        };
+        let json = serde_json::to_string(&reserve).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"wakes_held","count":1,"reason":{"reserve":{"window":"session","used":72}}}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), reserve);
         let late = Event::LateAnswer {
             request: 3,
             text: "Réponse".into(),
@@ -809,6 +866,20 @@ mod tests {
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), late);
         let archived = serde_json::to_string(&TurnOutcome::Archived).unwrap();
         assert_eq!(archived, r#""archived""#);
+    }
+
+    /// An entry logged before reasons were kept reads as held for the wake budget.
+    #[test]
+    fn older_wakes_held_entries_still_read() {
+        let older: Event = serde_json::from_str(r#"{"type":"wakes_held","count":3}"#).unwrap();
+        assert_eq!(
+            older,
+            Event::WakesHeld {
+                count: 3,
+                returned: false,
+                reason: HoldReason::Budget,
+            }
+        );
     }
 
     #[test]

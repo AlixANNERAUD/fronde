@@ -7,8 +7,10 @@ use fronde_agent::log::{ConversationLog, Event, TurnOutcome};
 use fronde_agent::threads::{
     Budget, ChildEnd, ChildTask, Delegation, Limits, Pause, Refusal, StartedBy, ThreadId, Threads,
 };
+use fronde_agent::usage::UsageBook;
+use fronde_protocol::usage::{LimitStatus, Window, WindowKind};
 use fronde_protocol::{
-    Card, ChoiceOption, Field, Outcome, Response, ThreadStatus, ThreadSummary, WokenBy,
+    Card, ChoiceOption, Field, HoldReason, Outcome, Response, ThreadStatus, ThreadSummary, WokenBy,
 };
 use fronde_requests::{Ask, Caller, Requests, User};
 use sea_orm::EntityTrait;
@@ -590,9 +592,17 @@ async fn open_pooled(dir: &Path, max_running: usize) -> (Arc<Threads>, Arc<Poole
 }
 
 async fn open_pooled_with(dir: &Path, budget: Budget) -> (Arc<Threads>, Arc<Pooled>) {
+    open_pooled_spec(dir, spec(), budget).await
+}
+
+async fn open_pooled_spec(
+    dir: &Path,
+    spec: AgentSpec,
+    budget: Budget,
+) -> (Arc<Threads>, Arc<Pooled>) {
     let pooled = Arc::new(Pooled::default());
     let db = fronde_db::open(dir).await.unwrap();
-    let threads = Threads::open_with(db, dir, spec(), pooled.connector(), alix(), budget)
+    let threads = Threads::open_with(db, dir, spec, pooled.connector(), alix(), budget)
         .await
         .unwrap();
     (threads, pooled)
@@ -1736,6 +1746,7 @@ fn held(count: u32) -> Event {
     Event::WakesHeld {
         count,
         returned: false,
+        reason: Default::default(),
     }
 }
 
@@ -1845,7 +1856,8 @@ async fn the_owners_stop_holds_the_results_waiting() {
             [
                 Event::WakesHeld {
                     count: 2,
-                    returned: false
+                    returned: false,
+                    reason: HoldReason::Stopped,
                 },
                 Event::TurnEnded { .. }
             ]
@@ -2390,7 +2402,7 @@ async fn late_answer_queued_while_busy() {
         .position(|event| matches!(event, Event::TurnEnded { .. }))
         .unwrap();
     assert!(
-        matches!(&shown[first_end - 1..=first_end + 1], [Event::WakesHeld { count: 1, returned: false }, Event::TurnEnded { .. }, message] if *message == user(PERSO)),
+        matches!(&shown[first_end - 1..=first_end + 1], [Event::WakesHeld { count: 1, returned: false, reason: HoldReason::Budget }, Event::TurnEnded { .. }, message] if *message == user(PERSO)),
         "{shown:?}"
     );
     assert_eq!(woken_count(&shown), 0, "no wake turn ran");
@@ -2587,7 +2599,8 @@ async fn held_results_stay_held_when_the_agent_fails_to_start() {
             [
                 Event::WakesHeld {
                     count: 1,
-                    returned: true
+                    returned: true,
+                    reason: HoldReason::Budget,
                 },
                 Event::TurnEnded {
                     outcome: TurnOutcome::Error
@@ -3020,4 +3033,468 @@ async fn a_late_answer_waiting_survives_a_restart() {
         assert_eq!(events(&second), shown, "given once");
         assert!(prompts(&pooled, ThreadId(2)).is_empty());
     }
+}
+
+// The owner's reserve: background work stops at the line of a subscription window.
+
+/// Pooled agents for every thread, with the requests set, on a spec reading its usage from
+/// `book`, under `limits`.
+async fn open_reserved(
+    dir: &Path,
+    limits: Limits,
+    book: &Arc<UsageBook>,
+) -> (Arc<Threads>, Arc<Pooled>, Arc<Requests>) {
+    let spec = AgentSpec {
+        usage: Some(book.clone()),
+        ..spec()
+    };
+    let (threads, pooled) = open_pooled_spec(
+        dir,
+        spec,
+        Budget {
+            max_running: 3,
+            limits,
+            ..Budget::default()
+        },
+    )
+    .await;
+    let db = fronde_db::open(dir).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    *pooled.requests.lock().unwrap() = Some(requests.clone());
+    (threads, pooled, requests)
+}
+
+/// When the windows read below reset: in two hours, to the minute.
+fn resets_at() -> chrono::DateTime<chrono::Utc> {
+    let at = chrono::Utc::now() + chrono::TimeDelta::hours(2);
+    chrono::DateTime::from_timestamp(at.timestamp() / 60 * 60, 0).unwrap()
+}
+
+fn window(kind: WindowKind, used: Option<f64>, status: LimitStatus) -> Window {
+    Window {
+        kind,
+        used,
+        status: Some(status),
+        resets_at: Some(resets_at()),
+        as_of: chrono::Utc::now(),
+        reset_since_reading: false,
+    }
+}
+
+/// Records a reading of both guarded windows.
+fn read(book: &UsageBook, session: f64, weekly: f64) {
+    book.record(
+        "claude",
+        vec![
+            window(WindowKind::Session, Some(session), LimitStatus::Allowed),
+            window(WindowKind::Weekly, Some(weekly), LimitStatus::Allowed),
+        ],
+    );
+}
+
+fn task(text: &str) -> ChildTask {
+    ChildTask {
+        task: text.into(),
+        title: Some("Mesurer".into()),
+        ..ChildTask::default()
+    }
+}
+
+fn delegation(error: anyhow::Error) -> Delegation {
+    error
+        .downcast::<Delegation>()
+        .unwrap_or_else(|error| panic!("not a refusal: {error:#}"))
+}
+
+/// Past the line of either window, `threads_start` is refused, the refusal naming the window,
+/// its use, the setting and the reset time; nothing is started.
+#[tokio::test]
+async fn reserve_refuses_start_past_the_line() {
+    let reset = resets_at().format("%Y-%m-%d %H:%M UTC").to_string();
+    for (session, weekly, kind, used, name) in [
+        (0.72, 0.10, WindowKind::Session, 72, "5-hour window"),
+        (0.20, 0.85, WindowKind::Weekly, 85, "weekly window"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let book = UsageBook::in_memory();
+        read(&book, session, weekly);
+        let (threads, pooled, _requests) =
+            open_reserved(dir.path(), Limits::default(), &book).await;
+        let refused = delegation(
+            threads
+                .start_child(ThreadId::MAIN, None, task("Mesure la porte"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            refused,
+            Delegation::Reserve {
+                window: kind,
+                used: Some(used),
+                status: Some(LimitStatus::Allowed),
+                reserve: 30,
+                resets_at: Some(resets_at()),
+            }
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "the owner's reserve of the {name} is reached ({used} % used, 30 % kept for the \
+                 owner, the setting [threads] reserve); it resets at {reset}; sub-agents can \
+                 neither start nor get messages until then: do the task yourself or tell the user"
+            )
+        );
+        assert_eq!(
+            threads.summaries(&alix()).await.unwrap().len(),
+            1,
+            "none started"
+        );
+        assert!(pooled.threads().is_empty());
+    }
+}
+
+/// Past the line, `threads_send` to a sub-agent is refused alike; below it, it goes.
+#[tokio::test]
+async fn reserve_refuses_send_past_the_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    read(&book, 0.1, 0.1);
+    let (threads, _pooled, _requests) = open_reserved(dir.path(), Limits::default(), &book).await;
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    until_done(&child).await;
+    let main = threads.main();
+    until_done(&main).await;
+    book.record(
+        "claude",
+        vec![window(
+            WindowKind::Session,
+            Some(0.71),
+            LimitStatus::Warning,
+        )],
+    );
+    let refused = delegation(
+        threads
+            .send_child(
+                ThreadId::MAIN,
+                None,
+                child.thread(),
+                "Et la fenêtre ?".into(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        matches!(
+            &refused,
+            Delegation::Reserve {
+                window: WindowKind::Session,
+                used: Some(71),
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        refused.to_string().contains("[threads] reserve"),
+        "{refused}"
+    );
+    assert_eq!(
+        events(&child)
+            .iter()
+            .filter(|event| matches!(event, Event::User { .. }))
+            .count(),
+        1,
+        "nothing sent"
+    );
+    // A rejected window without a percentage refuses too, and says so.
+    book.record(
+        "claude",
+        vec![Window {
+            used: None,
+            resets_at: Some(resets_at() + chrono::TimeDelta::hours(1)),
+            ..window(WindowKind::Weekly, None, LimitStatus::Rejected)
+        }],
+    );
+    let refused = delegation(
+        threads
+            .send_child(
+                ThreadId::MAIN,
+                None,
+                child.thread(),
+                "Et la fenêtre ?".into(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        refused.to_string().starts_with(
+            "the owner's reserve of the weekly window is reached (its limit reached, 30 % kept"
+        ),
+        "{refused}"
+    );
+}
+
+/// The daily counts are the safety net only: with no reading, the sub-agent past
+/// `children_per_day` is refused; with a reading below the line, it starts.
+#[tokio::test]
+async fn counts_apply_only_without_a_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    let limits = Limits {
+        children_per_day: 1,
+        child_turns_per_day: 1,
+        ..Limits::default()
+    };
+    let (threads, _pooled, _requests) = open_reserved(dir.path(), limits, &book).await;
+    let (first, _) = child_of(&threads, ThreadId::MAIN, "Un").await;
+    until_done(&first).await;
+    let refused = delegation(
+        threads
+            .start_child(ThreadId::MAIN, None, task("Deux"))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(refused, Delegation::TooManyToday { limit: 1 });
+    let refused = delegation(
+        threads
+            .send_child(ThreadId::MAIN, None, first.thread(), "Encore".into())
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(refused, Delegation::TooManyTurnsToday { limit: 1 });
+    // A reading with only the 5-hour window decides nothing either.
+    book.record(
+        "claude",
+        vec![window(WindowKind::Session, Some(0.1), LimitStatus::Allowed)],
+    );
+    assert!(matches!(
+        threads.start_child(ThreadId::MAIN, None, task("Deux")).await,
+        Err(error) if error.downcast_ref() == Some(&Delegation::TooManyToday { limit: 1 })
+    ));
+    // Both windows below the line: the reading decides, the counts do not apply.
+    read(&book, 0.1, 0.1);
+    assert!(matches!(
+        threads.background("claude"),
+        fronde_agent::threads::Background::Allowed { .. }
+    ));
+    let (second, _) = child_of(&threads, ThreadId::MAIN, "Deux").await;
+    until_done(&second).await;
+    threads
+        .send_child(ThreadId::MAIN, None, first.thread(), "Encore".into())
+        .await
+        .unwrap();
+    until_done(&first).await;
+}
+
+/// A window reset since its reading ends the pause: what was used since is not known, so the
+/// daily counts decide again.
+#[tokio::test]
+async fn reset_time_ends_the_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    let past = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+    book.record(
+        "claude",
+        vec![
+            Window {
+                resets_at: Some(past),
+                ..window(WindowKind::Session, Some(0.95), LimitStatus::Rejected)
+            },
+            window(WindowKind::Weekly, Some(0.1), LimitStatus::Allowed),
+        ],
+    );
+    let (threads, _pooled, _requests) = open_reserved(dir.path(), Limits::default(), &book).await;
+    assert_eq!(
+        threads.background("claude"),
+        fronde_agent::threads::Background::Unknown
+    );
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    until_done(&child).await;
+}
+
+/// `reserve = "0%"`: a reading past any line pauses nothing, and the counts decide.
+#[tokio::test]
+async fn reserve_zero_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    read(&book, 1.0, 1.0);
+    let limits = Limits {
+        reserve: 0,
+        children_per_day: 1,
+        ..Limits::default()
+    };
+    let (threads, _pooled, _requests) = open_reserved(dir.path(), limits, &book).await;
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Un").await;
+    until_done(&child).await;
+    let refused = delegation(
+        threads
+            .start_child(ThreadId::MAIN, None, task("Deux"))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(refused, Delegation::TooManyToday { limit: 1 });
+}
+
+fn reserve_held(count: u32, window: WindowKind, used: Option<u8>) -> Event {
+    Event::WakesHeld {
+        count,
+        returned: false,
+        reason: HoldReason::Reserve { window, used },
+    }
+}
+
+/// A sub-agent's result that comes once the line is passed wakes nothing: it is held, the
+/// thread says why, and the owner's next message, which runs past the reserve, carries it.
+#[tokio::test]
+async fn reserve_holds_wakes() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    let (threads, pooled, _requests) = open_reserved(dir.path(), Limits::default(), &book).await;
+    pooled.gate(ThreadId(2));
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    pooled.until_held(child.thread()).await;
+    read(&book, 0.72, 0.1);
+    pooled.open(child.thread());
+    until_done(&child).await;
+    let main = threads.main();
+    let held = reserve_held(1, WindowKind::Session, Some(72));
+    wait_until(&main, "the result was never held", |events| {
+        events.contains(&held)
+    })
+    .await;
+    assert_eq!(
+        events(&main),
+        [child_ended(child.thread().0, ANSWER), held.clone()]
+    );
+    assert_ne!(main.status(), ThreadStatus::Running);
+    assert!(prompts(&pooled, ThreadId::MAIN).is_empty(), "not woken");
+
+    main.send("Et alors ?".into()).await;
+    until_done(&main).await;
+    let given = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(given.len(), 1, "{given:?}");
+    assert!(
+        given[0].starts_with("1 sub-agent result(s) came"),
+        "{given:?}"
+    );
+    assert!(given[0].contains(&format!("\n{ANSWER}\n")), "{given:?}");
+    assert!(given[0].ends_with("The message:\nEt alors ?"), "{given:?}");
+    assert_eq!(woken_count(&events(&main)), 0);
+}
+
+/// A result waiting for the parent's turn is held at that turn's end once the line is passed.
+#[tokio::test]
+async fn reserve_holds_wakes_at_a_turns_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    let (threads, pooled, _requests) = open_reserved(dir.path(), Limits::default(), &book).await;
+    pooled.gate(ThreadId::MAIN);
+    let main = threads.main();
+    main.send("Va".into()).await;
+    pooled.until_held(ThreadId::MAIN).await;
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    until_done(&child).await;
+    wait_until(&main, "the result never came", |events| {
+        children_ended(events) == 1
+    })
+    .await;
+    book.record(
+        "claude",
+        vec![window(WindowKind::Weekly, None, LimitStatus::Warning)],
+    );
+    pooled.open(ThreadId::MAIN);
+    until_done(&main).await;
+    let shown = events(&main);
+    assert!(
+        matches!(
+            &shown[shown.len() - 2..],
+            [held, Event::TurnEnded { outcome: TurnOutcome::Done }]
+                if *held == reserve_held(1, WindowKind::Weekly, None)
+        ),
+        "{shown:?}"
+    );
+    assert_eq!(woken_count(&shown), 0);
+    assert_eq!(prompts(&pooled, ThreadId::MAIN).len(), 1, "Va only");
+}
+
+/// The owner's own turn always runs, whatever the reading says: the message reaches the agent
+/// with a window rejected.
+#[tokio::test]
+async fn owner_turn_runs_past_the_reserve() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    book.record(
+        "claude",
+        vec![
+            window(WindowKind::Session, Some(1.0), LimitStatus::Rejected),
+            window(WindowKind::Weekly, Some(1.0), LimitStatus::Rejected),
+        ],
+    );
+    let (threads, pooled, _requests) = open_reserved(dir.path(), Limits::default(), &book).await;
+    assert!(matches!(
+        threads.background("claude"),
+        fronde_agent::threads::Background::Paused(_)
+    ));
+    let other = new_thread(&threads, StartedBy::User).await;
+    for assistant in [threads.main(), other] {
+        assistant.send("Salut".into()).await;
+        until_done(&assistant).await;
+        assert_eq!(
+            prompts(&pooled, assistant.thread()),
+            ["Salut"],
+            "thread {}",
+            assistant.thread()
+        );
+    }
+}
+
+/// A wake a stop left before its prompt is held at the next start when the line is passed; the
+/// hold survives a further restart without a reading, and the owner's next message carries it.
+#[tokio::test]
+async fn reserve_hold_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (connector, _) = fake_connector(FakeScript::default());
+        let threads = open(dir.path(), connector).await;
+        let child = threads
+            .create(
+                "alix",
+                StartedBy::Thread(ThreadId::MAIN),
+                Some(ThreadId::MAIN),
+                "Mesurer",
+            )
+            .await
+            .unwrap();
+        threads
+            .main()
+            .log()
+            .append(child_ended(child.id.0, "83 cm"))
+            .await
+            .unwrap();
+    }
+    let book = UsageBook::in_memory();
+    read(&book, 0.1, 0.9);
+    let held = reserve_held(1, WindowKind::Weekly, Some(90));
+    {
+        let (threads, pooled, _requests) =
+            open_reserved(dir.path(), Limits::default(), &book).await;
+        let main = threads.main();
+        assert_ne!(main.status(), ThreadStatus::Running);
+        assert_eq!(events(&main), [child_ended(2, "83 cm"), held.clone()]);
+        assert!(prompts(&pooled, ThreadId::MAIN).is_empty());
+    }
+    // Restarted without any reading: the result stays held for the owner's message.
+    let (threads, pooled, _requests) =
+        open_reserved(dir.path(), Limits::default(), &UsageBook::in_memory()).await;
+    let main = threads.main();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_ne!(main.status(), ThreadStatus::Running);
+    assert_eq!(events(&main), [child_ended(2, "83 cm"), held]);
+    main.send("Et ?".into()).await;
+    until_done(&main).await;
+    let given = prompts(&pooled, ThreadId::MAIN);
+    assert_eq!(given.len(), 1, "{given:?}");
+    assert!(given[0].contains("\n83 cm\n"), "{given:?}");
+    assert!(given[0].ends_with("The message:\nEt ?"), "{given:?}");
 }

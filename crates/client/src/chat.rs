@@ -2,7 +2,8 @@
 //! APIs, so it is tested natively.
 
 use fronde_protocol::{
-    Card, Entry, Event, Outcome, RequestId, ServerMsg, ThreadId, ToolState, TurnOutcome, WokenBy,
+    Card, Entry, Event, HoldReason, Outcome, RequestId, ServerMsg, ThreadId, ToolState,
+    TurnOutcome, WokenBy,
 };
 
 /// How a tool call ended, as the chat shows it.
@@ -318,7 +319,7 @@ impl Chat {
             // A late answer waiting for the turn's end: the notice logged with it says so, and
             // the owner's message that gives it shows it.
             Event::LateAnswer { .. } => {}
-            Event::WakesHeld { count, .. } => {
+            Event::WakesHeld { count, reason, .. } => {
                 // Every result waiting is held, a wake turn that never gave its prompt included.
                 self.wakes = 0;
                 if self.unwoken {
@@ -328,7 +329,7 @@ impl Chat {
                 self.push(
                     seq,
                     Item::Notice {
-                        text: held_notice(count),
+                        text: held_notice(count, &reason),
                     },
                 );
             }
@@ -427,12 +428,36 @@ pub fn carries_line(count: u32) -> String {
     }
 }
 
-/// What the chat says when `count` sub-agents' results wait for the owner's next message.
-pub fn held_notice(count: u32) -> String {
-    if count == 1 {
-        "1 résultat de sous-agent en attente — envoie un message pour le recevoir".to_owned()
-    } else {
-        format!("{count} résultats de sous-agents en attente — envoie un message pour les recevoir")
+/// What the chat says when `count` sub-agents' results wait for the owner's next message, for
+/// `reason`: past the wake budget or after a Stop, that they wait; past the owner's reserve,
+/// which window reached it.
+pub fn held_notice(count: u32, reason: &HoldReason) -> String {
+    match reason {
+        HoldReason::Reserve { window, used } => {
+            let used = match used {
+                Some(used) => format!(" : {used} %"),
+                None => String::new(),
+            };
+            let held = if count == 1 {
+                "1 résultat de sous-agent gardé".to_owned()
+            } else {
+                format!("{count} résultats de sous-agents gardés")
+            };
+            format!(
+                "{held} pour ton prochain message : réserve de quota atteinte ({}{used})",
+                crate::usage::window_label(window)
+            )
+        }
+        HoldReason::Budget | HoldReason::Stopped => {
+            if count == 1 {
+                "1 résultat de sous-agent en attente — envoie un message pour le recevoir"
+                    .to_owned()
+            } else {
+                format!(
+                    "{count} résultats de sous-agents en attente — envoie un message pour les recevoir"
+                )
+            }
+        }
     }
 }
 
@@ -651,6 +676,7 @@ mod tests {
                     Event::WakesHeld {
                         count: 1,
                         returned: false,
+                        reason: Default::default(),
                     },
                 ),
             ],
@@ -667,6 +693,7 @@ mod tests {
                     Event::WakesHeld {
                         count: 2,
                         returned: false,
+                        reason: Default::default(),
                     },
                 ),
                 ended(6, TurnOutcome::Cancelled),
@@ -705,6 +732,52 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Past the owner's reserve, the notice says which window reached it; the other reasons
+    /// keep the wake budget's words.
+    #[test]
+    fn held_notice_says_why() {
+        use fronde_protocol::usage::WindowKind;
+        let reserve = HoldReason::Reserve {
+            window: WindowKind::Session,
+            used: Some(72),
+        };
+        assert_eq!(
+            held_notice(1, &reserve),
+            "1 résultat de sous-agent gardé pour ton prochain message : réserve de quota atteinte (5 h : 72 %)"
+        );
+        let weekly = HoldReason::Reserve {
+            window: WindowKind::Weekly,
+            used: None,
+        };
+        assert_eq!(
+            held_notice(2, &weekly),
+            "2 résultats de sous-agents gardés pour ton prochain message : réserve de quota atteinte (semaine)"
+        );
+        assert_eq!(
+            held_notice(2, &HoldReason::Stopped),
+            held_notice(2, &HoldReason::Budget)
+        );
+        let mut chat = Chat::default();
+        apply_all(
+            &mut chat,
+            [
+                child_ended(1, 7),
+                entry(
+                    2,
+                    Event::WakesHeld {
+                        count: 1,
+                        returned: false,
+                        reason: reserve.clone(),
+                    },
+                ),
+            ],
+        );
+        assert!(!chat.running());
+        assert!(items(&chat).contains(&Item::Notice {
+            text: held_notice(1, &reserve)
+        }));
     }
 
     #[test]

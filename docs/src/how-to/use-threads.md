@@ -97,9 +97,10 @@ the message names the setting, in `[threads]` of `fronde.toml`:
 [threads]
 max_depth = 1             # 0: no sub-agents; 2: a sub-agent may start its own
 children_running = 3      # per thread, at once
-children_per_day = 30     # all threads together, in 24 hours
+reserve = "30%"           # of each subscription window kept for you; "0%": off
+children_per_day = 30     # all threads together, in 24 hours, without a usage reading
 children_kept = 200       # per thread, not archived
-child_turns_per_day = 100 # each task and each threads_send, all threads, in 24 hours
+child_turns_per_day = 100 # each task and each threads_send, all threads, 24 hours, same
 child_turn_timeout = "30m" # also caps an answer a sub-agent's result started
 wakes_without_owner = 10  # answers to sub-agents' results in a row without your message
 ```

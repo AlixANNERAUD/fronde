@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use fronde_agent::assistant::{AdminFromSubAgent, LastingInWake, SecretInWake};
-use fronde_agent::threads::{ChildEnd, ChildTask, Delegation, ThreadId, Threads};
+use fronde_agent::threads::{Background, ChildEnd, ChildTask, Delegation, ThreadId, Threads};
 use fronde_hub::threads::{
     Child, NewChild, ProviderModels, ReadThread, Started, ThreadControl, ThreadError, Waited,
 };
@@ -34,15 +34,32 @@ fn hub_error(error: anyhow::Error) -> ThreadError {
     }
 }
 
+/// Whether background work may run, as `threads_list` tells an agent before it tries.
+pub fn background_text(background: &Background) -> String {
+    match background {
+        Background::Allowed { .. } => "allowed".to_owned(),
+        Background::Paused(pause) => match pause.resets_at {
+            Some(at) => format!("paused until {}", at.format("%Y-%m-%d %H:%M UTC")),
+            None => "paused".to_owned(),
+        },
+        Background::Unknown => "unknown".to_owned(),
+    }
+}
+
 #[async_trait]
 impl ThreadControl for ThreadBridge {
     async fn delegation(&self, caller: ThreadId) -> Result<(), ThreadError> {
         self.0.check_delegate(caller).await.map_err(hub_error)
     }
 
-    async fn providers(&self) -> Result<Vec<ProviderModels>, ThreadError> {
+    async fn providers(&self, caller: ThreadId) -> Result<Vec<ProviderModels>, ThreadError> {
+        let Some(caller) = self.0.get(caller).await.map_err(hub_error)? else {
+            return Err(ThreadError::NoSuchThread);
+        };
         let mut providers = Vec::new();
         for id in self.0.providers() {
+            // The account a sub-agent of the caller would spend on this provider.
+            let account = fronde_agent::usage::account_of(&caller.owner, id);
             let models = self.0.models(id).await.map_err(hub_error)?;
             providers.push(ProviderModels {
                 id: id.to_owned(),
@@ -50,6 +67,7 @@ impl ThreadControl for ThreadBridge {
                     .into_iter()
                     .map(|model| (model.id, model.name))
                     .collect(),
+                background: background_text(&self.0.background(&account)),
             });
         }
         Ok(providers)

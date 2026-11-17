@@ -56,6 +56,9 @@ struct Bench {
     gate: Arc<Notify>,
     /// The data directory.
     data: std::path::PathBuf,
+    /// The usage readings the threads decide background work from: none until a test records
+    /// one.
+    usage: Arc<fronde_agent::usage::UsageBook>,
     _dir: tempfile::TempDir,
 }
 
@@ -106,6 +109,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         }
     });
     let main = thread_dirs(&data, ThreadId::MAIN);
+    let usage = fronde_agent::usage::UsageBook::in_memory();
     let spec = AgentSpec {
         thread: ThreadId::MAIN,
         provider: &fronde_agent::provider::Provider::CLAUDE,
@@ -118,7 +122,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         oauth_token: None,
         system_prompt: String::new(),
         builtin_tools: Vec::new(),
-        usage: None,
+        usage: Some(usage.clone()),
     };
     let threads = Threads::open_with(db.clone(), &data, spec, connector, alix(), budget)
         .await
@@ -200,6 +204,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         fakes,
         gate: Arc::new(Notify::new()),
         data,
+        usage,
         _dir: dir,
     }
 }
@@ -1585,7 +1590,7 @@ async fn threads_list_shows_children_and_models() {
     assert!(children[0]["status"].is_string());
     assert_eq!(
         listed["result"]["providers"],
-        json!([{"id": "claude", "models": [
+        json!([{"id": "claude", "background": "unknown", "models": [
             {"id": "fake-small", "name": "fake small"},
             {"id": "fake-large", "name": "fake large"},
         ]}])
@@ -2073,15 +2078,18 @@ fn the_limits_come_from_threads_config() {
             child_turns_per_day: 100,
             child_turn_timeout: Duration::from_secs(30 * 60),
             wakes_without_owner: 10,
+            reserve: 30,
         }
     );
     assert_eq!(
         fronde::children_line(&config("")),
-        "your threads may start sub-agents, theirs may not; 3 running at once per thread, 30 a \
-         day in all (100 turns), 200 kept per thread, 30m per turn, 10 wakes in a row without you"
+        "your threads may start sub-agents, theirs may not; 3 running at once per thread, 200 \
+         kept per thread, 30m per turn, 10 wakes in a row without you; 30% of each subscription \
+         window kept for you; 30 a day in all (100 turns), daily counts apply only without a \
+         usage reading"
     );
     let set = config(
-        "[threads]\nmax_depth = 2\nchildren_running = 5\nchildren_per_day = 50\nchildren_kept = 80\nchild_turns_per_day = 70\nchild_turn_timeout = \"1h\"\nwakes_without_owner = 4\n",
+        "[threads]\nmax_depth = 2\nchildren_running = 5\nchildren_per_day = 50\nchildren_kept = 80\nchild_turns_per_day = 70\nchild_turn_timeout = \"1h\"\nwakes_without_owner = 4\nreserve = \"15%\"\n",
     );
     assert_eq!(
         fronde::budget(&set).limits,
@@ -2093,7 +2101,13 @@ fn the_limits_come_from_threads_config() {
             child_turns_per_day: 70,
             child_turn_timeout: Duration::from_secs(3600),
             wakes_without_owner: 4,
+            reserve: 15,
         }
+    );
+    assert!(
+        fronde::children_line(&config("[threads]\nreserve = \"0%\"\n"))
+            .ends_with("no reserve kept for you (reserve = \"0%\"); 30 a day in all (100 turns)"),
+        "reserve off"
     );
     assert!(
         fronde::children_line(&set).starts_with("sub-agents go 2 levels deep"),
@@ -2900,6 +2914,90 @@ async fn a_wake_turn_asks_no_secret_and_names_its_sub_agent() {
     );
     bench.requests.cancel(id).await.unwrap();
     asked.await.unwrap();
+    bench.gate.notify_waiters();
+}
+
+/// Both guarded windows read, the 5-hour one at `session` and the weekly one at `weekly`,
+/// resetting at `resets_at`.
+fn reading(
+    session: f64,
+    weekly: f64,
+    resets_at: chrono::DateTime<chrono::Utc>,
+) -> Vec<fronde_protocol::usage::Window> {
+    use fronde_protocol::usage::{LimitStatus, Window, WindowKind};
+    [(WindowKind::Session, session), (WindowKind::Weekly, weekly)]
+        .into_iter()
+        .map(|(kind, used)| Window {
+            kind,
+            used: Some(used),
+            status: Some(LimitStatus::Allowed),
+            resets_at: Some(resets_at),
+            as_of: chrono::Utc::now(),
+            reset_since_reading: false,
+        })
+        .collect()
+}
+
+/// The reserve is Fronde's: an agent calling `threads_start` or `threads_send` through the hub,
+/// in a turn the owner's own message started, is refused past the line with the setting named,
+/// and nothing starts.
+#[tokio::test]
+async fn reserve_refusal_is_server_side() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    // Its turn held open: the reserve is checked before whether the sub-agent is busy.
+    let child = start_child(&main, TASK).await;
+    let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+    bench.usage.record("claude", reading(0.75, 0.2, resets_at));
+    let refused = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": "Une de plus."}}),
+    )
+    .await;
+    let expected = "the owner's reserve of the 5-hour window is reached (75 % used, 30 % kept for \
+                    the owner, the setting [threads] reserve); it resets at 2100-01-01 00:00 UTC; \
+                    sub-agents can neither start nor get messages until then: do the task \
+                    yourself or tell the user";
+    assert_eq!(refused, json!({"error": expected}), "{refused}");
+    let refused = call(
+        &main,
+        "threads_send",
+        json!({"arguments": {"thread": child.0, "text": "Encore."}}),
+    )
+    .await;
+    assert_eq!(refused, json!({"error": expected}), "{refused}");
+    assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 1);
+    bench.gate.notify_waiters();
+}
+
+/// `threads_list` tells an agent whether background work may run on each provider before it
+/// tries: unknown without a reading, allowed below the line, paused until the reset past it.
+#[tokio::test]
+async fn threads_list_says_whether_background_may_run() {
+    let bench = held_bench().await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let background = |listed: &Value| listed["result"]["providers"][0]["background"].clone();
+    let listed = call(&main, "threads_list", json!({})).await;
+    assert_eq!(background(&listed), "unknown", "{listed}");
+    let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+    bench.usage.record("claude", reading(0.1, 0.2, resets_at));
+    let listed = call(&main, "threads_list", json!({})).await;
+    assert_eq!(background(&listed), "allowed", "{listed}");
+    bench.usage.record(
+        "claude",
+        reading(0.1, 0.95, resets_at + chrono::TimeDelta::hours(1)),
+    );
+    let listed = call(&main, "threads_list", json!({})).await;
+    assert_eq!(
+        background(&listed),
+        "paused until 2100-01-01 01:00 UTC",
+        "{listed}"
+    );
     bench.gate.notify_waiters();
 }
 

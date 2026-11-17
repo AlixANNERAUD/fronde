@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fronde_entity::{stream_entries, threads};
+use fronde_protocol::usage::{Background, LimitStatus, Pause as UsagePause, WindowKind};
 use fronde_protocol::{ThreadStatus, ThreadSummary};
 use sea_orm::sea_query::{Expr, ExprTrait};
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -48,6 +49,9 @@ pub const DEFAULT_CHILD_TURNS_PER_DAY: usize = 100;
 /// Turns a thread may be woken by its sub-agents' results in a row without the owner, by
 /// default.
 pub const DEFAULT_WAKES_WITHOUT_OWNER: usize = 10;
+
+/// The share of each subscription window kept for the owner, in percent, by default.
+pub const DEFAULT_RESERVE: u8 = 30;
 
 /// How long a sub-agent's turn may run once its agent has it, by default.
 pub const DEFAULT_CHILD_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -86,6 +90,12 @@ pub struct Limits {
     /// Turns a thread may be woken by its sub-agents' results since the owner's last message;
     /// later results wait for the owner's next message, which carries them.
     pub wakes_without_owner: usize,
+    /// The share of each guarded subscription window kept for the owner, in percent (0 to
+    /// 100): past the line, sub-agents are neither started nor sent messages and their results
+    /// are held for the owner's next message. With it deciding, `children_per_day` and
+    /// `child_turns_per_day` do not apply; they do when no usage reading decides
+    /// ([`Background::Unknown`]). 0 turns it off.
+    pub reserve: u8,
 }
 
 impl Default for Limits {
@@ -98,6 +108,7 @@ impl Default for Limits {
             child_turns_per_day: DEFAULT_CHILD_TURNS_PER_DAY,
             child_turn_timeout: DEFAULT_CHILD_TURN_TIMEOUT,
             wakes_without_owner: DEFAULT_WAKES_WITHOUT_OWNER,
+            reserve: DEFAULT_RESERVE,
         }
     }
 }
@@ -506,6 +517,29 @@ pub enum Delegation {
     Provider { given: String, configured: String },
     /// The caller's turn that made the call ended before it went through.
     TurnOver,
+    /// The owner's reserve of a subscription window is reached (`[threads] reserve`): `window`,
+    /// its use in percent and status as read, the reserve in percent and when the window resets.
+    Reserve {
+        window: WindowKind,
+        used: Option<u8>,
+        status: Option<LimitStatus>,
+        reserve: u8,
+        resets_at: Option<DateTime<Utc>>,
+    },
+}
+
+impl Delegation {
+    /// The refusal of a start or a send while `pause` holds background work, under a reserve
+    /// of `reserve` percent.
+    pub fn reserve(pause: UsagePause, reserve: u8) -> Self {
+        Self::Reserve {
+            used: pause.used_percent(),
+            window: pause.window,
+            status: pause.status,
+            reserve,
+            resets_at: pause.resets_at,
+        }
+    }
 }
 
 impl std::fmt::Display for Delegation {
@@ -561,6 +595,37 @@ impl std::fmt::Display for Delegation {
             Self::TurnOver => f.write_str(
                 "your turn ended before this call went through: nothing was started or sent",
             ),
+            Self::Reserve {
+                window,
+                used,
+                status,
+                reserve,
+                resets_at,
+            } => {
+                let what = match window {
+                    WindowKind::Extra => "paid extra usage is being spent".to_owned(),
+                    window => format!(
+                        "the owner's reserve of the {} is reached",
+                        window.describe()
+                    ),
+                };
+                let used = match (used, status) {
+                    (Some(used), _) => format!("{used} % used, "),
+                    (None, Some(LimitStatus::Rejected)) => "its limit reached, ".to_owned(),
+                    (None, Some(LimitStatus::Warning)) => {
+                        "close to its limit, no percentage given, ".to_owned()
+                    }
+                    (None, _) => String::new(),
+                };
+                let reset = match resets_at {
+                    Some(at) => format!("it resets at {}", at.format("%Y-%m-%d %H:%M UTC")),
+                    None => "its reset time is not known".to_owned(),
+                };
+                write!(
+                    f,
+                    "{what} ({used}{reserve} % kept for the owner, the setting [threads] reserve); {reset}; sub-agents can neither start nor get messages until then: do the task yourself or tell the user"
+                )
+            }
         }
     }
 }
@@ -607,6 +672,24 @@ impl Threads {
     /// What threads may do with sub-agents.
     pub fn limits(&self) -> Limits {
         self.children.limits
+    }
+
+    /// Whether background work may spend subscription account `account` now
+    /// ([`Threads::account`]), under [`Limits::reserve`]: [`Background::Unknown`] without a
+    /// usage book or a reading.
+    pub fn background(&self, account: &str) -> Background {
+        let usage = self.spec.usage.as_ref().and_then(|book| book.get(account));
+        fronde_protocol::usage::background(usage.as_ref(), self.limits().reserve, Utc::now())
+    }
+
+    /// Refuses background work past the owner's reserve of `account`; whether the daily counts
+    /// apply: only when no usage reading decides.
+    fn check_reserve(&self, account: &str) -> Result<bool, Delegation> {
+        match self.background(account) {
+            Background::Paused(pause) => Err(Delegation::reserve(pause, self.limits().reserve)),
+            Background::Allowed { .. } => Ok(false),
+            Background::Unknown => Ok(true),
+        }
     }
 
     /// How deep a thread may be and still start sub-agents.
@@ -672,30 +755,68 @@ impl Threads {
             .collect())
     }
 
-    /// How many sub-agents all threads together started since `since`, archived ones included.
-    async fn started_since(&self, since: chrono::DateTime<Utc>) -> anyhow::Result<u64> {
-        Ok(threads::Entity::find()
+    /// How many sub-agents on subscription account `account` all threads together started
+    /// since `since`, archived ones included.
+    async fn started_since(
+        &self,
+        account: &str,
+        since: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        let started = threads::Entity::find()
             .filter(threads::Column::StartedBy.starts_with("thread:"))
             .filter(threads::Column::CreatedAt.gt(since))
-            .count(&self.db)
-            .await?)
+            .all(&self.db)
+            .await?;
+        let on_account = started
+            .iter()
+            .filter(|row| crate::usage::account_of(&row.owner, &row.provider) == account)
+            .count();
+        Ok(u64::try_from(on_account).unwrap_or(u64::MAX))
     }
 
-    /// How many turns of sub-agents all threads together started since `since`: the messages
-    /// a thread wrote (a task, or a `threads_send`), read from the streams.
-    async fn turns_since(&self, since: chrono::DateTime<Utc>) -> anyhow::Result<u64> {
-        Ok(stream_entries::Entity::find()
+    /// How many turns of sub-agents on subscription account `account` all threads together
+    /// started since `since`: the messages a thread wrote (a task, or a `threads_send`), read
+    /// from the streams, by the account of the thread each went to.
+    async fn turns_since(
+        &self,
+        account: &str,
+        since: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        let by_topic: Vec<(String, i64)> = stream_entries::Entity::find()
+            .select_only()
+            .column(stream_entries::Column::Topic)
+            .column_as(stream_entries::Column::Seq.count(), "turns")
             .filter(stream_entries::Column::At.gt(since))
             .filter(Expr::cust("json_extract(event, '$.type')").eq("user"))
             .filter(Expr::cust("json_extract(event, '$.by')").is_not_null())
-            .count(&self.db)
-            .await?)
+            .group_by(stream_entries::Column::Topic)
+            .into_tuple()
+            .all(&self.db)
+            .await?;
+        if by_topic.is_empty() {
+            return Ok(0);
+        }
+        let accounts: HashMap<String, String> = threads::Entity::find()
+            .filter(threads::Column::Topic.is_in(by_topic.iter().map(|(topic, _)| topic.clone())))
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let account = crate::usage::account_of(&row.owner, &row.provider);
+                (row.topic, account)
+            })
+            .collect();
+        Ok(by_topic
+            .into_iter()
+            .filter(|(topic, _)| accounts.get(topic).is_some_and(|on| on == account))
+            .map(|(_, turns)| u64::try_from(turns).unwrap_or(0))
+            .sum())
     }
 
-    /// Refuses a new turn of a sub-agent past [`Limits::child_turns_per_day`].
-    async fn check_turns_today(&self) -> anyhow::Result<()> {
+    /// Refuses a new turn of a sub-agent on `account` past [`Limits::child_turns_per_day`].
+    async fn check_turns_today(&self, account: &str) -> anyhow::Result<()> {
         let limit = self.limits().child_turns_per_day;
-        let today = self.turns_since(Utc::now() - DAY).await?;
+        let today = self.turns_since(account, Utc::now() - DAY).await?;
         if today >= u64::try_from(limit).unwrap_or(u64::MAX) {
             bail!(Delegation::TooManyTurnsToday { limit });
         }
@@ -832,7 +953,11 @@ impl Threads {
         // The sub-agent's turn follows what the calling turn followed: a turn of wake origin
         // gives its own to it (see `Assistant::origin_of`).
         let origin = self.opened(parent).await?.origin_of(turn).await?;
-        // Under the start lock: two starts never both pass.
+        // Under the start lock: two starts never both pass. The owner's reserve first, from
+        // Fronde's own book: nothing the agent says changes it.
+        // The sub-agent spends the account of its parent's owner on its provider.
+        let account = crate::usage::account_of(&parent_row.owner, &provider);
+        let counts = self.check_reserve(&account)?;
         let limits = self.limits();
         let kept = self.kept_children(parent).await?;
         if self.running_among(&kept).await >= limits.children_running {
@@ -845,13 +970,16 @@ impl Threads {
                 limit: limits.children_kept
             });
         }
-        let today = self.started_since(Utc::now() - DAY).await?;
-        if today >= u64::try_from(limits.children_per_day).unwrap_or(u64::MAX) {
-            bail!(Delegation::TooManyToday {
-                limit: limits.children_per_day
-            });
+        // The daily counts are the safety net when no usage reading decides.
+        if counts {
+            let today = self.started_since(&account, Utc::now() - DAY).await?;
+            if today >= u64::try_from(limits.children_per_day).unwrap_or(u64::MAX) {
+                bail!(Delegation::TooManyToday {
+                    limit: limits.children_per_day
+                });
+            }
+            self.check_turns_today(&account).await?;
         }
-        self.check_turns_today().await?;
         Pauses::at(&self.children.pauses.start).await;
         let transaction = fronde_db::begin_write(&self.db).await?;
         let mut row = self
@@ -977,12 +1105,16 @@ impl Threads {
         // sub-agent itself is idle, or the send is refused below as busy.
         let _starting = self.children.starting.lock().await;
         self.check_delegate(caller).await?;
+        let account = Self::account(&row);
+        let counts = self.check_reserve(&account)?;
         let kept = self.kept_children(caller).await?;
         let limit = self.limits().children_running;
         if self.running_among(&kept).await >= limit {
             bail!(Delegation::TooManyRunning { limit });
         }
-        self.check_turns_today().await?;
+        if counts {
+            self.check_turns_today(&account).await?;
+        }
         let origin = self.opened(caller).await?.origin_of(turn).await?;
         let by = self.get(caller).await?.map(|caller| caller.title);
         let assistant = self.opened(row.id).await?;
