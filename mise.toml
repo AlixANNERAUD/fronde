@@ -50,6 +50,8 @@ depends = ["web-css", "components"]
 run = [
   "cargo fmt --all --check",
   "cargo clippy $FRONDE_SERVER_PACKAGES --all-targets -- -D warnings",
+  # Without dev-dependencies, so a `testing`-only item used by the binary fails here.
+  "cargo clippy $FRONDE_SERVER_PACKAGES -- -D warnings",
   "cargo clippy --package fronde-web --all-targets -- -D warnings",
   "cargo clippy --package fronde-web --target wasm32-unknown-unknown -- -D warnings",
   # The SDK carries a copy of the frozen WIT it targets.
