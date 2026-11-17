@@ -129,8 +129,8 @@ struct Session {
     client: Arc<AgentClient>,
     flushes: UnboundedSender<oneshot::Sender<()>>,
     /// The agent process's hub token: revoked once the last clone of the session is dropped,
-    /// with the client that stops the process.
-    _lease: Arc<TokenLease>,
+    /// with the client that stops the process, or at once by [`Assistant::retire`].
+    lease: Arc<TokenLease>,
     /// Its place among the agents running at once, freed with it.
     _slot: Arc<Slot>,
 }
@@ -632,9 +632,12 @@ impl Assistant {
             }
         }
         let saved = self.saved_session_id().await;
-        let lease = self.tokens.issue(self.thread)?;
+        let mut lease = self.tokens.issue(self.thread)?;
         let mut spec = self.spec.clone();
-        spec.hub_token = lease.token().clone();
+        // Only the spec, dropped once the agent started, holds the token itself.
+        spec.hub_token = lease
+            .take_token()
+            .context("a new token lease holds its token")?;
         let (events, agent_events) = mpsc::unbounded_channel();
         let client = (self.connector)(&spec, saved.clone(), events).await?;
         let id = client.session_id();
@@ -661,7 +664,7 @@ impl Assistant {
         let session = Session {
             client,
             flushes,
-            _lease: Arc::new(lease),
+            lease: Arc::new(lease),
             _slot: Arc::new(slot),
         };
         // In its slot before its events are read: a connection that ended at once finds it.
@@ -682,6 +685,21 @@ impl Assistant {
             timer.cancel();
         }
         self.session_slot().take().is_some()
+    }
+
+    /// Lets the thread's agent go for good, as archiving does: cancels the running turn, if
+    /// any, and revokes the agent's hub token at once; its process stops when the turn has
+    /// ended, or now when no turn runs.
+    pub(crate) async fn retire(&self) {
+        self.cancel().await;
+        if let Some(timer) = lock(&self.idle_timer).take() {
+            timer.cancel();
+        }
+        let session = self.session_slot().take();
+        if let Some(session) = session {
+            session.lease.revoke();
+            tracing::info!("the agent of thread {} was let go", self.thread);
+        }
     }
 
     /// Whether the thread's agent process is running, as far as Fronde knows.

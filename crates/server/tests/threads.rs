@@ -3,7 +3,7 @@
 
 use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::{Assistant, Connector};
-use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
+use fronde_agent::fake::{FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::Event;
 use fronde_agent::threads::{StartedBy, ThreadId, Threads, thread_dirs};
 use fronde_db::ephemeral::EphemeralSecrets;
@@ -42,6 +42,8 @@ struct Bench {
     requests: Arc<Requests>,
     /// Each agent start's thread and hub token, in order.
     starts: Arc<Mutex<Vec<(ThreadId, String)>>>,
+    /// Each agent start's fake agent, in order.
+    fakes: Arc<Mutex<Vec<FakeHandle>>>,
     /// Releases the turns the fake agents hold open.
     gate: Arc<Notify>,
     _dir: tempfile::TempDir,
@@ -66,16 +68,18 @@ async fn bench(script: FakeScript) -> Bench {
     fronde_hub::private::prepare_data_dir(&data).unwrap();
     let db = fronde_db::open(&data).await.unwrap();
     let starts: Arc<Mutex<Vec<(ThreadId, String)>>> = Arc::default();
+    let fakes: Arc<Mutex<Vec<FakeHandle>>> = Arc::default();
     let connector: Connector = Arc::new({
-        let starts = starts.clone();
+        let (starts, fakes) = (starts.clone(), fakes.clone());
         move |spec: &AgentSpec, resume, events| {
             starts
                 .lock()
                 .unwrap()
                 .push((spec.thread, spec.hub_token.expose_secret().to_owned()));
-            let (spec, script) = (spec.clone(), script.clone());
+            let (spec, script, fakes) = (spec.clone(), script.clone(), fakes.clone());
             Box::pin(async move {
-                let (transport, _handle) = fake_agent(script);
+                let (transport, handle) = fake_agent(script);
+                fakes.lock().unwrap().push(handle);
                 AgentClient::connect(transport, &spec, resume, events).await
             })
         }
@@ -152,6 +156,7 @@ async fn bench(script: FakeScript) -> Bench {
         threads,
         requests,
         starts,
+        fakes,
         gate: Arc::new(Notify::new()),
         _dir: dir,
     }
@@ -571,4 +576,137 @@ async fn ephemeral_secret_stays_in_its_thread() {
     );
     assert!(call(&main, "test_take_secret", take).await["error"].is_string());
     bench.gate.notify_waiters();
+}
+
+/// The fake agent of the latest start, once it connected.
+async fn latest_fake(bench: &Bench, count: usize) -> FakeHandle {
+    timeout(WAIT, async {
+        loop {
+            if let Some(handle) = bench.fakes.lock().unwrap().get(count - 1) {
+                return handle.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the fake agent never started")
+}
+
+/// An agent process that exits on its own while idle (a crash, say) loses its token: Fronde
+/// sees its connection end, and `/mcp` refuses the token.
+#[tokio::test]
+async fn an_agent_that_exits_on_its_own_loses_its_token() {
+    let bench = bench(FakeScript::default()).await;
+    let second = bench.new_thread().await;
+    let token = bench.start(second).await;
+    let assistant = bench.assistant(second).await;
+    until_idle(&assistant).await;
+    assert!(assistant.agent_running());
+    assert_eq!(bench.status(&token).await, 200);
+
+    latest_fake(&bench, 1).await.exit();
+    timeout(WAIT, async {
+        while assistant.agent_running() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Fronde never saw the agent exit");
+    assert_eq!(bench.status(&token).await, 401);
+    assert!(bench.threads.tokens().is_empty());
+    // The next message starts it again, with a new token.
+    let again = bench.start(second).await;
+    assert_ne!(again, token);
+    assert_eq!(bench.status(&again).await, 200);
+}
+
+/// Archiving a thread lets its agent go: its running turn is cancelled, its token refused at
+/// once, its process stopped; an idle agent goes the same way.
+#[tokio::test]
+async fn archiving_a_thread_stops_its_agent_and_revokes_its_token() {
+    let bench = Bench::held().await;
+    let second = bench.new_thread().await;
+    let token = bench.start(second).await;
+    let assistant = bench.assistant(second).await;
+    let fake = latest_fake(&bench, 1).await;
+    assert!(assistant.current_turn().await.is_some());
+    assert_eq!(bench.status(&token).await, 200);
+
+    bench.threads.set_archived(second, true).await.unwrap();
+    assert_eq!(bench.status(&token).await, 401);
+    assert!(!assistant.agent_running());
+    bench.gate.notify_waiters();
+    until_idle(&assistant).await;
+    timeout(WAIT, async {
+        while !fake.record().closed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the archived thread's agent never stopped");
+    assert!(fake.record().cancels >= 1);
+    assert!(bench.threads.tokens().is_empty());
+
+    // An idle agent.
+    let bench = bench_idle().await;
+    let third = bench.new_thread().await;
+    let token = bench.start(third).await;
+    let assistant = bench.assistant(third).await;
+    until_idle(&assistant).await;
+    let fake = latest_fake(&bench, 1).await;
+    assert_eq!(bench.status(&token).await, 200);
+    bench.threads.set_archived(third, true).await.unwrap();
+    assert_eq!(bench.status(&token).await, 401);
+    timeout(WAIT, async {
+        while !fake.record().closed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the archived thread's idle agent never stopped");
+}
+
+async fn bench_idle() -> Bench {
+    bench(FakeScript::default()).await
+}
+
+/// An MCP session is used only with the token that opened it: another valid token, an agent's
+/// or `server.token`, gets 403 in it.
+#[tokio::test]
+async fn an_mcp_session_keeps_the_token_that_opened_it() {
+    let bench = bench(FakeScript::default()).await;
+    let second = bench.new_thread().await;
+    let agent = bench.start(second).await;
+    let assistant = bench.assistant(second).await;
+    until_idle(&assistant).await;
+    let post = |token: &str, session: Option<&str>, body: &'static str| {
+        let mut request = reqwest::Client::new()
+            .post(format!("http://{}/mcp", bench.addr))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(body);
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        request.send()
+    };
+    const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    let opened = post(&agent, None, INITIALIZE).await.unwrap();
+    assert_eq!(opened.status(), 200);
+    let session = opened.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for other in [TOKEN.to_owned(), bench.start(ThreadId::MAIN).await] {
+        let refused = post(&other, Some(&session), INITIALIZED).await.unwrap();
+        assert_eq!(refused.status(), 403, "{other}");
+    }
+    // The token that opened it goes on.
+    let went_on = post(&agent, Some(&session), INITIALIZED).await.unwrap();
+    assert!(went_on.status().is_success(), "{}", went_on.status());
+    // So does another session, opened by the other token.
+    let outside = post(TOKEN, None, INITIALIZE).await.unwrap();
+    assert_eq!(outside.status(), 200);
 }

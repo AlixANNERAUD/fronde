@@ -791,3 +791,51 @@ async fn idle_agent_stops_and_resumes() {
     tokio::time::resume();
     assert_eq!(pooled.handles(main.thread()).len(), 2);
 }
+
+/// A thread's directory left from an earlier database (restored from a backup, or made anew)
+/// is moved aside before a new thread takes its id: the new agent never finds the old one's
+/// files.
+#[tokio::test]
+async fn a_new_thread_never_inherits_an_earlier_threads_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let leftover = dir.path().join("threads/2/home/.claude/projects/old.jsonl");
+    std::fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+    std::fs::write(&leftover, "an earlier conversation").unwrap();
+    let (connector, _) = fake_connector(FakeScript::default());
+    let threads = open(dir.path(), connector).await;
+
+    let row = threads
+        .create("alix", StartedBy::User, None, "Nouveau")
+        .await
+        .unwrap();
+    assert_eq!(row.id, ThreadId(2));
+    assert!(!dir.path().join("threads/2").exists());
+    let aside: Vec<_> = std::fs::read_dir(dir.path().join("threads"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(aside[0].starts_with("2.old-"), "{aside:?}");
+    let kept = dir
+        .path()
+        .join("threads")
+        .join(&aside[0])
+        .join("home/.claude/projects/old.jsonl");
+    assert_eq!(
+        std::fs::read_to_string(kept).unwrap(),
+        "an earlier conversation"
+    );
+
+    // Its agent starts in fresh directories.
+    let thread = threads.assistant(row.id).await.unwrap().unwrap();
+    thread.send("Salut".into()).await;
+    wait_for_turns(&thread, 1).await;
+    assert!(dir.path().join("threads/2/work").is_dir());
+    assert!(!dir.path().join("threads/2/home/.claude").exists());
+    // A thread whose directory is not there takes its id as usual.
+    let next = threads
+        .create("alix", StartedBy::User, None, "Encore")
+        .await
+        .unwrap();
+    assert_eq!(next.id, ThreadId(3));
+}

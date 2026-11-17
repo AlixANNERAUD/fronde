@@ -64,6 +64,9 @@ pub enum Caller {
     /// An MCP client other than Fronde's agents, by the name it gave (`clientInfo.name`).
     Mcp(String),
     Source(String),
+    /// A stored caller this version does not know, as stored. Never trusted: its requests are
+    /// cancelled when Fronde starts, it can never be answered, and it owns no secret.
+    Unknown(String),
 }
 
 /// How a thread's agent was stored before threads: it was the main thread's.
@@ -76,11 +79,12 @@ impl Caller {
             Self::Thread(id) => format!("thread:{id}"),
             Self::Mcp(name) => format!("mcp:{name}"),
             Self::Source(name) => format!("source:{name}"),
+            Self::Unknown(stored) => stored.clone(),
         }
     }
 
     /// The caller stored as `id`. A row from before threads (`assistant`) reads as the main
-    /// thread's, as does anything else unknown, as before.
+    /// thread's; anything else this version does not know is [`Caller::Unknown`].
     pub fn parse(id: &str) -> Self {
         if let Some(name) = id.strip_prefix("mcp:") {
             Self::Mcp(name.into())
@@ -88,11 +92,10 @@ impl Caller {
             Self::Source(name.into())
         } else if let Some(thread) = id.strip_prefix("thread:").and_then(|n| n.parse().ok()) {
             Self::Thread(ThreadId(thread))
-        } else {
-            if id != LEGACY_ASSISTANT {
-                tracing::warn!("a request's caller {id:?} is unknown: read as the main thread");
-            }
+        } else if id == LEGACY_ASSISTANT {
             Self::Thread(ThreadId::MAIN)
+        } else {
+            Self::Unknown(id.into())
         }
     }
 
@@ -106,7 +109,7 @@ impl Caller {
     pub fn from(&self) -> Option<&str> {
         match self {
             Self::Thread(_) => None,
-            Self::Mcp(name) | Self::Source(name) => Some(name),
+            Self::Mcp(name) | Self::Source(name) | Self::Unknown(name) => Some(name),
         }
     }
 }
@@ -372,6 +375,22 @@ impl Requests {
                 }
                 continue;
             }
+            // A caller this version does not know is never trusted with an answer.
+            if let Caller::Unknown(caller) = Caller::parse(&row.caller) {
+                tracing::warn!(
+                    "request {} was asked by an unknown caller {caller:?}: cancelled",
+                    row.id
+                );
+                match row_id(&row) {
+                    Ok(id) => {
+                        if let Err(error) = requests.cancel(id).await {
+                            tracing::error!("cannot cancel request {id}: {error:#}");
+                        }
+                    }
+                    Err(error) => tracing::error!("request {}: {error:#}", row.id),
+                }
+                continue;
+            }
             // One row this version cannot show must not keep Fronde from starting.
             if let Err(error) = requests.reopen(&row).await {
                 tracing::error!("cannot reopen request {}, cancelling it: {error:#}", row.id);
@@ -513,6 +532,11 @@ impl Requests {
         if row.status != PENDING {
             return Err(Refusal::Closed);
         }
+        // An asker this version does not know is never answered: its request is cancelled at
+        // start, and one left pending meanwhile counts as closed.
+        if matches!(Caller::parse(&row.caller), Caller::Unknown(_)) {
+            return Err(Refusal::Closed);
+        }
         let card: Card = serde_json::from_value(row.card.clone())
             .context("the request's card is not readable by this version of Fronde")
             .map_err(failed)?;
@@ -578,11 +602,15 @@ impl Requests {
         let mut new_key = None;
         let saved = match (keep, card) {
             (Keep::Conversation, _) => {
+                // As the asker's calls name it now: a row from before threads says
+                // `assistant`, the main thread's agent. An unknown asker owns no secret.
+                let asker = Caller::parse(&row.caller);
+                if matches!(asker, Caller::Unknown(_)) {
+                    return Err(Refusal::Closed);
+                }
                 let scope = EphemeralScope {
                     topic: row.topic.clone(),
-                    // As the asker's calls name it now: a row from before threads says
-                    // `assistant`, the main thread's agent.
-                    asker: Caller::parse(&row.caller).id(),
+                    asker: asker.id(),
                 };
                 let (reference, expires_at) = store
                     .ephemeral
@@ -902,6 +930,7 @@ fn retries(ask: &Ask, row: &requests::Model, now: chrono::DateTime<Utc>) -> bool
         Caller::Mcp(_) | Caller::Source(_) => {
             row.status == PENDING || row.expires_at.is_some_and(|expires_at| expires_at > now)
         }
+        Caller::Unknown(_) => false,
     };
     same_question && still_current
 }
@@ -968,6 +997,12 @@ mod tests {
             assert_eq!(caller.from(), Some(name));
         }
         assert_eq!(Caller::parse("assistant"), Caller::Thread(ThreadId::MAIN));
+        for stored in ["", "robot", "thread:", "thread:x", "THREAD:1", "assistant2"] {
+            let caller = Caller::parse(stored);
+            assert_eq!(caller, Caller::Unknown(stored.into()), "{stored:?}");
+            assert_eq!(caller.id(), stored);
+            assert!(!caller.is_source());
+        }
         assert_eq!(Caller::Thread(ThreadId::MAIN).from(), None);
         for id in [1, 2, 42] {
             let caller = Caller::Thread(ThreadId(id));

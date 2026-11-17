@@ -253,6 +253,12 @@ struct Plan {
     unix_paths: Vec<PathBuf>,
     /// The name of an abstract Unix socket listening outside the sandbox.
     unix_abstract: String,
+    /// Files outside the grants the probe links to from `link_dir`, its own, with a symbolic
+    /// and a hard link, then reads through each.
+    #[serde(default)]
+    link_targets: Vec<PathBuf>,
+    #[serde(default)]
+    link_dir: Option<PathBuf>,
 }
 
 /// What the probe tried, by name: `ok`, `denied`, or another error.
@@ -466,6 +472,33 @@ fn probe_child() {
         std::fs::write(&file, b"probe").unwrap();
         probe_file(&mut report, &file);
     }
+    if let Some(dir) = &plan.link_dir {
+        for (n, target) in plan.link_targets.iter().enumerate() {
+            let name = target.display();
+            let symbolic = dir.join(format!("symlink-{n}"));
+            report.insert(
+                format!("link: make symlink to {name}"),
+                outcome(std::os::unix::fs::symlink(target, &symbolic)),
+            );
+            report.insert(
+                format!("link: read symlink to {name}"),
+                outcome(std::fs::read(&symbolic)),
+            );
+            report.insert(
+                format!("link: write symlink to {name}"),
+                outcome(std::fs::OpenOptions::new().append(true).open(&symbolic)),
+            );
+            let hard = dir.join(format!("hardlink-{n}"));
+            report.insert(
+                format!("link: make hard link to {name}"),
+                outcome(std::fs::hard_link(target, &hard)),
+            );
+            report.insert(
+                format!("link: read hard link to {name}"),
+                outcome(std::fs::read(&hard)),
+            );
+        }
+    }
     let parent = rustix::process::getppid().expect("a parent");
     report.insert(
         "signal parent".to_owned(),
@@ -562,6 +595,8 @@ fn probe_setup() -> Probe {
         closed_port: closed.local_addr().unwrap().port(),
         unix_paths: vec![unix_path],
         unix_abstract,
+        link_targets: Vec::new(),
+        link_dir: None,
     };
     Probe {
         setup,
@@ -689,10 +724,16 @@ fn thread_agent_cannot_touch_other_threads_files() {
         }
         probe.plan.allowed_dirs = vec![own.work.clone(), own.home.clone(), own.home.join("tmp")];
         probe.plan.protected_dirs.push(data.join("threads"));
+        probe.plan.link_dir = Some(own.home.clone());
         for other in others {
             let dirs = thread_dirs(&data, other);
             probe.protect_file(dirs.home.join(".claude/projects/fronde/session.jsonl"));
             probe.protect_file(dirs.work.join("notes.md"));
+            probe
+                .plan
+                .link_targets
+                .extend([dirs.work.join("notes.md"), dirs.home.join(".claude.json")]);
+            std::fs::write(dirs.home.join(".claude.json"), "{\"sibling\": true}").unwrap();
             probe.plan.protected_dirs.extend([
                 dirs.work.clone(),
                 dirs.home.clone(),
@@ -715,6 +756,26 @@ fn thread_agent_cannot_touch_other_threads_files() {
         }
         let db = data.join("fronde.db").display().to_string();
         assert_eq!(report[&format!("read {db}")], "denied", "{thread}");
+        // A link of its own to a sibling's file gives no access: a symbolic one is followed to
+        // the sibling's path, which the sandbox refuses, and a hard one cannot be made: Landlock
+        // refuses to link a file from where the agent has no rights (EXDEV, as the kernel
+        // reports a refused reparenting).
+        for target in &probe.plan.link_targets {
+            let name = target.display();
+            let result = |attempt: &str| report[&format!("link: {attempt} {name}")].clone();
+            assert_eq!(result("make symlink to"), "ok", "{thread}");
+            for attempt in ["read symlink to", "write symlink to"] {
+                assert_eq!(result(attempt), "denied", "{thread}: {attempt} {name}");
+            }
+            let made = result("make hard link to");
+            assert!(
+                made == "denied" || made.contains("os error 18"),
+                "{thread}: hard link to {name}: {made}"
+            );
+            let read = result("read hard link to");
+            assert!(read.contains("os error 2"), "{thread}: {name}: {read}");
+        }
+        assert_eq!(probe.plan.link_targets.len(), 4);
     }
 }
 

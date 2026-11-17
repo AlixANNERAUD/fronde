@@ -339,8 +339,19 @@ thread's first message, with its own directories, its own sandbox and its own hu
   as before threads; thread `<id>`'s in `<data>/threads/<id>/work` and `<data>/threads/<id>/home`,
   created private (0700) when its agent first starts. Its sandbox grants it these two and no
   other thread's: one thread's agent cannot read another's files, nor its Claude transcripts
-  (`home/.claude/projects/`), nor list or write them. Each directory is checked against the
-  protected paths, as every grant is, each time an agent starts.
+  (`home/.claude/projects/`), nor list or write them. A symbolic link it makes to a sibling's
+  file leads to a path the sandbox refuses, and it cannot make a hard link to one: Landlock
+  refuses to link a file from where the agent has no rights. Each directory is checked against
+  the protected paths, as every grant is, each time an agent starts. A thread's id is never
+  reused with an earlier thread's files: when a new thread finds `threads/<id>` already there (a
+  database restored from a backup, or made anew), Fronde moves it to `threads/<id>.old-<time>`
+  first.
+- **Isolation needs the sandbox.** With `[agent] sandbox = false`, every agent runs as your user
+  with nothing between them: one thread's agent can read another's files and its
+  `/proc/<pid>/environ`, which holds that agent's `FRONDE_HUB_TOKEN`, and so act as that thread.
+  On a kernel with Landlock below ABI 6 (before Linux 6.12), the sandbox cannot scope signals:
+  an agent can signal another (stop or kill a sibling), as it can Fronde itself; the start log's
+  `agent sandbox:` line says which ABI applies.
 - **Sign-in.** A thread other than the main one has a fresh home, without a `/login` in it: the
   token of `[agent] oauth_token` (or `CLAUDE_CODE_OAUTH_TOKEN` kept from Fronde's environment)
   signs every thread in.
@@ -348,18 +359,25 @@ thread's first message, with its own directories, its own sandbox and its own hu
   memory and in that process's environment, never on a command line or in the log. The hub's
   gate knows the thread by this token and by nothing else: no argument, header, `clientInfo`
   name or `_meta` field can name a thread, and a call carrying another thread's id is still its
-  own thread's. Fronde keeps only each token's SHA-256 digest and compares it with every live one
-  in constant time, as it compares `server.token`. The token is revoked when Fronde lets the
-  process go: a turn that failed, Fronde stopping it, its connection ending (the process exited),
-  or Fronde stopping. After that, `/mcp` answers 401 to it, even within an MCP session opened
-  before.
+  own thread's. Fronde keeps only each token's SHA-256 digest, once the token is in the starting
+  process's environment, and compares it with every live one in constant time, as it compares
+  `server.token`; the time a lookup takes tells only how many agents run. The token is revoked
+  when Fronde lets the process go: a turn that failed, Fronde stopping it (idle, or to make room
+  for another thread's), the thread being archived (its running turn cancelled, the token refused
+  at once), its connection ending (the process exited or crashed), or Fronde stopping. After that,
+  `/mcp` answers 401 to it, even within an MCP session opened before. An MCP session is also tied
+  to the token that opened it: another valid token, `server.token` included, gets 403 in it.
+- **Unknown askers.** A request whose stored asker this version does not know (neither a thread,
+  an outside client nor a server, nor the `assistant` of rows from before threads) is never read
+  as a thread's: Fronde cancels it at start, and it can never be answered or own a secret.
 - **What it asks.** A thread's cards appear in that thread's stream, and a secret given in one of
   them "for this conversation" can be used only by that thread's agent, in that thread: another
   thread's agent, or an outside client, gets the same refusal as for an unknown reference.
 - **Limits.** Each agent process has its own systemd scope, named after its thread
   (`fronde-agent-<hash>-t<id>-…`), with the limits of `[agent.limits]`; starting or stopping one
-  never stops another. A cap on how many agents run at once, and on all of them together, is
-  planned.
+  never stops another. At most `[threads] max_running` run at once, and `fronde-agents.slice`
+  caps their memory together (`[agent.limits] total_memory`); see
+  [Architecture](architecture.md#threads).
 
 ### Where the agent runs
 

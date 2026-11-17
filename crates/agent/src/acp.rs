@@ -697,8 +697,14 @@ impl Connection {
         let mut task = tokio::spawn(async move {
             let result = builder
                 .connect_with(transport, async move |cx| {
-                    let _ = connected.send(cx);
-                    let _ = stopped.await;
+                    let _ = connected.send(cx.clone());
+                    // Until Fronde lets the agent go, or the agent's output ends (it exited):
+                    // the connection then ends, and with it the session and its hub token. A
+                    // clean end of input alone would not end it.
+                    tokio::select! {
+                        _ = stopped => {}
+                        () = cx.incoming_closed() => {}
+                    }
                     Ok(())
                 })
                 .await;

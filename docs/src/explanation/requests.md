@@ -69,7 +69,9 @@ for the admin only. On a form from an outside client or a server, a line above *
 where the answer goes: *Ce que tu saisis est envoyé à « github » (serveur MCP). N'y mets jamais
 de mot de passe ni de code.* Only the token makes a caller one of Fronde's
 agents: a client that calls itself `assistant` is still an outside client. Outside clients' cards
-go to the main thread. Since a client
+go to the main thread. The owner's page can answer any thread's card, by design: you answer for
+yourself, whichever of your threads asked. Today only the main thread is shown on the page;
+showing the others, with their cards, is planned (threads in the chat). Since a client
 chooses its name, the hub refuses to ask the user anything for one named *Fronde* or *assistant*
 (in any case), one whose name is longer than 40 characters, or one whose name holds a control
 character.

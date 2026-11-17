@@ -146,7 +146,7 @@ impl Calls {
                 Some(CallBy::Assistant),
                 context.turn.map(|turn| (context.topic.clone(), turn)),
             ),
-            Some((Caller::Mcp(name) | Caller::Source(name), _)) => {
+            Some((Caller::Mcp(name) | Caller::Source(name) | Caller::Unknown(name), _)) => {
                 let name = line(name, MAX_CALLER, &mut Notes::default());
                 (Some(CallBy::Client { name }), None)
             }

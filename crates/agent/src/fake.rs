@@ -101,11 +101,18 @@ pub struct FakeRecord {
 #[derive(Clone, Debug)]
 pub struct FakeHandle {
     record: Arc<Mutex<FakeRecord>>,
+    exit: tokio_util::sync::CancellationToken,
 }
 
 impl FakeHandle {
     pub fn record(&self) -> FakeRecord {
         lock(&self.record).clone()
+    }
+
+    /// Ends the fake agent on its own, as a process that exits or crashes: its end of the
+    /// connection closes.
+    pub fn exit(&self) {
+        self.exit.cancel();
     }
 }
 
@@ -119,12 +126,17 @@ fn lock(record: &Mutex<FakeRecord>) -> std::sync::MutexGuard<'_, FakeRecord> {
 pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
     let (client_end, agent_end) = Channel::duplex();
     let record = Arc::new(Mutex::new(FakeRecord::default()));
+    let exit = tokio_util::sync::CancellationToken::new();
     let handle = FakeHandle {
         record: record.clone(),
+        exit: exit.clone(),
     };
     let agent = scripted(script, record.clone());
     tokio::spawn(async move {
-        let _ = agent.connect_to(agent_end).await;
+        tokio::select! {
+            _ = agent.connect_to(agent_end) => {}
+            () = exit.cancelled() => {}
+        }
         lock(&record).closed = true;
     });
     (client_end, handle)

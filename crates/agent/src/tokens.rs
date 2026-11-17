@@ -56,13 +56,14 @@ impl Tokens {
             tokens: self.clone(),
             lease,
             thread,
-            token: SecretString::from(token),
+            token: Some(SecretString::from(token)),
         })
     }
 
     /// The thread whose live token `given` is, if any. Every live token's digest is compared,
     /// each in constant time and without stopping at a match, so the time taken tells nothing
-    /// of which token was close, nor whether one matched.
+    /// of which token was close, nor whether one matched. It grows with the number of live
+    /// tokens: all the timing reveals is how many agents are running.
     pub fn lookup(&self, given: &[u8]) -> Option<ThreadId> {
         let given = digest(given);
         let live = self.live();
@@ -94,18 +95,26 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-/// A live token: revoked when dropped.
+/// A live token: revoked when dropped. It holds the token itself only until
+/// [`TokenLease::take_token`] hands it to the agent's start; then only its digest is kept.
 pub struct TokenLease {
     tokens: Tokens,
     lease: u64,
     thread: ThreadId,
-    token: SecretString,
+    token: Option<SecretString>,
 }
 
 impl TokenLease {
-    /// The token, for the agent's environment only.
-    pub fn token(&self) -> &SecretString {
-        &self.token
+    /// The token, for the agent's environment only; the lease keeps it no longer. `None` once
+    /// taken.
+    pub fn take_token(&mut self) -> Option<SecretString> {
+        self.token.take()
+    }
+
+    /// Revokes the token now, before the lease is dropped: for an agent Fronde lets go while a
+    /// turn still holds its session.
+    pub fn revoke(&self) {
+        self.tokens.live().by_lease.remove(&self.lease);
     }
 
     pub fn thread(&self) -> ThreadId {
@@ -136,23 +145,38 @@ mod tests {
     #[test]
     fn a_token_names_its_thread_until_its_lease_is_dropped() {
         let tokens = Tokens::new();
-        let first = tokens.issue(ThreadId(1)).unwrap();
-        let second = tokens.issue(ThreadId(2)).unwrap();
-        let again = tokens.issue(ThreadId(2)).unwrap();
-        let token = |lease: &TokenLease| lease.token().expose_secret().as_bytes().to_vec();
-        assert_eq!(token(&first).len(), 64);
-        assert_ne!(token(&second), token(&again));
-        assert_eq!(tokens.lookup(&token(&first)), Some(ThreadId(1)));
-        assert_eq!(tokens.lookup(&token(&second)), Some(ThreadId(2)));
-        assert_eq!(tokens.lookup(&token(&again)), Some(ThreadId(2)));
+        let mut first = tokens.issue(ThreadId(1)).unwrap();
+        let mut second = tokens.issue(ThreadId(2)).unwrap();
+        let mut again = tokens.issue(ThreadId(2)).unwrap();
+        let token = |lease: &mut TokenLease| {
+            lease
+                .take_token()
+                .unwrap()
+                .expose_secret()
+                .as_bytes()
+                .to_vec()
+        };
+        let (first_token, second_token, again_token) =
+            (token(&mut first), token(&mut second), token(&mut again));
+        // Taken once: the lease keeps only the digest.
+        assert!(first.take_token().is_none());
+        assert_eq!(first_token.len(), 64);
+        assert_ne!(second_token, again_token);
+        assert_eq!(tokens.lookup(&first_token), Some(ThreadId(1)));
+        assert_eq!(tokens.lookup(&second_token), Some(ThreadId(2)));
+        assert_eq!(tokens.lookup(&again_token), Some(ThreadId(2)));
         assert_eq!(tokens.lookup(b""), None);
-        assert_eq!(tokens.lookup(&token(&first)[..63]), None);
-        let revoked = token(&second);
+        assert_eq!(tokens.lookup(&first_token[..63]), None);
         drop(second);
-        assert_eq!(tokens.lookup(&revoked), None);
-        assert_eq!(tokens.lookup(&token(&again)), Some(ThreadId(2)));
+        assert_eq!(tokens.lookup(&second_token), None);
+        assert_eq!(tokens.lookup(&again_token), Some(ThreadId(2)));
         assert_eq!(tokens.len(), 2);
-        assert!(!format!("{again:?}").contains(again.token().expose_secret()));
+        let shown = format!("{again:?}");
+        assert!(!shown.contains(std::str::from_utf8(&again_token).unwrap()));
+        // Revoked before the lease goes, and again when it goes.
+        again.revoke();
+        assert_eq!(tokens.lookup(&again_token), None);
+        assert_eq!(tokens.len(), 1);
         drop((first, again));
         assert!(tokens.is_empty());
     }

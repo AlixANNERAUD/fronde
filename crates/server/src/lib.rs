@@ -125,6 +125,56 @@ pub(crate) fn same_secret(given: &[u8], expected: &SecretString) -> bool {
 struct Gate {
     token: SecretString,
     threads: Option<Arc<Threads>>,
+    /// Which token opened each MCP session: a session is used with that token only.
+    sessions: std::sync::Mutex<SessionTokens>,
+}
+
+/// The header naming an MCP session (Streamable HTTP).
+const SESSION_HEADER: &str = "mcp-session-id";
+/// Sessions whose token is remembered; past it, the oldest is forgotten, and a request in it
+/// is then left to rmcp, which knows whether it still lives.
+const MAX_SESSIONS: usize = 4096;
+
+/// The digest of the token that opened each MCP session, by session id, oldest first.
+#[derive(Default)]
+struct SessionTokens {
+    by_session: std::collections::HashMap<String, [u8; 32]>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl SessionTokens {
+    fn bind(&mut self, session: String, token: [u8; 32]) {
+        if self.by_session.insert(session.clone(), token).is_none() {
+            self.order.push_back(session);
+        }
+        while self.order.len() > MAX_SESSIONS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_session.remove(&oldest);
+            }
+        }
+    }
+
+    fn unbind(&mut self, session: &str) {
+        if self.by_session.remove(session).is_some() {
+            self.order.retain(|kept| kept != session);
+        }
+    }
+
+    /// Whether `token` may use `session`: the token that opened it, or any for a session not
+    /// remembered (rmcp refuses one that does not exist).
+    fn allows(&self, session: &str, token: &[u8; 32]) -> bool {
+        self.by_session
+            .get(session)
+            .is_none_or(|opened| bool::from(opened.ct_eq(token)))
+    }
+}
+
+impl Gate {
+    fn sessions(&self) -> std::sync::MutexGuard<'_, SessionTokens> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 async fn require_token(
@@ -157,9 +207,41 @@ async fn require_token(
         (true, None) => McpCaller::Outside,
         (false, None) => return Err(StatusCode::UNAUTHORIZED),
     };
+    // An MCP session is tied to the token that opened it: another valid token cannot use it,
+    // even one whose caller would be the same. Defence in depth: every request is already
+    // checked and attributed by its own token above.
+    let digest: [u8; 32] = Sha256::digest(given.as_bytes()).into();
+    let session = req
+        .headers()
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if let Some(session) = &session
+        && !gate.sessions().allows(session, &digest)
+    {
+        tracing::warn!("refused a request in an MCP session that another token opened");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let closing = req.method() == axum::http::Method::DELETE;
     // rmcp hands the request's parts, extensions included, to the tool call.
     req.extensions_mut().insert(caller);
-    Ok(next.run(req).await)
+    let response = next.run(req).await;
+    match &session {
+        None => {
+            if let Some(opened) = response
+                .headers()
+                .get(SESSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+            {
+                gate.sessions().bind(opened.to_owned(), digest);
+            }
+        }
+        Some(session) if closing && response.status().is_success() => {
+            gate.sessions().unbind(session);
+        }
+        Some(_) => {}
+    }
+    Ok(response)
 }
 
 /// `/health` and `/mcp`. `threads`: the threads whose agents' tokens `/mcp` accepts, when the
@@ -176,7 +258,11 @@ pub fn router(hub: Arc<Hub>, token: SecretString, threads: Option<Arc<Threads>>)
         .nest_service("/mcp", mcp)
         // Only /mcp: unknown paths stay 404 and other routers can be merged in.
         .route_layer(middleware::from_fn_with_state(
-            Arc::new(Gate { token, threads }),
+            Arc::new(Gate {
+                token,
+                threads,
+                sessions: Default::default(),
+            }),
             require_token,
         ));
     Router::new()
@@ -806,6 +892,27 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tower_sessions::SessionStore;
+
+    #[test]
+    fn a_session_is_tied_to_the_token_that_opened_it() {
+        let mut sessions = SessionTokens::default();
+        let (agent, outside) = ([1u8; 32], [2u8; 32]);
+        sessions.bind("s1".into(), agent);
+        assert!(sessions.allows("s1", &agent));
+        assert!(!sessions.allows("s1", &outside));
+        // A session it never saw is rmcp's to refuse.
+        assert!(sessions.allows("s2", &outside));
+        sessions.unbind("s1");
+        assert!(sessions.allows("s1", &outside));
+        // Bounded: past the cap, the oldest is forgotten first.
+        for n in 0..=MAX_SESSIONS {
+            sessions.bind(format!("n{n}"), agent);
+        }
+        assert_eq!(sessions.by_session.len(), MAX_SESSIONS);
+        assert_eq!(sessions.order.len(), MAX_SESSIONS);
+        assert!(sessions.allows("n0", &outside));
+        assert!(!sessions.allows(&format!("n{MAX_SESSIONS}"), &outside));
+    }
     use tower_sessions::cookie::time::{self, OffsetDateTime};
     use tower_sessions::session::{Id, Record};
     use tower_sessions_sqlx_store::sqlx;

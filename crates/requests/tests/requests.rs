@@ -1001,6 +1001,51 @@ async fn old_assistant_rows_read_as_thread_one() {
     assert_eq!(row(dir.path(), waiter.id()).await.caller, "thread:2");
 }
 
+/// A caller this version does not know is never read as a thread: its request is cancelled at
+/// start, never shown again, and cannot be answered.
+#[tokio::test]
+async fn unknown_caller_rows_are_cancelled_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(dir.path()).await);
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let unknown = requests::ActiveModel {
+        topic: Set(TOPIC.into()),
+        turn: Set(Some(4)),
+        caller: Set("robot:42".into()),
+        client_request_id: Set(None),
+        kind: Set("form".into()),
+        card: Set(serde_json::to_value(question()).unwrap()),
+        for_user: Set("alix".into()),
+        admin_only: Set(false),
+        status: Set("pending".into()),
+        created_at: Set(chrono::Utc::now()),
+        expires_at: Set(Some(chrono::Utc::now() + chrono::Duration::minutes(10))),
+        ..Default::default()
+    };
+    let unknown = requests::Entity::insert(unknown)
+        .exec(&db)
+        .await
+        .unwrap()
+        .last_insert_id as RequestId;
+
+    let (requests, journal) = open(dir.path()).await;
+    assert_eq!(row(dir.path(), unknown).await.status, "cancelled");
+    assert!(journal.callers.lock().unwrap().is_empty());
+    assert!(
+        !journal
+            .shown()
+            .iter()
+            .any(|shown| matches!(shown, Shown::Announced { .. })),
+        "{:?}",
+        journal.shown()
+    );
+    assert_eq!(
+        requests.answer(unknown, pick("Seerr"), &alix()).await,
+        Err(Refusal::Closed)
+    );
+    assert_eq!(row(dir.path(), unknown).await.status, "cancelled");
+}
+
 #[tokio::test]
 async fn unannounced_row_is_announced_at_start() {
     let dir = tempfile::tempdir().unwrap();

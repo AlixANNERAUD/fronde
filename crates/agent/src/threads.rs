@@ -562,6 +562,7 @@ impl Threads {
             .await?
             .flatten();
         let id = ThreadId(last.unwrap_or(0) + 1);
+        move_aside_leftover(&self.data_dir, id)?;
         let topic = topic_of(id);
         streams::Entity::insert(new_stream(&topic, &new_log_id()))
             .exec(&transaction)
@@ -618,8 +619,9 @@ impl Threads {
             .await
     }
 
-    /// Archives thread `id`, or brings it back; an archived thread refuses messages. The main
-    /// thread is never archived.
+    /// Archives thread `id`, or brings it back; an archived thread refuses messages, and its
+    /// agent is let go: its running turn cancelled, its hub token revoked at once, its process
+    /// stopped. The main thread is never archived.
     pub async fn set_archived(&self, id: ThreadId, archived: bool) -> anyhow::Result<()> {
         if id == ThreadId::MAIN {
             bail!("the main thread cannot be archived");
@@ -627,8 +629,12 @@ impl Threads {
         let at = archived.then(Utc::now);
         self.update(id, threads::Column::ArchivedAt, Expr::value(at))
             .await?;
-        if let Some(assistant) = self.open.lock().await.get(&id) {
+        let assistant = self.open.lock().await.get(&id).cloned();
+        if let Some(assistant) = assistant {
             assistant.set_archived(archived);
+            if archived {
+                assistant.retire().await;
+            }
         }
         Ok(())
     }
@@ -651,6 +657,37 @@ impl Threads {
         }
         Ok(())
     }
+}
+
+/// Moves aside `threads/<id>` when it is already there, before a new thread takes the id: a
+/// database restored from a backup, or made anew, counts ids again from where it stands, and
+/// the new thread's agent must not find an earlier one's files, its Claude transcripts among
+/// them. It becomes `threads/<id>.old-<UTC time>`, which no thread uses.
+fn move_aside_leftover(data_dir: &Path, id: ThreadId) -> anyhow::Result<()> {
+    let dir = thread_dirs(data_dir, id)
+        .work
+        .parent()
+        .map(Path::to_path_buf)
+        .context("a thread's directory has a parent")?;
+    if dir.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    let aside = dir.with_file_name(format!(
+        "{id}.old-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%.6fZ")
+    ));
+    std::fs::rename(&dir, &aside).with_context(|| {
+        format!(
+            "cannot move {} aside for the new thread {id}",
+            dir.display()
+        )
+    })?;
+    tracing::warn!(
+        "{} was left by an earlier thread {id}: moved to {} for the new one",
+        dir.display(),
+        aside.display()
+    );
+    Ok(())
 }
 
 /// Makes the main thread's stream and row when missing, and moves the agent's session id from

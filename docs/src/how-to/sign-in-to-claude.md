@@ -2,7 +2,8 @@
 
 Fronde's agent is Claude Code, run through its ACP adapter. Each conversation (thread) has its
 own agent with its own home: `home/` in the data directory for the main one, the chat,
-`threads/<id>/home/` for the others. None uses your `~/.claude`. It reads none of Claude Code's settings: your
+`threads/<id>/home/` for the others (planned: today the chat shows only the main thread, and
+threads that agents start for a task come later). None uses your `~/.claude`. It reads none of Claude Code's settings: your
 plugins, MCP servers, hooks and permission rules do not apply to it. It signs in with a
 long-lived token, which you make once and give to Fronde as `[agent] oauth_token` (see
 [Configuration](../reference/configuration.md#agent)).
