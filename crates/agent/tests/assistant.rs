@@ -999,6 +999,7 @@ async fn requests_are_shown_in_the_conversation() {
             admin_only: false,
             timeout: WAIT,
             tied: false,
+            secret_fields: false,
         })
         .await
         .unwrap();
@@ -1094,6 +1095,7 @@ async fn ask_during_a_turn(
             admin_only: false,
             timeout: Duration::from_secs(600),
             tied: false,
+            secret_fields: false,
         })
         .await
         .unwrap();

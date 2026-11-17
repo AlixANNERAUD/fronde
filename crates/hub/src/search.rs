@@ -210,7 +210,7 @@ mod tests {
 
     fn registry_with_echo() -> Arc<Registry> {
         let r = Arc::new(Registry::new());
-        r.replace_source("hub", meta_tools(&r));
+        r.replace_source("hub", meta_tools(&r, None));
         let (mut d, h) = typed_tool(
             "mcphub_echo",
             "Echo text back to the caller",

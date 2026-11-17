@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 pub use request::{
     CallBy, Card, ChoiceAnswer, ChoiceOption, Field, FieldValue, Invalid, Keep, KeyPlace, Outcome,
-    PermissionChoice, PermissionKind, Remember, RequestId, Response, SecretValue, TextFormat,
-    ToolKind,
+    PermissionChoice, PermissionKind, Remember, RequestId, Response, SecretAnswer, SecretValue,
+    TextFormat, ToolKind,
 };
 
 /// State of a tool call shown in the conversation.

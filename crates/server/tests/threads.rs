@@ -138,9 +138,18 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         .unwrap();
     threads.set_requests(&requests).await;
     let control: Arc<dyn ThreadControl> = Arc::new(ThreadBridge(threads.clone()));
-    let hub = Hub::start(config, db, vec![], Some(requests.clone()), Some(control))
-        .await
-        .unwrap();
+    let integrations: Arc<dyn fronde_hub::integrations::Integrations> =
+        Arc::new(fronde::integrations::Shipped::new(&config, db.clone()).unwrap());
+    let hub = Hub::start(
+        config,
+        db,
+        vec![],
+        Some(requests.clone()),
+        Some(control),
+        Some(integrations),
+    )
+    .await
+    .unwrap();
     let (def, handler) = typed_tool_with_context(
         "test_whoami",
         "Who calls.",

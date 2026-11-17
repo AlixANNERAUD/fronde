@@ -137,6 +137,8 @@ fn shown(value: &FieldValue) -> String {
         FieldValue::Number(number) => number.to_string(),
         FieldValue::Toggle(true) => "oui".to_owned(),
         FieldValue::Toggle(false) => "non".to_owned(),
+        // Never told, not even late.
+        FieldValue::Secret(_) => "(secret)".to_owned(),
     }
 }
 

@@ -711,6 +711,18 @@ fn threads_prefix_is_reserved() {
 }
 
 #[test]
+fn integrations_prefix_is_reserved() {
+    // An upstream server named `integrations` would bring `integrations_*` tools, which set up
+    // components from a card.
+    let e = load_str(&format!(
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"integrations\"\nurl = \"http://127.0.0.1:1/mcp\"\n"
+    ))
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("reserved"), "{e:#}");
+    assert!(fronde_hub::config::RESERVED_TOOL_PREFIXES.contains(&"integrations_"));
+}
+
+#[test]
 fn python_source_name_is_taken_when_python_is_on() {
     let entry =
         "[[sources]]\nkind = \"mcp\"\nname = \"python\"\nurl = \"http://127.0.0.1:1/mcp\"\n";

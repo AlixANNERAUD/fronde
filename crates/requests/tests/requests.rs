@@ -157,6 +157,7 @@ fn ask() -> Ask {
         admin_only: false,
         timeout: Duration::from_secs(600),
         tied: false,
+        secret_fields: false,
     }
 }
 
@@ -943,6 +944,120 @@ async fn every_card_is_checked_before_it_is_written() {
     let error = requests.ask(long).await.unwrap_err();
     assert!(format!("{error:#}").contains("title has 201"), "{error:#}");
     assert_eq!(journal.shown(), []);
+}
+
+/// A form with a secret field, as only the hub's integration setup builds one.
+fn setup_form() -> Card {
+    Card::Form {
+        message: "Ajouter l'intégration « calendar ».".into(),
+        fields: vec![
+            Field::Text {
+                key: "events_url".into(),
+                title: "events_url".into(),
+                description: None,
+                placeholder: None,
+                format: None,
+                min_length: None,
+                max_length: None,
+                default: None,
+                required: true,
+            },
+            Field::Secret {
+                key: "caldav.secret".into(),
+                title: "Mot de passe".into(),
+                description: None,
+                required: true,
+            },
+        ],
+        submit: None,
+        truncated: false,
+        replaced: false,
+        during: Vec::new(),
+    }
+}
+
+/// A secret field reaches a card only from the hub's own setup form: a `user_ask`, an
+/// elicitation or any other ask that does not say so is refused, and so is one for anyone but
+/// an admin. Nothing is written for a refused card.
+#[tokio::test]
+async fn a_secret_field_is_refused_outside_the_hubs_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let refused = |ask: Ask| {
+        let requests = requests.clone();
+        async move { requests.ask(ask).await.unwrap_err().to_string() }
+    };
+    // As user_ask asks, and as an agent's or a server's elicitation (tied) asks.
+    for tied in [false, true] {
+        let error = refused(Ask {
+            card: setup_form(),
+            tied,
+            ..ask()
+        })
+        .await;
+        assert!(error.contains("user_secret"), "{error}");
+        let error = refused(Ask {
+            card: setup_form(),
+            caller: Caller::Source("github".into()),
+            admin_only: true,
+            tied,
+            ..ask()
+        })
+        .await;
+        assert!(error.contains("user_secret"), "{error}");
+    }
+    let error = refused(Ask {
+        card: setup_form(),
+        secret_fields: true,
+        ..ask()
+    })
+    .await;
+    assert!(error.contains("admin only"), "{error}");
+    assert!(journal.shown().is_empty(), "{:?}", journal.shown());
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    assert!(requests::Entity::find().all(&db).await.unwrap().is_empty());
+}
+
+/// A setup form's secrets reach its asker only: the row keeps the other answers, never them.
+#[tokio::test]
+async fn a_forms_secret_reaches_its_asker_only() {
+    const CANARY: &str = "canary-setup-secret-51d2";
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, journal) = open(dir.path()).await;
+    let waiter = requests
+        .ask(Ask {
+            card: setup_form(),
+            admin_only: true,
+            tied: true,
+            secret_fields: true,
+            ..ask()
+        })
+        .await
+        .unwrap();
+    let id = waiter.id();
+    let answer = Response::Form {
+        values: [
+            (
+                "events_url".to_owned(),
+                fronde_protocol::FieldValue::Text("https://cloud.example/dav/".into()),
+            ),
+            (
+                "caldav.secret".to_owned(),
+                fronde_protocol::FieldValue::Secret(fronde_protocol::SecretAnswer {
+                    secret: fronde_protocol::SecretValue::new(CANARY.into()),
+                }),
+            ),
+        ]
+        .into(),
+    };
+    requests.answer(id, answer.clone(), &alix()).await.unwrap();
+    assert_eq!(resolved(waiter).await, Resolution::Answered(answer));
+    let row = row(dir.path(), id).await;
+    let stored = serde_json::to_string(&row.response).unwrap();
+    assert!(stored.contains("cloud.example"), "{stored}");
+    assert!(!stored.contains(CANARY), "{stored}");
+    assert!(!format!("{:?}", journal.shown()).contains(CANARY));
+    assert_eq!(row.kind, "elicitation", "never answered late");
 }
 
 #[tokio::test]

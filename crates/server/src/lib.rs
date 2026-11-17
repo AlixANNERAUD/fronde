@@ -1,8 +1,10 @@
 //! HTTP front: /mcp behind a bearer token, /health, and the chat with Fronde when `[web]` is set.
 
 pub mod check;
+pub mod config_edit;
 pub mod hardening;
 pub mod init;
+pub mod integrations;
 pub mod secret;
 pub mod service;
 pub mod sessions;
@@ -924,7 +926,30 @@ pub async fn start_with(
         Arc::new(thread_control::ThreadBridge(threads.clone()))
             as Arc<dyn fronde_hub::threads::ThreadControl>
     });
-    let hub = Arc::new(Hub::start(config, db.clone(), components, requests, control).await?);
+    // Shipped components a setup card can add, once an admin answers it in the chat.
+    let integrations = match &chat {
+        Some(_) => match integrations::Shipped::new(&config, db.clone()) {
+            Ok(shipped) => {
+                Some(Arc::new(shipped) as Arc<dyn fronde_hub::integrations::Integrations>)
+            }
+            Err(error) => {
+                tracing::warn!("no integration can be set up from the chat: {error:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    let hub = Arc::new(
+        Hub::start(
+            config,
+            db.clone(),
+            components,
+            requests,
+            control,
+            integrations,
+        )
+        .await?,
+    );
     let threads = chat.as_ref().map(|(threads, ..)| threads.clone());
     let mut app = router(hub, token, threads);
     if let Some((threads, requests, password, secure_cookie)) = chat {

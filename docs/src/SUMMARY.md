@@ -17,6 +17,7 @@
 - [Configure the calendar](how-to/configure-calendar.md)
 - [Enable Python](how-to/enable-python.md)
 - [Store a secret](how-to/store-a-secret.md)
+- [Set up an integration from the chat](how-to/set-up-an-integration-from-the-chat.md)
 - [Run behind a reverse proxy](how-to/reverse-proxy.md)
 - [Develop and contribute](how-to/develop.md)
 

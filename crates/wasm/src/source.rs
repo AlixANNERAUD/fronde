@@ -582,6 +582,27 @@ fn check_settings(
     Ok(())
 }
 
+/// Whether `settings` fit the settings schema of `manifest`, as [`prepare`] checks them: known
+/// keys, an `enum`'s values, URLs without credentials, patterns, and, when `complete`, every
+/// required setting given.
+pub fn check_manifest_settings(
+    manifest: &Manifest,
+    settings: &BTreeMap<String, String>,
+    complete: bool,
+) -> anyhow::Result<()> {
+    let properties = manifest
+        .settings
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut schema = manifest.settings.clone();
+    if !complete && let Some(schema) = schema.as_object_mut() {
+        schema.remove("required");
+    }
+    check_settings(&schema, &properties, settings)
+}
+
 /// Whether a credential of `config` names a stored secret.
 fn uses_stored_secrets(config: &ComponentConfig) -> bool {
     config.credentials.iter().any(|c| {

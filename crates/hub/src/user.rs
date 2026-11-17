@@ -110,13 +110,13 @@ struct RememberArg {
 /// Where the `user_*` tools ask: the requests, and the threads that show a thread's card during
 /// its turn.
 #[derive(Clone)]
-struct Asking {
-    requests: Arc<Requests>,
-    threads: Option<Arc<dyn ThreadControl>>,
+pub(crate) struct Asking {
+    pub(crate) requests: Arc<Requests>,
+    pub(crate) threads: Option<Arc<dyn ThreadControl>>,
 }
 
 /// Why a card was not shown.
-enum NotShown {
+pub(crate) enum NotShown {
     /// The `client_request_id` names another request still pending.
     Reused(anyhow::Error),
     /// The calling thread's turn ended, or is ending: a card shown now would outlive it.
@@ -133,7 +133,12 @@ impl Asking {
     /// which show it while that turn still runs, so that the turn's end cancels it before its own
     /// end is logged; the turn the call came in may have ended since. Any other card (an outside
     /// client's, or one without threads to end a turn) is asked directly.
-    async fn open(&self, what: &str, context: &CallContext, ask: Ask) -> Result<Waiter, NotShown> {
+    pub(crate) async fn open(
+        &self,
+        what: &str,
+        context: &CallContext,
+        ask: Ask,
+    ) -> Result<Waiter, NotShown> {
         let asked = match (&context.caller, context.turn, &self.threads) {
             (Caller::Thread(thread), Some(_), Some(threads)) => {
                 match threads.ask(*thread, ask).await {
@@ -259,6 +264,7 @@ async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) ->
         timeout,
         // A question or secret outlives the call: a late answer reaches the thread's agent.
         tied: false,
+        secret_fields: false,
     };
     let waiter = match asking.open("user_secret", &context, ask).await {
         Ok(waiter) => waiter,
@@ -413,7 +419,7 @@ fn check_remember(remember: &RememberArg) -> Result<Remember, String> {
     })
 }
 
-fn check_timeout(timeout_ms: Option<u64>) -> Result<Duration, String> {
+pub(crate) fn check_timeout(timeout_ms: Option<u64>) -> Result<Duration, String> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
         return Err(format!(
@@ -455,6 +461,7 @@ async fn user_ask(asking: &Asking, context: CallContext, args: AskArgs) -> ToolO
         timeout,
         // A question or secret outlives the call: a late answer reaches the thread's agent.
         tied: false,
+        secret_fields: false,
     };
     let waiter = match asking.open("user_ask", &context, ask).await {
         Ok(waiter) => waiter,

@@ -222,6 +222,15 @@ impl Card {
         Ok(())
     }
 
+    /// Whether the card asks for a secret: a secret card, or a form with a [`Field::Secret`].
+    pub fn asks_secret(&self) -> bool {
+        match self {
+            Self::Secret { .. } => true,
+            Self::Form { fields, .. } => fields.iter().any(|f| matches!(f, Field::Secret { .. })),
+            Self::Permission { .. } => false,
+        }
+    }
+
     /// The card's kind, as stored with its request.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -332,6 +341,11 @@ fn check_field(field: &Field) -> Result<(), String> {
             }
         }
         Field::Toggle {
+            title,
+            description: about,
+            ..
+        }
+        | Field::Secret {
             title,
             description: about,
             ..
@@ -582,6 +596,18 @@ pub enum Field {
         #[serde(default)]
         default: bool,
     },
+    /// A secret typed in a masked box, answered with [`FieldValue::Secret`]. Only a form the hub
+    /// builds itself holds one (an integration's setup): a request refuses it from anyone else.
+    /// Its value never reaches the request's row, the stream, a summary or a log.
+    Secret {
+        key: String,
+        title: String,
+        /// Where the secret goes, in a sentence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default)]
+        required: bool,
+    },
 }
 
 /// Numbers in a card are finite ([`Card::check`]), so they equal themselves.
@@ -601,7 +627,8 @@ impl Field {
             Self::Choice { key, .. }
             | Self::Text { key, .. }
             | Self::Number { key, .. }
-            | Self::Toggle { key, .. } => key,
+            | Self::Toggle { key, .. }
+            | Self::Secret { key, .. } => key,
         }
     }
 
@@ -609,9 +636,10 @@ impl Field {
     pub fn label(&self) -> &str {
         match self {
             Self::Choice { question, .. } => question,
-            Self::Text { title, .. } | Self::Number { title, .. } | Self::Toggle { title, .. } => {
-                title
-            }
+            Self::Text { title, .. }
+            | Self::Number { title, .. }
+            | Self::Toggle { title, .. }
+            | Self::Secret { title, .. } => title,
         }
     }
 }
@@ -658,6 +686,24 @@ pub enum Response {
     Decline,
 }
 
+impl Response {
+    /// The response with every secret left out: a secret answer's value, a form's
+    /// [`FieldValue::Secret`]s. What a request's row may keep.
+    pub fn without_secrets(&self) -> Option<Self> {
+        match self {
+            Self::Secret { .. } => None,
+            Self::Form { values } => Some(Self::Form {
+                values: values
+                    .iter()
+                    .filter(|(_, value)| !matches!(value, FieldValue::Secret(_)))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            }),
+            other => Some(other.clone()),
+        }
+    }
+}
+
 /// The answer to one field, as its JSON says: an object for a [`Field::Choice`], a string for a
 /// [`Field::Text`], a number for a [`Field::Number`], `true` or `false` for a [`Field::Toggle`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -666,7 +712,17 @@ pub enum FieldValue {
     Toggle(bool),
     Number(f64),
     Text(String),
+    /// A [`Field::Secret`]'s value, as `{"secret": "…"}`: before a choice, which an object of
+    /// unknown fields would also read as.
+    Secret(SecretAnswer),
     Choice(ChoiceAnswer),
+}
+
+/// The answer to a [`Field::Secret`]: it prints as `[REDACTED]` and is wiped when dropped.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct SecretAnswer {
+    pub secret: SecretValue,
 }
 
 /// JSON carries no NaN, and [`check`] refuses an infinite number.
@@ -835,8 +891,28 @@ fn check_form(fields: &[Field], values: &BTreeMap<String, FieldValue>) -> Result
                 Some(_) => return Err(mismatch(key)),
             },
             (Field::Toggle { .. }, None | Some(FieldValue::Toggle(_))) => {}
+            (Field::Secret { required, .. }, value) => match value {
+                None if *required => return Err(invalid(Some(key), "Saisis ce secret.")),
+                None => {}
+                Some(FieldValue::Secret(answer)) => check_secret_field(key, answer, *required)?,
+                Some(_) => return Err(mismatch(key)),
+            },
             _ => return Err(mismatch(key)),
         }
+    }
+    Ok(())
+}
+
+/// A [`Field::Secret`]'s value: not blank when required, at most [`MAX_SECRET`] bytes.
+fn check_secret_field(key: &str, answer: &SecretAnswer, required: bool) -> Result<(), Invalid> {
+    if answer.secret.is_empty() && required {
+        return Err(invalid(Some(key), "Saisis ce secret."));
+    }
+    if answer.secret.len() > MAX_SECRET {
+        return Err(invalid(
+            Some(key),
+            format!("Secret trop long : {MAX_SECRET} octets au plus."),
+        ));
     }
     Ok(())
 }
@@ -1072,6 +1148,8 @@ pub fn summary(card: &Card, response: &Response) -> String {
                 FieldValue::Number(number) => show_number(*number),
                 FieldValue::Toggle(true) => format!("{} : oui", field.label()),
                 FieldValue::Toggle(false) => format!("{} : non", field.label()),
+                // Never summed up, not even by its length.
+                FieldValue::Secret(_) => String::new(),
             })
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
@@ -1968,5 +2046,111 @@ mod tests {
             };
         }
         assert!(card.check().unwrap_err().contains("a caller's name"));
+    }
+
+    fn secret_field(key: &str, required: bool) -> Field {
+        Field::Secret {
+            key: key.into(),
+            title: "Mot de passe".into(),
+            description: Some("Envoyé seulement à https://cloud.example".into()),
+            required,
+        }
+    }
+
+    fn secret_value(text: &str) -> FieldValue {
+        FieldValue::Secret(SecretAnswer {
+            secret: SecretValue::new(text.into()),
+        })
+    }
+
+    /// A secret field's value is an object of its own, never read as a choice or a text, and
+    /// prints as `[REDACTED]`.
+    #[test]
+    fn secret_field_value_shape() {
+        let value = secret_value("hunter2");
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, r#"{"secret":"hunter2"}"#);
+        assert_eq!(serde_json::from_str::<FieldValue>(&json).unwrap(), value);
+        assert!(!format!("{value:?}").contains("hunter2"));
+        // A choice's answer stays a choice.
+        let choice: FieldValue = serde_json::from_str(r#"{"selected":["a"]}"#).unwrap();
+        assert!(matches!(choice, FieldValue::Choice(_)));
+    }
+
+    /// A secret field takes a secret only, never a text that would be logged and stored; it is
+    /// never summed up and never kept in what a row stores.
+    #[test]
+    fn secret_field_is_checked_summed_up_and_dropped() {
+        let card = form(vec![
+            secret_field("password", true),
+            Field::Text {
+                key: "user".into(),
+                title: "Identifiant".into(),
+                description: None,
+                placeholder: None,
+                format: None,
+                min_length: None,
+                max_length: None,
+                default: None,
+                required: true,
+            },
+        ]);
+        assert!(card.check().is_ok());
+        assert!(card.asks_secret());
+        assert!(!form(vec![choice("a", false, false, true)]).asks_secret());
+        let text = Response::Form {
+            values: [
+                ("password".to_owned(), FieldValue::Text("hunter2".into())),
+                ("user".to_owned(), FieldValue::Text("alix".into())),
+            ]
+            .into(),
+        };
+        assert_eq!(refused(&card, &text).key.as_deref(), Some("password"));
+        let missing = Response::Form {
+            values: [("user".to_owned(), FieldValue::Text("alix".into()))].into(),
+        };
+        assert_eq!(refused(&card, &missing).key.as_deref(), Some("password"));
+        let blank = Response::Form {
+            values: [
+                ("password".to_owned(), secret_value("")),
+                ("user".to_owned(), FieldValue::Text("alix".into())),
+            ]
+            .into(),
+        };
+        assert_eq!(refused(&card, &blank).key.as_deref(), Some("password"));
+        let good = Response::Form {
+            values: [
+                ("password".to_owned(), secret_value("hunter2")),
+                ("user".to_owned(), FieldValue::Text("alix".into())),
+            ]
+            .into(),
+        };
+        check(&card, &good).unwrap();
+        // A secret value for a text field is refused too.
+        let swapped = Response::Form {
+            values: [
+                ("password".to_owned(), secret_value("hunter2")),
+                ("user".to_owned(), secret_value("alix")),
+            ]
+            .into(),
+        };
+        assert_eq!(refused(&card, &swapped).key.as_deref(), Some("user"));
+        assert_eq!(summary(&card, &good), "alix");
+        let kept = good.without_secrets().unwrap();
+        assert_eq!(
+            kept,
+            Response::Form {
+                values: [("user".to_owned(), FieldValue::Text("alix".into()))].into(),
+            }
+        );
+        assert!(!serde_json::to_string(&kept).unwrap().contains("hunter2"));
+        assert_eq!(
+            Response::Secret {
+                value: SecretValue::new("x".into()),
+                keep: Keep::Conversation
+            }
+            .without_secrets(),
+            None
+        );
     }
 }

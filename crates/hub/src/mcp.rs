@@ -104,10 +104,14 @@ impl HubServer {
         )
     }
 
-    /// Whether `caller` is offered the tool `name`: the `threads_*` tools only to a thread's
-    /// agent, and those that start or drive sub-agents only to a thread that may still
+    /// Whether `caller` is offered the tool `name`: the `threads_*` and `integrations_*` tools
+    /// only to a thread's agent, and those that start or drive sub-agents only to a thread that may still
     /// delegate. Each tool refuses the others' calls anyway.
     fn offers(name: &str, caller: &Caller, delegates: bool) -> bool {
+        // Setting up an integration is for Fronde's own agents only.
+        if name.starts_with("integrations_") {
+            return matches!(caller, Caller::Thread(_));
+        }
         if !name.starts_with("threads_") {
             return true;
         }
@@ -254,7 +258,9 @@ mod tests {
         let config: crate::config::Config = toml::from_str(&toml).unwrap();
         crate::private::prepare_data_dir(dir).unwrap();
         let db = fronde_db::open(dir).await.unwrap();
-        let hub = Hub::start(config, db, vec![], None, None).await.unwrap();
+        let hub = Hub::start(config, db, vec![], None, None, None)
+            .await
+            .unwrap();
         let (mut d, h) = typed_tool(
             "mcphub_secret_tool",
             "Hidden",
@@ -498,7 +504,7 @@ mod tests {
             .await
             .unwrap();
         let hub = Arc::new(
-            Hub::start(config, db, vec![], Some(requests), None)
+            Hub::start(config, db, vec![], Some(requests), None, None)
                 .await
                 .unwrap(),
         );

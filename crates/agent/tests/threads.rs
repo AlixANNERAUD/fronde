@@ -145,6 +145,7 @@ fn ask(topic: &str) -> Ask {
         admin_only: false,
         timeout: WAIT,
         tied: false,
+        secret_fields: false,
     }
 }
 
@@ -2626,6 +2627,40 @@ fn secret_ask(assistant: &Assistant, turn: Option<u64>) -> Ask {
     }
 }
 
+/// An integration's setup card, as the hub asks it: for an admin, with a password field or not.
+fn setup_ask(assistant: &Assistant, turn: Option<u64>, password: bool) -> Ask {
+    let mut fields = vec![Field::Toggle {
+        key: "allow.local".into(),
+        title: "Serveur local".into(),
+        description: None,
+        default: false,
+    }];
+    if password {
+        fields.push(Field::Secret {
+            key: "caldav.secret".into(),
+            title: "Mot de passe".into(),
+            description: None,
+            required: true,
+        });
+    }
+    Ask {
+        turn,
+        caller: Caller::Thread(assistant.thread()),
+        card: Card::Form {
+            message: "Ajouter l'intégration « calendar ».".into(),
+            fields,
+            submit: None,
+            truncated: false,
+            replaced: false,
+            during: Vec::new(),
+        },
+        admin_only: true,
+        tied: true,
+        secret_fields: password,
+        ..ask(assistant.topic())
+    }
+}
+
 /// A sub-agent's turn sent or started from a wake's turn follows what that wake followed: its
 /// cards name the same sub-agent and offer nothing lasting, a secret card is refused, and its
 /// agent, which was offered a lasting option before, is restarted first. A call of a turn that
@@ -2708,6 +2743,24 @@ async fn sub_agent_turns_from_a_wake_turn_are_of_wake_origin() {
         .unwrap_err();
     assert!(
         refused.is::<fronde_agent::assistant::SecretInWake>(),
+        "{refused:#}"
+    );
+    // An integration's setup card is refused there too: with a password, as a secret card;
+    // without, as a lasting change only an admin grants.
+    let refused = threads
+        .ask_during(child.thread(), setup_ask(&child, turn, true))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.is::<fronde_agent::assistant::SecretInWake>(),
+        "{refused:#}"
+    );
+    let refused = threads
+        .ask_during(child.thread(), setup_ask(&child, turn, false))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.is::<fronde_agent::assistant::LastingInWake>(),
         "{refused:#}"
     );
     requests

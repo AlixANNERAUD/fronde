@@ -834,9 +834,17 @@ fn default_user() -> String {
 }
 
 /// Prefixes of the hub's own tools (`search_tools`, `use_tool`, `memory_*`, `code_run_python`,
-/// `user_*`, `threads_*`) and of its source name: no component may declare them.
-pub const RESERVED_TOOL_PREFIXES: [&str; 7] = [
-    "code_", "hub_", "memory_", "search_", "threads_", "use_", "user_",
+/// `user_*`, `threads_*`, `integrations_*`) and of its source name: no component may declare
+/// them.
+pub const RESERVED_TOOL_PREFIXES: [&str; 8] = [
+    "code_",
+    "hub_",
+    "integrations_",
+    "memory_",
+    "search_",
+    "threads_",
+    "use_",
+    "user_",
 ];
 
 /// True for names usable as tool prefixes: `^[a-z][a-z0-9_]{0,63}$`.
@@ -1073,12 +1081,27 @@ fn calendar_source(old: &toml::Value) -> String {
 /// Where the shipped calendar component is: beside the binary as in the image
 /// (`/app/components`), or in `components/dist` of the checkout this binary was built from.
 pub fn shipped_calendar() -> Option<PathBuf> {
+    shipped_component("calendar")
+}
+
+/// Where the component `name` shipped with this build is (`<name>.wasm`, its manifest beside
+/// it): beside the binary as in the image (`/app/components`), or in `components/dist` of the
+/// checkout this binary was built from. Canonical.
+pub fn shipped_component(name: &str) -> Option<PathBuf> {
+    if !is_valid_name(name) {
+        return None;
+    }
+    let file = format!("{name}.wasm");
     let exe = std::env::current_exe().ok();
     let candidates = [
         exe.as_deref()
             .and_then(Path::parent)
-            .map(|d| d.join("components/calendar.wasm")),
-        Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../components/dist/calendar.wasm")),
+            .map(|d| d.join("components").join(&file)),
+        Some(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../components/dist")
+                .join(&file),
+        ),
     ];
     candidates
         .into_iter()

@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod guide;
+pub mod integrations;
 pub mod mcp;
 pub mod memory;
 pub mod origin;
@@ -17,6 +18,7 @@ pub mod user;
 use config::{Config, SourceConfig};
 use fronde_db::DatabaseConnection;
 use fronde_requests::Requests;
+use integrations::Integrations;
 use memory::index::MemoryIndex;
 use memory::{MemoryStore, tools::memory_tools};
 use source::{Native, Supervisor, ToolSource};
@@ -42,13 +44,15 @@ impl Hub {
     /// with a warning, unless it is waiting for a stored secret: that one is tried again) and
     /// connect upstream servers in the background. With `requests` (the chat runs), the `user_*`
     /// tools ask the user through it; with `threads`, the `threads_*` tools let a thread's agent
-    /// start and follow sub-agents.
+    /// start and follow sub-agents; with `integrations` too, `integrations_request_setup` lets
+    /// a thread's agent ask the admin to set up a shipped component, which `search_tools` lists.
     pub async fn start(
         config: Config,
         db: DatabaseConnection,
         components: Vec<Arc<dyn ToolSource>>,
         requests: Option<Arc<Requests>>,
         threads: Option<Arc<dyn ThreadControl>>,
+        integrations: Option<Arc<dyn Integrations>>,
     ) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
         private::prepare_data_dir(dir)?;
@@ -63,7 +67,9 @@ impl Hub {
 
         let registry = Arc::new(Registry::new());
         let sources = Supervisor::new(registry.clone());
-        let mut own = meta_tools(&registry);
+        // Set up from a card only where a card can be answered: with the chat's requests.
+        let integrations = integrations.filter(|_| requests.is_some());
+        let mut own = meta_tools(&registry, integrations.clone());
         own.extend(memory_tools(memory.clone(), index, config.memory.git));
         // Upstream servers' forms go to the admin; the one user so far is the owner, an admin.
         let asking = requests.as_ref().map(|requests| {
@@ -74,6 +80,16 @@ impl Hub {
             )
         });
         if let Some(requests) = requests {
+            if let Some(integrations) = integrations {
+                own.extend(integrations::integration_tools(integrations::Setup {
+                    requests: requests.clone(),
+                    threads: threads.clone(),
+                    integrations,
+                    sources: sources.clone(),
+                    registry: registry.clone(),
+                    admin: config.data.user.clone(),
+                }));
+            }
             own.extend(user::user_tools(requests, threads.clone()));
         }
         if let Some(threads) = &threads {

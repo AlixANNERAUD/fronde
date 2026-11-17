@@ -288,7 +288,9 @@ waits for a turn's end is written in the thread's stream (shown as nothing but t
 Fronde stops before it went out, the next start gives it to the agent, once, before any
 sub-agent's result, whether the stop cut the turn or came just after its end.
 
-Only these two kinds of cards get a late answer. An answer meant for an upstream server, for the
+Only these two kinds of cards get a late answer. An integration's setup card (see
+[Tools](../reference/tools.md#setting-up-an-integration)) does not: only its call acts on the
+answer, so a call cut short cancels it and a restart expires it, like an agent's form. An answer meant for an upstream server, for the
 agent's own form or permission, or for an outside MCP client never reaches an agent as a
 message: those cards expire at a restart, and an answer given after their call ended goes
 nowhere.
@@ -344,8 +346,8 @@ changes a few things:
 
 These use the same requests and cards, and are **not built yet**:
 
-- **Tools that take a `secret_ref`**: integration setup from the chat, and commands that read a
-  secret from a file in threads that have a shell. The first of them must refuse a reference in
+- **Tools that take a `secret_ref`**: commands that read a secret from a file in threads that
+  have a shell. (Integration setup from the chat takes its secrets on its own card.) The first of them must refuse a reference in
   a turn a sub-agent's result started, or one such a turn started, as a secret card is refused
   there (see [Wakes](threads.md#wakes)): a reference given earlier in the conversation would
   still work in it.

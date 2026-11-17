@@ -29,7 +29,7 @@ use fronde_db::master_key::{Backend, Backends};
 use fronde_entity::requests;
 pub use fronde_protocol::ThreadId;
 use fronde_protocol::request::{
-    self, Card, Invalid, Keep, KeyPlace, Outcome, RequestId, Response, SecretValue,
+    self, Card, Field, Invalid, Keep, KeyPlace, Outcome, RequestId, Response, SecretValue,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -153,6 +153,10 @@ pub struct Ask {
     /// upstream server's): after a restart nobody does, so the request expires then, as a
     /// permission does, rather than stay answerable.
     pub tied: bool,
+    /// The card may hold [`Field::Secret`]s: only the hub's integration setup, which builds its
+    /// form itself, sets it, and only for an `admin_only` card. Any other card with one is
+    /// refused, whoever built it (a `user_ask`, an elicitation).
+    pub secret_fields: bool,
 }
 
 /// How a request ended, for the one who asked.
@@ -507,6 +511,20 @@ impl Requests {
         if matches!(ask.card, Card::Permission { .. }) && !matches!(ask.caller, Caller::Thread(_)) {
             anyhow::bail!("only a thread's agent asks for permissions");
         }
+        if let Card::Form { fields, .. } = &ask.card
+            && fields
+                .iter()
+                .any(|field| matches!(field, Field::Secret { .. }))
+        {
+            anyhow::ensure!(
+                ask.secret_fields,
+                "the card cannot be shown: a form asks for no secret; ask for one with user_secret"
+            );
+            anyhow::ensure!(
+                ask.admin_only,
+                "the card cannot be shown: a form with secrets is for an admin only"
+            );
+        }
         let caller = ask.caller.id();
         if let Some(waiter) = self.retried(&ask).await? {
             return Ok(waiter);
@@ -619,12 +637,13 @@ impl Requests {
                 Resolution::Answered(response),
             ),
         };
+        // A form's secrets go to its asker only, in memory: never to the row.
         let stored = match &resolution {
-            Resolution::Answered(response) => Some(
-                serde_json::to_value(response)
-                    .context("cannot encode the answer")
-                    .map_err(failed)?,
-            ),
+            Resolution::Answered(response) => response
+                .without_secrets()
+                .map(|kept| serde_json::to_value(kept).context("cannot encode the answer"))
+                .transpose()
+                .map_err(failed)?,
             _ => None,
         };
         let won = self
@@ -706,29 +725,10 @@ impl Requests {
                         remember.name, remember.name
                     )));
                 }
-                // Under the backends' key lock: a first key is made and seals in one go.
-                let (key, created) = fronde_db::secrets::store(
-                    &self.db,
-                    &store.backends,
-                    fronde_db::secrets::SOURCES,
-                    &remember.name,
-                    &remember.origin,
-                    &value,
-                )
-                .await
-                .map_err(failed)?;
-                if created {
-                    tracing::warn!(
-                        "made the master key in {}: back it up apart from the data directory, \
-                         without it the stored secrets are lost",
-                        store.backends.place(key.backend())
-                    );
-                    new_key = Some(match key.backend() {
-                        Backend::Keychain => KeyPlace::Keychain,
-                        Backend::File => KeyPlace::File,
-                        Backend::Systemd => KeyPlace::Systemd,
-                    });
-                }
+                new_key = self
+                    .seal(store, &remember.name, &remember.origin, &value)
+                    .await
+                    .map_err(failed)?;
                 Saved::Stored {
                     name: remember.name.clone(),
                     origin: remember.origin.clone(),
@@ -766,6 +766,61 @@ impl Requests {
             self.deliver_late(row, card, &resolution).await;
         }
         Ok(())
+    }
+
+    /// Seals `value` under `name` for `origin` in the `sources` scope, with the master key,
+    /// made now under the backends' key lock when nothing is sealed yet: where it was made, then.
+    async fn seal(
+        &self,
+        store: &SecretStore,
+        name: &str,
+        origin: &str,
+        value: &SecretString,
+    ) -> anyhow::Result<Option<KeyPlace>> {
+        let (key, created) = fronde_db::secrets::store(
+            &self.db,
+            &store.backends,
+            fronde_db::secrets::SOURCES,
+            name,
+            origin,
+            value,
+        )
+        .await?;
+        if !created {
+            return Ok(None);
+        }
+        tracing::warn!(
+            "made the master key in {}: back it up apart from the data directory, without it \
+             the stored secrets are lost",
+            store.backends.place(key.backend())
+        );
+        Ok(Some(match key.backend() {
+            Backend::Keychain => KeyPlace::Keychain,
+            Backend::File => KeyPlace::File,
+            Backend::Systemd => KeyPlace::Systemd,
+        }))
+    }
+
+    /// Keeps `value`, a secret an admin typed in a form the hub built (an integration's
+    /// setup), sealed under `name` for the canonical `origin` only: refused when no secrets
+    /// are kept, or when `name` is stored for another origin. Where the master key was made,
+    /// when keeping it made one.
+    pub async fn keep_secret(
+        &self,
+        name: &str,
+        origin: &str,
+        value: &SecretString,
+    ) -> anyhow::Result<Option<KeyPlace>> {
+        let Some(store) = &self.secrets else {
+            anyhow::bail!("this Fronde keeps no secret");
+        };
+        let _saving = self.saving.lock().await;
+        if let Some(other) = self.stored_origin(name).await?
+            && other != origin
+        {
+            anyhow::bail!("a secret {name} is already stored for another origin");
+        }
+        self.seal(store, name, origin, value).await
     }
 
     /// Gives the answer `resolution` to request `row`, which no asker took, to the agent of the

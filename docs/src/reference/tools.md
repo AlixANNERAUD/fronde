@@ -2,8 +2,8 @@
 
 These are the tools the hub serves at `/mcp`, to its own agents and to any other client. Tool
 names match `^[a-z][a-z0-9_]{0,63}$`. The hub's own tools use the prefixes `code_`, `hub_`,
-`memory_`, `search_`, `threads_`, `use_` and `user_`, which no upstream server or component may
-take.
+`integrations_`, `memory_`, `search_`, `threads_`, `use_` and `user_`, which no upstream server or
+component may take.
 
 ## Results
 
@@ -26,7 +26,7 @@ the current `USER.md` and `MEMORY.md`. The client does not need to search memory
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `search_tools` | `need` (text), `limit` (1 to 10, default 5) | Finds deferred tools by need, best first, and returns their names, descriptions and input schemas. |
+| `search_tools` | `need` (text), `limit` (1 to 10, default 5) | Finds deferred tools by need, best first, and returns their names, descriptions and input schemas. With the chat, it also lists the shipped components not set up yet that the need may be about (all of them when no tool matches), as `{"integration", "description", "status": "available, not set up: call integrations_request_setup"}`. |
 | `use_tool` | `name`, `arguments` (object) | Calls a tool found with `search_tools`. |
 
 Deferred tools are hidden from the tool list to keep the agent's context small. Today the
@@ -128,10 +128,11 @@ The user picks how long the secret is kept:
    "next": "Kept for this conversation only, … No tool accepts a secret_ref yet: …"}
   ```
 
-  **No tool accepts a `secret_ref` yet.** The first ones to take one will be integration setup
-  from the chat and commands that read a secret from a file (both **planned**); until then the
-  reference expires unused, and the `next` says so. To give a component a credential now, use
-  `remember`.
+  **No tool accepts a `secret_ref` yet.** The first ones to take one will be commands that read a
+  secret from a file (**planned**); until then the reference expires unused, and the `next` says
+  so. To give a component a credential now, use `remember`, or set the component up with
+  [`integrations_request_setup`](#setting-up-an-integration), whose card takes the password
+  itself.
 
 - **Kept for an origin**, offered only when the call gives `remember: { name, origin }`, and only
   to an admin (today the owner). `name` is lower-case letters, digits and `_`, starting with a
@@ -158,6 +159,54 @@ that comes as its turn ends. A thread's turn that a sub-agent's result started (
 the turn the user's next message starts. `user_secret` is
 served only while the chat runs, beside `user_ask`. See
 [Requests and cards](../explanation/requests.md#secret-cards).
+
+## Setting up an integration
+
+Served only with `[web]`, to Fronde's own agents (an outside MCP client is not offered it, and is
+refused).
+
+| Tool | Arguments | Does |
+| --- | --- | --- |
+| `integrations_request_setup` | `integration` (a name `search_tools` lists as available), `prefill` (optional object), `timeout_ms` (as for `user_ask`) | Asks the admin, on a card, to set up a component shipped with this build that has no `[[sources]]` entry yet, and waits; returns the new tools' names. |
+
+`prefill` suggests values, by setting name (`{"events_url": "https://…"}`), and a user name as
+`"<credential>.username"`. It fills non-secret fields only: any other key (a password's, a
+setting the manifest does not declare) is refused, and so is a value the manifest's schema
+refuses (not one of an `enum`, a URL that is not one or that holds a user name or password, a
+`pattern` it does not match), a value on several lines or with a hidden character, and a user name
+holding `:`. Nothing is shown then.
+
+The card is the admin's (`admin_only`, for the admin whoever the caller acts for: a family
+member's agent gets a card that says *Demande envoyée à l'administrateur*). It shows the
+component's settings, a user name and a masked box for each credential (a `Field::Secret`, which
+only this tool can put on a card), where each secret goes (the origins of the URL settings), and
+a toggle for local addresses, off. Once answered, Fronde:
+
+1. checks the entry with a dry run of `prepare` (settings, allowed origins within the manifest's,
+   a local address only with the toggle), keeping nothing yet;
+2. asks the admin to confirm on a second card when the answer sends a secret or allows an origin
+   the first card did not show (a URL changed to another server);
+3. seals each secret in `fronde.db` for each origin of its credential (`<integration>_<credential>`,
+   numbered when that name is stored for another origin);
+4. checks the whole entry again, with the stored secrets, then writes it at the end of
+   `fronde.toml` (comments, order and file mode kept, never through a link) or, when the file
+   cannot be written, shows the entry to paste on a card of its own;
+5. starts the component.
+
+```json
+{"result": {"status": "set_up", "integration": "calendar", "tools": ["calendar_create", "…"],
+  "stored_secrets": ["calendar_caldav"], "config": "written"}}
+```
+
+`config` is `not_written` with a `snippet` when the file could not be written; `master_key_made`
+says where the first secret kept made the master key. A declined, expired or cancelled card
+returns `{"status": "declined"}`, `"expired"` or `"cancelled"`. A failure after the answer is an
+error saying what was kept (stored secrets) and that the configuration is unchanged.
+
+The card is tied to the call: a call its client cuts cancels it, a restart expires it, and its
+answer never comes later as a message. A turn a sub-agent's result started cannot ask for it (the
+call is refused), nor a call outside the caller's turn. See
+[Set up an integration from the chat](../how-to/set-up-an-integration-from-the-chat.md).
 
 ## Calendar
 

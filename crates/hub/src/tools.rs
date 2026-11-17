@@ -1,6 +1,7 @@
 //! Tool registry: every tool (native, upstream, meta) goes through here.
 
 use crate::config::is_valid_name;
+use crate::integrations::Integrations;
 use crate::search::ToolIndex;
 use crate::source::Tool;
 use anyhow::bail;
@@ -440,8 +441,13 @@ impl ToolHandler for UseTool {
     }
 }
 
-/// `search_tools` and `use_tool`, over `registry`.
-pub fn meta_tools(registry: &Arc<Registry>) -> Vec<Tool> {
+/// `search_tools` and `use_tool`, over `registry`. With `integrations`, `search_tools` also
+/// lists the shipped components not set up yet that the need may be about (every one when no
+/// tool matches), each as an `integration` to set up with `integrations_request_setup`.
+pub fn meta_tools(
+    registry: &Arc<Registry>,
+    integrations: Option<Arc<dyn Integrations>>,
+) -> Vec<Tool> {
     let r = Arc::downgrade(registry);
     let (def, h) = typed_tool(
         "search_tools",
@@ -449,22 +455,43 @@ pub fn meta_tools(registry: &Arc<Registry>) -> Vec<Tool> {
         false,
         move |a: SearchArgs| {
             let r = r.clone();
+            let integrations = integrations.clone();
             async move {
                 let Some(r) = r.upgrade() else {
                     return ToolOutput::error("hub is shutting down");
                 };
                 let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
-                let found: Vec<Value> = r
+                let mut found: Vec<Value> = r
                     .search(&a.need, limit)
                     .await
                     .into_iter()
                     .map(|d| json!({"name": d.name, "description": d.description, "input_schema": d.input_schema}))
                     .collect();
-                if found.is_empty() {
-                    ToolOutput::ok(found)
-                        .with_next("No tool matches. Rephrase the need, or answer without a tool.")
-                } else {
-                    ToolOutput::ok(found).with_next("Call use_tool with one of these names.")
+                let tools = found.len();
+                let available = integrations
+                    .map(|integrations| integrations.available())
+                    .unwrap_or_default();
+                let mut listed = crate::integrations::matching(&available, &a.need);
+                if tools == 0 && listed.is_empty() {
+                    listed = available.iter().collect();
+                }
+                for integration in &listed {
+                    found.push(json!({
+                        "integration": integration.name,
+                        "description": integration.description,
+                        "status": crate::integrations::AVAILABLE,
+                    }));
+                }
+                match (tools, listed.len()) {
+                    (0, 0) => ToolOutput::ok(found)
+                        .with_next("No tool matches. Rephrase the need, or answer without a tool."),
+                    (0, _) => ToolOutput::ok(found).with_next(
+                        "No tool matches yet. An integration listed may bring some: call integrations_request_setup with its name, and the owner sets it up.",
+                    ),
+                    (_, 0) => ToolOutput::ok(found).with_next("Call use_tool with one of these names."),
+                    _ => ToolOutput::ok(found).with_next(
+                        "Call use_tool with one of these names. An integration listed is not set up: integrations_request_setup asks the owner to.",
+                    ),
                 }
             }
         },

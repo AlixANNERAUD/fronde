@@ -1139,11 +1139,15 @@ impl Assistant {
         }
         // A secret kept "for this conversation" would go to a turn the owner did not start.
         // The first tool that takes a `secret_ref` must refuse it in such a turn too: a
-        // reference given earlier in the conversation still works there.
-        if matches!(ask.card, Card::Secret { .. })
-            && turn.as_ref().is_some_and(|turn| turn.woken_by.is_some())
-        {
+        // reference given earlier in the conversation still works there. A form's secret
+        // fields count.
+        let woken = turn.as_ref().is_some_and(|turn| turn.woken_by.is_some());
+        if woken && ask.card.asks_secret() {
             return Err(SecretInWake.into());
+        }
+        // Nor anything lasting only an admin grants, such as an integration's setup.
+        if woken && ask.admin_only {
+            return Err(LastingInWake.into());
         }
         let waiter = requests.ask(ask).await?;
         drop(turn);
@@ -1293,6 +1297,7 @@ impl Assistant {
                 timeout,
                 // The agent's call alone waits on it.
                 tied: true,
+                secret_fields: false,
             })
             .await;
         drop(running_turn);
@@ -1756,6 +1761,21 @@ impl std::fmt::Display for SecretInWake {
 }
 
 impl std::error::Error for SecretInWake {}
+
+/// A turn of wake origin asked the admin for something lasting (an integration's setup):
+/// refused, as a lasting permission is in such a turn. The text is for the agent.
+#[derive(Debug)]
+pub struct LastingInWake;
+
+impl std::fmt::Display for LastingInWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this turn was started by a sub-agent's result (or by a turn that was), not by the user: it cannot ask for a lasting change such as setting up an integration; end your turn saying what you need, and ask in the turn the user's next message starts",
+        )
+    }
+}
+
+impl std::error::Error for LastingInWake {}
 
 /// The agent did not start within [`START_TIMEOUT`].
 #[derive(Debug)]

@@ -311,6 +311,7 @@ impl UpstreamClient {
             admin_only: true,
             timeout: asking.timeout.min(MAX_TIMEOUT),
             tied: true,
+            secret_fields: false,
         };
         // Given up when the server cancels its request, when the last call to the server ends,
         // or when this future is dropped (the call that waits on an `input_required` round was

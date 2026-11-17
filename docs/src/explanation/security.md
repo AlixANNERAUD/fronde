@@ -215,6 +215,38 @@ lock, and the closed card and the log say where, to be backed up.
 The card's link button takes an `https://` address only, with no user name or password before
 the host, and names the host it opens: the agent's text never becomes a link otherwise.
 
+## Integrations set up from a card
+
+`integrations_request_setup` lets an agent ask the admin to add a component shipped with this
+build (see [Set up an integration from the chat](../how-to/set-up-an-integration-from-the-chat.md)).
+What it may change is narrow:
+
+- **Who writes.** The agent only names the component and suggests non-secret settings
+  (`prefill`), each checked against the manifest's schema. Fronde's own process builds the card
+  from the manifest, and writes `fronde.toml` only after an admin answered it, never from the
+  agent's arguments. The card is `admin_only`, refused in a turn a sub-agent's result started (as
+  a secret card and a lasting permission are), refused outside the caller's turn, and never
+  offered to an outside MCP client.
+- **Secrets.** A password or token is typed in a secret field of that card. Such a field is
+  accepted only in a card this tool builds: a request refuses one from `user_ask`, an elicitation
+  or anyone else, and for anyone but an admin. The value goes from the page to the requests, then
+  to the tool in memory, then to the sealed store: the request's row keeps the other answers only,
+  and the value never reaches the agent, the conversation, a summary, a log or a `Debug` print.
+  The entry names it as `{ stored = "…" }`, sealed for the origin it is sent to.
+- **Origins.** Where each secret goes follows from the URL settings, and the card says it. When
+  the answer sends a secret or allows an origin the card did not show, a second card asks the
+  admin to confirm, before anything is kept. A dry run of `prepare` checks the entry before any
+  secret is sealed (allowed origins within the manifest's, a local address only when the card's
+  toggle, off by default, allows it), and again with the stored secrets before anything is
+  written.
+- **The file.** Edited with `toml_edit`, keeping comments and order, replaced atomically through
+  `fronde-fs` with its own mode (never wider), never written through a link. When it cannot be
+  written (Docker's read-only `/config`), Fronde shows the entry to paste instead, which holds
+  only stored names. Keep the configuration out of the agent's reach as before: the sandbox does
+  not let it write the file, and a read-only mount is still the stronger guard.
+- **What it adds.** Only a component shipped with this build, whose files match the hashes the
+  build approves, and that has no `[[sources]]` entry yet; anything else is refused.
+
 ## Core dumps and other processes
 
 Zeroing on drop cannot help if a crash writes a core dump, which holds the whole address space, or

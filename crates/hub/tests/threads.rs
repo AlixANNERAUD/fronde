@@ -116,7 +116,7 @@ async fn hub(dir: &std::path::Path, control: Arc<Recording>) -> Arc<Hub> {
     let db = fronde_db::open(dir).await.unwrap();
     let control: Arc<dyn ThreadControl> = control;
     Arc::new(
-        Hub::start(config, db, vec![], None, Some(control))
+        Hub::start(config, db, vec![], None, Some(control), None)
             .await
             .unwrap(),
     )

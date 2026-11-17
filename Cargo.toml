@@ -73,6 +73,7 @@ tower-sessions = { version = "0.15", default-features = false, features = ["axum
 # Web sessions in fronde.db, on SeaORM's sqlx pool (one sqlx in the tree).
 tower-sessions-sqlx-store = { version = "0.16", default-features = false, features = ["sqlite"] }
 toml = "0.9"
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Which characters a card never shows as they are (format, unassigned, private use…).

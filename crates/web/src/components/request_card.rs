@@ -9,8 +9,8 @@ use fronde_client::RequestStatus;
 use fronde_protocol::request::{check, show_number};
 use fronde_protocol::{
     CallBy, Card, ChoiceAnswer, ChoiceOption, ClientMsg, Field, FieldValue, Invalid, Keep,
-    KeyPlace, Outcome, PermissionChoice, Remember, RequestId, Response, SecretValue, TextFormat,
-    ToolKind,
+    KeyPlace, Outcome, PermissionChoice, Remember, RequestId, Response, SecretAnswer, SecretValue,
+    TextFormat, ToolKind,
 };
 use std::collections::BTreeMap;
 
@@ -767,11 +767,31 @@ fn OpenSecretCard(
     }
 }
 
+/// The box of a form's field `index`: the page reads a secret's only to send it.
+fn input_id(request: RequestId, index: usize) -> String {
+    format!("r{request}-q{index}-input")
+}
+
+/// Empties the secret boxes of a form.
+fn clear_secrets(request: RequestId, fields: &[Field]) {
+    for (index, field) in fields.iter().enumerate() {
+        if matches!(field, Field::Secret { .. }) {
+            secret_box::clear(&input_id(request, index));
+        }
+    }
+}
+
 /// The answer the drafts make: fields left blank are left out, for [`check`] to name. A number
-/// box that holds no number is refused here, since no answer can say it.
-fn response(fields: &[Field], radios: &[String], drafts: &[Draft]) -> Result<Response, Invalid> {
+/// box that holds no number is refused here, since no answer can say it. A secret is read from
+/// its box only now.
+fn response(
+    request: RequestId,
+    fields: &[Field],
+    radios: &[String],
+    drafts: &[Draft],
+) -> Result<Response, Invalid> {
     let mut values = BTreeMap::new();
-    for ((field, radio), draft) in fields.iter().zip(radios).zip(drafts) {
+    for (index, ((field, radio), draft)) in fields.iter().zip(radios).zip(drafts).enumerate() {
         let value = match field {
             Field::Choice { options, multi, .. } => {
                 let (selected, other) = if *multi {
@@ -846,6 +866,15 @@ fn response(fields: &[Field], radios: &[String], drafts: &[Draft]) -> Result<Res
                 }
             }
             Field::Toggle { .. } => FieldValue::Toggle(draft.on),
+            Field::Secret { .. } => {
+                let secret = secret_box::read(&input_id(request, index));
+                if secret.is_empty() {
+                    continue;
+                }
+                FieldValue::Secret(SecretAnswer {
+                    secret: SecretValue::new(secret),
+                })
+            }
         };
         values.insert(field.key().to_owned(), value);
     }
@@ -930,7 +959,14 @@ fn FormCard(
     let drafts = use_signal(|| fields.iter().map(Draft::of).collect::<Vec<_>>());
     let mut invalid = use_signal(|| None::<Invalid>);
     let mut sent = use_signal(|| false);
-    let delivered = use_callback(move |()| sent.set(true));
+    // A secret typed is emptied once the answer went out: a refused answer is typed anew.
+    let delivered = use_callback({
+        let fields = fields.clone();
+        move |()| {
+            sent.set(true);
+            clear_secrets(id, &fields);
+        }
+    });
     // Sent: wait for the server to close the card, unless it refused the answer.
     let disabled = !open || sent() && refusal.is_none();
     let card = Card::Form {
@@ -946,7 +982,7 @@ fn FormCard(
         let fields = fields.clone();
         move |()| {
             let values: Vec<String> = radios.iter().map(|radio| radio()).collect();
-            let response = response(&fields, &values, &drafts.read());
+            let response = response(id, &fields, &values, &drafts.read());
             if let Err(error) = response
                 .as_ref()
                 .map_err(Clone::clone)
@@ -967,16 +1003,20 @@ fn FormCard(
             });
         }
     });
-    let decline = move |_| {
-        invalid.set(None);
-        on_send.call(Outgoing {
-            message: ClientMsg::Answer {
-                id,
-                response: Response::Decline,
-            },
-            sent: Some(delivered),
-            dropped: None,
-        });
+    let decline = {
+        let fields = fields.clone();
+        move |_| {
+            invalid.set(None);
+            clear_secrets(id, &fields);
+            on_send.call(Outgoing {
+                message: ClientMsg::Answer {
+                    id,
+                    response: Response::Decline,
+                },
+                sent: Some(delivered),
+                dropped: None,
+            });
+        }
     };
     let error_for = |key: &str| {
         invalid
@@ -1330,6 +1370,7 @@ fn InputField(
     on_submit: Callback<()>,
 ) -> Element {
     let mut drafts = drafts;
+    let mut shown = use_signal(|| false);
     let draft = drafts.read()[index].clone();
     let id = format!("r{request}-q{index}");
     let on_key = move |event: KeyboardEvent| {
@@ -1379,6 +1420,55 @@ fn InputField(
             };
         }
         Field::Choice { .. } => return rsx! {},
+        Field::Secret {
+            title,
+            description,
+            required,
+            ..
+        } => {
+            let input_id = input_id(request, index);
+            let (title, description, required) = (title.clone(), description.clone(), *required);
+            return rsx! {
+                div { class: "flex flex-col gap-2", onkeydown: on_key,
+                    label { r#for: "{input_id}", class: "text-sm font-medium wrap-break-word",
+                        "{title}"
+                        if !required {
+                            span { class: "text-muted-foreground font-normal", " (facultatif)" }
+                        }
+                    }
+                    if let Some(description) = description {
+                        p { class: "text-muted-foreground text-sm wrap-break-word", "{description}" }
+                    }
+                    div { class: "flex items-center gap-2",
+                        // Uncontrolled: the page reads it only to send it, and no signal holds it.
+                        Input {
+                            id: input_id.clone(),
+                            r#type: if shown() { InputType::Text } else { InputType::Password },
+                            autocomplete: "new-password",
+                            spellcheck: "false",
+                            autocapitalize: "off",
+                            disabled,
+                            class: "h-11 md:h-9",
+                        }
+                        Button {
+                            id: "{id}-show",
+                            variant: ButtonVariant::Ghost,
+                            class: "h-11 shrink-0 px-3 md:h-9",
+                            disabled,
+                            onclick: move |_| shown.toggle(),
+                            if shown() {
+                                "Masquer"
+                            } else {
+                                "Afficher"
+                            }
+                        }
+                    }
+                    if let Some(error) = error {
+                        FieldError { "{error}" }
+                    }
+                }
+            };
+        }
     };
     let (kind, mode, placeholder) = match &field {
         Field::Text {
@@ -1404,7 +1494,7 @@ fn InputField(
         ),
         _ => (InputType::Text, None, None),
     };
-    let input_id = format!("{id}-input");
+    let input_id = input_id(request, index);
     rsx! {
         div { class: "flex flex-col gap-2", onkeydown: on_key,
             label { r#for: "{input_id}", class: "text-sm font-medium wrap-break-word",
@@ -2997,5 +3087,70 @@ mod tests {
             };
             assert_eq!(values["price"], FieldValue::Number(number), "{typed}");
         }
+    }
+
+    /// A setup form's secret field: a masked box the page reads only to send it, sent as a
+    /// secret, never rendered back, and emptied once the answer went out.
+    #[test]
+    fn a_form_secret_field_is_read_only_to_send() {
+        let card = form(vec![
+            Field::Text {
+                key: "events_url".into(),
+                title: "events_url".into(),
+                description: None,
+                placeholder: None,
+                format: Some(TextFormat::Uri),
+                min_length: None,
+                max_length: None,
+                default: Some("https://cloud.example/dav/".into()),
+                required: true,
+            },
+            Field::Secret {
+                key: "caldav.secret".into(),
+                title: "Mot de passe « caldav »".into(),
+                description: Some("Envoyé seulement à https://cloud.example".into()),
+                required: true,
+            },
+        ]);
+        let mut live = Live::new(props(card));
+        let page = live.html();
+        let input = tag(&page, "r7-q1-input").unwrap();
+        assert!(input.contains(r#"type="password""#), "{input}");
+        assert!(input.contains(r#"autocomplete="new-password""#), "{input}");
+        assert!(
+            page.contains("Envoyé seulement à https://cloud.example"),
+            "{page}"
+        );
+        // Empty: refused on the page, nothing sent.
+        live.click("r7-send");
+        assert_eq!(sent(), []);
+        assert!(live.html().contains("Saisis ce secret."), "{}", live.html());
+        secret_box::type_in("r7-q1-input", CANARY);
+        assert!(!live.html().contains(CANARY));
+        live.click("r7-send");
+        let answers = sent();
+        let [ClientMsg::Answer { response, .. }] = answers.as_slice() else {
+            panic!("one answer: {answers:?}");
+        };
+        let Response::Form { values } = response else {
+            panic!("a form's answer");
+        };
+        assert!(!format!("{answers:?}").contains(CANARY), "never printed");
+        assert_eq!(
+            values["caldav.secret"],
+            FieldValue::Secret(SecretAnswer {
+                secret: SecretValue::new(CANARY.into())
+            })
+        );
+        assert_eq!(
+            values["events_url"],
+            FieldValue::Text("https://cloud.example/dav/".into())
+        );
+        assert_eq!(
+            secret_box::read("r7-q1-input"),
+            "",
+            "emptied once it went out"
+        );
+        assert!(!live.html().contains(CANARY));
     }
 }

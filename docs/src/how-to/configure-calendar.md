@@ -3,6 +3,10 @@
 Fronde reads and writes events and reminders on a CalDAV server: Nextcloud, Radicale, Fastmail
 and others. Events go to one calendar, reminders to a task list (`VTODO`).
 
+With the chat running, you can also ask the assistant to add it: you fill one card and Fronde
+writes the entry below for you (see
+[Set up an integration from the chat](set-up-an-integration-from-the-chat.md)).
+
 ## 1. Find the two collection URLs
 
 You need the address of the calendar for events and of the task list for reminders. On Nextcloud

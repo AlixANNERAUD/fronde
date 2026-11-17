@@ -2,7 +2,7 @@
 //! on `fronde-agent`, so the server hands it [`ThreadBridge`] over [`Threads`].
 
 use async_trait::async_trait;
-use fronde_agent::assistant::SecretInWake;
+use fronde_agent::assistant::{LastingInWake, SecretInWake};
 use fronde_agent::threads::{ChildEnd, ChildTask, Delegation, ThreadId, Threads};
 use fronde_hub::threads::{
     Child, NewChild, ProviderModels, ReadThread, Started, ThreadControl, ThreadError, Waited,
@@ -19,6 +19,9 @@ pub struct ThreadBridge(pub Arc<Threads>);
 /// thread and one out of reach alike, anything else a failure logged by the hub.
 fn hub_error(error: anyhow::Error) -> ThreadError {
     if let Some(refused) = error.downcast_ref::<SecretInWake>() {
+        return ThreadError::Refused(refused.to_string());
+    }
+    if let Some(refused) = error.downcast_ref::<LastingInWake>() {
         return ThreadError::Refused(refused.to_string());
     }
     match error.downcast_ref::<Delegation>() {

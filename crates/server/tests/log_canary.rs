@@ -544,7 +544,7 @@ async fn every_threads_token_never_appears() {
         .await
         .unwrap();
     threads.set_requests(&requests).await;
-    let hub = fronde_hub::Hub::start(config, db, vec![], Some(requests), None)
+    let hub = fronde_hub::Hub::start(config, db, vec![], Some(requests), None, None)
         .await
         .unwrap();
     let app = fronde::router(
