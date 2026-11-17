@@ -338,7 +338,8 @@ pub async fn start_with(
         }
         None => None,
     };
-    let hub = Arc::new(Hub::start(config, db.clone(), components).await?);
+    let requests = chat.as_ref().map(|(_, _, requests, ..)| requests.clone());
+    let hub = Arc::new(Hub::start(config, db.clone(), components, requests).await?);
     let own = chat
         .as_ref()
         .map(|(assistant, token, ..)| (token.clone(), assistant.clone()));

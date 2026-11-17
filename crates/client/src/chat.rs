@@ -1,7 +1,7 @@
 //! What the chat shows, built from the conversation log's entries. Pure logic, without browser
 //! APIs, so it is tested natively.
 
-use fronde_protocol::{Entry, Event, ServerMsg, ToolState, TurnOutcome};
+use fronde_protocol::{Card, Entry, Event, Outcome, RequestId, ServerMsg, ToolState, TurnOutcome};
 
 /// How a tool call ended, as the chat shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,14 @@ pub enum PermissionStatus {
     },
     /// Its turn ended without an answer.
     Expired,
+}
+
+/// Where a request to the user stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestStatus {
+    /// Answerable, until its end is logged: a turn ending does not close it.
+    Open,
+    Closed(Outcome),
 }
 
 /// One line or bubble of the chat.
@@ -46,6 +54,15 @@ pub enum Item {
     },
     Notice {
         text: String,
+    },
+    Request {
+        id: RequestId,
+        card: Card,
+        /// Who asks, when it is not Fronde's assistant.
+        from: Option<String>,
+        status: RequestStatus,
+        /// Why the server refused this page's last answer, while the request is open.
+        refusal: Option<String>,
     },
 }
 
@@ -116,9 +133,35 @@ impl Chat {
                 self.log_id = Some(log_id.clone());
             }
             ServerMsg::Entry(entry) => self.apply_entry(entry.clone()),
-            // Requests have no card on the page yet.
-            ServerMsg::Refused { .. } => {}
+            ServerMsg::Refused { id, reason } => {
+                if let Some(row) = self.open_request(*id) {
+                    let Item::Request { refusal, .. } = &mut row.item else {
+                        unreachable!("an open request row");
+                    };
+                    *refusal = Some(reason.clone());
+                    row.version += 1;
+                }
+            }
         }
+    }
+
+    /// The requests still open, oldest first.
+    pub fn open_requests(&self) -> impl Iterator<Item = &Row> {
+        self.rows.iter().filter(|row| {
+            matches!(
+                row.item,
+                Item::Request {
+                    status: RequestStatus::Open,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn open_request(&mut self, id: RequestId) -> Option<&mut Row> {
+        self.rows.iter_mut().rev().find(|row| {
+            matches!(&row.item, Item::Request { id: open, status: RequestStatus::Open, .. } if *open == id)
+        })
     }
 
     /// Adds an entry the server sent; one seen already is ignored.
@@ -197,7 +240,29 @@ impl Chat {
                 }
             }
             Event::Notice { text } => self.push(seq, Item::Notice { text }),
-            Event::Request { .. } | Event::RequestClosed { .. } => {}
+            Event::Request { id, card, from } => self.push(
+                seq,
+                Item::Request {
+                    id,
+                    card,
+                    from,
+                    status: RequestStatus::Open,
+                    refusal: None,
+                },
+            ),
+            Event::RequestClosed { id, outcome, .. } => {
+                if let Some(row) = self.open_request(id) {
+                    let Item::Request {
+                        status, refusal, ..
+                    } = &mut row.item
+                    else {
+                        unreachable!("an open request row");
+                    };
+                    *status = RequestStatus::Closed(outcome);
+                    *refusal = None;
+                    row.version += 1;
+                }
+            }
         }
     }
 
@@ -510,6 +575,117 @@ mod tests {
             status(&chat, 4),
             PermissionStatus::Answered { allowed: false }
         );
+    }
+
+    fn question(seq: u64, id: RequestId) -> Entry {
+        let card = serde_json::from_str(
+            r#"{"kind":"form","fields":[{"type":"choice","key":"q1","question":"Laquelle ?","options":[{"label":"Mealie"},{"label":"Seerr"}],"other":true,"required":true}]}"#,
+        )
+        .unwrap();
+        entry(
+            seq,
+            Event::Request {
+                id,
+                card,
+                from: None,
+            },
+        )
+    }
+
+    fn request_status(chat: &Chat, index: usize) -> (RequestStatus, Option<String>) {
+        match &chat.rows()[index].item {
+            Item::Request {
+                status, refusal, ..
+            } => (status.clone(), refusal.clone()),
+            other => panic!("not a request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_open_until_closed() {
+        let mut chat = Chat::default();
+        apply_all(&mut chat, [user(1, "Go"), question(2, 7)]);
+        assert_eq!(request_status(&chat, 1), (RequestStatus::Open, None));
+        // The turn ending does not close it: the server does, with its own entry.
+        apply_all(&mut chat, [ended(3, TurnOutcome::Done)]);
+        assert_eq!(request_status(&chat, 1), (RequestStatus::Open, None));
+
+        // A refused answer shows on the card, which stays open.
+        let version = chat.rows()[1].version;
+        chat.apply(&ServerMsg::Refused {
+            id: 7,
+            reason: "Réponds à cette question.".into(),
+        });
+        assert_eq!(
+            request_status(&chat, 1),
+            (
+                RequestStatus::Open,
+                Some("Réponds à cette question.".into())
+            )
+        );
+        assert_ne!(chat.rows()[1].version, version);
+        // A refusal for another request changes nothing.
+        let before = chat.clone();
+        chat.apply(&ServerMsg::Refused {
+            id: 8,
+            reason: "x".into(),
+        });
+        assert_eq!(chat, before);
+
+        let closed = |seq, id, outcome| {
+            entry(
+                seq,
+                Event::RequestClosed {
+                    id,
+                    outcome,
+                    by: Some("alix".into()),
+                },
+            )
+        };
+        let answered = Outcome::Answered {
+            summary: "Seerr".into(),
+        };
+        apply_all(&mut chat, [closed(4, 7, answered.clone())]);
+        assert_eq!(
+            request_status(&chat, 1),
+            (RequestStatus::Closed(answered.clone()), None)
+        );
+        // Closed once: a later close of the same id changes nothing.
+        apply_all(&mut chat, [closed(5, 7, Outcome::Expired)]);
+        assert_eq!(
+            request_status(&chat, 1),
+            (RequestStatus::Closed(answered), None)
+        );
+    }
+
+    #[test]
+    fn open_requests_lists_pending() {
+        let mut chat = Chat::default();
+        apply_all(
+            &mut chat,
+            [
+                user(1, "Go"),
+                question(2, 1),
+                question(3, 2),
+                question(4, 3),
+                entry(
+                    5,
+                    Event::RequestClosed {
+                        id: 2,
+                        outcome: Outcome::Declined,
+                        by: None,
+                    },
+                ),
+            ],
+        );
+        let open: Vec<RequestId> = chat
+            .open_requests()
+            .map(|row| match row.item {
+                Item::Request { id, .. } => id,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(open, [1, 3]);
     }
 
     #[test]

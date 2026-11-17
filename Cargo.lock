@@ -2392,6 +2392,7 @@ name = "fronde-client"
 version = "0.1.0"
 dependencies = [
  "fronde-protocol",
+ "serde_json",
 ]
 
 [[package]]

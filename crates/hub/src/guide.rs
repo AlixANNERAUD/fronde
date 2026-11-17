@@ -22,6 +22,11 @@ pub fn instructions(user: &str, tools: &[ToolDef], core: &Core) -> String {
             "- Exact arithmetic, dates or aggregates over data: code_run_python, never mental arithmetic.\n",
         );
     }
+    if tools.iter().any(|d| d.name == "user_ask") {
+        s.push_str(
+            "- A choice that is the user's: user_ask with options, never a guess. Never ask for a password or key in a question.\n",
+        );
+    }
     s.push_str("- Never poll: if something is not ready, say so and stop.\n");
     let deferred: Vec<&ToolDef> = tools.iter().filter(|d| d.deferred).collect();
     if !deferred.is_empty() {
@@ -118,6 +123,19 @@ mod tests {
         assert!(text.contains(rule), "{text}");
         assert!(!instructions("me", &[], &core).contains(rule));
         assert!(!instructions("me", &[def("mcphub_a", "mcphub")], &core).contains(rule));
+    }
+
+    #[test]
+    fn user_ask_rule_only_with_the_tool() {
+        let rule = "user_ask with options, never a guess";
+        let core = Core {
+            user: String::new(),
+            memory: String::new(),
+        };
+        let text = instructions("me", &[def("user_ask", "hub")], &core);
+        assert!(text.contains(rule), "{text}");
+        assert!(text.contains("Never ask for a password or key"), "{text}");
+        assert!(!instructions("me", &[], &core).contains(rule));
     }
 
     #[test]

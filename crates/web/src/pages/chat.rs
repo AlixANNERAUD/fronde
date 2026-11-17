@@ -6,6 +6,7 @@ use fronde_protocol::{ClientMsg, Response};
 
 use crate::{
     components::icons::{ArrowUp, Check, LogOut, Square, Wrench, X},
+    components::request_card::RequestCard,
     components::ui::{
         badge::{Badge, BadgeVariant},
         bubble::{Bubble, BubbleAlign, BubbleContent, BubbleVariant},
@@ -98,6 +99,23 @@ fn RowView(item: Item, open: bool, on_send: EventHandler<Outgoing>) -> Element {
         },
         Item::Notice { text } => rsx! {
             p { class: "text-muted-foreground px-4 text-center text-xs", "{text}" }
+        },
+        Item::Request {
+            id,
+            card,
+            from,
+            status,
+            refusal,
+        } => rsx! {
+            RequestCard {
+                id,
+                card,
+                from,
+                status,
+                refusal,
+                open,
+                on_send,
+            }
         },
     }
 }
@@ -474,6 +492,21 @@ mod tests {
         let page = render(chat(&[USER, PERMISSION, answered]), Status::Open);
         assert_eq!(button(&page, "Autoriser"), None, "{page}");
         assert!(page.contains("Refusé"), "{page}");
+    }
+
+    #[test]
+    fn question_card_stays_open_until_closed() {
+        let request = r#"{"type":"request","id":3,"card":{"kind":"form","fields":[{"type":"choice","key":"q1","header":"Appli","question":"Quelle appli ?","options":[{"label":"Mealie"},{"label":"Seerr"}],"other":true,"required":true}]}}"#;
+        // Asked during a turn, still open once the turn ended: the server closes it.
+        let page = render(chat(&[USER, request, ENDED]), Status::Open);
+        assert!(page.contains("Quelle appli ?"), "{page}");
+        assert_eq!(button(&page, "Envoyer"), Some(false), "{page}");
+        assert_eq!(button(&page, "Refuser"), Some(false), "{page}");
+
+        let closed = r#"{"type":"request_closed","id":3,"outcome":{"type":"answered","summary":"Seerr"},"by":"alix"}"#;
+        let page = render(chat(&[USER, request, ENDED, closed]), Status::Open);
+        assert!(page.contains("Réponse : Seerr"), "{page}");
+        assert_eq!(button(&page, "Refuser"), None, "{page}");
     }
 
     #[test]

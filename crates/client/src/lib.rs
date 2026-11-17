@@ -3,5 +3,5 @@
 pub mod chat;
 pub mod connection;
 
-pub use chat::{Chat, Item, PermissionStatus, Row, ToolStatus};
+pub use chat::{Chat, Item, PermissionStatus, RequestStatus, Row, ToolStatus};
 pub use connection::{Action, Connection, State};

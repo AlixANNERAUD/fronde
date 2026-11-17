@@ -10,9 +10,11 @@ pub mod search;
 pub mod source;
 pub mod tools;
 pub mod upstream;
+pub mod user;
 
 use config::{Config, SourceConfig};
 use fronde_db::DatabaseConnection;
+use fronde_requests::Requests;
 use memory::index::MemoryIndex;
 use memory::{MemoryStore, tools::memory_tools};
 use source::{Native, Supervisor, ToolSource};
@@ -33,11 +35,13 @@ pub struct Hub {
 impl Hub {
     /// Open memory, register the hub's own tools, start `components` (one that fails is skipped
     /// with a warning, unless it is waiting for a stored secret: that one is tried again) and
-    /// connect upstream servers in the background.
+    /// connect upstream servers in the background. With `requests` (the chat runs), the `user_*`
+    /// tools ask the user through it.
     pub async fn start(
         config: Config,
         db: DatabaseConnection,
         components: Vec<Arc<dyn ToolSource>>,
+        requests: Option<Arc<Requests>>,
     ) -> anyhow::Result<Self> {
         let dir = &config.data.dir;
         private::prepare_data_dir(dir)?;
@@ -54,6 +58,9 @@ impl Hub {
         let sources = Supervisor::new(registry.clone());
         let mut own = meta_tools(&registry);
         own.extend(memory_tools(memory.clone(), index, config.memory.git));
+        if let Some(requests) = requests {
+            own.extend(user::user_tools(requests));
+        }
         sources.start(Arc::new(Native::new("hub", own))).await?;
         for component in components {
             let name = component.name().to_string();

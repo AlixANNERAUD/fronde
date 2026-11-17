@@ -56,26 +56,8 @@ database, the topic `conversation`; the session id is saved there too.
 ## Requests
 
 Anything that waits on a human is a **request**: a row in the `requests` table, shown as a card in
-the conversation, answered once. The row is written first, then the card is announced as an entry
-of the stream (`request`), and the row is closed before the asker wakes, then the card is closed
-too (`request_closed`). Every change of status is a compare-and-set on `pending`: the first answer
-wins, from whichever signed-in page, and a closed request never reopens. A request ends
-`answered`, `declined`, `expired` or `cancelled`. Each has an expiry, and no answer means no.
-
-A page answers with one message, `answer`, whatever the card. The server checks the answer
-against the card (offered options only, one pick for a single choice, required questions
-answered) and against the user: only the user the request is for may answer it, and a card
-marked for admins only an admin. A refused answer leaves the request as it was and is told to
-that page only. The page runs the same checks before sending, from the same code
-(`fronde_protocol::request::check`).
-
-The table is the source of truth. A request survives a restart: one whose time ran out expires,
-and one whose card never made it to the stream (a crash in between) is announced again. A retried
-call that gives the same `client_request_id` gets the same request rather than a second card. The
-row keeps who answered, when, and a summary of the answer, never a secret.
-
-The agent's permission requests still go through their own path, answered with the same `answer`
-message, until they become requests too.
+the conversation and answered once, from whichever signed-in page. `user_ask` is the first tool to
+ask this way. See [Requests and cards](requests.md).
 
 ## The web interface
 

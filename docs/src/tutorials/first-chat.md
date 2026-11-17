@@ -77,6 +77,13 @@ Now look at `~/.local/share/fronde/memory/MEMORY.md`: the fact is there, as one 
 préfère boire ?*, now or after a restart: the hub hands its core memory to every agent that
 connects to it.
 
+When a choice is yours, Fronde asks instead of guessing. Try *Propose-moi un thé pour ce soir,
+demande-moi d'abord ce que j'aime*: a card titled *Question de Fronde* shows options, the advised
+one marked *Recommandé*, and *Autre…* for an answer in your own words. Pick one and press
+*Envoyer*, or *Refuser* to let Fronde go on without it. The card then shows your answer, and
+Fronde carries on from it. The card stays answerable from any page where you are signed in, your
+phone included, until it is answered or expires.
+
 ## What you built
 
 A Fronde server with its memory in `~/.local/share/fronde`, a chat behind a password, and an MCP server at

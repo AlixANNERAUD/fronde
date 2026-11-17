@@ -44,6 +44,45 @@ full-text search over names and descriptions, accents ignored.
 take `USER.md` or `MEMORY.md` over its limit is refused, with a hint to merge or prune lines
 first. See [Memory](../explanation/memory.md).
 
+## Asking the user
+
+Served only with `[web]`: the question shows as a card in Fronde's chat, the one place where the
+owner answers.
+
+| Tool | Arguments | Does |
+| --- | --- | --- |
+| `user_ask` | `questions` (1 to 4), `timeout_ms` (1000 to 3600000, default 600000), `client_request_id` (optional, 1 to 128 characters) | Asks the user multiple-choice questions on one card and waits for the answers. |
+
+Each question has `question` (the full text), `header` (a chip of at most 12 characters, such as
+"Appli"), `multi_select` (default `false`) and `options`: 2 to 4 of `{ label, description,
+preview?, recommended? }`. Labels are unique within a question. At most one option is
+`recommended`, and it comes first: the card marks it *Recommandé* and never picks it for the user.
+A `preview` is text shown in monospace while its option is picked: beside the options on a wide
+screen, under the option on a phone. Every question also offers *Autre…* with free text, and a
+note (*Ajouter une précision*).
+
+The call blocks until the request ends:
+
+```json
+{"result": {"status": "answered", "answers": [
+  {"question": "Quelle appli installer ?", "selected": ["Seerr"], "other": null, "note": null}
+]}}
+```
+
+`selected` holds labels of the options offered, never anything else; `other` is the free text,
+`note` the precision, both `null` when empty. A request that ends without an answer returns
+`{"status": "declined"}`, `"expired"` (after `timeout_ms`) or `"cancelled"`, each with a `next`
+saying what to do: a declined question is not asked again in the same turn.
+
+Give the same `client_request_id` when retrying a call that failed on the way: the retry joins the
+first request rather than showing a second card, and gets its answer, even one given already.
+
+A question from Fronde's own assistant is headed *Question de Fronde*; one from an outside client
+is headed with the name the client gave (`clientInfo.name`), such as *Question de Codex*. Never
+use it for a password or a key. An MCP client that cuts tool calls short needs a longer timeout
+than the question's: Codex, for instance, gives up after `tool_timeout_sec` (60 s by default).
+See [Requests and cards](../explanation/requests.md).
+
 ## Calendar
 
 Brought by the calendar component, when it is configured (see

@@ -1275,3 +1275,197 @@ async fn session_id_is_never_logged() {
         );
     }
 }
+
+/// An MCP client of `/mcp` holding `token`, named `name`.
+async fn mcp_client(
+    addr: SocketAddr,
+    token: &str,
+    name: &str,
+) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig> {
+    use rmcp::ServiceExt;
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(token),
+    );
+    let mut info = rmcp::model::ClientConfig::default();
+    info.client_info = rmcp::model::Implementation::new(name, "1.0");
+    timeout(WAIT, info.serve(transport)).await.unwrap().unwrap()
+}
+
+/// Calls `user_ask` with one question in the background; resolves to the tool's text.
+fn ask_in_background(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
+) -> tokio::task::JoinHandle<serde_json::Value> {
+    let peer = client.peer().clone();
+    tokio::spawn(async move {
+        let args = serde_json::json!({"questions": [{
+            "question": "Quelle appli installer ?",
+            "header": "Appli",
+            "options": [
+                {"label": "Mealie", "description": "Recettes"},
+                {"label": "Seerr", "description": "Films"},
+            ],
+        }]});
+        let result = peer
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("user_ask")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("{other:?}"),
+        };
+        serde_json::from_str(&text).unwrap()
+    })
+}
+
+/// The next request shown in the chat: its id and who asked.
+async fn next_request(socket: &mut Socket) -> (u64, Option<String>) {
+    loop {
+        if let Event::Request { id, from, .. } = next_entry(socket).await.event {
+            return (id, from);
+        }
+    }
+}
+
+#[tokio::test]
+async fn answer_over_websocket_reaches_the_waiter() {
+    let dir = tempfile::tempdir().unwrap();
+    // The fake agent holds its turn open until told to go on.
+    let gate = Arc::new(Notify::new());
+    let (connector, seen) = fake_connector_with(FakeScript {
+        updates: vec![text_chunk("Je regarde."), text_chunk(" Voilà.")],
+        pause: Some((1, gate.clone())),
+        ..FakeScript::default()
+    });
+    let addr = start_with(config(dir.path(), true), connector, &site(dir.path())).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+        },
+    )
+    .await;
+    // The turn runs: its user message is entry 1.
+    assert_eq!(
+        next_entry(&mut socket).await.event,
+        Event::User {
+            text: "Salut".into()
+        }
+    );
+    let assistant_token = loop {
+        if let Some(spec) = seen.lock().unwrap().clone() {
+            break secrecy::ExposeSecret::expose_secret(&spec.hub_token).to_owned();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // Fronde's assistant asks during its turn.
+    let assistant = mcp_client(addr, &assistant_token, "claude-code").await;
+    let asked = ask_in_background(&assistant);
+    let (id, from) = next_request(&mut socket).await;
+    assert_eq!(from, None, "the assistant asks as Fronde");
+    let answer = Response::Form {
+        values: [(
+            "q1".to_owned(),
+            fronde_protocol::ChoiceAnswer {
+                selected: vec!["Seerr".into()],
+                ..Default::default()
+            },
+        )]
+        .into(),
+    };
+    // A second page answers too late: the first answer wins.
+    let mut phone = open_chat(addr, &cookie).await;
+    hello(&mut phone, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Answer {
+            id,
+            response: answer.clone(),
+        },
+    )
+    .await;
+    let result = timeout(WAIT, asked).await.unwrap().unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!({"result": {"status": "answered", "answers": [{
+            "question": "Quelle appli installer ?",
+            "selected": ["Seerr"],
+            "other": null,
+            "note": null,
+        }]}})
+    );
+    say(
+        &mut phone,
+        ClientMsg::Answer {
+            id,
+            response: Response::Decline,
+        },
+    )
+    .await;
+    loop {
+        match next_message(&mut phone).await {
+            ServerMsg::Refused {
+                id: refused,
+                reason,
+            } => {
+                assert_eq!(refused, id);
+                assert_eq!(reason, "Cette demande est déjà close.");
+                break;
+            }
+            ServerMsg::Entry(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // An outside client asks the same owner, under its own name.
+    let outside = mcp_client(addr, TOKEN, "Codex").await;
+    let asked = ask_in_background(&outside);
+    let (outside_id, from) = next_request(&mut socket).await;
+    assert_eq!(from.as_deref(), Some("Codex"));
+    say(
+        &mut socket,
+        ClientMsg::Answer {
+            id: outside_id,
+            response: Response::Decline,
+        },
+    )
+    .await;
+    let result = timeout(WAIT, asked).await.unwrap().unwrap();
+    assert_eq!(result["result"], serde_json::json!({"status": "declined"}));
+    gate.notify_one();
+    until_turn_ended(&mut socket).await;
+
+    // The audit trail: who asked, in which turn, who answered what.
+    let db = database(dir.path()).await;
+    let rows: Vec<(String, Option<i64>, String, Option<String>)> =
+        sqlx::query_as("SELECT caller, turn, status, answered_by FROM requests ORDER BY id")
+            .fetch_all(db.get_sqlite_connection_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (
+                "assistant".into(),
+                Some(1),
+                "answered".into(),
+                Some("Alix".into())
+            ),
+            (
+                "mcp:Codex".into(),
+                None,
+                "declined".into(),
+                Some("Alix".into())
+            ),
+        ]
+    );
+}

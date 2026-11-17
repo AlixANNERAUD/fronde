@@ -151,6 +151,16 @@ rules on the same machine do not reach it. Its permission mode asks before actin
 it makes shows in the chat with *Autoriser* and *Refuser*. Adding a built-in tool beyond the two
 web ones is refused by the configuration check: widening it is a deliberate code change.
 
+## Requests
+
+A card is answered only by the user it is for, from a signed-in page, and the answer is checked
+against the card on the server: options the card did not offer, a second pick on a question with
+one answer, or an answer to a closed request are refused, and the request does not change. The
+refusal goes to that page only and is never logged; a message that does not parse is logged with
+its position only, never its content. A question card is not for secrets: `user_ask` tells agents
+never to ask for a password or key, and its answers are kept in `fronde.db` as an audit trail.
+Cards show agents' text as text, never as HTML. See [Requests and cards](requests.md).
+
 ## Untrusted content
 
 Text from the web, an email or a document can carry instructions written by someone else. Nothing

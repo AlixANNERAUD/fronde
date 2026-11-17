@@ -183,7 +183,7 @@ mod tests {
         let config: crate::config::Config = toml::from_str(&toml).unwrap();
         crate::private::prepare_data_dir(dir).unwrap();
         let db = fronde_db::open(dir).await.unwrap();
-        let hub = Hub::start(config, db, vec![]).await.unwrap();
+        let hub = Hub::start(config, db, vec![], None).await.unwrap();
         let (mut d, h) = typed_tool(
             "mcphub_secret_tool",
             "Hidden",

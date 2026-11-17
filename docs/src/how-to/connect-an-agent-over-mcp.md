@@ -26,6 +26,12 @@ things:
 
 Keep the token out of shared files: use the client's own secret store or an environment variable.
 
+When Fronde runs its chat (`[web]`), an agent can ask you a question with `user_ask`: the card
+shows in the chat, headed with the client's name, and the call waits for your answer, up to 10
+minutes by default. Raise the client's tool timeout above that, for example Codex's
+`tool_timeout_sec`, which is 60 s by default; a call cut short leaves the card answerable, but the
+answer no longer reaches the agent.
+
 ## Check the connection
 
 A request without the token gets `401 Unauthorized`:
