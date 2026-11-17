@@ -5,7 +5,8 @@ use fronde_hub::config::ComponentConfig;
 use fronde_hub::source::Supervisor;
 use fronde_hub::tools::Registry;
 use fronde_wasm::{
-    Allowed, Checks, ComponentHost, ComponentSource, ComponentSpec, Hashes, LoadedComponent,
+    Allowed, Approval, Checks, ComponentHost, ComponentSource, ComponentSpec, Hashes,
+    LoadedComponent, prepare, shipped,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -25,6 +26,64 @@ fn calendar_wasm() -> PathBuf {
         p.display()
     );
     p
+}
+
+/// The calendar shipped with this build, under an entry without hashes, as the `[calendar]`
+/// migration writes it: approved as shipped, loaded and listing its tools. Their contract is
+/// pinned by the component's own tests (components/calendar/tests/schemas.rs).
+#[tokio::test]
+async fn shipped_calendar_is_approved_loads_and_lists_its_tools() {
+    let config: ComponentConfig = toml::from_str(&format!(
+        r#"
+        name = "calendar"
+        path = {:?}
+        allow = ["https://cloud.example"]
+        [settings]
+        events_url = "https://cloud.example/dav/personal/"
+        reminders_url = "https://cloud.example/dav/tasks/"
+        "#,
+        calendar_wasm().display().to_string()
+    ))
+    .unwrap();
+    let checks = Checks {
+        timezone: "Europe/Paris".into(),
+        shipped: shipped(),
+        sources: vec![],
+    };
+    let prepared = prepare(&config, &checks).unwrap();
+    assert_eq!(
+        *prepared.approval(),
+        Approval::Shipped {
+            name: "calendar".into()
+        }
+    );
+    let calendar = LoadedComponent::load(&ComponentHost::new().unwrap(), prepared)
+        .await
+        .unwrap();
+    let mut names: Vec<&str> = calendar
+        .list_tools()
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "calendar_create",
+            "calendar_delete",
+            "calendar_list",
+            "calendar_update",
+            "reminders_create",
+            "reminders_delete",
+            "reminders_done",
+            "reminders_list",
+        ]
+    );
+    for tool in calendar.list_tools() {
+        assert!(!tool.description.is_empty(), "{}", tool.name);
+        assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
+        assert_eq!(tool.source, "calendar");
+    }
 }
 
 #[tokio::test]

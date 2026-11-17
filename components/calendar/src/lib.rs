@@ -14,6 +14,15 @@ pub mod tools;
 #[cfg(test)]
 mod testing;
 
+/// The tools as the component exports them: what the host lists, built on any target so that
+/// their contract is tested natively.
+pub fn exported_tools() -> Vec<fronde_component::Tool> {
+    tools::definitions()
+        .into_iter()
+        .map(|t| fronde_component::Tool::new(t.name, t.description, t.input_schema))
+        .collect()
+}
+
 /// The export glue: tools that read the settings and reach CalDAV over WASI HTTP.
 #[cfg(target_arch = "wasm32")]
 mod guest {
@@ -28,10 +37,7 @@ mod guest {
 
     impl Tools for Calendar {
         fn list_tools() -> Vec<Tool> {
-            tools::definitions()
-                .into_iter()
-                .map(|t| Tool::new(t.name, t.description, t.input_schema))
-                .collect()
+            crate::exported_tools()
         }
 
         fn call_tool(name: &str, arguments: &str) -> ToolOutput {
