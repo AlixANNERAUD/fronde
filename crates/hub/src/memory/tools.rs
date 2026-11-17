@@ -43,7 +43,7 @@ impl Ctx {
     /// Reindex and version a file after a successful write; returns the tool result.
     async fn after_write(&self, file: MemoryFile, path: PathBuf, action: &str) -> ToolOutput {
         let root = self.store.dir().to_path_buf();
-        if let Err(e) = self.index.reindex_file(&root, &path) {
+        if let Err(e) = self.index.reindex_file(&root, &path).await {
             tracing::warn!("memory index: {e:#}");
         }
         let name = path
@@ -129,7 +129,7 @@ pub fn memory_tools(store: Arc<MemoryStore>, index: Arc<MemoryIndex>, git: bool)
             let c = c.clone();
             async move {
                 let limit = a.limit.unwrap_or(10).clamp(1, 50) as usize;
-                ToolOutput::ok(c.index.search(&a.query, limit))
+                ToolOutput::ok(c.index.search(&a.query, limit).await)
             }
         },
     );
@@ -144,16 +144,18 @@ mod tests {
     use crate::tools::Registry;
     use serde_json::json;
 
-    fn setup(limit: usize, git: bool) -> (tempfile::TempDir, Registry) {
+    /// A data directory as the hub lays it out: the database, and the memory in `memory/`.
+    async fn setup(limit: usize, git: bool) -> (tempfile::TempDir, Registry) {
         let dir = tempfile::tempdir().unwrap();
         let cfg = MemoryConfig {
             memory_limit: limit,
             user_limit: limit,
             git,
         };
-        let store =
-            Arc::new(MemoryStore::open(dir.path(), &cfg, chrono_tz::Europe::Paris).unwrap());
-        let index = Arc::new(MemoryIndex::open(&dir.path().join(".index.sqlite")).unwrap());
+        let store = Arc::new(
+            MemoryStore::open(&dir.path().join("memory"), &cfg, chrono_tz::Europe::Paris).unwrap(),
+        );
+        let index = Arc::new(MemoryIndex::new(fronde_db::open(dir.path()).await.unwrap()));
         let reg = Registry::new();
         register_memory_tools(&reg, store, index, git).unwrap();
         (dir, reg)
@@ -161,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_then_search_finds_it() {
-        let (_d, reg) = setup(1000, false);
+        let (_d, reg) = setup(1000, false).await;
         let out = reg
             .call(
                 "memory_add",
@@ -187,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn near_full_adds_next_hint() {
-        let (_d, reg) = setup(100, false);
+        let (_d, reg) = setup(100, false).await;
         let out = reg
             .call(
                 "memory_add",
@@ -195,7 +197,7 @@ mod tests {
             )
             .await;
         assert!(out.next.unwrap().contains("nearly full"));
-        let (_d, reg) = setup(1000, false);
+        let (_d, reg) = setup(1000, false).await;
         let out = reg
             .call("memory_add", json!({"file": "user", "text": "short"}))
             .await;
@@ -204,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_is_a_tool_error() {
-        let (_d, reg) = setup(10, false);
+        let (_d, reg) = setup(10, false).await;
         let out = reg
             .call(
                 "memory_add",
@@ -225,14 +227,14 @@ mod tests {
             eprintln!("git absent: skipped");
             return;
         }
-        let (dir, reg) = setup(1000, true);
+        let (dir, reg) = setup(1000, true).await;
         reg.call("memory_add", json!({"file": "memory", "text": "one"}))
             .await;
         reg.call("memory_add", json!({"file": "journal", "text": "two"}))
             .await;
         let log = std::process::Command::new("git")
             .args(["log", "--oneline"])
-            .current_dir(dir.path())
+            .current_dir(dir.path().join("memory"))
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2);

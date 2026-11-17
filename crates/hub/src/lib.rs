@@ -45,8 +45,9 @@ impl Hub {
             &config.memory,
             config.data.timezone,
         )?);
-        let index = Arc::new(MemoryIndex::open(&dir.join("index.sqlite"))?);
-        index.reindex_all(memory.dir())?;
+        remove_legacy_index(dir);
+        let index = Arc::new(MemoryIndex::new(db.clone()));
+        index.reindex_all(memory.dir()).await?;
 
         let registry = Arc::new(Registry::new());
         let sources = Supervisor::new(registry.clone());
@@ -71,5 +72,24 @@ impl Hub {
             config,
             db,
         })
+    }
+}
+
+/// Delete the memory index file of Fronde versions before the database (`index.sqlite`, and the
+/// journal a crash may have left). It was a cache of the memory files, now in `fronde.db`.
+fn remove_legacy_index(dir: &std::path::Path) {
+    for name in ["index.sqlite", "index.sqlite-journal"] {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                "deleted {}: the memory index is now in the database",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                "cannot delete {}: {e}; it is no longer used, delete it by hand",
+                path.display()
+            ),
+        }
     }
 }

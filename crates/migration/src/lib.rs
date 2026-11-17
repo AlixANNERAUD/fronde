@@ -9,6 +9,7 @@
 pub use sea_orm_migration::prelude::*;
 
 mod m20261117_000001_kv;
+mod m20261117_000002_memory_fts;
 
 /// Every migration of Fronde, in the order they apply.
 pub struct Migrator;
@@ -16,6 +17,9 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(m20261117_000001_kv::Migration)]
+        vec![
+            Box::new(m20261117_000001_kv::Migration),
+            Box::new(m20261117_000002_memory_fts::Migration),
+        ]
     }
 }

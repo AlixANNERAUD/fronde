@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone)]
@@ -135,6 +136,9 @@ type Entry = Tool;
 #[derive(Default)]
 pub struct Registry {
     tools: RwLock<BTreeMap<String, Entry>>,
+    /// Moves, under the write lock, whenever a deferred tool comes or goes: the search index
+    /// rebuilds when it no longer matches.
+    generation: AtomicU64,
     index: ToolIndex,
 }
 
@@ -168,17 +172,17 @@ impl Registry {
             );
         }
         if def.deferred {
-            self.index.upsert(&def);
+            self.generation.fetch_add(1, Ordering::AcqRel);
         }
         tools.insert(def.name.clone(), (def, handler));
         Ok(())
     }
 
     fn remove_source(&self, tools: &mut BTreeMap<String, Entry>, source: &str) {
-        tools.retain(|name, (d, _)| {
+        tools.retain(|_, (d, _)| {
             let keep = d.source != source;
-            if !keep {
-                self.index.remove(name);
+            if !keep && d.deferred {
+                self.generation.fetch_add(1, Ordering::AcqRel);
             }
             keep
         });
@@ -204,9 +208,13 @@ impl Registry {
     }
 
     /// Deferred tools matching a need, best first.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<ToolDef> {
+    pub async fn search(&self, query: &str, limit: usize) -> Vec<ToolDef> {
+        // Read before listing the tools: a change in between makes the next search rebuild
+        // again, never keeps an index older than its generation.
+        let generation = self.generation.load(Ordering::Acquire);
         self.index
-            .search(query, limit)
+            .search(generation, || self.deferred(), query, limit)
+            .await
             .iter()
             .filter_map(|n| self.get(n))
             .collect()
@@ -302,6 +310,7 @@ pub fn meta_tools(registry: &Arc<Registry>) -> Vec<Tool> {
                 let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
                 let found: Vec<Value> = r
                     .search(&a.need, limit)
+                    .await
                     .into_iter()
                     .map(|d| json!({"name": d.name, "description": d.description, "input_schema": d.input_schema}))
                     .collect();
@@ -414,8 +423,8 @@ mod tests {
         assert_eq!(r.visible().len(), 1);
     }
 
-    #[test]
-    fn replace_source_swaps_its_tools_and_skips_clashes() {
+    #[tokio::test]
+    async fn replace_source_swaps_its_tools_and_skips_clashes() {
         let r = Registry::new();
         let (d, h) = double(false, "taken");
         r.register(d, h).unwrap();
@@ -433,7 +442,32 @@ mod tests {
         let count = r.replace_source("up", vec![double(true, "up_c"), double(true, "Bad")]);
         assert_eq!(count, 1);
         assert_eq!(r.deferred_names(), ["up_c"]);
-        assert_eq!(r.search("double", 5).len(), 1, "the index follows");
+        assert_eq!(r.search("double", 5).await.len(), 1, "the index follows");
+    }
+
+    #[tokio::test]
+    async fn search_follows_registry_changes() {
+        let r = Registry::new();
+        let names = |found: Vec<ToolDef>| found.into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert!(r.search("double", 5).await.is_empty());
+        let (mut d, h) = double(true, "other_b");
+        d.source = "other".into();
+        r.register(d, h).unwrap();
+        let (d, h) = double(false, "double_visible");
+        r.register(d, h).unwrap();
+        assert_eq!(names(r.search("double", 5).await), ["other_b"]);
+        r.replace_source("up", vec![double(true, "double_up")]);
+        assert_eq!(
+            names(r.search("double", 1).await),
+            ["double_up"],
+            "a match in the name ranks first"
+        );
+        r.replace_source("up", vec![]);
+        assert_eq!(
+            names(r.search("double", 1).await),
+            ["other_b"],
+            "a removed tool leaves the index"
+        );
     }
 
     #[test]

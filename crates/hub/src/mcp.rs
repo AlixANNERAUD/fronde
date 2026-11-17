@@ -96,11 +96,31 @@ mod tests {
         for p in ["", "memory", "memory/journal"] {
             assert_eq!(mode(&data.join(p)), 0o700, "{p}");
         }
-        assert_eq!(mode(&data.join("index.sqlite")), 0o600);
+        assert!(!data.join("index.sqlite").exists());
         assert_eq!(mode(&data.join("fronde.db")), 0o600);
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
         start_hub(&data).await;
         assert_eq!(mode(&data), 0o700);
+    }
+
+    #[tokio::test]
+    async fn legacy_index_file_is_deleted() {
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for name in ["index.sqlite", "index.sqlite-journal"] {
+            std::fs::write(data.join(name), "an old index").unwrap();
+        }
+        std::fs::create_dir_all(data.join("memory")).unwrap();
+        std::fs::write(data.join("memory/MEMORY.md"), "- has a cat named Tom\n").unwrap();
+        let hub = start_hub(&data).await;
+        assert!(!data.join("index.sqlite").exists());
+        assert!(!data.join("index.sqlite-journal").exists());
+        let found = hub
+            .registry
+            .call("memory_search", serde_json::json!({"query": "cat"}))
+            .await;
+        assert_eq!(found.value[0]["file"], "MEMORY.md", "{}", found.to_text());
     }
 
     async fn start_hub(dir: &std::path::Path) -> Arc<Hub> {

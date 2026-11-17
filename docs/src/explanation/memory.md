@@ -39,8 +39,8 @@ if it fails, the memory is still written, and the log says why.
 
 `memory_search` uses SQLite's FTS5, one row per non-empty line, with accents ignored and prefix
 matching on each word. It finds "train" in "trains" and "été" from "ete", needs no model and no
-network, and is rebuilt from the files at each start. The index is a cache: the files are the
-truth.
+network, and is rebuilt from the files at each start. The index lives in the database,
+`fronde.db`, but it is only a cache: the files are the truth.
 
 ## What is never saved
 
