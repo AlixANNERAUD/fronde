@@ -7,8 +7,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-# The in-process fake ACP agent used by tests here and in dependent crates.
-testing = []
+# The fake ACP agent used by tests here and in dependent crates, in process or on stdio.
+testing = ["tokio-util/compat"]
 
 [dependencies]
 agent-client-protocol.workspace = true

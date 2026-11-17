@@ -301,6 +301,35 @@ sandbox = true
 read = ["/home/alex/.local/share/claude"]
 ```
 
+### `[agent.limits]`
+
+Optional. What the agent, with everything it starts, may use of the machine. When a systemd
+user manager answers, Fronde starts the agent in a systemd scope under `fronde-agents.slice`
+with these limits (see [Run as a service](../how-to/run-as-a-service.md#the-agents-scope)).
+Without one, as in a container, they do not apply: give the container its own limits (see
+[Run in Docker](../how-to/run-in-docker.md#limits)). Either way, the kernel kills the agent
+before Fronde when memory runs out (`oom_score_adj` 1000), and the agent writes no core dump.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `memory` | size or `"none"` | `"2G"` | The most memory it may use (`MemoryMax`), as a number of bytes or with `K`, `M`, `G` or `T` (powers of 1024). Past three quarters of it (`MemoryHigh`), the kernel reclaims its memory first; at the limit, it is OOM-killed. |
+| `cpus` | number or `"none"` | `2` | How many CPUs' worth of time it may use (`CPUQuota`, 100 % per CPU): `0.5` is half of one. At least `0.01`. |
+| `tasks` | integer or `"none"` | `512` | How many processes and threads it may run at once (`TasksMax`). Node.js and Claude Code use a few dozen. |
+
+`"none"` leaves out that limit: the slice's and systemd's own defaults then apply (systemd caps
+a user's tasks at 15 % of the system's by default). With all three `"none"`, Fronde starts no
+scope. If `systemd-run` is there but the user manager makes no scope, the agent starts without
+one, and Fronde logs a warning saying why; the limits are a safeguard for the machine, not part
+of the agent's confinement, which never depends on systemd. `fronde check` and the start log
+say which applies (`agent limits: …`).
+
+```toml
+[agent.limits]
+memory = "4G"
+cpus = 1.5
+tasks = "none"
+```
+
 ## Environment variables
 
 | Variable | Meaning |

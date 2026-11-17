@@ -84,6 +84,23 @@ start that says what the kernel enforces. Without it, the agent does not start; 
 container, the agent's home is `/data/home` and no host socket (D-Bus, the user manager, the
 Docker socket) is there unless you mount it: do not mount one.
 
+## Limits
+
+A container has no systemd user manager, so [`[agent.limits]`](../reference/configuration.md#agentlimits)
+does not apply there: `docker logs fronde` shows `agent limits: none (no systemd-run here)`.
+Cap the container instead, which holds Fronde and its agent:
+
+```sh
+docker run … --memory 3g --cpus 2 --pids-limit 1024 …
+```
+
+(`mem_limit`, `cpus` and `pids_limit` in Compose). When the container runs out of memory, the
+kernel kills the agent first: Fronde starts it with the highest `oom_score_adj` (1000), and
+the chat starts a new one at the next message. Fronde sets no `ulimit` of its own besides core
+dumps (none for the agent): Linux counts processes per user, not per container, and the
+agent's Node.js reserves far more address space than it uses, so neither `RLIMIT_NPROC` nor
+`RLIMIT_AS` caps it well; `--pids-limit` and `--memory` do.
+
 ## 4. Check it
 
 ```sh
@@ -142,6 +159,9 @@ services:
     ports: ["8484:8484"]
     ulimits:
       core: 0
+    mem_limit: 3g
+    cpus: 2
+    pids_limit: 1024
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN
     volumes:

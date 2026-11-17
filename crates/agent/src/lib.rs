@@ -8,3 +8,4 @@ pub mod fake;
 pub mod legacy;
 pub mod log;
 pub mod permission;
+pub mod scope;

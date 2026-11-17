@@ -1,6 +1,7 @@
 //! ACP client: starts the agent, opens Fronde's session and runs prompt turns.
 
 use crate::confine::Confine;
+use crate::scope::ScopeStop;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
@@ -215,7 +216,7 @@ pub fn installed(program: &str, env: &[(String, String)]) -> bool {
     path.is_some_and(|path| std::env::split_paths(&path).any(|dir| executable(&dir.join(program))))
 }
 
-fn executable(path: &Path) -> bool {
+pub(crate) fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
@@ -228,6 +229,8 @@ pub struct AgentClient {
     permissions: Arc<Permissions>,
     // The connection task runs until this sender is dropped.
     _stop: oneshot::Sender<()>,
+    // Then the agent's scope, if it has one, is stopped.
+    _scope: Option<ScopeStop>,
 }
 
 impl AgentClient {
@@ -277,12 +280,25 @@ impl AgentClient {
             let token = read().await.context("[agent] oauth_token")?;
             secrets.push((OAUTH_TOKEN_VAR.to_owned(), token.expose_secret().to_owned()));
         }
+        let mut scope = None;
         let config = match confine {
             None => AcpAgentConfig::new(program)
                 .args(args.iter().cloned())
                 .envs(spec.env.iter().cloned().chain(secrets)),
             Some(confine) => {
+                let confine = confine.ready().await;
                 let helper = confine.command_with(spec, secrets)?;
+                if let (Some(unit), Some(run)) = (helper.unit, &confine.scope) {
+                    tracing::info!(
+                        "agent limits: {}, in the systemd scope {unit} under {}",
+                        run.limits.describe(),
+                        crate::scope::SLICE
+                    );
+                    scope = Some(ScopeStop {
+                        ctl: run.ctl(),
+                        unit,
+                    });
+                }
                 AcpAgentConfig::new(helper.program)
                     .args(helper.args)
                     .envs(helper.env)
@@ -292,7 +308,9 @@ impl AgentClient {
             .await
             .with_context(|| format!("cannot start the agent ({command})"))?;
         let header = format!("Bearer ${{{HUB_TOKEN_VAR}}}");
-        connection.open_session(spec, header, resume).await
+        let mut client = connection.open_session(spec, header, resume).await?;
+        client._scope = scope;
+        Ok(client)
     }
 
     /// Open a session (resumed when possible) with an agent reached through `transport`.
@@ -619,6 +637,7 @@ impl Connection {
             session_id,
             permissions,
             _stop: stop,
+            _scope: None,
         })
     }
 }

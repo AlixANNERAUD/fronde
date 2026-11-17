@@ -22,6 +22,7 @@ use fronde_agent::confine::{
     CONNECT_PORTS, Confine, GrantRequest, KEEP_ENV, Policy, SYSTEM_READ, Sandbox, Support, grants,
     url_port,
 };
+use fronde_agent::scope::{Limits, SLICE, Scope};
 use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
@@ -338,11 +339,16 @@ pub async fn start_with_helper(
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let connector = match &config.web {
         Some(_) => {
-            let confine = agent_confine(&config, helper)?;
+            let mut confine = agent_confine(&config, helper)?;
             match sandbox_line(&confine, config.server.listen.port()) {
                 (line, true) => tracing::info!("agent sandbox: {line}"),
                 (line, false) => tracing::error!("agent sandbox: {line}; the agent cannot start"),
             }
+            confine.scope = agent_scope(&config, std::env::var_os("PATH").as_deref());
+            tracing::info!(
+                "agent limits: {}",
+                limits_line(&config, confine.scope.as_ref())
+            );
             confined_connector(confine)
         }
         // Without `[web]` there is no chat, so no agent to start.
@@ -386,7 +392,72 @@ pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> 
             drop_env: config.secret_env_names(),
             sandbox,
         },
+        // `start` adds it: whether systemd-run is there is the machine's, not the configuration's.
+        scope: None,
     })
+}
+
+/// The systemd scope that caps the agent, with the `systemd-run` found on `path`: `None` when
+/// there is none (a container) or `[agent.limits]` turns every limit off. Whether the user
+/// manager answers is checked at each start of the agent.
+pub fn agent_scope(config: &Config, path: Option<&std::ffi::OsStr>) -> Option<Scope> {
+    let limits = agent_limits(config);
+    if limits.is_none() {
+        return None;
+    }
+    // Names this data directory's scopes, so that a Fronde stops only its own.
+    let digest = Sha256::digest(config.data.dir.as_os_str().as_encoded_bytes());
+    let hex: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    Scope::find(path, format!("fronde-agent-{hex}"), limits)
+}
+
+fn agent_limits(config: &Config) -> Limits {
+    let limits = config.agent.limits;
+    Limits {
+        memory: limits.memory,
+        cpus: limits.cpus,
+        tasks: limits.tasks,
+    }
+}
+
+/// What caps the agent's resources, for the start log; `fronde check` also asks the user
+/// manager ([`limits_check_line`]).
+pub fn limits_line(config: &Config, scope: Option<&Scope>) -> String {
+    match scope {
+        Some(scope) => format!(
+            "{}, in a systemd scope under {SLICE} when the user manager answers at the agent's \
+             start",
+            scope.limits.describe()
+        ),
+        None => no_scope(config, "no systemd-run here"),
+    }
+}
+
+/// [`limits_line`], once the user manager has been asked for a scope like the agent's.
+pub async fn limits_check_line(config: &Config, scope: Option<&Scope>) -> String {
+    let Some(scope) = scope else {
+        return limits_line(config, None);
+    };
+    match scope.probe().await {
+        Ok(()) => format!(
+            "{}, in a systemd scope under {SLICE}",
+            scope.limits.describe()
+        ),
+        Err(why) => no_scope(
+            config,
+            &format!("the systemd user manager made no scope: {why}"),
+        ),
+    }
+}
+
+fn no_scope(config: &Config, why: &str) -> String {
+    if agent_limits(config).is_none() {
+        return "none ([agent.limits] turns them off); the agent is OOM-killed first".to_owned();
+    }
+    format!(
+        "none ({why}); give the container or the service its own memory, CPU and task limits; \
+         the agent is OOM-killed first"
+    )
 }
 
 /// A variable of the agent's environment: `[agent] env`'s, else Fronde's.

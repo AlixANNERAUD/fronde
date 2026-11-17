@@ -97,3 +97,11 @@ builtin_tools = ["WebSearch", "WebFetch"]
 # `read`, and writes only <data>/agent and <data>/home. false runs it unconfined, with a warning.
 sandbox = true
 read = []
+
+# The agent's systemd scope, when a systemd user manager answers: memory (MemoryMax), CPUs
+# (CPUQuota) and processes and threads (TasksMax). "none" leaves one out. Without systemd, as in
+# a container, give the container its own limits.
+[agent.limits]
+memory = "2G"
+cpus = 2
+tasks = 512

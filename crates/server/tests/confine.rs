@@ -26,6 +26,7 @@ struct Setup {
     root: tempfile::TempDir,
     data: PathBuf,
     config_dir: PathBuf,
+    config: fronde_hub::config::Config,
     confine: Confine,
 }
 
@@ -72,6 +73,7 @@ password = {{ env = "CLAUDE_TEST_PASSWORD" }}
         root,
         data,
         config_dir,
+        config,
         confine,
     })
 }
@@ -957,4 +959,459 @@ fn agent_cannot_reach_terminals_or_shared_memory() {
     for attempt in ["device read /dev/urandom", "device write /dev/null"] {
         assert_eq!(report[attempt], "ok", "{attempt}: {report:#?}");
     }
+}
+
+/// A fake `systemd-run` and `systemctl` in a directory of their own, to put on the `PATH`. Each
+/// records its arguments, one per line, then `---`. `systemd-run` also records the
+/// `XDG_RUNTIME_DIR` it got, then runs what follows `--` as the real one does with `--scope`, or,
+/// when it does not `work`, fails as it does without a user manager.
+struct FakeSystemd {
+    dir: tempfile::TempDir,
+}
+
+impl FakeSystemd {
+    fn new(works: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let record = r#"#!/bin/sh
+here=$(dirname "$0")
+log="$here/$(basename "$0").log"
+for arg in "$@"; do printf '%s\n' "$arg"; done >> "$log"
+printf -- '---\n' >> "$log"
+"#;
+        let run = if works {
+            r#"printf '%s\n' "${XDG_RUNTIME_DIR-unset}" >> "$here/xdg"
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
+"#
+        } else {
+            "echo 'Failed to connect to user scope bus via local transport: No such file or \
+             directory' >&2\nexit 1\n"
+        };
+        for (name, script) in [
+            ("systemd-run", format!("{record}{run}")),
+            ("systemctl", record.to_owned()),
+        ] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, script).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self { dir }
+    }
+
+    fn path(&self) -> std::ffi::OsString {
+        self.dir.path().as_os_str().to_owned()
+    }
+
+    /// Each call of `program`, as its arguments.
+    fn calls(&self, program: &str) -> Vec<Vec<String>> {
+        let log = std::fs::read_to_string(self.dir.path().join(format!("{program}.log")))
+            .unwrap_or_default();
+        log.split_terminator("---\n")
+            .map(|call| call.lines().map(str::to_owned).collect())
+            .collect()
+    }
+}
+
+/// Run as an ACP agent by the tests below (`FRONDE_ACP_CHILD` set): the fake agent, on standard
+/// input and output, until its input ends. A no-op otherwise.
+#[test]
+fn acp_child() {
+    if std::env::var_os("FRONDE_ACP_CHILD").is_none() {
+        return;
+    }
+    let script = fronde_agent::fake::FakeScript {
+        updates: vec![fronde_agent::fake::text_chunk("depuis le scope")],
+        ..Default::default()
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let served = runtime.block_on(fronde_agent::fake::serve_on_stdio(script));
+    // Before the test harness writes its own lines on the standard output.
+    std::process::exit(i32::from(served.is_err()));
+}
+
+/// A setup whose agent is [`acp_child`], run by a shell that keeps only its JSON lines: the test
+/// harness writes its own on the same output.
+fn acp_setup(limits: &str) -> (Setup, AgentSpec) {
+    let exe = std::env::current_exe().unwrap();
+    let exe_dir = exe.parent().unwrap().display().to_string();
+    let setup = setup(&format!("read = [{exe_dir:?}]\n{limits}"));
+    let script = r#""$0" --exact acp_child --nocapture | grep --line-buffered '^{'"#;
+    let spec = setup.spec(
+        &["/bin/sh", "-c", script, exe.to_str().unwrap()],
+        &[("FRONDE_ACP_CHILD", "1")],
+    );
+    (setup, spec)
+}
+
+/// Starts the agent as Fronde does, and runs one turn: `false` when this kernel refused to
+/// confine it, as it must.
+async fn chat(spec: &AgentSpec, confine: &Confine) -> Option<fronde_agent::acp::AgentClient> {
+    use fronde_agent::acp::{AgentClient, AgentEvent, TurnEnd};
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let started = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        AgentClient::spawn_confined(spec, confine, None, events),
+    )
+    .await
+    .expect("the agent took too long to start");
+    if !landlock() {
+        let error = format!("{:#}", started.err().expect("an unconfined agent started"));
+        assert!(error.contains("[agent] sandbox = false"), "{error}");
+        return None;
+    }
+    let client = started.unwrap();
+    assert_eq!(client.prompt("Bonjour").await.unwrap(), TurnEnd::Done);
+    let mut text = String::new();
+    while let Ok(event) = received.try_recv() {
+        if let AgentEvent::Text(chunk) = event {
+            text.push_str(&chunk);
+        }
+    }
+    assert_eq!(text, "depuis le scope");
+    Some(client)
+}
+
+#[tokio::test]
+async fn scope_wraps_the_helper() {
+    let (mut setup, spec) = acp_setup("");
+    let fake = FakeSystemd::new(true);
+    let scope = fronde::agent_scope(&setup.config, Some(&fake.path())).expect("systemd-run found");
+    assert_eq!(scope.run, fake.dir.path().join("systemd-run"));
+    let prefix = scope.prefix.clone();
+    assert!(
+        prefix.starts_with("fronde-agent-") && prefix.len() == 21,
+        "{prefix}"
+    );
+    setup.confine.scope = Some(scope);
+    let Some(client) = chat(&spec, &setup.confine).await else {
+        return;
+    };
+
+    // First the leftovers of this data directory are stopped, then the user manager is asked
+    // for a scope, then the agent starts in one.
+    let ctl = fake.calls("systemctl");
+    assert_eq!(ctl, [["--user", "stop", &format!("{prefix}-*.scope")]]);
+    let runs = fake.calls("systemd-run");
+    assert_eq!(runs.len(), 2, "{runs:#?}");
+    let limits = [
+        "--property=MemoryMax=2147483648",
+        "--property=MemoryHigh=1610612736",
+        "--property=CPUQuota=200%",
+        "--property=TasksMax=512",
+    ];
+    let options = [
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--slice=fronde-agents.slice",
+    ];
+    let probe: Vec<&str> = options
+        .iter()
+        .chain(&limits)
+        .chain(&["--", "true"])
+        .copied()
+        .collect();
+    assert_eq!(runs[0], probe);
+    let start = &runs[1];
+    assert_eq!(start[..5], options);
+    let unit = start[5].strip_prefix("--unit=").expect("a unit name");
+    assert!(
+        unit.starts_with(&format!("{prefix}-")) && unit.len() == prefix.len() + 9,
+        "{unit}"
+    );
+    assert_eq!(start[6..10], limits);
+    assert_eq!(start[10], "--");
+    assert_eq!(start[11], env!("CARGO_BIN_EXE_fronde"));
+    assert_eq!(start[12], "__confine");
+    assert_eq!(start[15..17], ["--", "/bin/sh"]);
+    // systemd-run reached the user manager with Fronde's variable, in the check as at the start,
+    // although the agent never gets it.
+    let xdg = std::fs::read_to_string(fake.dir.path().join("xdg")).unwrap();
+    let expected = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "unset".to_owned());
+    assert_eq!(xdg.lines().collect::<Vec<_>>(), [&expected, &expected]);
+
+    // Once the client goes, so does its scope.
+    drop(client);
+    let stop = vec![
+        "--user".to_owned(),
+        "stop".to_owned(),
+        "--no-block".to_owned(),
+        format!("{unit}.scope"),
+    ];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !fake.calls("systemctl").contains(&stop) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scope was never stopped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn no_systemd_user_manager_means_no_scope() {
+    let (mut setup, spec) = acp_setup("");
+    let fake = FakeSystemd::new(false);
+    setup.confine.scope = fronde::agent_scope(&setup.config, Some(&fake.path()));
+    let line = fronde::limits_check_line(&setup.config, setup.confine.scope.as_ref()).await;
+    assert!(
+        line.starts_with("none (the systemd user manager made no scope: Failed to connect"),
+        "{line}"
+    );
+    assert!(line.ends_with("the agent is OOM-killed first"), "{line}");
+    // The agent starts all the same, without systemd-run.
+    let Some(client) = chat(&spec, &setup.confine).await else {
+        return;
+    };
+    drop(client);
+    let runs = fake.calls("systemd-run");
+    assert_eq!(
+        runs.len(),
+        2,
+        "the check and the agent's start ask once each: {runs:#?}"
+    );
+    assert!(
+        runs.iter().all(|run| run.last().unwrap() == "true"),
+        "{runs:#?}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        fake.calls("systemctl")
+            .iter()
+            .all(|call| !call.contains(&"--no-block".to_owned())),
+        "no scope to stop"
+    );
+
+    // Without systemd-run, as in a container, nothing is asked.
+    let empty = tempfile::tempdir().unwrap();
+    let scope = fronde::agent_scope(&setup.config, Some(empty.path().as_os_str()));
+    assert!(scope.is_none());
+    let line = fronde::limits_line(&setup.config, None);
+    assert!(line.starts_with("none (no systemd-run here)"), "{line}");
+    assert_eq!(fronde::limits_check_line(&setup.config, None).await, line);
+}
+
+#[tokio::test]
+async fn limits_turned_off_mean_no_scope() {
+    let (setup, _) =
+        acp_setup("[agent.limits]\nmemory = \"none\"\ncpus = \"none\"\ntasks = \"none\"");
+    let fake = FakeSystemd::new(true);
+    assert!(fronde::agent_scope(&setup.config, Some(&fake.path())).is_none());
+    let line = fronde::limits_line(&setup.config, None);
+    assert!(
+        line.starts_with("none ([agent.limits] turns them off)"),
+        "{line}"
+    );
+    // One limit off is left out of the scope, the others kept.
+    let (setup, _) = acp_setup("[agent.limits]\nmemory = \"none\"\ncpus = 0.5");
+    let scope = fronde::agent_scope(&setup.config, Some(&fake.path())).unwrap();
+    let args = scope.args(None);
+    assert!(
+        args.contains(&"--property=CPUQuota=50%".to_owned()),
+        "{args:?}"
+    );
+    assert!(
+        args.contains(&"--property=TasksMax=512".to_owned()),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains("Memory")), "{args:?}");
+    assert_eq!(
+        fronde::limits_check_line(&setup.config, Some(&scope)).await,
+        "memory uncapped, 0.5 CPUs, 512 tasks, in a systemd scope under fronde-agents.slice"
+    );
+}
+
+#[test]
+fn scope_keeps_the_agent_confined_and_its_environment_explicit() {
+    let fake = FakeSystemd::new(true);
+    let mut probe = probe_setup();
+    probe.setup.confine.scope = fronde::agent_scope(&probe.setup.config, Some(&fake.path()));
+    let Some(report) = probe.run() else { return };
+    assert_eq!(
+        fake.calls("systemd-run").len(),
+        1,
+        "the probe ran in the scope"
+    );
+    for file in &probe.plan.protected_files {
+        let attempt = format!("read {}", file.display());
+        assert_eq!(report[&attempt], "denied", "{attempt}: {report:#?}");
+    }
+    let spec = probe.setup.spec(&shell(r#"env > "$PWD/env.txt""#), &[]);
+    let output = probe.setup.run(
+        &spec,
+        &[
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("INVOCATION_ID", "0123"),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let text = std::fs::read_to_string(probe.setup.data.join("agent/env.txt")).unwrap();
+    for absent in ["XDG_", "DBUS_", "INVOCATION_ID"] {
+        assert!(
+            !text.contains(absent),
+            "{absent} reached the agent:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn agent_core_dumps_are_off() {
+    let setup = setup("");
+    let spec = setup.spec(&shell("ulimit -c; ulimit -H -c"), &[]);
+    let helper = setup.confine.command(&spec).unwrap();
+    // Started with core dumps allowed, as far as this process may allow them.
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"ulimit -c "$(ulimit -H -c)" 2>/dev/null; exec "$@""#,
+            "sh",
+        ])
+        .arg(&helper.program)
+        .args(&helper.args)
+        .envs(helper.env.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+        .output()
+        .unwrap();
+    if !landlock() {
+        return refused_without_landlock(&output);
+    }
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n0\n");
+}
+
+/// Runs `systemctl --user` with `args`, for the real-scope tests.
+fn systemctl(args: &[&str]) -> String {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// With the real user manager: the agent runs in `fronde-agents.slice`, capped, and its scope
+/// goes when it ends. Run by hand on a machine with a systemd user session:
+/// `mise exec -- cargo nextest run -p fronde --test confine real_scope --run-ignored only`.
+#[tokio::test]
+#[ignore = "needs a systemd user manager"]
+async fn real_scope_caps_the_agent() {
+    use std::io::{BufRead, Write};
+    let mut setup = setup("");
+    assert!(landlock(), "this kernel cannot confine the agent");
+    setup.confine.scope = fronde::agent_scope(&setup.config, std::env::var_os("PATH").as_deref());
+    let confine = setup.confine.ready().await;
+    assert!(confine.scope.is_some(), "no systemd user manager answered");
+    let script = r#"cg=$(cut -d: -f3 /proc/self/cgroup)
+echo "cgroup=$cg"
+echo "memory=$(cat /sys/fs/cgroup$cg/memory.max)"
+echo "high=$(cat /sys/fs/cgroup$cg/memory.high)"
+echo "pids=$(cat /sys/fs/cgroup$cg/pids.max)"
+echo "cpu=$(cat /sys/fs/cgroup$cg/cpu.max)"
+echo "invocation=${INVOCATION_ID-unset}"
+echo ready
+read line"#;
+    let helper = confine.command(&setup.spec(&shell(script), &[])).unwrap();
+    let unit = helper.unit.clone().unwrap();
+    let mut child = Command::new(&helper.program)
+        .args(&helper.args)
+        .envs(helper.env.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut seen = BTreeMap::new();
+    for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line == "ready" {
+            break;
+        }
+        let (name, value) = line.split_once('=').unwrap();
+        seen.insert(name.to_owned(), value.to_owned());
+    }
+    assert!(
+        seen["cgroup"].ends_with(&format!("/fronde.slice/fronde-agents.slice/{unit}.scope")),
+        "{seen:?}"
+    );
+    assert_eq!(seen["memory"], "2147483648");
+    assert_eq!(seen["high"], "1610612736");
+    assert_eq!(seen["pids"], "512");
+    assert_eq!(seen["cpu"], "200000 100000");
+    assert_eq!(
+        seen["invocation"], "unset",
+        "systemd-run's variable reached the agent"
+    );
+    // The same, as the user manager tells it.
+    let shown = systemctl(&[
+        "show",
+        &format!("{unit}.scope"),
+        "-p",
+        "Slice",
+        "-p",
+        "MemoryMax",
+        "-p",
+        "TasksMax",
+        "-p",
+        "CPUQuotaPerSecUSec",
+        "-p",
+        "ActiveState",
+    ]);
+    for expected in [
+        "Slice=fronde-agents.slice",
+        "MemoryMax=2147483648",
+        "TasksMax=512",
+        "CPUQuotaPerSecUSec=2s",
+        "ActiveState=active",
+    ] {
+        assert!(shown.lines().any(|l| l == expected), "{expected}:\n{shown}");
+    }
+    // The agent ends at the end of its input, and its scope with it.
+    writeln!(stdin).unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while systemctl(&["is-active", &format!("{unit}.scope")]) == "active" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{unit} outlived the agent"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// With the real user manager: a process that outlives its agent, as one could when Fronde is
+/// killed with SIGKILL, keeps the scope; the agent's next start stops it.
+#[tokio::test]
+#[ignore = "needs a systemd user manager"]
+async fn real_scope_leftovers_are_stopped_at_the_next_start() {
+    let mut setup = setup("");
+    assert!(landlock(), "this kernel cannot confine the agent");
+    setup.confine.scope = fronde::agent_scope(&setup.config, std::env::var_os("PATH").as_deref());
+    let confine = setup.confine.ready().await;
+    // Its input is not a pipe from Fronde: it never sees an end, and ignores it anyway.
+    let helper = confine
+        .command(&setup.spec(&shell("sleep 300 & wait"), &[]))
+        .unwrap();
+    let unit = format!("{}.scope", helper.unit.clone().unwrap());
+    let mut child = Command::new(&helper.program)
+        .args(&helper.args)
+        .envs(helper.env.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while systemctl(&["is-active", &unit]) != "active" {
+        assert!(std::time::Instant::now() < deadline, "{unit} never started");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Only the agent's own process dies; `sleep` stays, and so does the scope.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(systemctl(&["is-active", &unit]), "active");
+    let _ = setup.confine.ready().await;
+    assert_ne!(systemctl(&["is-active", &unit]), "active");
 }

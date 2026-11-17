@@ -42,6 +42,28 @@ journalctl --user -u fronde
 
 Add `-f` to `journalctl --user -u fronde` to follow new log lines as they arrive. `fronde service status` runs `systemctl --user status fronde.service --no-pager` and exits with its status code.
 
+## The agent's scope
+
+The service, like any Fronde run in a session with a systemd user manager, starts its agent in
+a scope of its own, `fronde-agent-<id>.scope`, under `fronde-agents.slice` (itself under
+`fronde.slice`), outside `fronde.service`. The scope caps the agent's memory, CPU time and
+tasks with the limits in [`[agent.limits]`](../reference/configuration.md#agentlimits): 2 GiB, 2
+CPUs and 512 tasks by default. It only caps resources: what the agent may read, write and reach
+is the [sandbox](../explanation/security.md#where-the-agent-runs)'s doing, with or without
+systemd. See the agent and what it uses with:
+
+```sh
+systemctl --user status fronde-agents.slice
+systemd-cgtop --user fronde.slice
+```
+
+When Fronde stops the agent, it stops its scope too. If Fronde is killed (`kill -9`, a crash),
+the agent's input closes, so the agent and Claude Code exit, and the scope goes with them. A
+process that outlived them would keep the scope until Fronde next starts its agent, which first
+stops every scope its data directory's agent left; `systemctl --user stop 'fronde-agent-*'`
+stops them by hand. At each start of the agent, Fronde logs `agent limits: …` with the scope's
+name, or why there is none.
+
 ## 5. Upgrade
 
 After replacing or rebuilding the `fronde` binary, re-run `install` with `--force` so the unit file is updated if the binary path changed:

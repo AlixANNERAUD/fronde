@@ -6,6 +6,7 @@
 //! Fronde's own.
 
 use crate::acp::AgentSpec;
+use crate::scope::{MANAGER_ENV, Scope, Unavailable};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -123,6 +124,9 @@ pub struct Confine {
     pub home: PathBuf,
     /// Everything but what the spec gives: its directory, its variables and the hub's port.
     pub policy: Policy,
+    /// The systemd scope that caps the agent's resources, when `systemd-run` is there; whether
+    /// the user manager answers is checked at each start ([`Confine::ready`]).
+    pub scope: Option<Scope>,
 }
 
 /// The command that starts an agent through the helper.
@@ -134,9 +138,40 @@ pub struct HelperCommand {
     /// policy names.
     pub env: Vec<(String, String)>,
     pub policy: Policy,
+    /// The agent's scope unit, without `.scope`, when `systemd-run` starts the helper.
+    pub unit: Option<String>,
 }
 
 impl Confine {
+    /// This confinement as the agent starts now. With a scope, it first stops what an earlier
+    /// agent left, then checks that the user manager makes a scope; when it does not, the agent
+    /// starts without one, with a warning: the limits are a safeguard for the machine, not
+    /// part of the agent's confinement, which Landlock and seccomp make.
+    pub async fn ready(&self) -> Self {
+        let mut confine = self.clone();
+        if let Some(scope) = &self.scope {
+            scope.stop_leftovers().await;
+            match scope.probe().await {
+                Ok(()) => {}
+                Err(Unavailable::Missing) => {
+                    tracing::info!(
+                        "agent limits: none, {} is gone; the agent is OOM-killed first",
+                        scope.run.display()
+                    );
+                    confine.scope = None;
+                }
+                Err(Unavailable::Failed(why)) => {
+                    tracing::warn!(
+                        "agent limits: the systemd user manager made no scope ({why}); the \
+                         agent runs without memory, CPU or task caps, and is OOM-killed first"
+                    );
+                    confine.scope = None;
+                }
+            }
+        }
+        confine
+    }
+
     /// The helper's command line and environment for `spec`.
     pub fn command(&self, spec: &AgentSpec) -> anyhow::Result<HelperCommand> {
         self.command_with(spec, Vec::new())
@@ -178,9 +213,16 @@ impl Confine {
         // every variable the agent does not get is set empty, so that its value, a `{ env }`
         // secret's among them, never reaches the helper.
         let mut env = env;
+        // `systemd-run` needs the user manager's variables; the helper drops them.
+        let manager = |name: &str| {
+            self.scope.is_some()
+                && MANAGER_ENV.contains(&name)
+                && !policy.drop_env.iter().any(|dropped| dropped == name)
+        };
         for (name, _) in std::env::vars_os() {
             if let Some(name) = name.to_str()
                 && !policy.keeps(name)
+                && !manager(name)
                 && !env.iter().any(|(set, _)| set == name)
             {
                 env.push((name.to_owned(), String::new()));
@@ -201,11 +243,26 @@ impl Confine {
             program.clone(),
         ];
         helper_args.extend(args.iter().cloned());
+        let Some(scope) = &self.scope else {
+            return Ok(HelperCommand {
+                program: self.helper.clone(),
+                args: helper_args,
+                env,
+                policy,
+                unit: None,
+            });
+        };
+        // `systemd-run --scope` puts itself in the scope and `exec`s the helper.
+        let unit = scope.new_unit();
+        let mut run_args = scope.args(Some(&unit));
+        run_args.push(path_string(&self.helper)?);
+        run_args.extend(helper_args);
         Ok(HelperCommand {
-            program: self.helper.clone(),
-            args: helper_args,
+            program: scope.run.clone(),
+            args: run_args,
             env,
             policy,
+            unit: Some(unit),
         })
     }
 }
@@ -616,10 +673,19 @@ fn command_for(
 }
 
 /// The kernel kills the agent first when memory runs out, and Fronde comes first for the CPU.
-/// Neither needs a privilege; neither is worth stopping the agent for.
+/// A crash of the agent writes no core, which would hold its tokens (and, with the host's
+/// `core_pattern`, could land outside a container). None needs a privilege; none is worth
+/// stopping the agent for.
 fn yield_to_fronde() {
     #[cfg(target_os = "linux")]
     {
+        let no_core = rustix::process::Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        };
+        if let Err(error) = rustix::process::setrlimit(rustix::process::Resource::Core, no_core) {
+            eprintln!("fronde __confine: cannot turn the agent's core dumps off: {error}");
+        }
         if let Err(error) = std::fs::write("/proc/self/oom_score_adj", "1000") {
             eprintln!("fronde __confine: cannot raise the agent's OOM score: {error}");
         }
@@ -887,6 +953,7 @@ mod tests {
                     connect_ports: CONNECT_PORTS.to_vec(),
                 }),
             },
+            scope: None,
         }
     }
 
@@ -969,6 +1036,61 @@ mod tests {
             .collect();
         assert!(env.contains(&("HOME", "/data/home")));
         assert!(env.contains(&("TMPDIR", "/data/home/tmp")));
+    }
+
+    #[test]
+    fn helper_command_runs_through_the_scope() {
+        let mut confine = confine(true);
+        let spec = spec(Vec::new());
+        let plain = confine.command(&spec).unwrap();
+        assert!(plain.unit.is_none());
+        confine.scope = Some(Scope {
+            run: PathBuf::from("/usr/bin/systemd-run"),
+            prefix: "fronde-agent-0123abcd".to_owned(),
+            limits: crate::scope::Limits {
+                memory: Some(1 << 30),
+                cpus: Some(1.5),
+                tasks: Some(100),
+            },
+        });
+        let command = confine.command(&spec).unwrap();
+        assert_eq!(command.program, PathBuf::from("/usr/bin/systemd-run"));
+        let unit = command.unit.clone().unwrap();
+        let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
+        let dash = args.iter().position(|a| *a == "--").unwrap();
+        assert_eq!(
+            args[..dash],
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--slice=fronde-agents.slice",
+                &format!("--unit={unit}"),
+                "--property=MemoryMax=1073741824",
+                "--property=MemoryHigh=805306368",
+                "--property=CPUQuota=150%",
+                "--property=TasksMax=100",
+            ]
+        );
+        // Then the helper's own command, unchanged.
+        assert_eq!(args[dash + 1], "/usr/bin/fronde");
+        assert_eq!(
+            args[dash + 2..],
+            plain.args.iter().map(String::as_str).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(command.policy, plain.policy);
+        // systemd-run keeps the user manager's variables; the policy still drops them.
+        for name in MANAGER_ENV {
+            assert!(!command.policy.keeps(name));
+            assert!(!command.env.iter().any(|(n, _)| n == name), "{name}");
+            if std::env::var_os(name).is_some() {
+                assert!(
+                    plain.env.contains(&(name.to_owned(), String::new())),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]

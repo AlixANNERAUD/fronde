@@ -218,6 +218,104 @@ pub struct AgentConfig {
     /// The token `claude setup-token` printed, given to the agent as `CLAUDE_CODE_OAUTH_TOKEN`
     /// and read again at each start. A stored one must be stored for [`CLAUDE_ORIGIN`].
     pub oauth_token: Option<Secret>,
+    /// The caps of the agent's systemd scope, when a systemd user manager runs it.
+    pub limits: AgentLimits,
+}
+
+/// `[agent.limits]`: what the agent's systemd scope caps; `None` (`"none"`) for no cap of
+/// Fronde's. Without a systemd user manager there is no scope, and these do not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentLimits {
+    /// Bytes of memory (`MemoryMax`; `MemoryHigh` is three quarters of it).
+    #[serde(deserialize_with = "memory_limit")]
+    pub memory: Option<u64>,
+    /// CPUs' worth of time (`CPUQuota`, 100 % per CPU).
+    #[serde(deserialize_with = "cpus_limit")]
+    pub cpus: Option<f64>,
+    /// Processes and threads (`TasksMax`).
+    #[serde(deserialize_with = "tasks_limit")]
+    pub tasks: Option<u64>,
+}
+
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            memory: Some(2 << 30),
+            cpus: Some(2.0),
+            tasks: Some(512),
+        }
+    }
+}
+
+/// A limit as TOML writes it: a number, or a string (a size, or `"none"`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawLimit {
+    Integer(i64),
+    Float(f64),
+    Text(String),
+}
+
+fn memory_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let expected = "memory: expected a size such as \"2G\" or \"512M\", or \"none\"";
+    match RawLimit::deserialize(d)? {
+        RawLimit::Text(text) if text == "none" => Ok(None),
+        RawLimit::Text(text) => parse_size(&text)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("{expected}, not {text:?}"))),
+        RawLimit::Integer(bytes) if bytes > 0 => Ok(Some(bytes.unsigned_abs())),
+        _ => Err(serde::de::Error::custom(expected)),
+    }
+}
+
+/// A size in bytes, as systemd writes it: a number with an optional `K`, `M`, `G` or `T`
+/// (powers of 1024); `None` unless it is above zero.
+pub fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (number, unit) = match text.char_indices().last()? {
+        (at, c) if c.is_ascii_alphabetic() => (&text[..at], c.to_ascii_uppercase()),
+        _ => (text, 'B'),
+    };
+    let shift = match unit {
+        'B' => 0,
+        'K' => 10,
+        'M' => 20,
+        'G' => 30,
+        'T' => 40,
+        _ => return None,
+    };
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let bytes = number.parse::<f64>().ok()? * 2f64.powi(shift);
+    // Below 2^64, so the cast is exact enough and never saturates.
+    (1.0..1.8e19).contains(&bytes).then_some(bytes as u64)
+}
+
+fn cpus_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    let expected = "cpus: expected a number of CPUs above 0, such as 2 or 0.5, or \"none\"";
+    let cpus = match RawLimit::deserialize(d)? {
+        RawLimit::Text(text) if text == "none" => return Ok(None),
+        RawLimit::Integer(cpus) => cpus as f64,
+        RawLimit::Float(cpus) => cpus,
+        RawLimit::Text(_) => return Err(serde::de::Error::custom(expected)),
+    };
+    // systemd counts in percent: at least 1 % of one CPU.
+    if (0.01..=100_000.0).contains(&cpus) {
+        Ok(Some(cpus))
+    } else {
+        Err(serde::de::Error::custom(expected))
+    }
+}
+
+fn tasks_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let expected = "tasks: expected a number of processes and threads above 0, or \"none\"";
+    match RawLimit::deserialize(d)? {
+        RawLimit::Text(text) if text == "none" => Ok(None),
+        RawLimit::Integer(tasks) if tasks > 0 => Ok(Some(tasks.unsigned_abs())),
+        _ => Err(serde::de::Error::custom(expected)),
+    }
 }
 
 /// The origin a stored `[agent] oauth_token` is stored for: Claude's API, which it opens.
@@ -232,6 +330,7 @@ impl Default for AgentConfig {
             sandbox: true,
             read: Vec::new(),
             oauth_token: None,
+            limits: AgentLimits::default(),
         }
     }
 }

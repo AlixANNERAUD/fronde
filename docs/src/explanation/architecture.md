@@ -47,6 +47,20 @@ from the assistant belongs to its conversation and its running turn, a call with
 to an outside client, named from the `clientInfo` it gave. The session id is saved, so a restart
 resumes the same conversation.
 
+Fronde does not start the adapter itself, but through a chain of programs that each `exec` the
+next, so that the adapter keeps Fronde's pipes and process group:
+
+```
+fronde serve
+  └─ systemd-run --user --scope --slice=fronde-agents.slice …   only with a systemd user manager
+       └─ fronde __confine --policy '<json>' -- claude-agent-acp      always
+            └─ claude-agent-acp, then Claude Code
+```
+
+`systemd-run` puts the agent in a scope capped by `[agent.limits]`; `fronde __confine` keeps
+only the environment it needs, confines itself with Landlock and seccomp, and becomes the
+adapter. See [Where the agent runs](security.md#where-the-agent-runs).
+
 Each turn streams back as events: text, tool calls, permission requests, the end of the turn.
 Fronde numbers them and saves each one in the database, committed to disk, before it broadcasts
 it to every open page: a page never shows an entry a crash could lose. A page that reconnects
@@ -101,9 +115,6 @@ component; moving to it means a component linker for this world, with no change 
 
 These are designed but **not built yet**:
 
-- **A user service.** `fronde service install|uninstall|status`, installing Fronde as a
-  `systemd --user` unit without root, with each agent in its own scope under a memory-capped
-  slice, so that the agents, not the server, give way when memory runs low.
 - **Federation.** Several Fronde instances linked together: a node, such as a laptop, opens an
   outgoing WebSocket over TLS (`wss://`) to the main instance, which reaches the node's tools over
   MCP inside that socket. TLS is mandatory between instances, with a self-signed certificate

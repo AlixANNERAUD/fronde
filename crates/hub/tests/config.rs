@@ -907,3 +907,60 @@ fn the_agent_token_is_a_secret() {
     .to_string();
     assert!(error.contains("oauth_token"), "{error}");
 }
+
+#[test]
+fn agent_limits_default_and_parse() {
+    use fronde_hub::config::AgentLimits;
+    let c = load_str(MIN).unwrap();
+    assert_eq!(
+        c.agent.limits,
+        AgentLimits {
+            memory: Some(2 * 1024 * 1024 * 1024),
+            cpus: Some(2.0),
+            tasks: Some(512),
+        }
+    );
+    let limits = |table: &str| {
+        load_str(&format!("{MIN}\n[agent.limits]\n{table}\n"))
+            .unwrap()
+            .agent
+            .limits
+    };
+    let l = limits("memory = \"512M\"\ncpus = 0.5\ntasks = 64");
+    assert_eq!(
+        (l.memory, l.cpus, l.tasks),
+        (Some(512 << 20), Some(0.5), Some(64))
+    );
+    assert_eq!(limits("memory = \"1.5g\"").memory, Some(3 << 29));
+    assert_eq!(limits("memory = \"4096K\"").memory, Some(4 << 20));
+    assert_eq!(limits("memory = 1048576").memory, Some(1 << 20));
+    assert_eq!(limits("cpus = 3").cpus, Some(3.0));
+    // Each limit is turned off on its own; the others keep their defaults.
+    let l = limits("memory = \"none\"");
+    assert_eq!((l.memory, l.cpus, l.tasks), (None, Some(2.0), Some(512)));
+    let l = limits("memory = \"none\"\ncpus = \"none\"\ntasks = \"none\"");
+    assert_eq!((l.memory, l.cpus, l.tasks), (None, None, None));
+}
+
+#[test]
+fn agent_limits_refuse_bad_values() {
+    for (table, expected) in [
+        ("memory = \"2X\"", "memory: expected a size"),
+        ("memory = \"G\"", "memory: expected a size"),
+        ("memory = \"0\"", "memory: expected a size"),
+        ("memory = 0", "memory: expected a size"),
+        ("memory = \"-1G\"", "memory: expected a size"),
+        ("memory = \"unlimited\"", "memory: expected a size"),
+        ("cpus = 0", "cpus: expected"),
+        ("cpus = -1.5", "cpus: expected"),
+        ("cpus = \"fast\"", "cpus: expected"),
+        ("cpus = nan", "cpus: expected"),
+        ("tasks = 0", "tasks: expected"),
+        ("tasks = 1.5", "tasks: expected"),
+        ("tasks = \"many\"", "tasks: expected"),
+        ("swap = \"1G\"", "unknown field"),
+    ] {
+        let e = refused(&format!("{MIN}\n[agent.limits]\n{table}\n"));
+        assert!(e.contains(expected), "{table}: {e}");
+    }
+}

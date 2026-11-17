@@ -287,7 +287,8 @@ outside its sandbox. The agent signs in with a token instead, which you make wit
 `claude setup-token` in your own home (see
 [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md)). The helper also
 raises the agent's OOM score to the maximum and lowers its priority, so that the kernel kills the
-agent first when memory runs out, and Fronde comes first for the CPU.
+agent first when memory runs out, and Fronde comes first for the CPU, and turns its core dumps
+off.
 
 ### Where the agent runs
 
@@ -404,8 +405,17 @@ What the sandbox does not cover:
   other UDP, to any host.
 - **Hosts.** TCP is limited by port, not by host: `WebFetch` needs the open web on 443, so the
   agent can reach any https server.
-- **Memory and CPU.** Limits for the agent's processes are **planned (C4)**; for now only its OOM
-  score and priority favour Fronde.
+- **Memory, CPU and processes.** These are not the sandbox's: with a systemd user manager,
+  the agent runs in a scope capped by [`[agent.limits]`](../reference/configuration.md#agentlimits)
+  (2 GiB, 2 CPUs and 512 tasks by default; see
+  [Run as a service](../how-to/run-as-a-service.md#the-agents-scope)). `systemd-run` makes the
+  scope and then becomes the helper, so the agent keeps Fronde's pipes and process group. A
+  scope cannot sandbox (systemd refuses its sandboxing settings for one), so it adds nothing to
+  what the agent may reach. Without systemd, as in a container, there is no scope: the
+  container's limits apply, and the agent's OOM score and priority still favour Fronde. If the
+  user manager makes no scope, the agent starts without one and Fronde logs a warning: a missing
+  cap costs the machine some memory, never the agent's confinement. Whatever the case, the
+  agent writes no core dump (`RLIMIT_CORE` 0), which would hold its tokens.
 
 ## Requests
 

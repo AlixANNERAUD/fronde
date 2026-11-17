@@ -105,10 +105,31 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
     let handle = FakeHandle {
         record: record.clone(),
     };
+    let agent = scripted(script, record.clone());
+    tokio::spawn(async move {
+        let _ = agent.connect_to(agent_end).await;
+        lock(&record).closed = true;
+    });
+    (client_end, handle)
+}
+
+/// Serve the fake agent on this process's standard input and output, as a real agent does,
+/// until its input ends: for tests that start an agent process.
+pub async fn serve_on_stdio(script: FakeScript) -> Result<(), Error> {
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+    let stdio = agent_client_protocol::ByteStreams::new(
+        tokio::io::stdout().compat_write(),
+        tokio::io::stdin().compat(),
+    );
+    scripted(script, Arc::default()).connect_to(stdio).await
+}
+
+/// The fake agent, replaying `script` and writing what it receives to `record`.
+fn scripted(script: FakeScript, record: Arc<Mutex<FakeRecord>>) -> impl ConnectTo<Client> {
     let script = Arc::new(script);
     let cancelled = Arc::new(Notify::new());
 
-    let agent = Agent
+    Agent
         .v1()
         .on_receive_request(
             {
@@ -232,13 +253,7 @@ pub fn fake_agent(script: FakeScript) -> (impl ConnectTo<Client>, FakeHandle) {
                 }
             },
             agent_client_protocol::on_receive_request!(),
-        );
-
-    tokio::spawn(async move {
-        let _ = agent.connect_to(agent_end).await;
-        lock(&record).closed = true;
-    });
-    (client_end, handle)
+        )
 }
 
 fn permission_request(

@@ -69,6 +69,9 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
             "; the agent cannot start"
         };
         writeln!(out, "agent sandbox: {line}{warning}")?;
+        let scope = crate::agent_scope(config, std::env::var_os("PATH").as_deref());
+        let limits = crate::limits_check_line(config, scope.as_ref()).await;
+        writeln!(out, "agent limits: {limits}")?;
         // A stored token is opened at each start of the agent, with the master key.
         match &config.agent.oauth_token {
             Some(fronde_hub::config::Secret::Stored { stored }) => {
