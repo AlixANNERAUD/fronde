@@ -14,23 +14,32 @@ fronde secret set caldav --origin https://cloud.example --config fronde.toml < c
 ```
 
 or, to type it without leaving it in a file or in your shell history (`read -s` does not echo,
-and `printf` is built into the shell, so the value never shows in the process list):
+`IFS=` keeps leading and trailing spaces, and `printf` is built into the shell, so the value
+never shows in the process list):
 
 ```sh
-read -rs value
+IFS= read -rs value
 printf '%s' "$value" | fronde secret set caldav --origin https://cloud.example --config fronde.toml
 unset value
 ```
 
 `fronde secret set` never takes the value as an argument, where other users could see it in the
-process list, and refuses to read it from a terminal, which would echo it. One final line break
+process list: an extra argument is refused without being shown. It also refuses to read the
+value from a terminal, which would echo it. One final line break
 is dropped. The origin is stored as Fronde normalises it: `HTTPS://Cloud.Example:443` is stored as
 `https://cloud.example`. Setting a name again replaces its value and origin.
 
-The first secret creates the master key, `master.key` in the data directory (mode 0600). Back it
-up now, apart from the database: see [Data directory](../reference/data-directory.md). Without
-it, the stored secrets cannot be read, and Fronde does not make a new key while secrets are
-stored.
+The first secret creates the master key, `master.key` beside the configuration file (mode 0600),
+and prints its path. It is kept out of the data directory, so that backups of the data directory
+do not hold it: back it up now, once, apart from them, in a password manager for instance (see
+[Data directory](../reference/data-directory.md)). Without it, the stored secrets cannot be read,
+and Fronde does not make a new key while secrets are stored. To keep it elsewhere, set
+`[secrets] master_key = { file = "…" }` (see
+[Configuration](../reference/configuration.md#secrets-1)) before storing the first secret.
+
+If the configuration's directory is read-only, as in a container, the key cannot be created
+there: `fronde secret set` says so and names both fixes, a writable directory there or
+`[secrets] master_key`. [Run in Docker](run-in-docker.md#stored-secrets) shows the second.
 
 ## Use it in a credential
 

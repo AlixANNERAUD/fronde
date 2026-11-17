@@ -61,7 +61,8 @@ line. `--ulimit core=0` keeps a crash from writing a core dump with secrets in i
 turns core dumps off for itself at start. [Sign Fronde in to Claude](sign-in-to-claude.md) says how to get it.
 
 The `fronde-data` volume keeps the memory, the conversation and the agent's home, where Claude
-keeps its settings. Back it up as a whole.
+keeps its settings. Back it up as a whole. It never holds the master key of
+[stored secrets](#stored-secrets), which is kept apart.
 
 ## 4. Check it
 
@@ -72,6 +73,39 @@ docker logs fronde
 
 Then open <http://127.0.0.1:8484>. To reach it from other devices, put it
 [behind a reverse proxy](reverse-proxy.md) with https.
+
+## Stored secrets
+
+To use [`fronde secret`](store-a-secret.md), Fronde needs a place for its master key outside the
+data volume, so that a backup or a snapshot of the volume does not hold the key with the secrets
+it opens. By default the key goes beside the configuration, but `/config` is read-only to
+Fronde here (the image's directory belongs to root, and the file is mounted `:ro`), so
+`fronde secret set` would stop with an error naming the fix. Give the key a directory of its
+own, writable by uid 65532:
+
+```sh
+mkdir -m 700 fronde-keys && sudo chown 65532 fronde-keys
+```
+
+name the file in the configuration:
+
+```toml
+[secrets]
+master_key = { file = "/keys/master.key" }
+```
+
+and add `-v ./fronde-keys:/keys` to `docker run` (or `- ./fronde-keys:/keys` to the Compose
+volumes). Do not mount the configuration's directory writable instead: the agent runs as the
+same user and could then change the configuration, component hashes included. Then store a
+secret through the running container, the value on standard input:
+
+```sh
+docker exec -i fronde /app/fronde secret set caldav --origin https://cloud.example \
+  --config /config/fronde.toml < caldav-password
+```
+
+The first secret creates `fronde-keys/master.key`. Back it up once, apart from the volume's
+backups.
 
 ## Docker Compose
 

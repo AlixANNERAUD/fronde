@@ -26,6 +26,36 @@ pub struct Config {
     pub agent: AgentConfig,
     /// The `code_run_python` tool; without it there is none.
     pub python: Option<PythonConfig>,
+    /// Where the master key of the stored secrets is kept.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+impl Config {
+    /// The master key file, which [`load`] always sets: `[secrets] master_key`, or `master.key`
+    /// beside the configuration file, out of the data directory, so that a backup of the data
+    /// directory does not hold the key with the secrets it opens.
+    /// A configuration parsed without [`load`] has only the file it names, as written.
+    pub fn master_key_file(&self) -> anyhow::Result<&Path> {
+        match (&self.secrets.master_key_file, &self.secrets.master_key) {
+            (Some(file), _) | (None, Some(Secret::File { file })) => Ok(file),
+            _ => bail!(
+                "no master key file: this configuration was not read by config::load; set \
+                 [secrets] master_key = {{ file = \"…\" }}"
+            ),
+        }
+    }
+}
+
+/// `[secrets]`: where the master key that seals stored secrets is kept.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// `{ file = "…" }` only: never `{ env }`, which the agent inherits, nor `{ stored }`.
+    master_key: Option<Secret>,
+    /// The key file, read from the configuration's directory when relative; [`load`] sets it.
+    #[serde(skip)]
+    master_key_file: Option<PathBuf>,
 }
 
 /// `[python]`: where the Python runtime is, as `mise run python` lays it out.
@@ -428,6 +458,14 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
             }
         }
     }
+    config.secrets.master_key_file = Some(match &config.secrets.master_key {
+        None => base.join(fronde_db::master_key::FILE_NAME),
+        Some(Secret::File { file }) => base.join(file).components().collect(),
+        Some(_) => bail!(
+            "[secrets] master_key must be {{ file = \"…\" }}: the master key never comes from \
+             the environment, which the agent inherits, nor from the store it opens"
+        ),
+    });
     if let Some(python) = &mut config.python {
         python.dir = base.join(&python.dir).components().collect();
         if config.sources.iter().any(|s| s.name() == PYTHON_SOURCE) {

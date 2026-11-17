@@ -171,6 +171,7 @@ async fn call_calendar(status: u16) -> CallToolResult {
         "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n\
          [data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
          [memory]\ngit = false\n\
+         [secrets]\nmaster_key = {{ file = {:?} }}\n\
          [web]\npassword = {{ file = {:?} }}\n\
          [[sources]]\nkind = \"component\"\nname = \"calendar\"\npath = {:?}\nmanifest = {:?}\n\
          sha256 = {:?}\nmanifest_sha256 = {:?}\n\
@@ -180,6 +181,7 @@ async fn call_calendar(status: u16) -> CallToolResult {
          basic = {{ username = \"alix\", password = {{ file = {:?} }} }}\n",
         token_file.display().to_string(),
         dir.path().join("data").display().to_string(),
+        dir.path().join("master.key").display().to_string(),
         web_file.display().to_string(),
         component_cfg.path.display().to_string(),
         component_cfg.manifest_path().display().to_string(),

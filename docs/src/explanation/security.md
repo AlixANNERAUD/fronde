@@ -22,11 +22,13 @@ XChaCha20-Poly1305 under a master key of 256 bits and a random 24-byte nonce dra
 write. The seal also covers, without encrypting them, the row's format version, its scope, its
 name and the canonical origin it is for: a row edited, or moved to another name or origin,
 fails to open instead of handing its secret to another place. With the first secret, Fronde
-stores a key check, a fixed text sealed with the same key: a wrong key is then reported as a
-wrong key, and Fronde never makes a new key while secrets are stored, since it could not open
-them. The value is read from standard input, never from the command line, where other users
-could see it in the process list, and never from a terminal, which would echo it. Decrypted
-values are held in buffers zeroed when dropped, and no command, log or tool output shows one.
+stores a key check, a fixed text sealed with the same key under a label of its own, so that it
+never passes for a secret: a wrong key is then reported as a wrong key, and Fronde never makes a
+new key while secrets are stored, since it could not open them. The value is read from standard
+input, never from the command line, where other users could see it in the process list, and
+never from a terminal, which would echo it; a value given as an argument is refused without
+being shown. Decrypted values are held in buffers zeroed when dropped, and no command, log or
+tool output shows one.
 
 A stored secret is used only as a component's credential, `{ stored = "name" }` in
 `[[sources.credentials]]`; the configuration refuses it anywhere else. Rows are read still sealed,
@@ -40,18 +42,22 @@ Fronde runs reaches a component waiting for it, which Fronde tries again until i
 Fronde checks the master key when it starts: a key that did not seal the stored secrets, or no
 key file while some are stored, stops it.
 
-The master key is one line, `fronde-key-v1:` followed by the key in base64url, in `master.key`
-in the data directory, mode 0600, created with the first secret. Fronde never takes it from an
-environment variable: the agent inherits Fronde's environment. Keeping it in the system's
-keychain or in a systemd credential is **planned**.
+The master key is one line, `fronde-key-v1:` followed by the key in base64url, in a file of mode
+0600 created with the first secret: `master.key` beside the configuration file, or the file
+`[secrets] master_key` names. It is kept out of the data directory on purpose. Fronde reads it
+only from a plain file it owns, never through a symbolic link, and never from an environment
+variable: the agent inherits Fronde's environment. Earlier versions kept it in the data
+directory; Fronde moves it from there at the next start or `fronde secret` command, and stops
+if both places hold different keys. Keeping it in the system's keychain or in a systemd
+credential is **planned**.
 
-What this protects against, today: a copy of `fronde.db` alone, such as a backup made without
-the key file, reveals no stored secret; and nothing in the database's files, its write-ahead log
-included, holds a value in clear. What it does not protect against yet: the key file sits beside
-the database, so whoever can read the data directory can read both, and that includes any
-process running as Fronde's user, the agent among them. Until the key moves to a keychain, treat
-the data directory, and any backup of it that holds `master.key`, as holding the secrets
-themselves.
+What this protects against, today: a backup of the data directory, or a snapshot of the volume
+that holds it, contains `fronde.db` but not the key, so it reveals no stored secret; and nothing
+in the database's files, its write-ahead log included, holds a value in clear. What it does not
+protect against yet: whoever can read both the key file and the data directory has the secrets,
+and that includes any process running as Fronde's user, the agent among them. Until the key
+moves to a keychain, treat a copy that holds both, such as a backup of the whole home directory,
+as holding the secrets themselves.
 
 ## Secrets in memory
 
@@ -83,7 +89,8 @@ Some plain copies remain:
 
 Zeroing on drop cannot help if a crash writes a core dump, which holds the whole address space, or
 if another process reads Fronde's memory. On Linux, `fronde serve` makes itself non-dumpable
-(`PR_SET_DUMPABLE` 0) and sets `RLIMIT_CORE` to 0 before it reads any secret. Non-dumpable also
+(`PR_SET_DUMPABLE` 0) and sets `RLIMIT_CORE` to 0 before it reads any secret, and so do the
+`fronde secret` commands. Non-dumpable also
 stops processes of the same user, the agent and the tools it runs among them, from reading
 `/proc/<pid>/environ` and `/proc/<pid>/mem` or attaching to Fronde with ptrace. Root, or a process
 with `CAP_SYS_PTRACE`, still can. To debug a crash, set `FRONDE_ALLOW_CORE_DUMPS=1`: Fronde then
@@ -97,10 +104,11 @@ As belt and braces, disable core dumps outside Fronde too: `fronde service insta
 
 Fronde creates its data directory and every directory inside it with mode 0700, and every file it
 writes (memory, the database `fronde.db`, which holds the conversation, the agent's session id,
-the web sessions and the stored secrets, its `-wal` and `-shm` files, the master key, temporary
-files) with mode 0600, whatever the umask. At start, a data directory that group or others could
-enter is tightened to 0700 and a warning is logged. Other users on the same machine cannot read
-your memory or conversation. Only stored secrets are encrypted: see above, and below.
+the web sessions and the stored secrets, its `-wal` and `-shm` files, temporary files, and the
+master key beside the configuration) with mode 0600, whatever the umask. At start, a data
+directory that group or others could enter is tightened to 0700 and a warning is logged. Other
+users on the same machine cannot read your memory or conversation. Only stored secrets are
+encrypted: see above, and below.
 
 ## Two doors
 
@@ -245,6 +253,7 @@ needs write access to the installation, which would also allow replacing the `fr
 
 - Several users: there is one password and one conversation.
 - Encryption at rest, beyond stored secrets: file modes keep other users out, but not someone
-  with the disk, who finds the memory, the conversation and the master key beside the stored
-  secrets. Protect the data directory with the machine's own means.
+  with the disk, who finds the memory, the conversation and, unless it is kept on another disk,
+  the master key that opens the stored secrets. Protect the data directory with the machine's
+  own means.
 - TLS: put Fronde behind a reverse proxy for https. Built-in TLS is **planned** with federation.

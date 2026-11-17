@@ -51,7 +51,9 @@ manifest, settings, tool prefixes, credentials over https) and prints which appr
 opens, stored for this origin`, never the value; a secret that is not stored, one stored for
 another origin, or one that does not open is an error saying how to fix it. It reads the
 approvals and secrets stored in `fronde.db` when the data directory has one, and checks the master
-key against them, as `serve` does at start, and never creates, updates or writes the database: it
+key against them, as `serve` does at start (a key an earlier version left in the data directory
+is read there and not moved: `serve` moves it), and never creates, updates or writes the
+database: it
 opens it read-only, and a database an older Fronde left without the approvals or secrets table
 has no stored approval or secret, which is what `serve` would find after updating it. With
 `[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
@@ -66,8 +68,9 @@ It prints `config OK` when all is well. It does not connect to anything.
 
 Stores, lists and removes the secrets kept encrypted in `fronde.db`, scope `sources` (see
 [Store a secret](../how-to/store-a-secret.md) and
-[Security model](../explanation/security.md#stored-secrets)). Each command opens the database,
-creating or updating it as `serve` does, and works while Fronde runs.
+[Security model](../explanation/security.md#stored-secrets)). Each command makes itself
+non-dumpable on Linux, moves a master key an earlier version left in the data directory to its
+place, and opens the database, each as `serve` does, and works while Fronde runs.
 
 ```text
 fronde secret set <name> --origin <origin> --config <file>  < value
@@ -80,9 +83,11 @@ fronde secret remove <name> --config <file>
   that is not UTF-8 or one over 64 KiB is refused. The name is 1 to 64 letters, digits, `-`, `_`
   or `.`. The origin is `scheme://host[:port]` over http or https, stored as Fronde normalises it
   (`HTTPS://Cloud.Example:443` becomes `https://cloud.example`); the secret is bound to it.
-  Setting a name again replaces its value and origin. The first secret creates `master.key` in
-  the data directory and says so; while secrets are stored, a missing or different key file is
-  an error and no new key is made. It prints `stored secret <name> for <origin>`.
+  Setting a name again replaces its value and origin. The first secret creates the master key,
+  `master.key` beside the configuration file unless `[secrets] master_key` names another file,
+  and prints its path; while secrets are stored, a missing or different key file is an error and
+  no new key is made. Any argument besides the name and the options is refused, exit status 2,
+  without being shown. It prints `stored secret <name> for <origin>`.
 - `list` prints one line per secret: its name, origin and last change (UTC), separated by tabs,
   or `no stored secret`. It never prints a value.
 - `remove` removes one secret, and exits with 1 if there is none by that name. Removing the last

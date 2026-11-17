@@ -49,7 +49,7 @@ fn text(out: &Output) -> String {
 async fn stored(config: &Path, name: &str) -> String {
     let config = fronde_hub::config::load(config).unwrap();
     let db = fronde_db::open(&config.data.dir).await.unwrap();
-    let key = fronde_db::master_key::load(&db, &config.data.dir)
+    let key = fronde_db::master_key::load(&db, config.master_key_file().unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -83,6 +83,11 @@ async fn set_list_and_remove_from_the_command_line() {
         shown.contains("stored secret caldav for https://cloud.example.org"),
         "{shown}"
     );
+    // The key is beside the configuration, not in the data directory.
+    let key_file = dir.path().join("master.key");
+    assert!(shown.contains(&key_file.display().to_string()), "{shown}");
+    assert!(key_file.is_file());
+    assert!(!dir.path().join("data/master.key").exists());
     assert!(!shown.contains(CANARY), "{shown}");
     // The final line break is not part of the value; the origin is stored canonical.
     assert_eq!(stored(&path, "caldav").await, CANARY);
@@ -128,9 +133,39 @@ async fn set_list_and_remove_from_the_command_line() {
     assert!(text(&out).contains("no stored secret"), "{}", text(&out));
 }
 
-/// The value is never an argument: one given there is refused and nothing is stored.
+/// The value is never an argument: one given there is refused, without being shown, and nothing
+/// is stored.
 #[test]
 fn set_takes_no_value_as_an_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path());
+    let hyphenated = format!("-{CANARY}");
+    let flag = format!("--value={CANARY}");
+    for given in [
+        vec!["caldav", CANARY, "--origin", "https://cloud.example"],
+        vec!["caldav", "--origin", "https://cloud.example", CANARY],
+        vec!["caldav", &hyphenated, "--origin", "https://cloud.example"],
+        vec!["caldav", "--origin", "https://cloud.example", &flag],
+    ] {
+        let args: Vec<&str> = ["secret", "set"].into_iter().chain(given).collect();
+        let out = fronde(&args, &path, Some(b"from stdin"));
+        let shown = text(&out);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {shown}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains(CANARY)
+                && !String::from_utf8_lossy(&out.stderr).contains(CANARY),
+            "{args:?}: the argument was shown: {shown}"
+        );
+        assert!(shown.contains("standard input"), "{args:?}: {shown}");
+    }
+    let out = fronde(&["secret", "list"], &path, None);
+    assert!(text(&out).contains("no stored secret"), "{}", text(&out));
+}
+
+/// A master key an earlier version kept in the data directory moves beside the configuration
+/// at the next command, and the secrets still open with it.
+#[tokio::test]
+async fn a_key_in_the_data_directory_moves_beside_the_configuration() {
     let dir = tempfile::tempdir().unwrap();
     let path = config(dir.path());
     let out = fronde(
@@ -138,16 +173,23 @@ fn set_takes_no_value_as_an_argument() {
             "secret",
             "set",
             "caldav",
-            CANARY,
             "--origin",
             "https://cloud.example",
         ],
         &path,
-        Some(b"from stdin"),
+        Some(CANARY.as_bytes()),
     );
-    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let key_file = dir.path().join("master.key");
+    let legacy = dir.path().join("data/master.key");
+    std::fs::rename(&key_file, &legacy).unwrap();
+
     let out = fronde(&["secret", "list"], &path, None);
-    assert!(text(&out).contains("no stored secret"), "{}", text(&out));
+    let shown = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(shown.contains("moved the master key"), "{shown}");
+    assert!(key_file.is_file() && !legacy.exists());
+    assert_eq!(stored(&path, "caldav").await, CANARY);
 }
 
 #[test]
@@ -185,7 +227,7 @@ fn set_refuses_empty_input_and_bad_origins() {
     assert!(shown.contains("scheme://host[:port]"), "{shown}");
     assert!(!shown.contains(CANARY), "{shown}");
     assert!(
-        !fronde_db::master_key::path(&dir.path().join("data")).exists(),
+        !dir.path().join("master.key").exists() && !dir.path().join("data/master.key").exists(),
         "a refused secret made a key"
     );
 }

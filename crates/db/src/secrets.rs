@@ -4,8 +4,9 @@
 //! scope or origin fails to open instead of handing its secret to the wrong place.
 //!
 //! The first secret also stores a key check: a fixed text sealed with the same key, in `kv`
-//! (`secrets`/`key_check`). A wrong key is then reported as a wrong key, not as damaged rows, and
-//! a new key is never made while it exists.
+//! (`secrets`/`key_check`), under associated data of its own domain (`fronde key check`), so
+//! that it can never be taken for a secret row or the other way round. A wrong key is then
+//! reported as a wrong key, not as damaged rows, and a new key is never made while it exists.
 //!
 //! Origins are stored as the caller gives them: canonical, written by `Origin::to_string()`
 //! (`fronde_hub::origin`). Values only leave this module as `SecretString`, and nothing here
@@ -37,9 +38,17 @@ const NONCE_LEN: usize = 24;
 /// Where the key check lives in `kv`.
 const CHECK_SCOPE: &str = "secrets";
 const CHECK_KEY: &str = "key_check";
-/// The key check's format, its first byte; then the nonce, then the sealed text.
-const CHECK_VERSION: u8 = 1;
+/// The key check's format, its first byte; then the nonce, then the sealed text. Format 2 seals
+/// it under its own domain label; format 1, written by the first version of the store, sealed it
+/// under the secret rows' label: it is still accepted, and sealed again in format 2 by the next
+/// write ([`set`], [`upgrade_key_check`]).
+const CHECK_VERSION: u8 = 2;
+const CHECK_VERSION_ROW_LABEL: u8 = 1;
 const CHECK_TEXT: &[u8] = b"fronde key check v1";
+
+/// The domain labels that start the associated data: a secret row, the key check.
+const ROW_LABEL: &[u8] = b"fronde secret";
+const CHECK_LABEL: &[u8] = b"fronde key check";
 
 /// The longest value accepted, in bytes.
 pub const MAX_VALUE_LEN: usize = 64 * 1024;
@@ -123,9 +132,14 @@ impl Sealed {
 
 /// `fronde secret | version | scope | name | origin`, each part prefixed by its length.
 fn associated_data(version: i64, scope: &str, name: &str, origin: &str) -> Vec<u8> {
+    labelled(ROW_LABEL, version, scope, name, origin)
+}
+
+/// `label | version | scope | name | origin`, each part prefixed by its length.
+fn labelled(label: &[u8], version: i64, scope: &str, name: &str, origin: &str) -> Vec<u8> {
     let version = version.to_be_bytes();
     let parts: [&[u8]; 5] = [
-        b"fronde secret",
+        label,
         &version,
         scope.as_bytes(),
         name.as_bytes(),
@@ -176,8 +190,30 @@ fn open_with(
         .map_err(|_| anyhow::anyhow!("it does not authenticate"))
 }
 
-fn check_aad() -> Vec<u8> {
-    associated_data(i64::from(CHECK_VERSION), CHECK_SCOPE, CHECK_KEY, "")
+/// The key check's associated data in `format`.
+fn check_aad(format: u8) -> Vec<u8> {
+    let label = if format == CHECK_VERSION_ROW_LABEL {
+        ROW_LABEL
+    } else {
+        CHECK_LABEL
+    };
+    labelled(label, i64::from(format), CHECK_SCOPE, CHECK_KEY, "")
+}
+
+/// A new key check for `cipher`'s key, in the current format.
+fn seal_check(cipher: &XChaCha20Poly1305) -> anyhow::Result<Vec<u8>> {
+    let nonce = new_nonce()?;
+    let sealed = seal_with(cipher, &nonce, CHECK_TEXT, &check_aad(CHECK_VERSION))?;
+    let mut value = vec![CHECK_VERSION];
+    value.extend_from_slice(&nonce);
+    value.extend_from_slice(&sealed);
+    Ok(value)
+}
+
+async fn write_check<C: ConnectionTrait>(db: &C, check: Vec<u8>) -> anyhow::Result<()> {
+    crate::kv::set(db, CHECK_SCOPE, CHECK_KEY, check, None)
+        .await
+        .context("cannot store the master key's check")
 }
 
 /// Whether anything is sealed: a secret, or the key check that the first one stored.
@@ -195,8 +231,9 @@ async fn stored_check<C: ConnectionTrait>(db: &C) -> anyhow::Result<Option<Vec<u
         .context("cannot read the master key's check in the database")
 }
 
-/// Whether `key` opens the stored key check `check`.
-fn opens(key: &MasterKey, check: &[u8]) -> anyhow::Result<()> {
+/// Whether `key` opens the stored key check `check`: an error if not, else whether the check is
+/// in the older format and is to be sealed again.
+fn opens(key: &MasterKey, check: &[u8]) -> anyhow::Result<bool> {
     let wrong = || {
         format!(
             "this master key (from {}) is not the one that sealed the stored secrets; restore \
@@ -205,25 +242,25 @@ fn opens(key: &MasterKey, check: &[u8]) -> anyhow::Result<()> {
         )
     };
     let (&version, rest) = check.split_first().context("the key check is empty")?;
-    if version != CHECK_VERSION {
+    if version != CHECK_VERSION && version != CHECK_VERSION_ROW_LABEL {
         bail!("the key check is in format {version}, which this Fronde does not read");
     }
     if rest.len() < NONCE_LEN {
         bail!("the key check is cut short");
     }
     let (nonce, sealed) = rest.split_at(NONCE_LEN);
-    let plain = open_with(&key.cipher(), nonce, sealed, &check_aad()).with_context(wrong)?;
+    let plain = open_with(&key.cipher(), nonce, sealed, &check_aad(version)).with_context(wrong)?;
     if plain.as_slice() != CHECK_TEXT {
         bail!(wrong());
     }
-    Ok(())
+    Ok(version != CHECK_VERSION)
 }
 
 /// Check that `key` is the one that sealed the stored secrets. With nothing stored, any key is.
 /// Secrets stored without a key check cannot be checked and are refused.
 pub async fn check_key<C: ConnectionTrait>(db: &C, key: &MasterKey) -> anyhow::Result<()> {
     match stored_check(db).await? {
-        Some(check) => opens(key, &check),
+        Some(check) => opens(key, &check).map(drop),
         None => {
             let rows = secrets::Entity::find()
                 .count(db)
@@ -238,6 +275,27 @@ pub async fn check_key<C: ConnectionTrait>(db: &C, key: &MasterKey) -> anyhow::R
             Ok(())
         }
     }
+}
+
+/// Check `key` as [`check_key`] does and, if the key check is in the older format, seal it again
+/// in the current one, in one write transaction. True if it was sealed again. `fronde serve` calls
+/// it at start, so that a database stays in the older format only until then.
+pub async fn upgrade_key_check(db: &DatabaseConnection, key: &MasterKey) -> anyhow::Result<bool> {
+    let transaction = crate::begin_write(db)
+        .await
+        .context("cannot write to the database")?;
+    let Some(check) = stored_check(&transaction).await? else {
+        return Ok(false);
+    };
+    if !opens(key, &check)? {
+        return Ok(false);
+    }
+    write_check(&transaction, seal_check(&key.cipher())?).await?;
+    transaction
+        .commit()
+        .await
+        .context("cannot store the master key's check")?;
+    Ok(true)
 }
 
 /// Whether the database has the secrets table. A database last opened by an older Fronde does
@@ -292,18 +350,18 @@ pub async fn set(
     let transaction = crate::begin_write(db)
         .await
         .context("cannot write to the database")?;
+    // The real guard against sealing under a key that is not the stored secrets' one: inside the
+    // write transaction, so no other writer can store a first secret under another key between
+    // this check and this write.
     match stored_check(&transaction).await? {
-        Some(check) => opens(key, &check)?,
+        Some(check) => {
+            if opens(key, &check)? {
+                write_check(&transaction, seal_check(&cipher)?).await?;
+            }
+        }
         None => {
             check_key(&transaction, key).await?;
-            let check_nonce = new_nonce()?;
-            let sealed = seal_with(&cipher, &check_nonce, CHECK_TEXT, &check_aad())?;
-            let mut value = vec![CHECK_VERSION];
-            value.extend_from_slice(&check_nonce);
-            value.extend_from_slice(&sealed);
-            crate::kv::set(&transaction, CHECK_SCOPE, CHECK_KEY, value, None)
-                .await
-                .context("cannot store the master key's check")?;
+            write_check(&transaction, seal_check(&cipher)?).await?;
         }
     }
     let now = Utc::now();
@@ -439,6 +497,83 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The key check and the secret rows are sealed under different domain labels: a check does
+    /// not open as a row with the same scope, name and origin, nor the other way round.
+    #[test]
+    fn key_check_has_its_own_domain() {
+        let key = MasterKey::generate("test").unwrap();
+        let check = seal_check(&key.cipher()).unwrap();
+        assert_eq!(check[0], CHECK_VERSION);
+        assert!(
+            !opens(&key, &check).unwrap(),
+            "a current check needs no new seal"
+        );
+        let (nonce, sealed) = check[1..].split_at(NONCE_LEN);
+        let as_row = associated_data(i64::from(CHECK_VERSION), CHECK_SCOPE, CHECK_KEY, "");
+        assert!(open_with(&key.cipher(), nonce, sealed, &as_row).is_err());
+        assert_ne!(check_aad(CHECK_VERSION), as_row);
+    }
+
+    /// A key check written by the first version of the store, under the rows' label.
+    fn row_labelled_check(key: &MasterKey) -> Vec<u8> {
+        let nonce = new_nonce().unwrap();
+        let aad = associated_data(1, CHECK_SCOPE, CHECK_KEY, "");
+        let sealed = seal_with(&key.cipher(), &nonce, CHECK_TEXT, &aad).unwrap();
+        let mut check = vec![CHECK_VERSION_ROW_LABEL];
+        check.extend_from_slice(&nonce);
+        check.extend_from_slice(&sealed);
+        check
+    }
+
+    /// A check in the older format still opens with its key, and is sealed again in the current
+    /// format by the next write, in the same transaction, or by `upgrade_key_check`; a wrong key
+    /// is still refused.
+    #[tokio::test]
+    async fn older_key_check_is_accepted_and_sealed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::open(dir.path()).await.unwrap();
+        let key = MasterKey::generate("test").unwrap();
+        let other = MasterKey::generate("test").unwrap();
+        let old = row_labelled_check(&key);
+        assert!(
+            opens(&key, &old).unwrap(),
+            "the older format is to be sealed again"
+        );
+        assert!(opens(&other, &old).is_err());
+
+        // Through `set`.
+        write_check(&db, old.clone()).await.unwrap();
+        check_key(&db, &key).await.unwrap();
+        assert!(check_key(&db, &other).await.is_err());
+        let value = SecretString::from("value");
+        assert!(
+            set(&db, &other, SOURCES, "a", "https://x", &value)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            stored_check(&db).await.unwrap().unwrap(),
+            old,
+            "refused, unchanged"
+        );
+        set(&db, &key, SOURCES, "a", "https://x", &value)
+            .await
+            .unwrap();
+        let new = stored_check(&db).await.unwrap().unwrap();
+        assert_eq!(new[0], CHECK_VERSION);
+        assert!(!opens(&key, &new).unwrap());
+
+        // Through `upgrade_key_check`, which `serve` runs at start.
+        write_check(&db, old.clone()).await.unwrap();
+        assert!(upgrade_key_check(&db, &other).await.is_err());
+        assert_eq!(stored_check(&db).await.unwrap().unwrap(), old);
+        assert!(upgrade_key_check(&db, &key).await.unwrap());
+        let new = stored_check(&db).await.unwrap().unwrap();
+        assert_eq!(new[0], CHECK_VERSION);
+        assert!(!upgrade_key_check(&db, &key).await.unwrap(), "only once");
+        assert_eq!(stored_check(&db).await.unwrap().unwrap(), new);
     }
 
     /// Length prefixes keep parts apart: moving a character from one part to the next changes

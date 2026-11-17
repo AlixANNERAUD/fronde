@@ -91,7 +91,10 @@ async fn approval_checks(config: &Config) -> anyhow::Result<fronde_wasm::Checks>
         .await
         .with_context(unreadable)?
     {
-        checks.secrets = fronde_wasm::StoredSecrets::load(&db, &config.data.dir).await?;
+        // Where serving would read the key, without moving one an earlier version left in the
+        // data directory: serving moves it.
+        let key_file = fronde_db::master_key::locate(config.master_key_file()?, &config.data.dir)?;
+        checks.secrets = fronde_wasm::StoredSecrets::load(&db, &key_file).await?;
     }
     db.close().await?;
     Ok(checks)

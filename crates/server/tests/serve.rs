@@ -8,9 +8,10 @@ fn config(dir: &std::path::Path, token: &str) -> fronde_hub::config::Config {
     let token_file = dir.join("token");
     fronde_hub::private::write(&token_file, token).unwrap();
     let toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n",
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n",
         token_file.display().to_string(),
-        dir.join("data").display().to_string()
+        dir.join("data").display().to_string(),
+        dir.join("master.key").display().to_string()
     );
     toml::from_str(&toml).unwrap()
 }
@@ -246,9 +247,10 @@ async fn broken_component_is_skipped() {
     let base = config(dir.path(), TOKEN);
     let token_file = dir.path().join("token");
     let toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n{}{}",
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n{}{}",
         token_file.display().to_string(),
         base.data.dir.display().to_string(),
+        base.master_key_file().unwrap().display().to_string(),
         component_entry("broken", &broken, &broken_manifest),
         component_entry("echo", &dist("echo.wasm"), &dist("echo.toml")),
     );
@@ -528,11 +530,18 @@ fn calendar_with_stored_password(
     (path, data)
 }
 
-/// Store `value` as `name` for `origin` in `data`'s database, as `fronde secret set` does.
-async fn store_secret(data: &std::path::Path, name: &str, origin: &str, value: &str) {
+/// Store `value` as `name` for `origin` in `data`'s database, sealed with the key in `key_file`,
+/// as `fronde secret set` does.
+async fn store_secret(
+    data: &std::path::Path,
+    key_file: &std::path::Path,
+    name: &str,
+    origin: &str,
+    value: &str,
+) {
     fronde_hub::private::prepare_data_dir(data).unwrap();
     let db = fronde_db::open(data).await.unwrap();
-    let (key, _) = fronde_db::master_key::load_or_create(&db, data)
+    let (key, _) = fronde_db::master_key::load_or_create(&db, key_file)
         .await
         .unwrap();
     fronde_db::secrets::set(
@@ -587,7 +596,14 @@ async fn check_reports_stored_credentials() {
     assert!(!fronde_db::path(&data).exists(), "check made no database");
 
     // Stored for another origin.
-    store_secret(&data, "caldav", "https://other.example", VALUE).await;
+    store_secret(
+        &data,
+        &dir.path().join("master.key"),
+        "caldav",
+        "https://other.example",
+        VALUE,
+    )
+    .await;
     let out = run_check(&path);
     let shown = output(&out);
     assert_eq!(out.status.code(), Some(1), "{shown}");
@@ -600,7 +616,14 @@ async fn check_reports_stored_credentials() {
     assert!(!shown.contains(VALUE), "{shown}");
 
     // Stored for its origin: it opens, and its value is never shown nor anything written.
-    store_secret(&data, "caldav", "https://cloud.example", VALUE).await;
+    store_secret(
+        &data,
+        &dir.path().join("master.key"),
+        "caldav",
+        "https://cloud.example",
+        VALUE,
+    )
+    .await;
     let before = snapshot(&data);
     let out = run_check(&path);
     let shown = output(&out);
@@ -623,7 +646,7 @@ async fn check_reports_stored_credentials() {
     assert!(after == before, "check changed the data directory");
 
     // A key that did not seal it.
-    let key_file = fronde_db::master_key::path(&data);
+    let key_file = dir.path().join("master.key");
     std::fs::remove_file(&key_file).unwrap();
     fronde_hub::private::write(&key_file, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
     let out = run_check(&path);
@@ -640,8 +663,15 @@ async fn check_reports_stored_credentials() {
 async fn start_refuses_a_wrong_or_missing_master_key() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(dir.path(), TOKEN);
-    store_secret(&config.data.dir, "caldav", "https://cloud.example", "v").await;
-    let key_file = fronde_db::master_key::path(&config.data.dir);
+    let key_file = config.master_key_file().unwrap().to_path_buf();
+    store_secret(
+        &config.data.dir,
+        &key_file,
+        "caldav",
+        "https://cloud.example",
+        "v",
+    )
+    .await;
 
     std::fs::remove_file(&key_file).unwrap();
     fronde_hub::private::write(&key_file, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
@@ -658,6 +688,43 @@ async fn start_refuses_a_wrong_or_missing_master_key() {
         "{e:#}"
     );
     assert!(!key_file.exists(), "no new key is made");
+}
+
+/// A key an earlier version left in the data directory: `fronde check` reads it there and moves
+/// nothing, `serve` moves it to the configured file; a different key in each place stops `serve`.
+#[tokio::test]
+async fn a_key_in_the_data_directory_is_read_by_check_and_moved_by_serve() {
+    const VALUE: &str = "canary-stored-caldav-5e6f7a8b";
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = calendar_with_stored_password(dir.path());
+    let legacy = data.join("master.key");
+    let key_file = dir.path().join("master.key");
+    store_secret(&data, &legacy, "caldav", "https://cloud.example", VALUE).await;
+    let line = std::fs::read(&legacy).unwrap();
+
+    let out = run_check(&path);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{shown}");
+    assert!(shown.contains("stored secret caldav opens"), "{shown}");
+    assert!(legacy.exists() && !key_file.exists(), "check moved the key");
+
+    // `serve`, here with no component: the move does not depend on one.
+    let mut config = config(dir.path(), TOKEN);
+    config.data.dir = data.clone();
+    assert_eq!(config.master_key_file().unwrap(), key_file);
+    let (_addr, server) = fronde::start(config.clone()).await.unwrap();
+    server.abort();
+    assert!(!legacy.exists(), "the data directory still holds the key");
+    assert_eq!(std::fs::read(&key_file).unwrap(), line);
+
+    fronde_hub::private::write(&legacy, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
+    let e = format!("{:#}", fronde::start(config).await.unwrap_err());
+    assert!(e.contains("two different master keys"), "{e}");
+    assert!(legacy.exists() && key_file.exists());
 }
 
 #[test]

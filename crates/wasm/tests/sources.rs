@@ -921,8 +921,10 @@ async fn checks_load_reads_stored_approvals() {
     let component = unpinned(dir.path(), SETTINGS);
     let hashes = Hashes::of(&component).unwrap();
     let config: fronde_hub::config::Config = toml::from_str(&format!(
-        "[server]\ntoken = {{ env = \"FRONDE_UNUSED\" }}\n[data]\ndir = {:?}\ntimezone = \"UTC\"\n",
-        data.path().display().to_string()
+        "[server]\ntoken = {{ env = \"FRONDE_UNUSED\" }}\n[data]\ndir = {:?}\ntimezone = \"UTC\"\n\
+         [secrets]\nmaster_key = {{ file = {:?} }}\n",
+        data.path().display().to_string(),
+        data.path().join("master.key").display().to_string()
     ))
     .unwrap();
 

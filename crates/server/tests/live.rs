@@ -34,9 +34,10 @@ fn config(dir: &Path, agent: &str) -> fronde_hub::config::Config {
         Err(_) => "{}".to_owned(),
     };
     let toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n[memory]\ngit = false\n[web]\npassword = {{ file = {:?} }}\n[agent]\ncommand = [{agent:?}]\nenv = {env}\n",
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n[web]\npassword = {{ file = {:?} }}\n[agent]\ncommand = [{agent:?}]\nenv = {env}\n",
         dir.join("token").display().to_string(),
         dir.join("data").display().to_string(),
+        dir.join("master.key").display().to_string(),
         dir.join("password").display().to_string(),
     );
     toml::from_str(&toml).unwrap()

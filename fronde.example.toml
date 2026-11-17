@@ -20,6 +20,12 @@ memory_limit = 4000
 user_limit = 2000
 git = true
 
+# Optional: where the master key of stored secrets (`fronde secret`) is kept, apart from the data
+# directory so that its backups do not hold it. Left out, master.key beside this file; in a
+# container, whose /config is read-only, a writable directory of its own (see Run in Docker).
+[secrets]
+master_key = { file = "/keys/master.key" }
+
 # Optional: code_run_python, which runs short Python for exact arithmetic, dates and aggregates,
 # in a sandbox with the standard library only, no files and no network. dir holds the CPython
 # for WASI that `mise run python` fetches; the image ships it here. Without it, no tool.

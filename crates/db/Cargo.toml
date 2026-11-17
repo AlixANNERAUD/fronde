@@ -19,6 +19,7 @@ getrandom.workspace = true
 percent-encoding = "2"
 sea-orm.workspace = true
 secrecy.workspace = true
+tracing.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]

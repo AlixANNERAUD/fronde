@@ -57,10 +57,15 @@ enum SecretCommand {
         /// The secret's name: letters, digits, '-', '_' or '.'.
         name: String,
         /// The only origin the secret is for, such as https://cloud.example.
-        #[arg(long)]
-        origin: String,
-        #[arg(long)]
-        config: PathBuf,
+        #[arg(long, required_unless_present = "unexpected")]
+        origin: Option<String>,
+        #[arg(long, required_unless_present = "unexpected")]
+        config: Option<PathBuf>,
+        /// Anything else, refused without being shown: clap's own error for an unexpected
+        /// argument would quote it, and that argument may well be the secret. Once it takes a
+        /// value it takes the rest, options included, so nothing is required then.
+        #[arg(hide = true, num_args = 0.., allow_hyphen_values = true)]
+        unexpected: Vec<String>,
     },
     /// List the stored secrets' names and origins, never their values.
     List {
@@ -161,28 +166,46 @@ fn init(config: &std::path::Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn secret(action: &SecretCommand) -> anyhow::Result<()> {
+/// The exit status of a command line that cannot be used, as clap gives it.
+const USAGE: u8 = 2;
+
+async fn secret(action: &SecretCommand) -> anyhow::Result<ExitCode> {
     use std::io::IsTerminal as _;
+    // Before any secret or the master key is read.
+    fronde::hardening::harden()?;
     let mut out = std::io::stdout();
     match action {
+        SecretCommand::Set { unexpected, .. } if !unexpected.is_empty() => {
+            eprintln!(
+                "error: fronde secret set takes the name, --origin and --config only, and the \
+                 value on standard input; it got {} more argument(s), not shown here in case one \
+                 is the secret. If it was, it may be in your shell history and was visible in \
+                 the process list: change it where it comes from",
+                unexpected.len()
+            );
+            return Ok(ExitCode::from(USAGE));
+        }
         SecretCommand::Set {
             name,
-            origin,
-            config,
+            origin: Some(origin),
+            config: Some(config),
+            ..
         } => {
             let config = fronde_hub::config::load(config)?;
             let stdin = std::io::stdin();
             let terminal = stdin.is_terminal();
             let value = fronde::secret::read_value(stdin.lock(), terminal)?;
-            fronde::secret::set(&config, name, origin, &value, &mut out).await
+            fronde::secret::set(&config, name, origin, &value, &mut out).await?;
         }
+        SecretCommand::Set { .. } => unreachable!("clap requires --origin and --config"),
         SecretCommand::List { config } => {
-            fronde::secret::list(&fronde_hub::config::load(config)?, &mut out).await
+            fronde::secret::list(&fronde_hub::config::load(config)?, &mut out).await?;
         }
         SecretCommand::Remove { name, config } => {
-            fronde::secret::remove(&fronde_hub::config::load(config)?, name, &mut out).await
+            fronde::secret::remove(&fronde_hub::config::load(config)?, name, &mut out).await?;
         }
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn healthcheck(path: &std::path::Path) -> anyhow::Result<()> {
@@ -235,7 +258,7 @@ async fn main() -> ExitCode {
             ServiceCommand::Uninstall => fronde::service::uninstall().map(|()| ExitCode::SUCCESS),
             ServiceCommand::Status => fronde::service::status(),
         },
-        Command::Secret { action } => secret(action).await.map(|()| ExitCode::SUCCESS),
+        Command::Secret { action } => secret(action).await,
     };
     match result {
         Ok(code) => code,

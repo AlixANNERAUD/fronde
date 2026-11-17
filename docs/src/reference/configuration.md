@@ -8,7 +8,8 @@ shows every section.
 
 ## Relative paths
 
-A relative path in the file (`[data] dir`, a secret `file`, a component's `path`, `[python] dir`) is resolved from the directory
+A relative path in the file (`[data] dir`, a secret `file`, a component's `path`, `[python] dir`,
+`[secrets] master_key`) is resolved from the directory
 containing the configuration file, whatever directory Fronde is started from, and becomes
 absolute. Earlier versions read relative secret paths from the working directory.
 
@@ -28,7 +29,7 @@ refuse it, saying to use `{ file = "…" }` or `{ env = "…" }`.
 
 When secrets are stored, Fronde checks the master key as it starts: a key file that is not the one
 that sealed them, or no key file at all, stops it with an error that says to restore the key from
-a backup. `fronde check` does the same.
+a backup. `fronde check` does the same. The key file is set in [`[secrets]`](#secrets-1).
 
 A secret file must be private. On Unix, Fronde refuses a file that group or others can read or
 write, or that another user owns, and says so: `secret file <path> is readable by other users; run
@@ -58,6 +59,24 @@ Required.
 | `dir` | path | `$XDG_DATA_HOME/fronde`, else `~/.local/share/fronde` (macOS and Windows: the platform's per-user data directory) | Where Fronde keeps its memory, index and conversation. Created (mode 0700) if missing; it must be writable by the user running Fronde. A relative path is read from the configuration file's directory. See [Data directory](data-directory.md). |
 | `timezone` | IANA name | required | Time zone of the journal, the calendar and reminders, such as `"Europe/Paris"`. |
 | `user` | string | `"me"` | What the assistant calls you, in its instructions and its system prompt. |
+
+## `[secrets]`
+
+Optional.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `master_key` | `{ file = "…" }` | `master.key` beside the configuration file | The file holding the master key of the [stored secrets](../how-to/store-a-secret.md), created (mode 0600) with the first one. A relative path is read from the configuration file's directory. Only `{ file = "…" }`: the key never comes from an environment variable, which the agent inherits. |
+
+The key is kept out of the data directory, so that a backup of the data directory, or a snapshot
+of its volume, does not hold it with the secrets it opens (see
+[Data directory](data-directory.md)). Pick a file outside `[data] dir`. Fronde must be able to
+create it in its directory when the first secret is stored: if the configuration's directory is
+read-only, as in a container where it is mounted read-only, set `master_key` to a file in a
+writable directory of its own (see [Run in Docker](../how-to/run-in-docker.md)). A key left in
+the data directory by an earlier version is moved to this file at the next start or
+`fronde secret` command; if both hold a key and they differ, Fronde refuses to start.
+Reading the key from the system's keychain or a systemd credential is **planned**.
 
 ## `[memory]`
 

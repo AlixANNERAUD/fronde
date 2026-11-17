@@ -162,12 +162,13 @@ async fn wasm_sources(
     }
     let host = ComponentHost::new()?;
     let checks = Checks::load(config, db).await?;
+    let key_file = config.master_key_file()?;
     let mut sources: Vec<Arc<dyn ToolSource>> = entries
         .into_iter()
         .map(|c| {
             Arc::new(
                 ComponentSource::new(c, checks.clone(), host.clone())
-                    .reading_secrets_from(db.clone(), config.data.dir.clone()),
+                    .reading_secrets_from(db.clone(), key_file.to_path_buf()),
             ) as Arc<dyn ToolSource>
         })
         .collect();
@@ -253,11 +254,16 @@ pub async fn start_with(
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
     let agent = config.agent.clone();
+    let key_file = config.master_key_file()?.to_path_buf();
     fronde_hub::private::prepare_data_dir(&data_dir)?;
+    // A key an earlier version kept in the data directory moves to the configured key file.
+    fronde_db::master_key::migrate(&key_file, &data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
     // A wrong master key, or none while secrets are stored, stops Fronde here, whether or not a
     // component needs a stored secret.
-    fronde_db::master_key::load(&db, &data_dir).await?;
+    if let Some(key) = fronde_db::master_key::load(&db, &key_file).await? {
+        fronde_db::secrets::upgrade_key_check(&db, &key).await?;
+    }
     let components = wasm_sources(&config, &db).await?;
     // The store creates its own table, `tower_sessions`, which the entities leave out.
     let sessions = Sessions::new(db.get_sqlite_connection_pool().clone());

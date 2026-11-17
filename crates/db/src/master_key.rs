@@ -1,6 +1,9 @@
 //! The master key that seals stored secrets ([`crate::secrets`]), and where it is kept: for now a
-//! 0600 file, `master.key`, in the data directory. The keychain and systemd credentials are
-//! planned. The key never comes from the environment: the agent inherits Fronde's.
+//! 0600 file, by default `master.key` beside the configuration file, never in the data directory,
+//! so that a backup of the data directory or a snapshot of its volume does not hold the key with
+//! the secrets it opens. Earlier versions kept it in the data directory: [`migrate`] moves it.
+//! The keychain and systemd credentials are planned. The key never comes from the environment:
+//! the agent inherits Fronde's.
 //!
 //! The key is written as one line, `fronde-key-v1:` followed by its 32 bytes in unpadded
 //! base64url, the same in a file, a keychain entry or a systemd credential, so that anything else
@@ -18,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
-/// The key file's name in the data directory.
+/// The key file's name: beside the configuration by default, in the data directory before.
 pub const FILE_NAME: &str = "master.key";
 
 /// What starts the key's one line, naming its format.
@@ -27,8 +30,8 @@ const PREFIX: &str = "fronde-key-v1:";
 /// The key's length in unpadded base64url.
 const ENCODED_LEN: usize = 43;
 
-/// The key file in `data_dir`.
-pub fn path(data_dir: &Path) -> PathBuf {
+/// Where earlier versions kept the key: in the data directory, where [`migrate`] looks for it.
+pub fn legacy_path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE_NAME)
 }
 
@@ -91,11 +94,18 @@ impl MasterKey {
     }
 
     /// The key's one line, to store it.
-    fn encode(&self) -> Zeroizing<String> {
-        let mut line = Zeroizing::new(String::with_capacity(PREFIX.len() + ENCODED_LEN + 1));
-        line.push_str(PREFIX);
-        URL_SAFE_NO_PAD.encode_string(self.key.expose_secret(), &mut line);
-        line.push('\n');
+    fn encode(&self) -> Zeroizing<Vec<u8>> {
+        // Straight into a buffer zeroed on drop: `encode_string` goes through a chunked encoder
+        // whose stack buffer keeps a copy of the encoded key.
+        let mut encoded = Zeroizing::new([0u8; ENCODED_LEN]);
+        let written = URL_SAFE_NO_PAD
+            .encode_slice(self.key.expose_secret(), encoded.as_mut_slice())
+            .expect("32 bytes are 43 base64url characters");
+        debug_assert_eq!(written, ENCODED_LEN);
+        let mut line = Zeroizing::new(Vec::with_capacity(PREFIX.len() + ENCODED_LEN + 1));
+        line.extend_from_slice(PREFIX.as_bytes());
+        line.extend_from_slice(encoded.as_slice());
+        line.push(b'\n');
         line
     }
 
@@ -105,12 +115,29 @@ impl MasterKey {
 }
 
 /// The key in `file`, or `None` when there is no such file. A key file that other users could
-/// read, or that another user owns, is refused.
+/// read, or that another user owns, is refused, and so is anything but a plain file.
 pub fn read(file: &Path) -> anyhow::Result<Option<MasterKey>> {
+    let Some(text) = read_text(file)? else {
+        return Ok(None);
+    };
+    MasterKey::parse(&text, "file").map(Some).with_context(|| {
+        format!(
+            "the master key {} is unreadable; restore it from a backup",
+            file.display()
+        )
+    })
+}
+
+/// The text of the key file `file`, not parsed, after the checks of [`read`].
+fn read_text(file: &Path) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     let shown = file.display();
-    let mut opened = match std::fs::File::open(file) {
+    let mut opened = match open_plain(file) {
         Ok(opened) => opened,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) if is_link_refused(&e) => bail!(
+            "the master key {shown} is a symbolic link; Fronde reads the key only from a plain \
+             file: put the file itself there"
+        ),
         Err(e) => return Err(e).with_context(|| format!("cannot read the master key {shown}")),
     };
     check_private(&opened, file)?;
@@ -122,9 +149,33 @@ pub fn read(file: &Path) -> anyhow::Result<Option<MasterKey>> {
         .take(limit as u64)
         .read_to_end(&mut text)
         .with_context(|| format!("cannot read the master key {shown}"))?;
-    MasterKey::parse(&text, "file")
-        .map(Some)
-        .with_context(|| format!("the master key {shown} is unreadable; restore it from a backup"))
+    Ok(Some(text))
+}
+
+/// Whether opening without following links failed on a symbolic link (`ELOOP`).
+fn is_link_refused(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    return e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error());
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// `file` opened for reading, without following a symbolic link, and without waiting on a FIFO
+/// (no writer would ever come): [`check_private`] then refuses anything but a plain file.
+fn open_plain(file: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use rustix::fs::OFlags;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags = OFlags::NOFOLLOW | OFlags::NONBLOCK;
+        options.custom_flags(flags.bits() as i32);
+    }
+    options.open(file)
 }
 
 #[cfg(unix)]
@@ -133,6 +184,12 @@ fn check_private(opened: &std::fs::File, file: &Path) -> anyhow::Result<()> {
     let meta = opened
         .metadata()
         .with_context(|| format!("cannot read the master key {}", file.display()))?;
+    if !meta.is_file() {
+        bail!(
+            "the master key {} is not a plain file; Fronde reads the key only from a plain file",
+            file.display()
+        );
+    }
     if meta.mode() & 0o077 != 0 {
         bail!(
             "the master key {0} is open to other users; run chmod 600 {0}",
@@ -149,18 +206,40 @@ fn check_private(opened: &std::fs::File, file: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn check_private(_opened: &std::fs::File, _file: &Path) -> anyhow::Result<()> {
+fn check_private(opened: &std::fs::File, file: &Path) -> anyhow::Result<()> {
+    let meta = opened
+        .metadata()
+        .with_context(|| format!("cannot read the master key {}", file.display()))?;
+    if !meta.is_file() {
+        bail!(
+            "the master key {} is not a plain file; Fronde reads the key only from a plain file",
+            file.display()
+        );
+    }
     Ok(())
 }
 
 /// Write a new key to `file`, 0600, unless the file exists. Returns the key in the file: the new
 /// one, or the one another writer put there first.
-///
-/// The key is written and synced to a temporary file, which is then linked to `file`: the link
-/// fails if `file` exists, and a crash never leaves `file` empty or half written.
 fn create(file: &Path) -> anyhow::Result<MasterKey> {
     let key = MasterKey::generate("file")?;
-    let shown = file.display();
+    match place(file, &key.encode()) {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            read(file)?.with_context(|| format!("the master key {} vanished", file.display()))
+        }
+        Err(e) if unwritable(&e) => Err(not_writable(file, e)),
+        Err(e) => {
+            Err(e).with_context(|| format!("cannot create the master key {}", file.display()))
+        }
+    }
+}
+
+/// Put `text` in a new file `file`, 0600, unless the file exists (`AlreadyExists`). The text is
+/// written and synced to a temporary file, which is then linked to `file`: the link fails if
+/// `file` exists, and a crash never leaves `file` empty or half written. The directory is synced
+/// so that the new name survives a power cut.
+fn place(file: &Path, text: &[u8]) -> std::io::Result<()> {
     let mut staged = file.as_os_str().to_owned();
     staged.push(format!(".{}.new", std::process::id()));
     let staged = PathBuf::from(staged);
@@ -171,22 +250,152 @@ fn create(file: &Path) -> anyhow::Result<MasterKey> {
         .create_new(true)
         .open(&staged)
         .and_then(|mut opened| {
-            opened.write_all(key.encode().as_bytes())?;
+            opened.write_all(text)?;
             opened.sync_all()
         });
     let linked = written.and_then(|()| std::fs::hard_link(&staged, file));
     // The staged name goes whatever happened; the key stays in `file` once linked.
     let _ = std::fs::remove_file(&staged);
-    match linked {
-        Ok(()) => {
-            sync_dir(file).with_context(|| format!("cannot write the master key {shown}"))?;
-            Ok(key)
-        }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            read(file)?.with_context(|| format!("the master key {shown} vanished"))
-        }
-        Err(e) => Err(e).with_context(|| format!("cannot create the master key {shown}")),
+    linked?;
+    sync_dir(file)
+}
+
+/// Whether `e` says the directory cannot be written to: a read-only mount, or a directory that
+/// Fronde's user may not write.
+fn unwritable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+    )
+}
+
+/// The error for a key file that cannot be made because its directory is not writable, such as a
+/// configuration directory mounted read-only in a container, with the two ways out.
+fn not_writable(file: &Path, e: std::io::Error) -> anyhow::Error {
+    let dir = file.parent().unwrap_or(Path::new("/"));
+    anyhow::Error::new(e).context(format!(
+        "cannot write the master key {}: Fronde's user cannot write to {} (a read-only mount, \
+         such as a configuration directory in a container?). Make that directory writable, or \
+         set [secrets] master_key = {{ file = \"…\" }} in the configuration to a file in a \
+         writable directory kept apart from the data directory",
+        file.display(),
+        dir.display()
+    ))
+}
+
+/// Move the key an earlier version kept in `data_dir` to `file`, where it now belongs. Returns
+/// whether it moved (or whether a copy left by an interrupted move was removed).
+///
+/// The key is checked as [`read`] checks it, then linked to its new name, or, from another
+/// filesystem, copied, synced and read back before the old file is removed: a crash leaves the
+/// key in one place or both, never in neither. Two different keys, one in each place, are refused:
+/// only the owner knows which one sealed the secrets.
+pub fn migrate(file: &Path, data_dir: &Path) -> anyhow::Result<bool> {
+    let legacy = legacy_path(data_dir);
+    if same_place(&legacy, file) {
+        return Ok(false);
     }
+    let Some(old) = read_text(&legacy)? else {
+        return Ok(false);
+    };
+    MasterKey::parse(&old, "file").with_context(|| {
+        format!(
+            "the master key {} is unreadable; restore it from a backup",
+            legacy.display()
+        )
+    })?;
+    match read_text(file)? {
+        Some(new) if new == old => {}
+        Some(_) => return Err(conflict(file, &legacy)),
+        None => match std::fs::hard_link(&legacy, file) {
+            Ok(()) => sync_dir(file)
+                .with_context(|| format!("cannot write the master key {}", file.display()))?,
+            Err(e) if e.kind() == ErrorKind::CrossesDevices => match place(file, &old) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) if unwritable(&e) => return Err(not_writable(file, e)),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("cannot copy the master key to {}", file.display())
+                    });
+                }
+            },
+            // Another Fronde moved it at the same time: checked below.
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) if unwritable(&e) => return Err(not_writable(file, e)),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("cannot move the master key to {}", file.display()));
+            }
+        },
+    }
+    // The old file goes only once the new one reads back the same.
+    if read_text(file)?.as_ref().map(|new| new.as_slice()) != Some(old.as_slice()) {
+        return Err(conflict(file, &legacy));
+    }
+    match std::fs::remove_file(&legacy) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "the master key is now in {}, but its old copy {} cannot be removed; remove \
+                     it by hand",
+                    file.display(),
+                    legacy.display()
+                )
+            });
+        }
+    }
+    sync_dir(&legacy).with_context(|| format!("cannot remove {}", legacy.display()))?;
+    tracing::info!(
+        "moved the master key from {} to {}: it is kept out of the data directory, so that \
+         backups of the data directory do not hold it; back it up apart",
+        legacy.display(),
+        file.display()
+    );
+    Ok(true)
+}
+
+/// Where the key is to be read from now, moving nothing: `file`, or the data directory's key
+/// that [`migrate`] would move there. For `fronde check`, which changes nothing.
+pub fn locate(file: &Path, data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let legacy = legacy_path(data_dir);
+    if same_place(&legacy, file) {
+        return Ok(file.to_path_buf());
+    }
+    let Some(old) = read_text(&legacy)? else {
+        return Ok(file.to_path_buf());
+    };
+    match read_text(file)? {
+        None => Ok(legacy),
+        Some(new) if new == old => Ok(file.to_path_buf()),
+        Some(_) => Err(conflict(file, &legacy)),
+    }
+}
+
+fn conflict(file: &Path, legacy: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "there are two different master keys, {} and {} (where earlier versions kept it); \
+         Fronde cannot tell which one sealed the stored secrets. Keep the right one at {} and \
+         move the other out of the way (try each: `fronde check` says when a key does not open \
+         the stored secrets)",
+        file.display(),
+        legacy.display(),
+        file.display()
+    )
+}
+
+/// Whether `a` and `b` name the same file, as written or once resolved.
+fn same_place(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let resolved = |p: &Path| {
+        let dir = p.parent()?.canonicalize().ok()?;
+        Some(dir.join(p.file_name()?))
+    };
+    matches!((resolved(a), resolved(b)), (Some(a), Some(b)) if a == b)
 }
 
 /// Sync the directory of `file`, so that its new name survives a power cut.
@@ -200,15 +409,11 @@ fn sync_dir(file: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The key that opens the stored secrets, from `<data_dir>/master.key`, checked against the
-/// database. `None` when the file is missing and nothing is stored. A missing file while secrets
-/// are stored, or a key that does not open them, is an error that says so.
-pub async fn load(
-    db: &DatabaseConnection,
-    data_dir: &Path,
-) -> anyhow::Result<Option<Arc<MasterKey>>> {
-    let file = path(data_dir);
-    match read(&file)? {
+/// The key that opens the stored secrets, from `file`, checked against the database. `None`
+/// when the file is missing and nothing is stored. A missing file while secrets are stored, or a
+/// key that does not open them, is an error that says so.
+pub async fn load(db: &DatabaseConnection, file: &Path) -> anyhow::Result<Option<Arc<MasterKey>>> {
+    match read(file)? {
         Some(key) => {
             crate::secrets::check_key(db, &key)
                 .await
@@ -227,13 +432,18 @@ pub async fn load(
 
 /// [`load`], or, when nothing is stored and there is no key file yet, a new key in a new file.
 /// The flag says whether the key was created now.
+///
+/// The key is checked against the database here, but another process may store the first secret
+/// under its own key between this check and the caller's write: the check that
+/// [`crate::secrets::set`] makes inside its write transaction is what keeps a secret from being
+/// sealed under a key that does not match the stored ones.
 pub async fn load_or_create(
     db: &DatabaseConnection,
-    data_dir: &Path,
+    file: &Path,
 ) -> anyhow::Result<(Arc<MasterKey>, bool)> {
-    if let Some(key) = load(db, data_dir).await? {
+    if let Some(key) = load(db, file).await? {
         return Ok((key, false));
     }
-    let key = create(&path(data_dir))?;
+    let key = create(file)?;
     Ok((Arc::new(key), true))
 }

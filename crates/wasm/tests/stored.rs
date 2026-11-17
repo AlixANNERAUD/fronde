@@ -64,9 +64,14 @@ fn entry(dir: &Path, server: &MockServer, secret: &str) -> ComponentConfig {
     config
 }
 
+/// The master key file of these tests, where `serve` would read it from the configuration.
+fn key_file(data: &Path) -> std::path::PathBuf {
+    data.join("master.key")
+}
+
 /// Store `value` as `name` for `origin` in the database of `data`, making the key if needed.
 async fn store(db: &DatabaseConnection, data: &Path, name: &str, origin: &str, value: &str) {
-    let (key, _) = fronde_db::master_key::load_or_create(db, data)
+    let (key, _) = fronde_db::master_key::load_or_create(db, &key_file(data))
         .await
         .unwrap();
     fronde_db::secrets::set(
@@ -101,7 +106,7 @@ async fn expect_bearer(server: &MockServer, token: &str, times: u64) {
 async fn checks(db: &DatabaseConnection, data: &Path) -> Checks {
     Checks {
         timezone: "UTC".into(),
-        secrets: StoredSecrets::load(db, data).await.unwrap(),
+        secrets: StoredSecrets::load(db, &key_file(data)).await.unwrap(),
         ..Checks::default()
     }
 }
@@ -138,7 +143,7 @@ async fn stored_credential_reaches_the_gate() {
     assert_eq!(token.expose_secret(), "stored-token");
 
     let source = ComponentSource::new(config, Checks::default(), ComponentHost::new().unwrap())
-        .reading_secrets_from(db, data.path().to_path_buf());
+        .reading_secrets_from(db, key_file(data.path()));
     let registry = Arc::new(Registry::new());
     Supervisor::new(registry.clone())
         .start(Arc::new(source))
@@ -239,21 +244,18 @@ async fn wrong_key_is_refused() {
     let db = fronde_db::open(data.path()).await.unwrap();
     store(&db, data.path(), "api", &server.uri(), "stored-token").await;
     // Another valid key: 32 zero bytes.
-    let key_file = fronde_db::master_key::path(data.path());
-    std::fs::remove_file(&key_file).unwrap();
-    fronde_hub::private::write(&key_file, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
+    let file = key_file(data.path());
+    std::fs::remove_file(&file).unwrap();
+    fronde_hub::private::write(&file, format!("fronde-key-v1:{}\n", "A".repeat(43))).unwrap();
     let config = entry(dir.path(), &server, "{ stored = \"api\" }");
 
-    let e = format!(
-        "{:#}",
-        StoredSecrets::load(&db, data.path()).await.unwrap_err()
-    );
+    let e = format!("{:#}", StoredSecrets::load(&db, &file).await.unwrap_err());
     assert!(
         e.contains("is not the one that sealed the stored secrets") && e.contains("restore"),
         "{e}"
     );
     let source = ComponentSource::new(config, Checks::default(), ComponentHost::new().unwrap())
-        .reading_secrets_from(db.clone(), data.path().to_path_buf());
+        .reading_secrets_from(db.clone(), file.clone());
     let e = format!("{:#}", source.start().await.err().unwrap());
     assert!(
         e.contains("is not the one that sealed the stored secrets"),
@@ -261,13 +263,10 @@ async fn wrong_key_is_refused() {
     );
 
     // No key file at all while secrets are stored.
-    std::fs::remove_file(&key_file).unwrap();
-    let e = format!(
-        "{:#}",
-        StoredSecrets::load(&db, data.path()).await.unwrap_err()
-    );
+    std::fs::remove_file(&file).unwrap();
+    let e = format!("{:#}", StoredSecrets::load(&db, &file).await.unwrap_err());
     assert!(e.contains("is missing") && e.contains("restore"), "{e}");
-    assert!(!key_file.exists(), "no new key is made");
+    assert!(!file.exists(), "no new key is made");
 }
 
 /// The secret is read again each time the component starts: one stored after a failed start
@@ -282,7 +281,7 @@ async fn restart_picks_up_a_new_secret() {
     let config = entry(dir.path(), &server, "{ stored = \"api\" }");
     let source = Arc::new(
         ComponentSource::new(config, Checks::default(), ComponentHost::new().unwrap())
-            .reading_secrets_from(db.clone(), data.path().to_path_buf()),
+            .reading_secrets_from(db.clone(), key_file(data.path())),
     );
     let registry = Arc::new(Registry::new());
     let supervisor = Supervisor::new(registry.clone());

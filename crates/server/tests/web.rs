@@ -39,9 +39,10 @@ fn config(dir: &Path, web: bool) -> fronde_hub::config::Config {
     fronde_hub::private::write(dir.join("token"), TOKEN).unwrap();
     fronde_hub::private::write(dir.join("password"), format!("{PASSWORD}\n")).unwrap();
     let mut toml = format!(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n[memory]\ngit = false\n[agent]\nenv = {{ FRONDE_TEST = \"1\" }}\nbuiltin_tools = [\"WebFetch\"]\n",
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n[memory]\ngit = false\n[secrets]\nmaster_key = {{ file = {:?} }}\n[agent]\nenv = {{ FRONDE_TEST = \"1\" }}\nbuiltin_tools = [\"WebFetch\"]\n",
         dir.join("token").display().to_string(),
-        dir.join("data").display().to_string()
+        dir.join("data").display().to_string(),
+        dir.join("master.key").display().to_string()
     );
     if web {
         toml.push_str(&format!(

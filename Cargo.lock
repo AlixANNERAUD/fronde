@@ -2409,6 +2409,7 @@ dependencies = [
  "secrecy",
  "tempfile",
  "tokio",
+ "tracing",
  "zeroize",
 ]
 

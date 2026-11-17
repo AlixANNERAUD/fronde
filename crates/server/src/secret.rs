@@ -41,8 +41,11 @@ pub fn read_value(input: impl Read, is_terminal: bool) -> anyhow::Result<SecretS
     Ok(SecretString::from(owned))
 }
 
+/// The database, after moving a master key an earlier version kept in the data directory to
+/// where the configuration says.
 async fn open(config: &Config) -> anyhow::Result<fronde_db::DatabaseConnection> {
     fronde_hub::private::prepare_data_dir(&config.data.dir)?;
+    fronde_db::master_key::migrate(config.master_key_file()?, &config.data.dir)?;
     fronde_db::open(&config.data.dir).await
 }
 
@@ -58,15 +61,16 @@ pub async fn set(
     secrets::check_name(name)?;
     let origin = Origin::parse(origin)?.to_string();
     let db = open(config).await?;
-    let (key, created) = fronde_db::master_key::load_or_create(&db, &config.data.dir).await?;
+    let key_file = config.master_key_file()?;
+    let (key, created) = fronde_db::master_key::load_or_create(&db, key_file).await?;
     secrets::set(&db, &key, secrets::SOURCES, name, &origin, value).await?;
     db.close().await?;
     if created {
         writeln!(
             out,
-            "created the master key {}: back it up apart from fronde.db, without it the stored \
-             secrets are lost",
-            fronde_db::master_key::path(&config.data.dir).display()
+            "created the master key {}: back it up apart from the data directory, without it the \
+             stored secrets are lost",
+            key_file.display()
         )?;
     }
     writeln!(out, "stored secret {name} for {origin}")?;

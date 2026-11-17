@@ -161,11 +161,11 @@ pub struct StoredSecrets {
 }
 
 impl StoredSecrets {
-    /// The rows of `db` in the `sources` scope, and the key of `data_dir`, checked against `db`:
+    /// The rows of `db` in the `sources` scope, and the key in `key_file`, checked against `db`:
     /// a key that did not seal them, or no key file while secrets are stored, is an error. Only
     /// reads.
-    pub async fn load(db: &fronde_db::DatabaseConnection, data_dir: &Path) -> anyhow::Result<Self> {
-        let key = fronde_db::master_key::load(db, data_dir).await?;
+    pub async fn load(db: &fronde_db::DatabaseConnection, key_file: &Path) -> anyhow::Result<Self> {
+        let key = fronde_db::master_key::load(db, key_file).await?;
         let sealed = fronde_db::secrets::load_sealed(db, fronde_db::secrets::SOURCES).await?;
         Ok(Self { key, sealed })
     }
@@ -228,13 +228,13 @@ impl Checks {
     }
 
     /// [`Checks::of`], with the approvals and the sealed secrets stored in `db` and the master
-    /// key of the data directory, read now: [`prepare`] reads no database, so an approval stored
+    /// key of the configuration, read now: [`prepare`] reads no database, so an approval stored
     /// later applies at the next start. A [`ComponentSource`] reads the secrets again each time
     /// it starts.
     pub async fn load(config: &Config, db: &fronde_db::DatabaseConnection) -> anyhow::Result<Self> {
         let mut checks = Self::of(config);
         checks.approvals.stored = stored_approvals(db).await?;
-        checks.secrets = StoredSecrets::load(db, &config.data.dir).await?;
+        checks.secrets = StoredSecrets::load(db, config.master_key_file()?).await?;
         Ok(checks)
     }
 }
@@ -664,14 +664,14 @@ impl ComponentSource {
         }
     }
 
-    /// Read the stored secrets from `db`, and the master key from `data_dir`, each time the
+    /// Read the stored secrets from `db`, and the master key from `key_file`, each time the
     /// component starts.
     pub fn reading_secrets_from(
         mut self,
         db: fronde_db::DatabaseConnection,
-        data_dir: PathBuf,
+        key_file: PathBuf,
     ) -> Self {
-        self.store = Some((db, data_dir));
+        self.store = Some((db, key_file));
         self
     }
 }
@@ -684,9 +684,9 @@ impl ToolSource for ComponentSource {
 
     async fn start(&self) -> anyhow::Result<Session> {
         let prepared = match &self.store {
-            Some((db, data_dir)) if uses_stored_secrets(&self.config) => {
+            Some((db, key_file)) if uses_stored_secrets(&self.config) => {
                 let mut checks = self.checks.clone();
-                checks.secrets = StoredSecrets::load(db, data_dir).await?;
+                checks.secrets = StoredSecrets::load(db, key_file).await?;
                 prepare(&self.config, &checks)?
             }
             _ => prepare(&self.config, &self.checks)?,

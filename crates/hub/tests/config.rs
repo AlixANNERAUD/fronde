@@ -30,6 +30,10 @@ fn loads_example() {
         .collect();
     assert_eq!(kinds, [("component", "calendar"), ("mcp", "mcphub")]);
     assert_eq!(c.data.user, "alix");
+    assert_eq!(
+        c.master_key_file().unwrap(),
+        std::path::Path::new("/keys/master.key")
+    );
     assert!(c.web.is_some());
     assert_eq!(
         c.python.unwrap().dir,
@@ -706,4 +710,69 @@ fn python_source_name_is_taken_when_python_is_on() {
     assert!(load_str(&format!("{MIN}\n{entry}")).is_ok());
     let e = load_str(&format!("{MIN}\n[python]\ndir = \"/app/python\"\n{entry}")).unwrap_err();
     assert!(format!("{e:#}").contains("taken by [python]"), "{e:#}");
+}
+
+/// The master key lives beside the configuration file unless `[secrets] master_key` names a
+/// file, read from the configuration's directory when relative; never in the data directory by
+/// default, so that a backup of the data directory does not hold it.
+#[test]
+fn master_key_is_beside_the_configuration_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(&path, MIN).unwrap();
+    let c = load(&path).unwrap();
+    assert_eq!(c.master_key_file().unwrap(), dir.path().join("master.key"));
+    assert!(!c.master_key_file().unwrap().starts_with(&c.data.dir));
+
+    for (written, expected) in [
+        ("keys/master.key", dir.path().join("keys/master.key")),
+        ("../keys/fronde.key", dir.path().join("../keys/fronde.key")),
+        (
+            "/keys/master.key",
+            std::path::PathBuf::from("/keys/master.key"),
+        ),
+    ] {
+        std::fs::write(
+            &path,
+            format!("{MIN}[secrets]\nmaster_key = {{ file = {written:?} }}\n"),
+        )
+        .unwrap();
+        let c = load(&path).unwrap();
+        let expected: std::path::PathBuf = expected.components().collect();
+        assert_eq!(c.master_key_file().unwrap(), expected, "{written}");
+    }
+}
+
+#[test]
+fn master_key_is_only_a_file() {
+    for written in ["{ env = \"FRONDE_KEY\" }", "{ stored = \"key\" }"] {
+        let err = load_str(&format!("{MIN}[secrets]\nmaster_key = {written}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[secrets] master_key must be { file = \"…\" }"),
+            "{written}: {err}"
+        );
+    }
+    let err = format!(
+        "{:#}",
+        load_str(&format!("{MIN}[secrets]\nbackend = \"keyring\"\n")).unwrap_err()
+    );
+    assert!(err.contains("unknown field"), "{err}");
+}
+
+/// A configuration that `load` did not read has no master key location, rather than a guess.
+#[test]
+fn master_key_needs_a_loaded_configuration() {
+    let c: fronde_hub::config::Config = toml::from_str(MIN).unwrap();
+    let err = c.master_key_file().unwrap_err().to_string();
+    assert!(err.contains("[secrets] master_key"), "{err}");
+    let c: fronde_hub::config::Config = toml::from_str(&format!(
+        "{MIN}[secrets]\nmaster_key = {{ file = \"/k/master.key\" }}\n"
+    ))
+    .unwrap();
+    assert_eq!(
+        c.master_key_file().unwrap(),
+        std::path::Path::new("/k/master.key")
+    );
 }
