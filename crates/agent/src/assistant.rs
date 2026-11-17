@@ -634,7 +634,7 @@ impl Journal for Assistant {
         topic: &str,
         id: RequestId,
         card: &Card,
-        from: Option<&str>,
+        caller: &Caller,
     ) -> anyhow::Result<u64> {
         if topic != TOPIC {
             bail!("no stream {topic:?} to show request {id} in");
@@ -644,7 +644,8 @@ impl Journal for Assistant {
             .append(Event::Request {
                 id,
                 card: card.clone(),
-                from: from.map(str::to_owned),
+                from: caller.from().map(str::to_owned),
+                server: caller.is_source(),
             })
             .await?;
         Ok(entry.seq)

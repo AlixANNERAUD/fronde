@@ -21,9 +21,11 @@ impl Journal for Shown {
         _topic: &str,
         id: RequestId,
         card: &Card,
-        from: Option<&str>,
+        caller: &Caller,
     ) -> anyhow::Result<u64> {
-        let _ = self.0.send((id, card.clone(), from.map(str::to_owned)));
+        let _ = self
+            .0
+            .send((id, card.clone(), caller.from().map(str::to_owned)));
         Ok(id)
     }
 

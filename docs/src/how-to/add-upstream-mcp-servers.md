@@ -42,6 +42,27 @@ Upstream tools are **deferred**: they do not appear in the tool list. The hub's 
 their names, and the agent calls `search_tools` with its need, then `use_tool` with the name it
 found. This keeps the agent's context small however many servers you add.
 
+## When a server asks you something
+
+A server may ask you to fill a form while one of its tools runs (MCP's `elicitation/create`, or an
+`input_required` round of MCP 2026-07-28). When the chat runs (`[web]`), Fronde tells servers it
+takes forms, and shows each one as a card in the chat, headed with the server's name, such as
+*Question de « github » (serveur MCP)*. Only an admin answers it, whoever's call made the server
+ask. The fields are those of the agent's forms (see
+[Forms from the agent](../explanation/requests.md#forms-from-the-agent)): questions, texts,
+numbers and toggles. *Refuser* sends the server a `decline`; a card left for **10 minutes**
+expires, and the server gets a `cancel`. When the server gives up its own request, the card
+closes; so does it when the call that waits on an `input_required` round is given up.
+
+Fronde never takes a secret in a form. A form with a text or number field named like one
+(*password*, *token*, *key*, *secret*…) is declined without a card, the reason in the answer's
+`_meta` (`fronde/refused`), and `fronde serve` logs a warning. Give such a server its secret
+through its configuration instead, such as its `token` above. A server's forms by URL (a sign-in
+page) are cancelled: Fronde does not show them yet.
+
+Without the chat, Fronde does not tell servers it takes forms, and cancels any form one sends
+anyway.
+
 ## When a server is down
 
 Fronde connects in the background and keeps trying, waiting 2 seconds at first and up to one

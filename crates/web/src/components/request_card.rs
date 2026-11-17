@@ -95,6 +95,9 @@ pub fn RequestCard(
     id: RequestId,
     card: Card,
     from: Option<String>,
+    /// `from` is one of Fronde's upstream MCP servers, not a client.
+    #[props(default)]
+    server: bool,
     status: RequestStatus,
     refusal: Option<String>,
     /// Who answered, on a closed card, when it was not this page's user.
@@ -146,7 +149,7 @@ pub fn RequestCard(
             url,
             remember,
         } => {
-            let title = secret_asker(from.as_deref());
+            let title = secret_asker(from.as_deref(), server);
             return rsx! {
                 SecretCard {
                     id,
@@ -166,7 +169,7 @@ pub fn RequestCard(
             };
         }
     };
-    let title = asker(from.as_deref(), fields.len());
+    let title = asker(from.as_deref(), server, fields.len());
     match status {
         RequestStatus::Open => rsx! {
             FormCard {
@@ -365,9 +368,9 @@ fn permission_badge(outcome: &Outcome) -> Element {
     }
 }
 
-/// Who asks, as the card's header says it. An outside client is quoted and marked as one: it
-/// chose its name, which must never read as Fronde's own.
-fn asker(from: Option<&str>, questions: usize) -> String {
+/// Who asks, as the card's header says it. An outside client, or an upstream MCP server
+/// (`server`), is quoted and marked as one: its name must never read as Fronde's own.
+fn asker(from: Option<&str>, server: bool, questions: usize) -> String {
     let what = if questions > 1 {
         "Questions"
     } else {
@@ -375,15 +378,24 @@ fn asker(from: Option<&str>, questions: usize) -> String {
     };
     match from {
         None => format!("{what} de Fronde"),
-        Some(name) => format!("{what} de « {name} » (client MCP)"),
+        Some(name) => format!("{what} de « {name} » {}", outside(server)),
     }
 }
 
 /// Who asks for a secret, as [`asker`] says it for questions.
-fn secret_asker(from: Option<&str>) -> String {
+fn secret_asker(from: Option<&str>, server: bool) -> String {
     match from {
         None => "Secret demandé par Fronde".into(),
-        Some(name) => format!("Secret demandé par « {name} » (client MCP)"),
+        Some(name) => format!("Secret demandé par « {name} » {}", outside(server)),
+    }
+}
+
+/// What an asker other than Fronde's assistant is.
+fn outside(server: bool) -> &'static str {
+    if server {
+        "(serveur MCP)"
+    } else {
+        "(client MCP)"
     }
 }
 
@@ -2784,5 +2796,43 @@ mod tests {
         for text in ["Adresse e-mail", "Combien de places ?", "Me le rappeler"] {
             assert!(page.contains(text), "{text}: {page}");
         }
+    }
+
+    #[test]
+    fn an_upstream_server_is_marked_as_one() {
+        #[derive(Props, Clone, PartialEq)]
+        struct ServerProps {
+            card: Card,
+        }
+        let render = |card: Card| {
+            let mut dom = VirtualDom::new_with_props(
+                |props: ServerProps| {
+                    rsx! {
+                        RequestCard {
+                            id: ID,
+                            card: props.card,
+                            from: Some("github".into()),
+                            server: true,
+                            status: RequestStatus::Open,
+                            refusal: None,
+                            by: None,
+                            open: true,
+                            admin: true,
+                            on_send: |_| {},
+                        }
+                    }
+                },
+                ServerProps { card },
+            );
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        };
+        let page = render(inputs());
+        assert!(
+            page.contains("Questions de « github » (serveur MCP)"),
+            "{page}"
+        );
+        assert!(!page.contains("client MCP"), "{page}");
+        assert!(render(single()).contains("Question de « github » (serveur MCP)"));
     }
 }

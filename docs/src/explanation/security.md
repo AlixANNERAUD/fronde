@@ -465,8 +465,12 @@ Cards show agents' text as text, never as HTML. See [Requests and cards](request
 
 ## Forms from agents and servers
 
-The agent's forms (`AskUserQuestion`) and, with the same rules, upstream MCP servers' are cards:
-their texts are the asker's, cleaned and capped as any card's, and checked by `Card::check` before
+The agent's forms (`AskUserQuestion`) and, with the same rules, upstream MCP servers' are cards.
+An upstream server is trusted to ask, not to decide: its card is for the admin only (a family
+member never answers for a server), headed with its name and marked *(serveur MCP)* so that it
+never reads as Fronde's own, and it lasts at most 10 minutes. A form gives a server nothing it
+did not ask for and that the admin did not type or pick. Forms are advertised to servers only when
+the chat runs; otherwise a form sent anyway is cancelled unseen. The forms' texts are the asker's, cleaned and capped as any card's, and checked by `Card::check` before
 they are written. An answer gives back only what the card asked: an offered option's value, a
 text, a number within its bounds, a toggle. The answer is kept in `fronde.db` as an audit trail,
 so a form never carries a secret: a text or number field whose name or title holds a word such as

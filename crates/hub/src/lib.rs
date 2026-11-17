@@ -58,6 +58,14 @@ impl Hub {
         let sources = Supervisor::new(registry.clone());
         let mut own = meta_tools(&registry);
         own.extend(memory_tools(memory.clone(), index, config.memory.git));
+        // Upstream servers' forms go to the admin; the one user so far is the owner, an admin.
+        let asking = requests.as_ref().map(|requests| {
+            upstream::Asking::new(
+                requests.clone(),
+                config.data.user.clone(),
+                mcp::TOPIC.to_owned(),
+            )
+        });
         if let Some(requests) = requests {
             own.extend(user::user_tools(requests));
         }
@@ -74,7 +82,7 @@ impl Hub {
         }
         for source in &config.sources {
             if let SourceConfig::Mcp(m) = source {
-                sources.spawn(Arc::new(Upstream::new(m.clone())));
+                sources.spawn(Arc::new(Upstream::asking(m.clone(), asking.clone())));
             }
         }
         Ok(Self {

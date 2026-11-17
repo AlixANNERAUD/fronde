@@ -66,12 +66,15 @@ pub enum Event {
         text: String,
     },
     /// A request to the user, open until its [`Event::RequestClosed`], whatever the turns do.
-    /// `from` names an asker other than Fronde's assistant, such as an outside MCP client.
+    /// `from` names an asker other than Fronde's assistant: an outside MCP client, or with
+    /// `server` one of Fronde's upstream MCP servers.
     Request {
         id: RequestId,
         card: Card,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        server: bool,
     },
     /// `by`: the user who answered, when someone did.
     RequestClosed {
@@ -271,8 +274,9 @@ mod tests {
         };
         let asked = Event::Request {
             id: 4,
-            card,
+            card: card.clone(),
             from: Some("Codex".into()),
+            server: false,
         };
         let json = serde_json::to_string(&asked).unwrap();
         assert_eq!(
@@ -280,6 +284,19 @@ mod tests {
             r#"{"type":"request","id":4,"card":{"kind":"form","fields":[]},"from":"Codex"}"#
         );
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), asked);
+        // An upstream server says it is one.
+        let served = Event::Request {
+            id: 5,
+            card,
+            from: Some("github".into()),
+            server: true,
+        };
+        let json = serde_json::to_string(&served).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"request","id":5,"card":{"kind":"form","fields":[]},"from":"github","server":true}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), served);
         let closed = Event::RequestClosed {
             id: 4,
             outcome: Outcome::Declined,

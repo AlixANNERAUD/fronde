@@ -395,7 +395,7 @@ mod tests {
             _topic: &str,
             id: u64,
             _card: &fronde_protocol::Card,
-            _from: Option<&str>,
+            _caller: &fronde_requests::Caller,
         ) -> anyhow::Result<u64> {
             Ok(id)
         }

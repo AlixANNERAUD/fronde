@@ -60,7 +60,9 @@ The hub knows who asks. Fronde's own assistant reaches `/mcp` with a token of it
 each start and kept in memory: its questions are tied to its running turn and headed *Question de
 Fronde*. Any other client uses `server.token`: its questions are headed with the name it gave when
 it connected, quoted and marked as a client, such as *Question de « Codex » (client MCP)*, so a
-card from an outside agent never passes for Fronde's own. Only the token makes a caller the
+card from an outside agent never passes for Fronde's own. An upstream MCP server's form is
+headed with the server's name, marked as a server: *Question de « github » (serveur MCP)*, and is
+for the admin only. Only the token makes a caller the
 assistant: a client that calls itself `assistant` is still an outside client. Since a client
 chooses its name, the hub refuses to ask the user anything for one named *Fronde* or *assistant*
 (in any case), one whose name is longer than 40 characters, or one whose name holds a control
@@ -156,8 +158,10 @@ other forms the same way: the choice to retry a refused request with another mod
 of MCP servers it connects to (with Fronde's settings, it connects to Fronde's hub only, which
 sends none).
 
-Each form becomes a card of the running turn, headed *Question de Fronde*. The form's schema is a
-flat object of fields, and maps onto the card's fields:
+Each form becomes a card of the running turn, headed *Question de Fronde*. Upstream MCP servers'
+forms follow the same rules, on a card for the admin headed with the server's name (see
+[Add upstream MCP servers](../how-to/add-upstream-mcp-servers.md#when-a-server-asks-you-something)).
+The form's schema is a flat object of fields, and maps onto the card's fields:
 
 | Schema | Card field |
 | --- | --- |
@@ -279,8 +283,8 @@ These use the same requests and cards, and are **not built yet**:
 
 - **Tools that take a `secret_ref`**: integration setup from the chat, and commands that read a
   secret from a file in threads that have a shell.
-- **Upstream servers' forms**: forms that upstream MCP servers send, shown as cards for the
-  admin.
+- **Forms by URL**: an MCP server's sign-in page, sent as a URL elicitation, shown as a link on a
+  card. Today such a form is cancelled.
 - **Late answers**: an answer to a question whose asker is gone (after a restart, or a tool call
   cut short) reaches the assistant as a message. Today such an answer is saved but goes nowhere.
 - **A tray** above the message box listing the open cards, and their count in the tab's title.

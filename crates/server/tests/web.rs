@@ -1558,8 +1558,14 @@ async fn permission_card_over_websocket() {
     .await;
     // The agent's permission request is a card of the conversation, from Fronde.
     let (id, card) = loop {
-        if let Event::Request { id, card, from } = next_entry(&mut socket).await.event {
-            assert_eq!(from, None);
+        if let Event::Request {
+            id,
+            card,
+            from,
+            server,
+        } = next_entry(&mut socket).await.event
+        {
+            assert_eq!((from, server), (None, false));
             break (id, card);
         }
     };

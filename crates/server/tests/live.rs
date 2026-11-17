@@ -237,6 +237,7 @@ async fn live_ask_user_question_becomes_a_card() {
                     id,
                     card: Card::Form { fields, .. },
                     from: None,
+                    ..
                 } => {
                     let Some(Field::Choice { key, options, .. }) = fields.first() else {
                         panic!("not a question: {fields:?}");

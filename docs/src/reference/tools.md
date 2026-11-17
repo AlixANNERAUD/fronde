@@ -252,7 +252,10 @@ Days between two dates:
 
 Each tool of an upstream MCP server becomes `<server>_<tool>`, deferred, with the server's own
 description and schema. Its result passes through: structured content as it is, otherwise the
-text blocks joined, with images, audio and resources replaced by a placeholder.
+text blocks joined, with images, audio and resources replaced by a placeholder. A form the server
+asks for while the tool runs is a card for the admin (see
+[Add upstream MCP servers](../how-to/add-upstream-mcp-servers.md#when-a-server-asks-you-something)),
+and the tool waits for it. A call its caller gives up is given up with the server too.
 
 ## Agent built-in tools
 

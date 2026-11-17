@@ -45,9 +45,10 @@ impl Journal for FakeJournal {
         topic: &str,
         id: RequestId,
         _card: &Card,
-        from: Option<&str>,
+        caller: &Caller,
     ) -> anyhow::Result<u64> {
         assert_eq!(topic, TOPIC);
+        let from = caller.from();
         if *self.refuse.lock().unwrap() {
             anyhow::bail!("disk full");
         }

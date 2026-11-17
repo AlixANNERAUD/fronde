@@ -61,6 +61,8 @@ pub enum Item {
         card: Box<Card>,
         /// Who asks, when it is not Fronde's assistant.
         from: Option<String>,
+        /// `from` is one of Fronde's upstream MCP servers, not a client.
+        server: bool,
         status: RequestStatus,
         /// Why the server refused this page's last answer, while the request is open.
         refusal: Option<String>,
@@ -259,12 +261,18 @@ impl Chat {
                 }
             }
             Event::Notice { text } => self.push(seq, Item::Notice { text }),
-            Event::Request { id, card, from } => self.push(
+            Event::Request {
+                id,
+                card,
+                from,
+                server,
+            } => self.push(
                 seq,
                 Item::Request {
                     id,
                     card: Box::new(card),
                     from,
+                    server,
                     status: RequestStatus::Open,
                     refusal: None,
                     by: None,
@@ -615,6 +623,7 @@ mod tests {
                 id,
                 card,
                 from: None,
+                server: false,
             },
         )
     }
@@ -655,6 +664,7 @@ mod tests {
                         id: 9,
                         card,
                         from: None,
+                        server: false,
                     },
                 ),
             ],

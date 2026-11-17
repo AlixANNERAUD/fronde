@@ -41,6 +41,8 @@ rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# In-process servers that ask Fronde to fill a form.
+rmcp = { workspace = true, features = ["elicitation"] }
 fronde-db = { path = "../db", features = ["testing"] }
 axum.workspace = true
 tempfile.workspace = true

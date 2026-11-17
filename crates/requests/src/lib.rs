@@ -80,6 +80,12 @@ impl Caller {
         }
     }
 
+    /// Whether the caller is one of Fronde's own tool sources (an upstream MCP server), rather
+    /// than a client: the card says which.
+    pub fn is_source(&self) -> bool {
+        matches!(self, Self::Source(_))
+    }
+
     /// The name a card shows for an asker other than the assistant.
     pub fn from(&self) -> Option<&str> {
         match self {
@@ -215,13 +221,14 @@ impl std::error::Error for Reused {}
 /// Where requests are shown: a stream of entries, such as the conversation log.
 #[async_trait]
 pub trait Journal: Send + Sync {
-    /// Shows the request `id` in `topic`; returns the seq of its entry.
+    /// Shows the request `id` that `caller` asks in `topic`; returns the seq of its entry. An
+    /// asker other than the assistant is named on the card ([`Caller::from`]).
     async fn announce(
         &self,
         topic: &str,
         id: RequestId,
         card: &Card,
-        from: Option<&str>,
+        caller: &Caller,
     ) -> anyhow::Result<u64>;
 
     /// Shows in `topic` that the request `id` ended.
@@ -743,7 +750,7 @@ impl Requests {
         let caller = Caller::parse(&row.caller);
         let seq = self
             .journal
-            .announce(&row.topic, id, &card, caller.from())
+            .announce(&row.topic, id, &card, &caller)
             .await
             .with_context(|| format!("cannot show request {id}"))?;
         requests::Entity::update_many()
