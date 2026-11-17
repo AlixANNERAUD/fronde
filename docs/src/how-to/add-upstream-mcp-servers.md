@@ -64,7 +64,7 @@ numbers and toggles.
 - A pending card expires when Fronde restarts.
 
 Fronde never takes a secret in a form. A form whose message or fields read like they ask for one
-(*password*, *token*, *key*, *PIN*, *code*…) is declined without a card, with a plain reason in
+(*password*, *token*, *secret*…, or a field named *code*, *PIN* or *key*) is declined without a card, with a plain reason in
 the answer's `_meta` (`fronde/refused`), and `fronde serve` logs which text tripped the rule. Give
 such a server its secret through its configuration instead, such as its `token` above. A server's
 forms by URL (a sign-in page) are cancelled: Fronde does not show them yet.

@@ -531,11 +531,12 @@ An upstream server is trusted to ask, not to decide, and only on behalf of a cal
 an audit trail. Fronde declines a form unseen, telling the asker only that it does not show it,
 when the text around anything typed reads like it asks for a secret: the message, and the name,
 title and description of every text and number field and of every question that takes free text.
-The rule looks for words such as *password*, *passcode*, *secret*, *token*, *key*, *PIN*, *code*,
-*CVV*, *IBAN*, *OTP*, *2FA*, *mot de passe*, *clé*, *jeton* or *identifiant*, however written:
-after NFKC normalisation and case folding, with digits read as the letters they mimic (`p4ssw0rd`),
-look-alike letters read by their Unicode confusable skeleton (a Cyrillic `а` as `a`), and invisible
-characters ignored, so they cannot split a word. A field with `format: password` is declined too.
+The rule looks for words such as *password*, *passcode*, *secret*, *token*, *CVV*, *IBAN*, *OTP*,
+*2FA*, *mot de passe*, *clé*, *jeton* or *identifiant*, and, in a field's own name or title only,
+*code*, *PIN* and *key*, which a question's text uses harmlessly (*quel style de code ?*). Words
+are read however written: after NFKC normalisation and case folding, with digits read as the
+letters they mimic (`p4ssw0rd`), look-alike letters read by their Unicode confusable skeleton (a
+Cyrillic `а` as `a`), and invisible characters ignored, so they cannot split a word. A field with `format: password` is declined too.
 
 This catches an honest asker's mistake, not a hostile one. A server, or a page the agent read,
 can word a question so that no rule sees it, and phish through the card's own text. The card

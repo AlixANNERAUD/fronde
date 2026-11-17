@@ -69,8 +69,6 @@ const SECRET_WORDS: &[&str] = &[
     "tokens",
     "jeton",
     "jetons",
-    "key",
-    "keys",
     "apikey",
     "clé",
     "clés",
@@ -82,14 +80,16 @@ const SECRET_WORDS: &[&str] = &[
     "totp",
     "2fa",
     "mfa",
-    "pin",
-    "code",
-    "codes",
     "cvv",
     "cvc",
     "cvv2",
     "iban",
 ];
+
+/// Words that read like a secret only as a field's own name or title (`pin`, `code_secret`,
+/// "Clé"), never in a message or a question's text, where they are mostly harmless: « quel
+/// style de code ? », « which key binding? ».
+const NAME_WORDS: &[&str] = &["code", "codes", "pin", "pins", "key", "keys"];
 
 /// Words written together or apart (`mot de passe`, `api_key`), found in a text's words joined.
 const SECRET_PHRASES: &[&str] = &[
@@ -313,11 +313,21 @@ fn words(text: &str) -> Vec<String> {
 
 /// Whether `text` reads like it asks for a secret: one of its [`words`] is one of
 /// [`SECRET_WORDS`], or its words joined hold one of [`SECRET_PHRASES`], all compared
-/// [`normalize`]d. Plain on purpose: it also refuses a harmless "code postal".
+/// [`normalize`]d. Plain on purpose: it also refuses a harmless "token count".
 pub fn looks_secret(text: &str) -> bool {
+    holds(text, SECRET_WORDS)
+}
+
+/// Whether `name`, a field's own name or title, reads like a secret: [`looks_secret`], or one of
+/// its words is one of [`NAME_WORDS`]. It also refuses a harmless "code postal" field.
+pub fn names_secret(name: &str) -> bool {
+    holds(name, SECRET_WORDS) || holds(name, NAME_WORDS)
+}
+
+fn holds(text: &str, secret_words: &[&str]) -> bool {
     let words: Vec<String> = words(text).iter().map(|word| normalize(word)).collect();
     let joined: String = words.concat();
-    SECRET_WORDS
+    secret_words
         .iter()
         .any(|secret| words.contains(&normalize(secret)))
         || SECRET_PHRASES
@@ -327,7 +337,8 @@ pub fn looks_secret(text: &str) -> bool {
 
 /// The first text of a form that reads like it asks for a secret, as `what: text`: the message,
 /// and the name, title and description of each field something is typed into (a text, a number,
-/// a question that takes free text, that free text's own field).
+/// a question that takes free text, that free text's own field). A name or a title is read with
+/// [`names_secret`], the message and a description (a question's text) with [`looks_secret`].
 fn secret_text(
     message: &str,
     properties: &Map<String, Value>,
@@ -348,12 +359,13 @@ fn secret_text(
         if property.get("format").and_then(Value::as_str) == Some("password") {
             return Some(format!("the field {name:?}, of format password"));
         }
-        let texts = [
-            Some(name.as_str()),
-            text_of(property, "title"),
-            text_of(property, "description"),
-        ];
-        if let Some(text) = texts.into_iter().flatten().find(|text| looks_secret(text)) {
+        let names = [Some(name.as_str()), text_of(property, "title")];
+        let found = names
+            .into_iter()
+            .flatten()
+            .find(|text| names_secret(text))
+            .or_else(|| text_of(property, "description").filter(|text| looks_secret(text)));
+        if let Some(text) = found {
             return Some(format!("the field {name:?}: {text:?}"));
         }
     }
@@ -896,8 +908,6 @@ mod tests {
             "cle d'acces",
             "Ton jeton",
             "Tes identifiants",
-            "Code PIN",
-            "pin",
             "passcode",
             "CVV",
             "cvc",
@@ -912,6 +922,11 @@ mod tests {
             assert!(looks_secret(text), "{text:?}");
         }
         for text in [
+            // Asked as a question, these three are mostly harmless (`names_secret` reads them).
+            "Quel style de code ?",
+            "Code PIN",
+            "Which key binding do you prefer?",
+            "p1n",
             "monkey",
             "keyboard layout",
             "tokenizer",
@@ -941,12 +956,12 @@ mod tests {
         // A text field's description.
         let detail = declined(
             "",
-            one(json!({"type": "string", "description": "Le code reçu par SMS"})),
+            one(json!({"type": "string", "description": "Ton mot de passe Nextcloud"})),
         );
         assert!(detail.contains("\"f\""), "{detail}");
         // A question that takes free text, as AskUserQuestion's do: its question...
         let mut ask = ask_user_question();
-        ask["properties"]["question_0"]["description"] = json!("Quel est ton code PIN ?");
+        ask["properties"]["question_0"]["description"] = json!("Quel est ton mot de passe ?");
         declined("Please answer the following questions.", ask);
         // ...and its free-text field.
         let mut ask = ask_user_question();
@@ -1457,5 +1472,56 @@ mod tests {
             ),
             "Alix"
         );
+    }
+
+    #[test]
+    fn code_pin_and_key_count_only_as_a_fields_name_or_title() {
+        // A field's own name or title, however written: declined.
+        for name in [
+            "code", "Code", "pin", "PIN", "key", "c0de", "p1n", "k3y", "codes", "Keys",
+        ] {
+            assert!(names_secret(name), "{name}");
+            assert!(!looks_secret(name), "{name}");
+        }
+        let declined = |schema: Value| {
+            let error = form("Réglages", &schema).unwrap_err();
+            assert!(error.secret, "{schema}: {error}");
+        };
+        let one =
+            |name: &str, property: Value| json!({"type": "object", "properties": {name: property}});
+        declined(one("pin", json!({"type": "string"})));
+        declined(one("k3y", json!({"type": "integer"})));
+        declined(one(
+            "f",
+            json!({"type": "string", "title": "Code reçu par SMS"}),
+        ));
+        declined(one("f", json!({"type": "number", "title": "Ton PIN"})));
+        // A question that takes free text: its chip (title) is a name too.
+        let mut ask = ask_user_question();
+        ask["properties"]["question_0"]["title"] = json!("Code");
+        declined(ask);
+        // The free text's own field.
+        let mut ask = ask_user_question();
+        ask["properties"]["question_1_custom"]["title"] = json!("Ta clé"); // a strong word
+        declined(ask);
+        let mut ask = ask_user_question();
+        ask["properties"]["question_1_custom"]["title"] = json!("PIN");
+        declined(ask);
+
+        // In the message or a question's text they pass: « quel style de code ? ».
+        let mut ask = ask_user_question();
+        ask["properties"]["question_0"]["description"] = json!("Quel style de code préfères-tu ?");
+        ask["properties"]["question_1"]["description"] =
+            json!("Quelle key binding, et quel PIN de couleur ?");
+        assert!(form("Code review : quelques questions", &ask).is_ok());
+        assert!(
+            form(
+                "Which key binding?",
+                &one("f", json!({"type": "string", "title": "Raccourci", "description": "Le code de la touche"}))
+            )
+            .is_ok()
+        );
+        // Every other word still counts everywhere.
+        assert!(form("Ton mot de passe ?", &one("f", json!({"type": "string"}))).is_err());
     }
 }
