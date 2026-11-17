@@ -28,7 +28,7 @@ pub use egress::{Allowed, Credential};
 pub use fronde_hub::origin::Origin;
 pub use host::{ComponentHost, Limits};
 pub use manifest::{CredentialRequest, Injection, LimitRequest, Manifest, NetworkRule, World};
-pub use python::{PYTHON_VERSION, PYTHON_WASM_SHA256, Python};
+pub use python::{PYTHON_VERSION, PYTHON_WASM_SHA256, Python, PythonSource};
 pub use source::{
     Approval, Approvals, Checks, ComponentSource, Hashes, NotApproved, NotApprovedReason, Prepared,
     Shipped, Stored, prepare, shipped,

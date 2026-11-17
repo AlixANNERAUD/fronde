@@ -65,7 +65,7 @@ whose prefix:
 
 - is the name of another `[[sources]]` entry followed by `_` (an upstream MCP server named
   `github` has the tools `github_…`);
-- is reserved for the hub's own tools: `hub_`, `memory_`, `search_` and `use_`;
+- is reserved for the hub's own tools: `code_`, `hub_`, `memory_`, `search_` and `use_`;
 - is also declared by another component.
 
 ## `[permissions]`

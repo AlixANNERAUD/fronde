@@ -45,6 +45,20 @@ async fn adds_numbers() {
     let out = run(&python, "print(1+1)").await;
     eprintln!("print(1+1) after load: {:?}", started.elapsed());
     assert_eq!(value(&out), &json!({"stdout": "2\n"}));
+    // Timings for the record, not assertions: warm runs, then one that imports the usual modules.
+    for _ in 0..3 {
+        let started = Instant::now();
+        run(&python, "print(1+1)").await;
+        eprintln!("print(1+1), warm: {:?}", started.elapsed());
+    }
+    let started = Instant::now();
+    let out = run(
+        &python,
+        "import json, math, statistics, datetime, decimal, fractions, itertools, collections, re, zoneinfo",
+    )
+    .await;
+    eprintln!("ten imports, warm: {:?}", started.elapsed());
+    assert!(!out.is_error, "{}", out.to_text());
 }
 
 fn error(out: &ToolOutput) -> String {

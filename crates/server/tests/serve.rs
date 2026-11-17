@@ -590,3 +590,138 @@ fn service_commands_report_clear_error_without_systemd_user_instance() {
     }
     assert!(!xdg.exists());
 }
+
+/// The runtime `mise run python` fetched into the checkout.
+fn python_dir() -> std::path::PathBuf {
+    let dir =
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../python")).to_path_buf();
+    assert!(
+        dir.join("python.wasm").exists(),
+        "{} has no python.wasm: run `mise run python`",
+        dir.display()
+    );
+    dir
+}
+
+/// Fronde, with `[python]` when `python` is set, and a client connected to its `/mcp`.
+async fn with_python(
+    dir: &std::path::Path,
+    python: bool,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    let mut config = config(dir, TOKEN);
+    if python {
+        config.python = Some(fronde_hub::config::PythonConfig { dir: python_dir() });
+    }
+    let (addr, _h) = fronde::start(config).await.unwrap();
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(TOKEN),
+    );
+    ().serve(transport).await.unwrap()
+}
+
+async fn use_tool(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> (bool, String) {
+    let args = serde_json::json!({"name": name, "arguments": arguments})
+        .as_object()
+        .unwrap()
+        .clone();
+    let r = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("use_tool").with_arguments(args))
+        .await
+        .unwrap();
+    let text = match &r.content[0] {
+        rmcp::model::ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("{other:?}"),
+    };
+    (r.is_error == Some(true), text)
+}
+
+#[tokio::test]
+async fn python_tool_is_served_when_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = with_python(dir.path(), true).await;
+    let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
+    assert!(
+        instructions.contains("code_run_python, never mental arithmetic"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("python: code_run_python"),
+        "{instructions}"
+    );
+    let (failed, text) = use_tool(
+        &client,
+        "code_run_python",
+        serde_json::json!({"code": "sum(data) / len(data)", "data": [1, 2, 6]}),
+    )
+    .await;
+    assert!(!failed, "{text}");
+    assert!(text.contains("\"value\":3.0"), "{text}");
+    let (failed, text) = use_tool(
+        &client,
+        "code_run_python",
+        serde_json::json!({"script": "1"}),
+    )
+    .await;
+    assert!(failed, "{text}");
+    assert!(text.contains("invalid arguments"), "{text}");
+}
+
+#[tokio::test]
+async fn python_tool_is_absent_without_python() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = with_python(dir.path(), false).await;
+    let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
+    assert!(!instructions.contains("code_run_python"), "{instructions}");
+    let (failed, _) = use_tool(&client, "code_run_python", serde_json::json!({"code": "1"})).await;
+    assert!(failed);
+}
+
+#[test]
+fn check_reports_the_python_approval() {
+    let dir = cache_tempdir();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
+    let path = dir.path().join("fronde.toml");
+    let write = |python: &std::path::Path| {
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\n[python]\ndir = {:?}\n",
+                python.display().to_string()
+            ),
+        )
+        .unwrap();
+    };
+    let check = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+            .args(["check", "--config"])
+            .arg(&path)
+            .output()
+            .unwrap()
+    };
+    write(&python_dir());
+    let out = check();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("python: approved (CPython 3.15.2)"),
+        "{stdout}"
+    );
+    write(&dir.path().join("nowhere"));
+    let out = check();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr.contains("python") && stderr.contains("mise run python"),
+        "{stderr}"
+    );
+}

@@ -146,6 +146,7 @@ depends = ["lint", "test", "deny"]
 # `listen` is where `web-dev` sends /ws and the sign-in forms (crates/web/Dioxus.toml).
 [tasks.dev]
 description = "Run the server on http://127.0.0.1:8484 for `mise run web-dev` (password: fronde)"
+depends = ["python"]
 run = '''
 set -eu
 dev=target/dev
@@ -166,6 +167,9 @@ git = false
 
 [web]
 password = { file = "$PWD/$dev/password" }
+
+[python]
+dir = "$PWD/python"
 EOF
 cargo run --package fronde -- serve --config "$dev/fronde.toml"
 '''

@@ -17,6 +17,11 @@ pub fn instructions(user: &str, tools: &[ToolDef], core: &Core) -> String {
             "- A time slot is calendar_*; something to remember at a given time is reminders_*.\n",
         );
     }
+    if tools.iter().any(|d| d.name == "code_run_python") {
+        s.push_str(
+            "- Exact arithmetic, dates or aggregates over data: code_run_python, never mental arithmetic.\n",
+        );
+    }
     s.push_str("- Never poll: if something is not ready, say so and stop.\n");
     let deferred: Vec<&ToolDef> = tools.iter().filter(|d| d.deferred).collect();
     if !deferred.is_empty() {
@@ -98,6 +103,19 @@ mod tests {
             text.contains("calendar: reminders_list\n"),
             "visible tools are not listed: {text}"
         );
+        assert!(!instructions("me", &[], &core).contains(rule));
+        assert!(!instructions("me", &[def("mcphub_a", "mcphub")], &core).contains(rule));
+    }
+
+    #[test]
+    fn python_rule_only_with_the_tool() {
+        let rule = "code_run_python, never mental arithmetic";
+        let core = Core {
+            user: String::new(),
+            memory: String::new(),
+        };
+        let text = instructions("me", &[def("code_run_python", "python")], &core);
+        assert!(text.contains(rule), "{text}");
         assert!(!instructions("me", &[], &core).contains(rule));
         assert!(!instructions("me", &[def("mcphub_a", "mcphub")], &core).contains(rule));
     }

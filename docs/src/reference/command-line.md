@@ -49,9 +49,11 @@ manifest, settings, tool prefixes, credentials over https) and prints which appr
 `approved: by the owner, stored in the database`. It reads the approvals stored in `fronde.db`
 when the data directory has one, as `serve` does at start, and never creates, updates or writes
 the database: it opens it read-only, and a database an older Fronde left without the approvals
-table has no stored approval, which is what `serve` would find after updating it. It also checks
-that `[data] dir` can be created and written: it creates the directory (mode 0700), writes a
-probe file and removes it, and otherwise names the path and the fix (set `[data] dir` to a directory you own, such as `~/.local/share/fronde`). A `[server]
+table has no stored approval, which is what `serve` would find after updating it. With
+`[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
+`python: approved (CPython 3.15.2)`. It also checks that `[data] dir` can be created and written:
+it creates the directory (mode 0700), writes a probe file and removes it, and otherwise names the
+path and the fix (set `[data] dir` to a directory you own, such as `~/.local/share/fronde`). A `[server]
 listen` that is not an address is reported by the parse. When `[web]` is set and the agent
 command is not found on `PATH` (or at the path given), it prints a warning, not an error. It
 prints `config OK` when all is well. It does not connect to anything.

@@ -7,7 +7,8 @@ use std::io::Write;
 /// Check the secrets and sources of a loaded configuration. For each component, write the hashes
 /// that approve its files to `out` first, so that a component not approved yet shows them, then
 /// what approved it. Approvals stored in the database count as when serving; a data directory
-/// without a database has none, and the database is never changed by this check.
+/// without a database has none, and the database is never changed by this check. With `[python]`,
+/// check and compile the runtime as `serve` would.
 pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
     crate::check_token(&config.server.token.resolve().context("server.token")?)?;
     if let Some(web) = &config.web {
@@ -37,6 +38,17 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
                 writeln!(out, "source {name}: {}", prepared.approval())?;
             }
         }
+    }
+    if let Some(python) = &config.python {
+        let host = fronde_wasm::ComponentHost::new()?;
+        fronde_wasm::Python::load(&host, &python.dir)
+            .await
+            .context("python")?;
+        writeln!(
+            out,
+            "python: approved (CPython {})",
+            fronde_wasm::PYTHON_VERSION
+        )?;
     }
     Ok(())
 }

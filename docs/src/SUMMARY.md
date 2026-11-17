@@ -14,6 +14,7 @@
 - [Connect an agent over MCP](how-to/connect-an-agent-over-mcp.md)
 - [Add upstream MCP servers](how-to/add-upstream-mcp-servers.md)
 - [Configure the calendar](how-to/configure-calendar.md)
+- [Enable Python](how-to/enable-python.md)
 - [Run behind a reverse proxy](how-to/reverse-proxy.md)
 - [Develop and contribute](how-to/develop.md)
 

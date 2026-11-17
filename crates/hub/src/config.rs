@@ -24,7 +24,20 @@ pub struct Config {
     pub web: Option<WebConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
+    /// The `code_run_python` tool; without it there is none.
+    pub python: Option<PythonConfig>,
 }
+
+/// `[python]`: where the Python runtime is, as `mise run python` lays it out.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonConfig {
+    /// Holds `python.wasm` and `lib/`; the image has it at `/app/python`.
+    pub dir: PathBuf,
+}
+
+/// The name of the source that serves `code_run_python`.
+pub const PYTHON_SOURCE: &str = "python";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -319,9 +332,9 @@ fn default_user() -> String {
     "me".to_string()
 }
 
-/// Prefixes of the hub's own tools (`search_tools`, `use_tool`, `memory_*`) and of its source
-/// name: no component may declare them.
-pub const RESERVED_TOOL_PREFIXES: [&str; 4] = ["hub_", "memory_", "search_", "use_"];
+/// Prefixes of the hub's own tools (`search_tools`, `use_tool`, `memory_*`, `code_run_python`) and
+/// of its source name: no component may declare them.
+pub const RESERVED_TOOL_PREFIXES: [&str; 5] = ["code_", "hub_", "memory_", "search_", "use_"];
 
 /// True for names usable as tool prefixes: `^[a-z][a-z0-9_]{0,63}$`.
 pub fn is_valid_name(name: &str) -> bool {
@@ -380,6 +393,14 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
                     }
                 }
             }
+        }
+    }
+    if let Some(python) = &mut config.python {
+        python.dir = base.join(&python.dir).components().collect();
+        if config.sources.iter().any(|s| s.name() == PYTHON_SOURCE) {
+            bail!(
+                "source name \"{PYTHON_SOURCE}\" is taken by [python]'s code_run_python; pick another name"
+            );
         }
     }
     check_sources(&config.sources)?;

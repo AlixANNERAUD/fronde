@@ -69,6 +69,23 @@ of it, approved by the files' hashes: those in the entry, or those of the compon
 was built with (`crates/wasm/build.rs` hashes `components/dist`). See [Component interface](../reference/wit-interface.md)
 and [Security model](security.md#wasm-components).
 
+## The script world
+
+`code_run_python` runs CPython built for WASI in the same wasmtime engine as components. It is a
+profile of the host, not a WIT world: Python is a plain WASI preview 1 command, which reads a
+JSON envelope (the code, the data, the time zone) on standard input and writes one JSON reply on
+standard output, through a fixed runner that Fronde passes as its argument. No `fronde:component`
+interface is involved, so the frozen WIT stays as it is. The script world has its own linker,
+with WASI preview 1 and nothing else, and its own limits, larger than a component's because
+CPython needs 40 MiB to start. It shares the engine, the epoch ticker that meters CPU, and the
+call timeout with the tool world.
+
+The `python.wasm` is compiled once, in memory, when the source starts; each call gets a fresh
+instance, whose memory starts as a copy-on-write image of the compiled module. A call takes
+around 50 to 100 ms on top of the code's own work. CPython 3.16 moves to WASI 0.3 as a
+component; moving to it means a component linker for this world, with no change to the tool. See
+[Security model](security.md#python-sandbox).
+
 ## Planned
 
 These are designed but **not built yet**:

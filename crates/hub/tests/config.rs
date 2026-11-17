@@ -31,6 +31,10 @@ fn loads_example() {
     assert_eq!(kinds, [("component", "calendar"), ("mcp", "mcphub")]);
     assert_eq!(c.data.user, "alix");
     assert!(c.web.is_some());
+    assert_eq!(
+        c.python.unwrap().dir,
+        std::path::PathBuf::from("/app/python")
+    );
 }
 
 #[test]
@@ -589,4 +593,53 @@ fn old_sections_point_to_sources() {
         e.contains("[[sources]]") && e.contains("kind = \"mcp\""),
         "{e}"
     );
+}
+
+#[test]
+fn python_is_off_unless_configured() {
+    assert!(load_str(MIN).unwrap().python.is_none());
+}
+
+#[test]
+fn python_dir_is_read_from_the_config_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!("{MIN}\n[python]\ndir = \"runtime/python\"\n"),
+    )
+    .unwrap();
+    let c = load(&path).unwrap();
+    assert_eq!(c.python.unwrap().dir, dir.path().join("runtime/python"));
+}
+
+#[test]
+fn python_refuses_unknown_keys() {
+    let e = load_str(&format!(
+        "{MIN}\n[python]\ndir = \"/app/python\"\nmemory_mb = 1024\n"
+    ))
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("memory_mb"), "{e:#}");
+    let e = load_str(&format!("{MIN}\n[python]\n")).unwrap_err();
+    assert!(format!("{e:#}").contains("dir"), "{e:#}");
+}
+
+#[test]
+fn code_prefix_is_reserved() {
+    // An upstream server named `code` would bring `code_*` tools.
+    let e = load_str(&format!(
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"code\"\nurl = \"http://127.0.0.1:1/mcp\"\n"
+    ))
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("reserved"), "{e:#}");
+    assert!(fronde_hub::config::RESERVED_TOOL_PREFIXES.contains(&"code_"));
+}
+
+#[test]
+fn python_source_name_is_taken_when_python_is_on() {
+    let entry =
+        "[[sources]]\nkind = \"mcp\"\nname = \"python\"\nurl = \"http://127.0.0.1:1/mcp\"\n";
+    assert!(load_str(&format!("{MIN}\n{entry}")).is_ok());
+    let e = load_str(&format!("{MIN}\n[python]\ndir = \"/app/python\"\n{entry}")).unwrap_err();
+    assert!(format!("{e:#}").contains("taken by [python]"), "{e:#}");
 }

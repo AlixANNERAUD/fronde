@@ -14,12 +14,15 @@
 use crate::guest_log::GuestLog;
 use crate::host::{ComponentHost, Limits, TICK, bounded, meter};
 use anyhow::{Context, bail, ensure};
-use fronde_hub::tools::ToolOutput;
+use async_trait::async_trait;
+use fronde_hub::config::PYTHON_SOURCE;
+use fronde_hub::source::{Session, Tool, ToolSource};
+use fronde_hub::tools::{ToolDef, ToolHandler, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasmtime::{InstancePre, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
@@ -167,7 +170,11 @@ impl Python {
             .stderr(GuestLog::new("python"))
             .allow_tcp(false)
             .allow_udp(false)
-            .allow_ip_name_lookup(false);
+            .allow_ip_name_lookup(false)
+            // Imports read hundreds of small files from the standard library, which sits in the
+            // page cache: sending each read to the blocking pool would triple a run's time.
+            // Must precede the preopen, which takes it.
+            .allow_blocking_current_thread(true);
         if let Err(e) = wasi.preopened_dir(&self.inner.lib, "/lib", FsPerms::ReadOnly) {
             return ToolOutput::error(format!(
                 "Python's standard library cannot be opened ({e:#}); the hub's [python] dir needs \
@@ -207,6 +214,110 @@ impl Python {
         };
         drop(store);
         reply(&stdout.contents(), exit, &self.limits)
+    }
+}
+
+/// The tool's name; `code_` is reserved for it.
+pub const TOOL: &str = "code_run_python";
+
+const DESCRIPTION: &str = "Run short Python 3.15 to calculate or aggregate; not for writing programs. \
+`data` (any JSON) is the global `data`; `TZ` is the user's time zone. The last expression is the \
+result (else `result`); prints are returned too. Standard library only: json, math, statistics, \
+decimal, fractions, datetime, zoneinfo, collections, itertools, re, csv. No numpy/pandas, files, \
+network or processes. Limits: 10 s CPU, 256 MiB, 64 KiB output: return aggregates, not rows.";
+
+impl Python {
+    /// `code_run_python`, its code run with `timezone` as `TZ`.
+    pub fn tool(&self, timezone: &str) -> Tool {
+        let def = ToolDef {
+            name: TOOL.into(),
+            description: DESCRIPTION.into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python source; its last expression is the result"
+                    },
+                    "data": {
+                        "description": "Any JSON, read by the code as the global `data`"
+                    }
+                },
+                "required": ["code"],
+                "additionalProperties": false
+            }),
+            deferred: true,
+            source: PYTHON_SOURCE.into(),
+        };
+        let handler = Arc::new(RunPython {
+            python: self.clone(),
+            timezone: timezone.into(),
+        });
+        (def, handler)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunArgs {
+    code: String,
+    #[serde(default)]
+    data: Option<Value>,
+}
+
+struct RunPython {
+    python: Python,
+    timezone: String,
+}
+
+#[async_trait]
+impl ToolHandler for RunPython {
+    async fn call(&self, args: Value) -> ToolOutput {
+        match serde_json::from_value::<RunArgs>(args) {
+            Ok(args) => {
+                self.python
+                    .run(&args.code, args.data.as_ref(), &self.timezone)
+                    .await
+            }
+            Err(e) => ToolOutput::error(format!(
+                "invalid arguments: {e}; pass {{\"code\": \"…\"}} and optionally \"data\""
+            )),
+        }
+    }
+}
+
+/// `[python]` as a source of tools: the runtime is checked and compiled when the hub starts.
+pub struct PythonSource {
+    dir: PathBuf,
+    timezone: String,
+    host: ComponentHost,
+}
+
+impl PythonSource {
+    /// The runtime in `dir`, run with the user's `timezone` (an IANA name).
+    pub fn new(dir: PathBuf, timezone: impl Into<String>, host: ComponentHost) -> Self {
+        Self {
+            dir,
+            timezone: timezone.into(),
+            host,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolSource for PythonSource {
+    fn name(&self) -> &str {
+        PYTHON_SOURCE
+    }
+
+    async fn start(&self) -> anyhow::Result<Session> {
+        let started = Instant::now();
+        let python = Python::load(&self.host, &self.dir).await?;
+        tracing::info!(
+            "python: approved (CPython {PYTHON_VERSION}), compiled in {:.1} s",
+            started.elapsed().as_secs_f32()
+        );
+        Ok(Session::lasting(vec![python.tool(&self.timezone)]))
     }
 }
 

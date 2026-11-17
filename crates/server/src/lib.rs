@@ -21,7 +21,7 @@ use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::HubServer;
 use fronde_hub::source::ToolSource;
-use fronde_wasm::{Checks, ComponentHost, ComponentSource};
+use fronde_wasm::{Checks, ComponentHost, ComponentSource, PythonSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use secrecy::{ExposeSecret, SecretString};
@@ -141,9 +141,9 @@ fn site_root() -> PathBuf {
     )
 }
 
-/// The configured components, sharing one engine; each is checked and loaded by the hub, against
-/// the approvals stored in `db` when Fronde started.
-async fn component_sources(
+/// The configured components and `[python]`, sharing one engine; each is checked and loaded by
+/// the hub, components against the approvals stored in `db` when Fronde started.
+async fn wasm_sources(
     config: &Config,
     db: &fronde_db::DatabaseConnection,
 ) -> anyhow::Result<Vec<Arc<dyn ToolSource>>> {
@@ -155,17 +155,25 @@ async fn component_sources(
             SourceConfig::Mcp(_) => None,
         })
         .collect();
-    if entries.is_empty() {
+    if entries.is_empty() && config.python.is_none() {
         return Ok(Vec::new());
     }
     let host = ComponentHost::new()?;
     let checks = Checks::load(config, db).await?;
-    Ok(entries
+    let mut sources: Vec<Arc<dyn ToolSource>> = entries
         .into_iter()
         .map(|c| {
             Arc::new(ComponentSource::new(c, checks.clone(), host.clone())) as Arc<dyn ToolSource>
         })
-        .collect())
+        .collect();
+    if let Some(python) = &config.python {
+        sources.push(Arc::new(PythonSource::new(
+            python.dir.clone(),
+            config.data.timezone.name(),
+            host,
+        )));
+    }
+    Ok(sources)
 }
 
 /// Deletes expired web sessions and key-value entries. Reads already refuse them (the session
@@ -242,7 +250,7 @@ pub async fn start_with(
     let agent = config.agent.clone();
     fronde_hub::private::prepare_data_dir(&data_dir)?;
     let db = fronde_db::open(&data_dir).await?;
-    let components = component_sources(&config, &db).await?;
+    let components = wasm_sources(&config, &db).await?;
     // The store creates its own table, `tower_sessions`, which the entities leave out.
     let sessions = Sessions::new(db.get_sqlite_connection_pool().clone());
     sessions.migrate().await.with_context(|| {

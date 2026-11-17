@@ -8,7 +8,7 @@ shows every section.
 
 ## Relative paths
 
-A relative path in the file (`[data] dir`, a secret `file`, a component's `path`) is resolved from the directory
+A relative path in the file (`[data] dir`, a secret `file`, a component's `path`, `[python] dir`) is resolved from the directory
 containing the configuration file, whatever directory Fronde is started from, and becomes
 absolute. Earlier versions read relative secret paths from the working directory.
 
@@ -67,7 +67,7 @@ Optional.
 Zero or more sources of tools besides Fronde's own (memory and tool search), each an upstream
 MCP server or a tool component. `kind` says which. Every source has a `name`, unique among all
 sources, matching `^[a-z][a-z0-9_]{0,63}$`, and not `hub`, which is reserved for Fronde's own
-tools.
+tools. With `[python]`, `python` is taken too.
 
 Earlier versions had `[calendar]` and `[[mcp]]`: Fronde now refuses them and says what to write
 instead. The calendar is a component (see
@@ -80,7 +80,7 @@ An upstream MCP server. See [Add upstream MCP servers](../how-to/add-upstream-mc
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | Required. Prefixes the server's tools, so it cannot overlap the hub's reserved prefixes (`hub_`, `memory_`, `search_`, `use_`). |
+| `name` | string | Required. Prefixes the server's tools, so it cannot overlap the hub's reserved prefixes (`code_`, `hub_`, `memory_`, `search_`, `use_`). |
 | `url` | URL | Streamable HTTP address of the server. |
 | `command` | array of strings | Program and arguments to run, talking MCP over standard input and output. |
 | `token` | secret | Optional, with `url` only: sent as `Authorization: Bearer <token>`. |
@@ -103,7 +103,7 @@ origins granted here. Its manifest says what it asks for (see
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | Required. The source of its tools, which keep the names the component gives them, each starting with one of its manifest's `tool_prefixes`. No other source's tools may use those prefixes: a component whose prefix is `<another source's name>_`, a prefix of the hub's own tools (`hub_`, `memory_`, `search_`, `use_`) or another component's is not loaded. |
+| `name` | string | Required. The source of its tools, which keep the names the component gives them, each starting with one of its manifest's `tool_prefixes`. No other source's tools may use those prefixes: a component whose prefix is `<another source's name>_`, a prefix of the hub's own tools (`code_`, `hub_`, `memory_`, `search_`, `use_`) or another component's is not loaded. |
 | `path` | path | Required. The `.wasm` file. |
 | `manifest` | path | The manifest. Default: the `.toml` file beside `path` with the same name (`calendar.wasm`, `calendar.toml`). |
 | `sha256` | hex string | SHA-256 of the `.wasm` file. Set it with `manifest_sha256`, or neither for a component shipped with Fronde. |
@@ -171,6 +171,25 @@ for, a credential over plain http to another machine, a tool prefix another sour
 missing secret) is skipped with a warning, and the rest of Fronde starts. `fronde check` reports
 the same problems as errors, except those only compiling the component finds (a file that is not
 a component, imports it may not have, tools outside its prefixes).
+
+## `[python]`
+
+Optional. With it, Fronde serves `code_run_python`, which runs Python in a sandbox for
+calculations (see [Tools](tools.md#python)). Without it, there is no such tool.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `dir` | path | required | The Python runtime: `python.wasm` and the standard library under `lib/`, as `mise run python` lays them out in `python/`. The container image has it at `/app/python`. A relative path is read from the configuration file's directory. |
+
+```toml
+[python]
+dir = "/app/python"
+```
+
+At start, Fronde checks that `python.wasm` is the CPython build it pins and compiles it, which
+takes about a second. If that fails (another build, a missing directory), the tool is left out
+with a warning and the rest of Fronde starts. `fronde check` loads it the same way and prints
+`python: approved (CPython 3.15.2)`, or the error.
 
 ## `[web]`
 

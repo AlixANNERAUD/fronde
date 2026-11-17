@@ -28,7 +28,8 @@ the current `USER.md` and `MEMORY.md`. The client does not need to search memory
 | `use_tool` | `name`, `arguments` (object) | Calls a tool found with `search_tools`. |
 
 Deferred tools are hidden from the tool list to keep the agent's context small. Today the
-deferred tools are those of upstream MCP servers, named `<server>_<tool>`. The search is a
+deferred tools are `code_run_python` and those of upstream MCP servers, named
+`<server>_<tool>`. The search is a
 full-text search over names and descriptions, accents ignored.
 
 ## Memory
@@ -73,6 +74,71 @@ collection.
 Reminders come back as `uid`, `text`, `at` and `done`. Tasks without a due time are not listed.
 Recurring events and tasks are never changed or deleted: the tools say to do it in a calendar
 app.
+
+## Python
+
+`code_run_python`, deferred, from the source `python`. Served only when `[python]` is configured
+(see [Enable Python](../how-to/enable-python.md)). It runs short Python 3.15 for exact
+arithmetic, dates and aggregates over data, in a sandbox: it is not for writing programs.
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `code` | string | Required. Python source. Its last expression is the result; without one, the variable `result`, if set. |
+| `data` | any JSON | Optional. The code reads it as the global `data`. |
+
+The code also has `TZ`, a `zoneinfo.ZoneInfo` for `[data] timezone` (`datetime.now()` is UTC).
+
+On success the result is an object with `value`, the result as plain JSON, and `stdout`, what the
+code printed; each is left out when empty. The value is converted for JSON: `Decimal` and
+`Fraction` become strings (`"0.3"`, `"1/3"`), dates and times ISO 8601 strings, sets and tuples
+lists, NaN and infinities the strings `"nan"`, `"inf"` and `"-inf"`, keys strings, and any other
+object its `repr`, cut at 1000 characters.
+
+A Python exception is a tool error naming the exception and the line of `code` it came from,
+such as `ZeroDivisionError: division by zero (line 3)`, followed by what the code printed before
+it. `sys.exit()` with no code or 0 is not an error.
+
+| Limit | Value | Past it |
+| --- | --- | --- |
+| CPU | about 10 s of running time | The run is stopped: "used up its compute budget". |
+| Wall clock | 30 s | The run is stopped: "timed out". |
+| Memory | 256 MiB | `MemoryError`. |
+| Result | 60 KiB of JSON | An error asking for an aggregate rather than the rows. |
+| Printed output | the first 16 KiB | Cut, with `"stdout_truncated": true`. |
+
+What is there: the standard library, including `json`, `math`, `statistics`, `decimal`,
+`fractions`, `datetime`, `zoneinfo` (with the full time zone database), `collections`,
+`itertools`, `functools`, `re`, `csv`, `random`, `heapq`, `bisect`, `calendar`, `difflib`,
+`unicodedata`, `hashlib` and `base64`. What is not: third-party packages (numpy, pandas), C
+extensions, `sqlite3`, `zlib` and the compression modules, files other than the standard library
+(read-only), the network, processes and threads. Nothing is kept from one call to the next.
+
+Sum by month:
+
+```json
+{
+  "code": "from collections import defaultdict\nfrom decimal import Decimal\ntotals = defaultdict(Decimal)\nfor row in data:\n    totals[row['date'][:7]] += Decimal(row['amount'])\ndict(sorted(totals.items()))",
+  "data": [
+    {"date": "2026-10-03", "amount": "12.50"},
+    {"date": "2026-10-19", "amount": "7.25"},
+    {"date": "2026-11-02", "amount": "40.00"}
+  ]
+}
+```
+
+```json
+{"result": {"value": {"2026-10": "19.75", "2026-11": "40.00"}}}
+```
+
+Days between two dates:
+
+```json
+{"code": "from datetime import date\n(date(2026, 12, 25) - date(2026, 11, 17)).days"}
+```
+
+```json
+{"result": {"value": 38}}
+```
 
 ## Upstream tools
 

@@ -36,6 +36,8 @@ phone or computer. Other agents, such as Claude Code, Codex or T3 Code, reach th
 - **Memory** in plain Markdown files (`USER.md`, `MEMORY.md` and a dated journal), searchable and
   versioned with git.
 - **Calendar and reminders** on any CalDAV server (Nextcloud, Radicale, Fastmail and others).
+- **Python for calculations**: exact arithmetic, dates and aggregates in a sandboxed CPython for
+  WASI, with the standard library only and no files or network.
 - **More tools** from upstream MCP servers (MCPHub or any other), found with `search_tools`.
 - **An MCP server** at `/mcp` behind a bearer token, for your other agents.
 - **One binary or one container**, configured with one TOML file. Secrets live in files or
@@ -115,6 +117,11 @@ user = "alix"
 password = { file = "/run/secrets/fronde_password" }
 # true when the page is served over https.
 secure_cookie = false
+
+# code_run_python: Python in a sandbox for calculations. The image ships the runtime here; from a
+# checkout, `mise run python` fetches it into python/.
+[python]
+dir = "/app/python"
 
 # The agent Fronde runs (ACP over stdio), started on the first message.
 [agent]

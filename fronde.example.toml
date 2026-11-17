@@ -20,6 +20,12 @@ memory_limit = 4000
 user_limit = 2000
 git = true
 
+# Optional: code_run_python, which runs short Python for exact arithmetic, dates and aggregates,
+# in a sandbox with the standard library only, no files and no network. dir holds the CPython
+# for WASI that `mise run python` fetches; the image ships it here. Without it, no tool.
+[python]
+dir = "/app/python"
+
 # Where tools come from besides Fronde's own (memory, tool search), 0..n, each with a unique name.
 
 # A tool component: a .wasm file run in a sandbox, with its manifest beside it (calendar.toml)

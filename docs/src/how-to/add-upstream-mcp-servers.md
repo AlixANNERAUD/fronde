@@ -32,7 +32,7 @@ Fronde's rights and environment, so only run programs you trust.
 ## Names
 
 `name` must match `^[a-z][a-z0-9_]{0,63}$`, must be unique among all sources, and may not be
-`hub` or overlap the hub's reserved tool prefixes (`hub_`, `memory_`, `search_`, `use_`). Each
+`hub` or overlap the hub's reserved tool prefixes (`code_`, `hub_`, `memory_`, `search_`, `use_`). Each
 upstream tool becomes `<name>_<tool>`, lowercased, with any character outside `a-z`, `0-9` and `_`
 turned into `_`, cut at 64 characters.
 
