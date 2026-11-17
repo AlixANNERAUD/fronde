@@ -31,12 +31,80 @@ fn statement(sql: &str, values: impl IntoIterator<Item = Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Sqlite, sql, values)
 }
 
-/// Replace the rows of `file` with its current lines, inside the caller's transaction.
-async fn index_file<C: ConnectionTrait>(db: &C, root: &Path, file: &Path) -> anyhow::Result<()> {
+/// What identifies one version of a memory file. Memory writes replace files atomically and a
+/// hand edit changes the modification time, so the same stamp means the same content.
+#[derive(Debug, PartialEq)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            ino: std::os::unix::fs::MetadataExt::ino(meta),
+        }
+    }
+}
+
+/// A file's content as read, with the stamp of the version read (`None`: unreadable or missing,
+/// indexed as empty).
+struct Snapshot {
+    content: String,
+    stamp: Option<Stamp>,
+}
+
+impl Snapshot {
+    /// Read `file`, taking the stamp from the open file so it names the version read.
+    async fn read(file: &Path) -> Self {
+        let file = file.to_path_buf();
+        let read = tokio::task::spawn_blocking(move || -> std::io::Result<Self> {
+            let mut f = std::fs::File::open(&file)?;
+            let stamp = Stamp::of(&f.metadata()?);
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut bytes)?;
+            Ok(Self {
+                content: String::from_utf8_lossy(&bytes).into_owned(),
+                stamp: Some(stamp),
+            })
+        })
+        .await;
+        match read {
+            Ok(Ok(snapshot)) => snapshot,
+            _ => Self {
+                content: String::new(),
+                stamp: None,
+            },
+        }
+    }
+
+    /// The file as it is now: `self` when it has not changed since it was read, else a new read.
+    /// Called under the write lock, so of two writes racing on one file, the last to index it
+    /// indexes its latest content; only a race pays for a read under the lock.
+    async fn current(self, file: &Path) -> Self {
+        let now = tokio::fs::metadata(file).await.ok().map(|m| Stamp::of(&m));
+        if now == self.stamp {
+            self
+        } else {
+            Self::read(file).await
+        }
+    }
+}
+
+/// Replace the rows of `file` with the lines of `snapshot`, inside the caller's transaction.
+async fn index_file<C: ConnectionTrait>(
+    db: &C,
+    root: &Path,
+    file: &Path,
+    snapshot: Snapshot,
+) -> anyhow::Result<()> {
     let rel = relative(root, file);
-    let content = std::fs::read(file)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
+    let content = snapshot.current(file).await.content;
     db.execute_raw(statement(
         "DELETE FROM memory_fts WHERE file = ?",
         [rel.clone().into()],
@@ -62,10 +130,10 @@ impl MemoryIndex {
     }
 
     pub async fn reindex_file(&self, root: &Path, file: &Path) -> anyhow::Result<()> {
-        // The file is read once the write lock is held: of two writes racing on one file, the
-        // last to index it sees its latest content.
+        // Read before taking the write lock, which every database writer waits for.
+        let snapshot = Snapshot::read(file).await;
         let tx = fronde_db::begin_write(&self.db).await?;
-        index_file(&tx, root, file).await?;
+        index_file(&tx, root, file, snapshot).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -81,10 +149,15 @@ impl MemoryIndex {
                     .filter(|p| p.extension().is_some_and(|x| x == "md")),
             );
         }
+        let mut snapshots = Vec::new();
+        for f in files.into_iter().filter(|f| f.exists()) {
+            let snapshot = Snapshot::read(&f).await;
+            snapshots.push((f, snapshot));
+        }
         let tx = fronde_db::begin_write(&self.db).await?;
         tx.execute_unprepared("DELETE FROM memory_fts").await?;
-        for f in files.iter().filter(|f| f.exists()) {
-            index_file(&tx, root, f).await?;
+        for (f, snapshot) in snapshots {
+            index_file(&tx, root, &f, snapshot).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -154,5 +227,37 @@ mod tests {
         // Reindexing twice does not duplicate.
         idx.reindex_all(dir.path()).await.unwrap();
         assert_eq!(idx.search("cat", 10).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_file_changed_after_its_read_is_indexed_as_it_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("MEMORY.md");
+        std::fs::write(&file, "- likes tea\n").unwrap();
+        let idx = MemoryIndex::new(fronde_db::open(dir.path()).await.unwrap());
+        let stale = Snapshot::read(&file).await;
+        // Another write replaces the file, as memory writes do, between the read and the lock.
+        let next = dir.path().join("MEMORY.md.next");
+        std::fs::write(&next, "- likes coffee\n").unwrap();
+        std::fs::rename(&next, &file).unwrap();
+        let tx = fronde_db::begin_write(&idx.db).await.unwrap();
+        index_file(&tx, dir.path(), &file, stale).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(idx.search("tea", 10).await.is_empty());
+        assert_eq!(idx.search("coffee", 10).await[0].text, "- likes coffee");
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_file_is_indexed_from_its_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("MEMORY.md");
+        std::fs::write(&file, "- likes tea\n").unwrap();
+        let snapshot = Snapshot::read(&file).await;
+        assert_eq!(snapshot.content, "- likes tea\n");
+        let kept = snapshot.current(&file).await;
+        assert_eq!(kept.content, "- likes tea\n");
+        // A missing file reads as empty, and stays so.
+        let missing = Snapshot::read(&dir.path().join("USER.md")).await;
+        assert!(missing.stamp.is_none() && missing.content.is_empty());
     }
 }

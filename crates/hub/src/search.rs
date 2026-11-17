@@ -153,11 +153,47 @@ mod tests {
         assert!(i.search(2, || vec![mealie], "light", 5).await.is_empty());
     }
 
+    #[test]
+    fn fts_query_quotes_every_word() {
+        assert_eq!(fts_query("a\"b").as_deref(), Some("\"a\"* OR \"b\"*"));
+        assert_eq!(
+            fts_query("NEAR(a b)").as_deref(),
+            Some("\"NEAR\"* OR \"a\"* OR \"b\"*")
+        );
+        assert_eq!(fts_query("a*").as_deref(), Some("\"a\"*"));
+        assert_eq!(fts_query("(a").as_deref(), Some("\"a\"*"));
+        assert_eq!(fts_query("name:a").as_deref(), Some("\"name\"* OR \"a\"*"));
+        assert_eq!(
+            fts_query("a AND -b").as_deref(),
+            Some("\"a\"* OR \"AND\"* OR \"b\"*")
+        );
+        for q in ["", "*", "(", ":", "\"", "-:*(\""] {
+            assert_eq!(fts_query(q), None, "{q:?} has no word");
+        }
+    }
+
     #[tokio::test]
     async fn search_survives_fts_syntax() {
         let i = ToolIndex::default();
-        for q in ["\"-:*( AND", "", "NEAR(", "a\"b", "*", "OR OR"] {
-            let _ = i.search(1, || vec![def("a_b", "Something")], q, 5).await;
+        let tools = || vec![def("a_b", "Something")];
+        // A query error gives no hits, so each hostile query also carries a real word: finding
+        // the tool proves the query reached FTS5 as valid syntax.
+        for q in [
+            "\"-:*( AND",
+            "",
+            "NEAR(",
+            "a\"b",
+            "*",
+            "OR OR",
+            "name:",
+            "(",
+            "\"",
+        ] {
+            assert_eq!(
+                i.search(1, tools, &format!("{q} something"), 5).await,
+                vec!["a_b"],
+                "query {q:?}"
+            );
         }
     }
 
