@@ -313,7 +313,8 @@ async fn sign_in_sets_session_and_wrong_password_refused() {
 async fn only_the_owner_signs_in_until_names_exist() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();
-    let mut config = config(path, false);
+    // Writes the server's token and the owner's password.
+    config(path, false);
     for (file, value) in [
         ("marie.password", "password-of-marie"),
         ("alix.token", "token-of-alix"),
@@ -321,22 +322,22 @@ async fn only_the_owner_signs_in_until_names_exist() {
     ] {
         fronde_hub::private::write(path.join(file), value).unwrap();
     }
-    let people: fronde_hub::config::Config = toml::from_str(&format!(
-        "[server]\ntoken = {{ file = \"t\" }}\n[data]\ntimezone = \"UTC\"\n\
-         [web]\n\
-         [users.Alix]\nadmin = true\npassword = {{ file = {:?} }}\n\
-         [users.marie]\npassword = {{ file = {:?} }}\n\
-         [accounts.alix]\nprovider = \"claude\"\nowner = \"Alix\"\noauth_token = {{ file = {:?} }}\n\
-         [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\noauth_token = {{ file = {:?} }}\n",
-        path.join("password").display().to_string(),
-        path.join("marie.password").display().to_string(),
-        path.join("alix.token").display().to_string(),
-        path.join("marie.token").display().to_string(),
-    ))
+    // Every check `fronde serve` makes of the file.
+    let config = fronde_hub::config::load_str(
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = { file = \"token\" }\n\
+             [data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n\
+             [memory]\ngit = false\n\
+             [secrets]\nbackend = \"file\"\nmaster_key = { file = \"master.key\" }\n\
+             [web]\n\
+             [users.Alix]\nadmin = true\npassword = { file = \"password\" }\n\
+             [users.marie]\npassword = { file = \"marie.password\" }\n\
+             [accounts.alix]\nprovider = \"claude\"\nowner = \"Alix\"\n\
+             oauth_token = { file = \"alix.token\" }\n\
+             [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+             oauth_token = { file = \"marie.token\" }\n",
+        path,
+    )
     .unwrap();
-    config.web = people.web;
-    config.users = people.users;
-    config.accounts = people.accounts;
     let (connector, seen) = fake_connector();
     let addr = start_with(config, connector, &site(path)).await;
 

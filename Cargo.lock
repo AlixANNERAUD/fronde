@@ -2596,6 +2596,8 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "unicode-normalization",
+ "unicode-security",
  "url",
  "wiremock",
 ]

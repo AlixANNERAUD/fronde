@@ -13,6 +13,7 @@ use std::io::Write;
 /// none, and the database is never changed by this check. With `[python]`, check and compile the
 /// runtime as `serve` would.
 pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
+    config.check_inherited()?;
     crate::check_token(&config.server.token.resolve().context("server.token")?)?;
     if config.web.is_some() {
         for user in config.users().iter() {
@@ -23,6 +24,11 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         }
     }
     let checks = approval_checks(config).await?;
+    // No two people's credentials hold the same value, as `serve` checks.
+    let claude = fronde_hub::origin::Origin::parse(fronde_hub::config::CLAUDE_ORIGIN)?;
+    crate::refuse_equal(&crate::readable_credentials(config, |name| {
+        checks.secrets.open(name, &claude).ok()
+    }))?;
     if let Some(backend) = checks.secrets.key_backend() {
         writeln!(
             out,
@@ -119,7 +125,7 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
 }
 
 /// Who signs in, whether an admin, and the accounts each owns: `alix (admin, account alix),
-/// paul (no account: no agent)`.
+/// paul (no account)`.
 fn users_line(config: &Config) -> String {
     let accounts = config.accounts();
     config
@@ -136,7 +142,7 @@ fn users_line(config: &Config) -> String {
                 .map(|account| format!("account {}", account.name))
                 .collect();
             if owned.is_empty() {
-                parts.push("no account: no agent".to_owned());
+                parts.push("no account".to_owned());
             }
             parts.extend(owned);
             format!("{} ({})", user.name, parts.join(", "))

@@ -108,7 +108,17 @@ impl Setup {
     /// Runs `spec` through the helper, as Fronde would, with `parent` added to the environment
     /// Fronde has.
     fn run(&self, spec: &AgentSpec, parent: &[(&str, &str)]) -> Output {
-        let helper = self.confine.command(spec).unwrap();
+        self.run_with(spec, parent, Vec::new())
+    }
+
+    /// [`Setup::run`], Fronde giving the agent `secrets` as it gives its hub and sign-in tokens.
+    fn run_with(
+        &self,
+        spec: &AgentSpec,
+        parent: &[(&str, &str)],
+        secrets: Vec<(String, String)>,
+    ) -> Output {
+        let helper = self.confine.command_with(spec, secrets).unwrap();
         Command::new(&helper.program)
             .args(&helper.args)
             .envs(parent.iter().copied())
@@ -165,10 +175,19 @@ fn check_environment(sandbox: bool) {
         ("FRONDE_TEST_SERVER_TOKEN", "server-token-value"),
         // A secret's variable is dropped even when a kept prefix matches its name.
         ("CLAUDE_TEST_PASSWORD", "password-value"),
-        ("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token"),
+        // Fronde's own sign-in variables: an agent never inherits them, nor where its API is.
+        ("CLAUDE_CODE_OAUTH_TOKEN", "inherited-oauth-value"),
+        ("ANTHROPIC_API_KEY", "inherited-api-key-value"),
+        ("ANTHROPIC_BASE_URL", "https://elsewhere.example"),
+        ("CLAUDE_CODE_USE_BEDROCK", "1"),
         ("LANG", "fr_FR.UTF-8"),
     ];
-    let output = setup.run(&spec, &parent);
+    // The account's token, as Fronde gives it from the agent's spec.
+    let given = vec![(
+        "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+        "token-of-the-account".to_owned(),
+    )];
+    let output = setup.run_with(&spec, &parent, given);
     if sandbox && !landlock() {
         return refused_without_landlock(&output);
     }
@@ -184,6 +203,9 @@ fn check_environment(sandbox: bool) {
         "SSH_AUTH_SOCK",
         "FRONDE_TEST_SERVER_TOKEN",
         "CLAUDE_TEST_PASSWORD",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
     ] {
         assert!(
             !env.contains_key(absent),
@@ -197,14 +219,16 @@ fn check_environment(sandbox: bool) {
     assert!(!text.contains("XDG_") && !text.contains("DBUS_"), "{text}");
     assert_eq!(env["FOO"], "bar");
     assert_eq!(env["LANG"], "fr_FR.UTF-8");
-    assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "oauth-token");
+    // Only the value given, never the inherited one.
+    assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "token-of-the-account");
     assert!(env.contains_key("PATH"));
     let home = setup.data.join("home");
     assert_eq!(env["HOME"], home.display().to_string());
     assert_eq!(env["TMPDIR"], home.join("tmp").display().to_string());
     assert!(home.join("tmp").is_dir());
     // Only what the shell sets itself besides what the policy keeps.
-    let policy = setup.confine.command(&spec).unwrap().policy;
+    let given = vec![("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), String::new())];
+    let policy = setup.confine.command_with(&spec, given).unwrap().policy;
     for name in env.keys() {
         assert!(
             policy.keeps(name) || ["PWD", "SHLVL", "_", "OLDPWD"].contains(&name.as_str()),

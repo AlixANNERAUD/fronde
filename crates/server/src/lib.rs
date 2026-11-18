@@ -506,7 +506,7 @@ pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> 
         policy: Policy {
             cwd: main.work,
             keep_env: KEEP_ENV.map(str::to_owned).to_vec(),
-            drop_env: config.secret_env_names(),
+            drop_env: drop_env(config),
             sandbox,
         },
         protected,
@@ -849,6 +849,77 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
     })
 }
 
+/// What no agent inherits from Fronde's environment: every `{ env }` secret's variable, and
+/// every provider's sign-in variables and prefixes. An agent's own token is given through its
+/// spec, never inherited.
+fn drop_env(config: &Config) -> Vec<String> {
+    let mut dropped = config.secret_env_names();
+    for provider in fronde_hub::config::PROVIDERS {
+        dropped.extend(
+            fronde_hub::config::sign_in_vars(provider)
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        dropped.extend(
+            fronde_hub::config::sign_in_prefixes(provider)
+                .iter()
+                .map(|prefix| format!("{prefix}*")),
+        );
+    }
+    dropped.sort();
+    dropped.dedup();
+    dropped
+}
+
+/// Refuses two of `values` that are equal, naming their keys and never the values: a person's
+/// credential shared with another's under two names (two files with the same content, a file
+/// and a variable). Compares SHA-256 digests in memory.
+pub(crate) fn refuse_equal(values: &[(String, SecretString)]) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashMap<[u8; 32], &str> = std::collections::HashMap::new();
+    for (key, value) in values {
+        let digest: [u8; 32] = Sha256::digest(value.expose_secret().as_bytes()).into();
+        if let Some(other) = seen.insert(digest, key) {
+            bail!(
+                "{other} and {key} hold the same value: one would open the other, so a person's \
+                 credential is never shared; give each its own"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The value of every person's credential that reads now: `server.token`, each user's
+/// password and each account's token, a stored one through `stored`. One that does not read is
+/// left out: it fails where it is used.
+pub(crate) fn readable_credentials(
+    config: &Config,
+    stored: impl Fn(&str) -> Option<SecretString>,
+) -> Vec<(String, SecretString)> {
+    let mut values = Vec::new();
+    if let Ok(token) = config.server.token.resolve() {
+        values.push(("server.token".to_owned(), token));
+    }
+    for user in config.users().iter() {
+        if let Some((key, password)) = config.password_of(&user.name)
+            && let Ok(password) = password.resolve()
+        {
+            values.push((key, password));
+        }
+    }
+    for account in config.accounts() {
+        let key = format!("account {}: oauth_token", account.name);
+        let value = match &account.token {
+            Some(fronde_hub::config::Secret::Stored { stored: name }) => stored(name),
+            Some(token) => token.resolve().ok(),
+            None => None,
+        };
+        if let Some(value) = value {
+            values.push((key, value));
+        }
+    }
+    values
+}
+
 /// The token of the account `account`, read at each start of the agent: a file or a variable as
 /// any secret, or a secret stored for Claude's API, opened with the master key. A stored one
 /// that is not stored yet fails with [`fronde_agent::acp::SignInMissing`].
@@ -980,12 +1051,22 @@ pub async fn start_signed_in_as(
     // owner's so far. The legacy form's inherited variable is left to the agent's environment,
     // as before accounts. The configuration is read once per run: a future reload must restart
     // the agents of every person whose account changed.
-    let owner_token = config
+    config.check_inherited()?;
+    let owner_account = config
         .accounts()
         .into_iter()
-        .find(|account| account.owner == config.data.user && account.provider == "claude")
-        .filter(|account| account.form != fronde_hub::config::AccountForm::Inherited)
-        .and_then(|account| Some((account.name, account.token?)));
+        .find(|account| account.owner == config.data.user && account.provider == "claude");
+    if owner_account
+        .as_ref()
+        .is_some_and(|account| account.form == fronde_hub::config::AccountForm::Inherited)
+    {
+        tracing::warn!(
+            "the owner's Claude token is read from CLAUDE_CODE_OAUTH_TOKEN in Fronde's \
+             environment (the legacy form): name it, as [accounts.<name>] with oauth_token = \
+             {{ env = \"CLAUDE_CODE_OAUTH_TOKEN\" }}"
+        );
+    }
+    let owner_token = owner_account.and_then(|account| Some((account.name, account.token?)));
     let budget = budget(&config);
     warn_if_keychain_off();
     let backends = config.master_key_backends()?;
@@ -1001,9 +1082,18 @@ pub async fn start_signed_in_as(
     // A wrong master key, none while secrets are stored, or a backend holding them that cannot
     // be read (a locked keychain), stops Fronde here, whether or not a component needs a stored
     // secret.
-    if let Some(key) = backends.load(&db).await? {
-        fronde_db::secrets::upgrade_key_check(&db, &key).await?;
+    let key = backends.load(&db).await?;
+    if let Some(key) = &key {
+        fronde_db::secrets::upgrade_key_check(&db, key).await?;
     }
+    // No two people's credentials hold the same value, the stored ones included.
+    let sealed = fronde_db::secrets::load_sealed(&db, fronde_db::secrets::SOURCES).await?;
+    let stored = |name: &str| {
+        let row = sealed.iter().find(|row| row.name == name)?;
+        row.open(key.as_ref()?).ok()
+    };
+    refuse_equal(&readable_credentials(&config, stored))?;
+    drop(sealed);
     let components = wasm_sources(&config, &db).await?;
     // The store creates its own table, `tower_sessions`, which the entities leave out.
     let sessions = Sessions::new(db.get_sqlite_connection_pool().clone());
@@ -1179,13 +1269,20 @@ mod tests {
         }
     }
 
-    /// `[agent] env` refuses exactly the variables each provider signs its agent in with.
+    /// `[agent] env` refuses, and no agent inherits, exactly the variables and prefixes each
+    /// provider signs its agent in with.
     #[test]
     fn sign_in_variables_agree() {
         for provider in fronde_agent::provider::Provider::ALL {
             assert_eq!(
                 fronde_hub::config::sign_in_vars(provider.id),
                 provider.sign_in_vars,
+                "{}",
+                provider.id
+            );
+            assert_eq!(
+                fronde_hub::config::sign_in_prefixes(provider.id),
+                provider.sign_in_prefixes,
                 "{}",
                 provider.id
             );

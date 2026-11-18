@@ -43,10 +43,11 @@ pub struct Config {
     /// The file this configuration was read from, absolute; [`load`] sets it.
     #[serde(skip)]
     path: Option<PathBuf>,
-    /// Whether Fronde's environment held `CLAUDE_CODE_OAUTH_TOKEN` when [`load`] read the file:
-    /// the legacy form's owner account then reads it.
+    /// The sign-in variables ([`sign_in_vars`]) Fronde's environment held when [`load`] read
+    /// the file: the legacy form's owner account reads `CLAUDE_CODE_OAUTH_TOKEN`, and with
+    /// `[accounts]` each must be an account's (see [`Config::check_inherited`]).
     #[serde(skip)]
-    inherited_sign_in: bool,
+    inherited: Vec<String>,
 }
 
 impl Config {
@@ -176,7 +177,7 @@ impl Config {
         }
         let (token, form) = match &self.agent.oauth_token {
             Some(token) => (Some(token.clone()), AccountForm::AgentToken),
-            None if self.inherited_sign_in => (
+            None if self.inherited.iter().any(|name| name == INHERITED_SIGN_IN) => (
                 Some(Secret::Env {
                     env: INHERITED_SIGN_IN.to_owned(),
                 }),
@@ -191,6 +192,29 @@ impl Config {
             token,
             form,
         }]
+    }
+
+    /// With `[accounts]`, refuses a sign-in variable in Fronde's environment that no account
+    /// names: each agent signs in with its own account's token and nothing else, so a token
+    /// Fronde inherited would belong to nobody. Says which variable, never its value. `serve`
+    /// and `fronde check` call it.
+    pub fn check_inherited(&self) -> anyhow::Result<()> {
+        if self.accounts.is_empty() {
+            return Ok(());
+        }
+        for name in &self.inherited {
+            let named = self.accounts.values().any(
+                |account| matches!(&account.oauth_token, Some(Secret::Env { env }) if env == name),
+            );
+            if !named {
+                bail!(
+                    "Fronde's environment holds {name}, which signs an agent in, and no \
+                     [accounts.<name>] names it: unset it before starting Fronde, or name it as \
+                     its account's oauth_token = {{ env = \"{name}\" }}"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The master key file, which [`load`] always sets: `[secrets] master_key`, or `master.key`
@@ -235,7 +259,10 @@ impl Config {
 impl Config {
     /// Read the legacy form as if Fronde's environment held `CLAUDE_CODE_OAUTH_TOKEN`, or not.
     pub fn set_inherited_sign_in(&mut self, inherited: bool) {
-        self.inherited_sign_in = inherited;
+        self.inherited.retain(|name| name != INHERITED_SIGN_IN);
+        if inherited {
+            self.inherited.push(INHERITED_SIGN_IN.to_owned());
+        }
     }
 }
 
@@ -254,7 +281,7 @@ pub struct UserConfig {
 /// The longest user name, in characters.
 pub const MAX_USER_NAME: usize = 64;
 
-/// `name` as a key of a TOML table: bare when it can be, quoted otherwise.
+/// `name` as a key of a TOML table: bare when it can be, quoted as TOML quotes it otherwise.
 fn table_key(name: &str) -> String {
     let bare = !name.is_empty()
         && name
@@ -263,8 +290,48 @@ fn table_key(name: &str) -> String {
     if bare {
         name.to_owned()
     } else {
-        format!("{name:?}")
+        toml::Value::String(name.to_owned()).to_string()
     }
+}
+
+/// The characters a user's name may not hold: it names a session, and may name a directory.
+const FORBIDDEN_IN_NAMES: [char; 3] = ['/', '\\', ':'];
+
+/// Checks a user's name, `key` naming it: 1 to [`MAX_USER_NAME`] characters, no hidden
+/// character, no space at either end, no `/`, `\`, `:` or `..`.
+fn check_user_name(name: &str, key: &str) -> anyhow::Result<()> {
+    let length = name.chars().count();
+    if !(1..=MAX_USER_NAME).contains(&length) {
+        bail!("{key}: a user's name is 1 to {MAX_USER_NAME} characters");
+    }
+    if let Some(hidden) = fronde_protocol::text::first_hidden(name, false) {
+        bail!(
+            "{key}: a user's name may not hold a hidden character ({hidden:?}); write it with \
+             visible characters only"
+        );
+    }
+    if name.trim() != name {
+        bail!("{key}: a user's name may not start or end with a space");
+    }
+    if let Some(c) = name.chars().find(|c| FORBIDDEN_IN_NAMES.contains(c)) {
+        bail!("{key}: a user's name may not hold {c:?}");
+    }
+    if name.contains("..") {
+        bail!("{key}: a user's name may not hold \"..\"");
+    }
+    Ok(())
+}
+
+/// A name as two names are compared for looking alike: NFKC, case-folded, then its UTS #39
+/// confusable skeleton (a Cyrillic `а` reads as a Latin `a`), NFKC and case-folded again.
+fn look(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let folded: String = name.nfkc().flat_map(char::to_lowercase).collect();
+    unicode_security::confusable_detection::skeleton(&folded)
+        .collect::<String>()
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// `[accounts.<name>]`: a subscription of one provider, whose owner's agents sign in with it.
@@ -321,9 +388,31 @@ pub fn sign_in_vars(provider: &str) -> &'static [&'static str] {
             "CLAUDE_CODE_OAUTH_TOKEN",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
         ],
         _ => &[],
     }
+}
+
+/// The prefixes of the variables that choose where and how a provider's agent signs in (its
+/// API's address, another cloud): `[agent] env` sets none, and an agent inherits none.
+/// `fronde_agent::provider::Provider::sign_in_prefixes` lists the same.
+pub fn sign_in_prefixes(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "claude" => &["ANTHROPIC_", "CLAUDE_CODE_USE_"],
+        _ => &[],
+    }
+}
+
+/// The provider whose agent's sign-in the variable `name` is, or decides: see
+/// [`sign_in_vars`] and [`sign_in_prefixes`].
+pub fn signs_in(name: &str) -> Option<&'static str> {
+    PROVIDERS.into_iter().find(|provider| {
+        sign_in_vars(provider).contains(&name)
+            || sign_in_prefixes(provider)
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    })
 }
 
 /// `[secrets]`: where the master key that seals stored secrets is kept.
@@ -1198,13 +1287,10 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
     }
     check_sources(&config.sources)?;
     for name in config.agent.env.keys() {
-        if let Some(provider) = PROVIDERS
-            .into_iter()
-            .find(|provider| sign_in_vars(provider).contains(&name.as_str()))
-        {
+        if let Some(provider) = signs_in(name) {
             bail!(
-                "[agent] env sets {name}, which signs {provider}'s agent in: Fronde gives each \
-                 agent its own account's token and nothing else; name the token in \
+                "[agent] env sets {name}, which decides how {provider}'s agent signs in: Fronde \
+                 gives each agent its own account's token and nothing else; name the token in \
                  [accounts.<name>] oauth_token (or the legacy [agent] oauth_token), never in \
                  fronde.toml, and remove {name} from env"
             );
@@ -1226,10 +1312,21 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
             fronde_db::secrets::check_name(stored).context("[agent] oauth_token")?;
         }
     }
-    check_accounts(&mut config, base)?;
-    // Read once, here: `Config::accounts` stays pure.
-    config.inherited_sign_in =
-        std::env::var_os(INHERITED_SIGN_IN).is_some_and(|value| !value.is_empty());
+    for account in config.accounts.values_mut() {
+        if let Some(token) = &mut account.oauth_token {
+            token.anchor(base);
+        }
+    }
+    check_shared_secrets(&config)?;
+    check_accounts(&config)?;
+    // Read once, here: `Config::accounts` stays pure, and `serve` and `check` refuse what
+    // `check_inherited` finds.
+    config.inherited = PROVIDERS
+        .into_iter()
+        .flat_map(|provider| sign_in_vars(provider).iter())
+        .filter(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        .map(|name| (*name).to_owned())
+        .collect();
     for tool in &config.agent.builtin_tools {
         if !SAFE_BUILTIN_TOOLS.contains(&tool.as_str()) {
             bail!(
@@ -1245,6 +1342,7 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
 fn check_users(config: &mut Config, base: &Path) -> anyhow::Result<()> {
     let owner = config.data.user.clone();
     if config.users.is_empty() {
+        check_user_name(&owner, "[data] user")?;
         if config
             .web
             .as_ref()
@@ -1268,22 +1366,22 @@ fn check_users(config: &mut Config, base: &Path) -> anyhow::Result<()> {
             table_key(&owner)
         );
     }
-    for (name, user) in &mut config.users {
+    // A name as it looks -> the name: two that look alike are refused.
+    let mut looks: BTreeMap<String, &str> = BTreeMap::new();
+    for name in config.users.keys() {
         let key = table_key(name);
-        let length = name.chars().count();
-        if !(1..=MAX_USER_NAME).contains(&length) {
-            bail!("[users.{key}]: a user's name is 1 to {MAX_USER_NAME} characters");
-        }
-        if let Some(hidden) = fronde_protocol::text::first_hidden(name, false) {
+        check_user_name(name, &format!("[users.{key}]"))?;
+        if let Some(other) = looks.insert(look(name), name) {
             bail!(
-                "[users.{key}]: a user's name may not hold a hidden character ({:?}); write it \
-                 with visible characters only",
-                hidden
+                "[users.{}] and [users.{key}] look alike (in case, accents or letters of \
+                 another script that look the same): two people never have names that could \
+                 be taken one for the other; rename one",
+                table_key(other)
             );
         }
-        if name.trim() != name {
-            bail!("[users.{key}]: a user's name may not start or end with a space");
-        }
+    }
+    for (name, user) in &mut config.users {
+        let key = table_key(name);
         let Some(password) = &mut user.password else {
             bail!(
                 "[users.{key}] has no way to sign in: set password = {{ file = \"…\" }} or \
@@ -1307,8 +1405,156 @@ fn check_users(config: &mut Config, base: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// The rules of `[accounts]`, each refusal naming its key; anchors the tokens' files.
-fn check_accounts(config: &mut Config, base: &Path) -> anyhow::Result<()> {
+/// Where a secret is read from, as two references are compared: the same stored name, the same
+/// variable, or the same file, however its path is written (`..`, a link: the file it leads to,
+/// by device and inode).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SecretPlace {
+    Stored(String),
+    Env(String),
+    #[cfg(unix)]
+    Inode(u64, u64),
+    Path(PathBuf),
+}
+
+impl SecretPlace {
+    fn of(secret: &Secret) -> Self {
+        match secret {
+            Secret::Stored { stored } => Self::Stored(stored.clone()),
+            Secret::Env { env } => Self::Env(env.clone()),
+            Secret::File { file } => Self::of_file(file),
+        }
+    }
+
+    fn of_file(file: &Path) -> Self {
+        #[cfg(unix)]
+        if let Ok(metadata) = std::fs::metadata(file) {
+            use std::os::unix::fs::MetadataExt;
+            return Self::Inode(metadata.dev(), metadata.ino());
+        }
+        match std::fs::canonicalize(file) {
+            Ok(file) => Self::Path(file),
+            Err(_) => Self::Path(lexical(file)),
+        }
+    }
+}
+
+/// `path` with `.` and `..` resolved by name only, for a file that does not exist yet.
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// What a secret reference reads from, for a message: never a value.
+fn secret_place(secret: &Secret) -> String {
+    match secret {
+        Secret::Stored { stored } => format!("the stored secret {stored}"),
+        Secret::Env { env } => format!("the environment variable {env}"),
+        Secret::File { file } => format!("the file {}", file.display()),
+    }
+}
+
+/// Refuses a secret that a person's credential (`server.token`, a password, an account's
+/// token, the master key) shares with any other credential: the same stored name, variable or
+/// file would let one open the other. Two credentials of sources (a component's, an upstream
+/// server's) may share one; `[agent] env` never sets the variable of a person's credential.
+fn check_shared_secrets(config: &Config) -> anyhow::Result<()> {
+    // (key naming it, the secret, whether it is a person's)
+    let mut named: Vec<(String, Secret, bool)> =
+        vec![("server.token".to_owned(), config.server.token.clone(), true)];
+    if let Some(password) = config.web.as_ref().and_then(|web| web.password.as_ref()) {
+        named.push(("web.password".to_owned(), password.clone(), true));
+    }
+    for (name, user) in &config.users {
+        if let Some(password) = &user.password {
+            named.push((
+                format!("[users.{}] password", table_key(name)),
+                password.clone(),
+                true,
+            ));
+        }
+    }
+    if let Some(token) = &config.agent.oauth_token {
+        named.push(("[agent] oauth_token".to_owned(), token.clone(), true));
+    }
+    for (name, account) in &config.accounts {
+        if let Some(token) = &account.oauth_token {
+            named.push((
+                format!("[accounts.{name}] oauth_token"),
+                token.clone(),
+                true,
+            ));
+        }
+    }
+    if let Some(file) = &config.secrets.master_key_file {
+        named.push((
+            "[secrets] master_key".to_owned(),
+            Secret::File { file: file.clone() },
+            true,
+        ));
+    }
+    for source in &config.sources {
+        let name = source.name();
+        match source {
+            SourceConfig::Mcp(m) => {
+                if let Some(token) = &m.token {
+                    named.push((format!("source {name:?}: token"), token.clone(), false));
+                }
+            }
+            SourceConfig::Component(c) => {
+                for credential in &c.credentials {
+                    let secret = credential.basic.as_ref().map(|b| &b.password);
+                    if let Some(secret) = secret.or(credential.bearer.as_ref()) {
+                        named.push((
+                            format!("source {name:?}: the credential for {}", credential.origin),
+                            secret.clone(),
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut seen: BTreeMap<SecretPlace, (&str, &Secret, bool)> = BTreeMap::new();
+    for (key, secret, person) in &named {
+        let place = SecretPlace::of(secret);
+        match seen.get(&place) {
+            Some((other, first, other_person)) if *person || *other_person => bail!(
+                "{other} and {key} both read their secret from {}: one would open the other, so \
+                 a person's credential is never shared; give each its own",
+                secret_place(first)
+            ),
+            Some(_) => {}
+            None => {
+                seen.insert(place, (key, secret, *person));
+            }
+        }
+    }
+    for name in config.agent.env.keys() {
+        let place = SecretPlace::Env(name.clone());
+        if let Some((key, _, true)) = seen.get(&place) {
+            bail!(
+                "[agent] env sets {name}, the variable {key} is read from: the agent would get a \
+                 value under a secret's name; remove {name} from env"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The rules of `[accounts]`, each refusal naming its key. Their tokens are anchored, and checked
+/// against every other secret by [`check_shared_secrets`], before.
+fn check_accounts(config: &Config) -> anyhow::Result<()> {
     if config.accounts.is_empty() {
         return Ok(());
     }
@@ -1319,14 +1565,8 @@ fn check_accounts(config: &mut Config, base: &Path) -> anyhow::Result<()> {
         );
     }
     let users = config.user_names();
-    // (owner, provider) -> account, and each token's place -> account.
+    // (owner, provider) -> account.
     let mut owned: BTreeMap<(&str, &str), &str> = BTreeMap::new();
-    let mut tokens: BTreeMap<String, &str> = BTreeMap::new();
-    for account in config.accounts.values_mut() {
-        if let Some(token) = &mut account.oauth_token {
-            token.anchor(base);
-        }
-    }
     for (name, account) in &config.accounts {
         if !is_valid_name(name) {
             bail!("[accounts.{name:?}]: an account's name must match ^[a-z][a-z0-9_]{{0,63}}$");
@@ -1346,23 +1586,17 @@ fn check_accounts(config: &mut Config, base: &Path) -> anyhow::Result<()> {
                  {{ file = \"…\" }} or {{ env = \"…\" }}, the token `claude setup-token` prints"
             );
         };
-        let place = match token {
-            Secret::Stored { stored } => {
-                fronde_db::secrets::check_name(stored)
-                    .with_context(|| format!("[accounts.{name}] oauth_token"))?;
-                format!("the stored secret {stored}")
-            }
-            Secret::File { file } => format!(
-                "the file {}",
-                file.components().collect::<PathBuf>().display()
-            ),
-            Secret::Env { env } => format!("the environment variable {env}"),
-        };
-        if let Some(other) = tokens.insert(place.clone(), name) {
+        if let Secret::Stored { stored } = token {
+            fronde_db::secrets::check_name(stored)
+                .with_context(|| format!("[accounts.{name}] oauth_token"))?;
+        }
+        // The usage readings kept before accounts are the legacy account's, the owner's.
+        if name == LEGACY_ACCOUNT && *owner != config.data.user {
             bail!(
-                "[accounts.{other}] and [accounts.{name}] both read their token from {place}: \
-                 one token would sign both in, so two accounts never share one; give each \
-                 account its own"
+                "[accounts.{LEGACY_ACCOUNT}] belongs to {owner}, but that name is the owner's \
+                 account of the legacy form, [data] user = {:?}: give {owner}'s account another \
+                 name",
+                config.data.user
             );
         }
         if let Some(other) = owned.insert((owner, &account.provider), name) {

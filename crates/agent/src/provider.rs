@@ -34,8 +34,13 @@ pub struct Provider {
     /// The variable the provider reads its sign-in token from: where `[agent] oauth_token` goes.
     pub sign_in_env: Option<&'static str>,
     /// Every variable its agent may sign in with, `sign_in_env` included: `[agent] env` never
-    /// sets them (`fronde_hub::config::sign_in_vars` lists the same).
+    /// sets them, and an agent never inherits them from Fronde (`fronde_hub::config::sign_in_vars`
+    /// lists the same).
     pub sign_in_vars: &'static [&'static str],
+    /// The prefixes of the variables that choose where and how its agent signs in (its API's
+    /// address, another cloud): likewise never set nor inherited
+    /// (`fronde_hub::config::sign_in_prefixes`).
+    pub sign_in_prefixes: &'static [&'static str],
     /// Which permission options a card may offer.
     pub permissions: PermissionRules,
     /// What the sandbox grants for the provider's program to run.
@@ -158,7 +163,9 @@ impl Provider {
             "CLAUDE_CODE_OAUTH_TOKEN",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
         ],
+        sign_in_prefixes: &["ANTHROPIC_", "CLAUDE_CODE_USE_"],
         permissions: PermissionRules {
             mode_switch_prefix: Some(CLAUDE_EXIT_PLAN),
             mode_switch_options: CLAUDE_MODE_SWITCH_OPTIONS,
@@ -179,6 +186,7 @@ impl Provider {
             mode_after_open: None,
             sign_in_env: None,
             sign_in_vars: &[],
+            sign_in_prefixes: &[],
             permissions: PermissionRules::NONE,
             install: Install::Directory,
             usage: UsageSource::None,

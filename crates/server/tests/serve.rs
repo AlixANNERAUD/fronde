@@ -1455,13 +1455,17 @@ async fn check_lists_users_and_their_accounts() {
         "{shown}"
     );
 
-    for (name, value) in [("alix", "password-of-alix"), ("marie", "password-of-marie")] {
+    for (name, value) in [
+        ("alix", "password-of-alix"),
+        ("marie", "password-of-marie"),
+        ("paul", "password-of-paul"),
+    ] {
         fronde_hub::private::write(dir.path().join(format!("{name}.password")), value).unwrap();
     }
     let people = format!(
         "{}[users.alix]\nadmin = true\npassword = {{ file = \"alix.password\" }}\n\
          [users.marie]\npassword = {{ file = \"marie.password\" }}\n\
-         [users.paul]\npassword = {{ file = \"marie.password\" }}\n\
+         [users.paul]\npassword = {{ file = \"paul.password\" }}\n\
          [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n\
          oauth_token = {{ stored = \"claude_alix\" }}\n\
          [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
@@ -1478,12 +1482,31 @@ async fn check_lists_users_and_their_accounts() {
         ALIX,
     )
     .await;
-    let (code, shown) = check_with(&path, &people, Some(ALIX));
+    // Two people never share a password file: Paul reading Marie's is refused.
+    let shared = people.replace("\"paul.password\"", "\"marie.password\"");
+    let (code, shown) = check_with(&path, &shared, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains(
+            "[users.marie] password and [users.paul] password both read their secret from the \
+             file"
+        ),
+        "{shown}"
+    );
+    // Nor the same value in two files.
+    fronde_hub::private::write(dir.path().join("paul.password"), "password-of-marie").unwrap();
+    let (code, shown) = check_with(&path, &people, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("[users.marie] password and [users.paul] password hold the same value"),
+        "{shown}"
+    );
+    fronde_hub::private::write(dir.path().join("paul.password"), "password-of-paul").unwrap();
+    let (code, shown) = check_with(&path, &people, None);
     assert_eq!(code, Some(0), "{shown}");
     assert!(
         shown.contains(
-            "\nusers: alix (admin, account alix), marie (account marie), paul (no account: no \
-             agent)\n"
+            "\nusers: alix (admin, account alix), marie (account marie), paul (no account)\n"
         ),
         "{shown}"
     );
@@ -1502,9 +1525,39 @@ async fn check_lists_users_and_their_accounts() {
         ),
         "{shown}"
     );
-    for secret in [ALIX, "password-of-alix", "password-of-marie"] {
+    for secret in [
+        ALIX,
+        "password-of-alix",
+        "password-of-marie",
+        "password-of-paul",
+    ] {
         assert!(!shown.contains(secret), "{secret}: {shown}");
     }
+    // With accounts, a sign-in variable Fronde inherits and no account names stops the
+    // check, named, its value never shown.
+    let (code, shown) = check_with(&path, &people, Some(ALIX));
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("Fronde's environment holds CLAUDE_CODE_OAUTH_TOKEN")
+            && !shown.contains(ALIX),
+        "{shown}"
+    );
+    // A stored token holding a password's value is refused too.
+    store_secret(
+        &data,
+        &dir.path().join("master.key"),
+        "claude_marie",
+        "https://api.anthropic.com",
+        "password-of-paul",
+    )
+    .await;
+    let (code, shown) = check_with(&path, &people, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("[users.paul] password and account marie: oauth_token hold the same value")
+            && !shown.contains("password-of-paul"),
+        "{shown}"
+    );
 
     // A member's password that does not read fails the check, naming its key.
     std::fs::remove_file(dir.path().join("marie.password")).unwrap();

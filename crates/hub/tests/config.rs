@@ -356,7 +356,7 @@ fn loads_a_component_source() {
          [sources.settings]\nevents_url = \"https://cloud.example/e/\"\n\
          [[sources.credentials]]\norigin = \"https://cloud.example\"\n\
          basic = { username = \"alix\", password = { file = \"caldav\" } }\n\
-         [[sources.credentials]]\norigin = \"http://192.168.1.10:5232\"\nbearer = { env = \"T\" }\n",
+         [[sources.credentials]]\norigin = \"http://192.168.1.10:5232\"\nbearer = { env = \"CAL_TOKEN\" }\n",
     );
     std::fs::write(&path, text).unwrap();
     let c = load(&path).unwrap();
@@ -431,7 +431,7 @@ fn rejects_duplicate_allowed_origin() {
 fn credential_origin_matches_its_allowed_spelling() {
     let c = load_str(&component(
         "allow = [{ origin = \"http://0x7f.1:5232\", local = true }]\n\
-         [[sources.credentials]]\norigin = \"http://127.0.0.1:5232/\"\nbearer = { env = \"T\" }\n",
+         [[sources.credentials]]\norigin = \"http://127.0.0.1:5232/\"\nbearer = { env = \"CAL_TOKEN\" }\n",
     ))
     .unwrap();
     let [SourceConfig::Component(c)] = &c.sources[..] else {
@@ -444,7 +444,7 @@ fn credential_origin_matches_its_allowed_spelling() {
 #[test]
 fn credential_origin_must_be_allowed() {
     let e = refused(&component(
-        "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://b.example\"\nbearer = { env = \"T\" }\n",
+        "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://b.example\"\nbearer = { env = \"CAL_TOKEN\" }\n",
     ));
     assert!(
         e.contains("https://b.example") && e.contains("not in allow"),
@@ -454,13 +454,13 @@ fn credential_origin_must_be_allowed() {
 
 #[test]
 fn credential_needs_exactly_one_kind_and_no_plain_secret() {
-    let both = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"T\" }\nbasic = { username = \"a\", password = { env = \"P\" } }\n";
+    let both = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"CAL_TOKEN\" }\nbasic = { username = \"a\", password = { env = \"P\" } }\n";
     assert!(refused(&component(both)).contains("exactly one of basic or bearer"));
     let none = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\n";
     assert!(refused(&component(none)).contains("exactly one of basic or bearer"));
     let plain = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = \"tok\"\n";
     assert!(load_str(&component(plain)).is_err());
-    let twice = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"T\" }\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"U\" }\n";
+    let twice = "allow = [\"https://a.example\"]\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"CAL_TOKEN\" }\n[[sources.credentials]]\norigin = \"https://a.example\"\nbearer = { env = \"U\" }\n";
     assert!(refused(&component(twice)).contains("two credentials"));
 }
 
@@ -1427,35 +1427,242 @@ fn one_account_per_owner_and_provider() {
 /// token is stored, in a file (however its path is written) or in a variable.
 #[test]
 fn two_accounts_cannot_name_one_secret() {
-    for (a, b, place) in [
+    // A real file, reached through a link and through `..`: the same file however it is named.
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    fronde_hub::private::write(&token, "token-of-alix").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let link = dir.path().join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&token, &link).unwrap();
+    let file = |path: &std::path::Path| format!("{{ file = {:?} }}", path.display().to_string());
+    let mut cases = vec![
         (
-            "{ stored = \"claude\" }",
-            "{ stored = \"claude\" }",
+            "{ stored = \"claude\" }".to_owned(),
+            "{ stored = \"claude\" }".to_owned(),
             "the stored secret claude",
         ),
         (
-            "{ file = \"token\" }",
-            "{ file = \"./token\" }",
+            "{ file = \"token\" }".to_owned(),
+            "{ file = \"./token\" }".to_owned(),
             "the file ",
         ),
         (
-            "{ env = \"CLAUDE\" }",
-            "{ env = \"CLAUDE\" }",
+            "{ file = \"token\" }".to_owned(),
+            "{ file = \"sub/../token\" }".to_owned(),
+            "the file ",
+        ),
+        (
+            file(&token),
+            file(&dir.path().join("sub/../token")),
+            "the file ",
+        ),
+        (
+            "{ env = \"CLAUDE\" }".to_owned(),
+            "{ env = \"CLAUDE\" }".to_owned(),
             "the environment variable CLAUDE",
         ),
+    ];
+    #[cfg(unix)]
+    cases.push((file(&token), file(&link), "the file "));
+    for (a, b, place) in cases {
+        // Two people, or one person twice: the shared token is refused first.
+        for owner in ["marie", "alix"] {
+            let e = refused(&owned_by_alix(&format!(
+                "{USERS}\
+                 [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {a}\n\
+                 [accounts.other]\nprovider = \"claude\"\nowner = \"{owner}\"\noauth_token = {b}\n"
+            )));
+            assert!(
+                e.contains(
+                    "[accounts.alix] oauth_token and [accounts.other] oauth_token both read their \
+                     secret from"
+                ) && e.contains(place)
+                    && e.contains("never shared"),
+                "{a} {b}: {e}"
+            );
+        }
+    }
+}
+
+/// A person's credentials (`server.token`, each password, each account's token, the master key)
+/// share nothing with each other: not a variable, not a file however it is named.
+#[test]
+fn people_never_share_a_secret() {
+    let account = |token: &str| {
+        format!(
+            "[accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\noauth_token = {token}\n"
+        )
+    };
+    for (rest, keys) in [
+        // Two passwords.
+        (
+            USERS
+                .replace("MARIE_PASSWORD", "SHARED")
+                .replace("{ file = \"alix.password\" }", "{ env = \"SHARED\" }"),
+            ["[users.alix] password", "[users.marie] password"],
+        ),
+        (
+            USERS.replace(
+                "{ env = \"MARIE_PASSWORD\" }",
+                "{ file = \"./alix.password\" }",
+            ),
+            ["[users.alix] password", "[users.marie] password"],
+        ),
+        // A token and a password.
+        (
+            format!("{USERS}{}", account("{ env = \"MARIE_PASSWORD\" }")),
+            ["[users.marie] password", "[accounts.marie] oauth_token"],
+        ),
+        (
+            format!("{USERS}{}", account("{ file = \"alix.password\" }")),
+            ["[users.alix] password", "[accounts.marie] oauth_token"],
+        ),
+        // The server's token and a password; the master key and a token.
+        (
+            USERS.replace("MARIE_PASSWORD", "T"),
+            ["server.token", "[users.marie] password"],
+        ),
+        (
+            format!("{USERS}{}", account("{ file = \"master.key\" }")),
+            ["[accounts.marie] oauth_token", "[secrets] master_key"],
+        ),
     ] {
-        // The token is checked before the owner: the same refusal once two people exist.
-        let e = refused(&format!(
-            "{MIN}user = \"alix\"\n\
-             [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {a}\n\
-             [accounts.other]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {b}\n"
-        ));
+        let e = refused(&owned_by_alix(&rest));
         assert!(
-            e.contains("[accounts.alix] and [accounts.other] both read their token from")
-                && e.contains(place)
-                && e.contains("never share one"),
-            "{e}"
+            e.contains(&format!(
+                "{} and {} both read their secret from",
+                keys[0], keys[1]
+            )) && e.contains("never shared"),
+            "{rest}: {e}"
         );
+    }
+}
+
+/// What an account's token or a password is read from is named by nothing else: no source's
+/// credential or token, no variable `[agent] env` sets.
+#[test]
+fn account_secrets_are_named_nowhere_else() {
+    let account = "[accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n";
+    let upstream = |token: &str| {
+        format!(
+            "[[sources]]\nkind = \"mcp\"\nname = \"up\"\nurl = \"https://up.example/mcp\"\ntoken = {token}\n"
+        )
+    };
+    let component = |secret: &str| {
+        format!(
+            "[[sources]]\nkind = \"component\"\nname = \"calendar\"\npath = \"calendar.wasm\"\n\
+             allow = [\"https://cloud.example\"]\n[[sources.credentials]]\n\
+             origin = \"https://cloud.example\"\nbearer = {secret}\n"
+        )
+    };
+    for (token, other, key) in [
+        (
+            "{ stored = \"claude_alix\" }",
+            upstream("{ stored = \"claude_alix\" }"),
+            "source \"up\": token",
+        ),
+        (
+            "{ env = \"ALIX_TOKEN\" }",
+            component("{ env = \"ALIX_TOKEN\" }"),
+            "source \"calendar\": the credential for https://cloud.example",
+        ),
+        (
+            "{ file = \"alix.token\" }",
+            component("{ file = \"alix.token\" }"),
+            "source \"calendar\": the credential for https://cloud.example",
+        ),
+    ] {
+        let e = refused(&owned_by_alix(&format!(
+            "{account}oauth_token = {token}\n{other}"
+        )));
+        assert!(
+            e.contains(&format!(
+                "[accounts.alix] oauth_token and {key} both read their secret from"
+            )),
+            "{token}: {e}"
+        );
+    }
+    // A password's variable, set by [agent] env.
+    let e = refused(&owned_by_alix(&format!(
+        "[agent]\nenv = {{ MARIE_PASSWORD = \"x\" }}\n{USERS}"
+    )));
+    assert!(
+        e.contains(
+            "[agent] env sets MARIE_PASSWORD, the variable [users.marie] password is read from"
+        ),
+        "{e}"
+    );
+    // Two sources may still share one.
+    load_str(&format!(
+        "{MIN}{}{}",
+        upstream("{ env = \"SHARED\" }"),
+        component("{ env = \"SHARED\" }")
+    ))
+    .unwrap();
+}
+
+/// `[accounts.claude]`, the legacy form's name, is only ever the owner's account.
+#[test]
+fn the_legacy_account_name_is_the_owners() {
+    let e = refused(&owned_by_alix(&format!(
+        "{USERS}[accounts.claude]\nprovider = \"claude\"\nowner = \"marie\"\noauth_token = {{ file = \"t\" }}\n"
+    )));
+    assert!(
+        e.contains("[accounts.claude] belongs to marie") && e.contains("another name"),
+        "{e}"
+    );
+    load_str(&owned_by_alix(&format!(
+        "{USERS}[accounts.claude]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ file = \"t\" }}\n"
+    )))
+    .unwrap();
+}
+
+/// Two names that could be taken one for the other are never two people: the same letters in
+/// another case, composed otherwise (NFD), or in another script that looks the same.
+#[test]
+fn user_names_never_look_alike() {
+    for (a, b) in [
+        ("marie", "Marie"),
+        ("Andr\u{e9}", "Andre\u{301}"),
+        ("marie", "m\u{430}rie"),
+        ("paul", "\u{440}aul"),
+        ("ﬁona", "fiona"),
+    ] {
+        let e = refused(&format!(
+            "{MIN}user = {}\n[users.{}]\nadmin = true\npassword = {{ file = \"p\" }}\n\
+             [users.{}]\npassword = {{ file = \"q\" }}\n",
+            toml::Value::String(a.to_owned()),
+            toml::Value::String(a.to_owned()),
+            toml::Value::String(b.to_owned()),
+        ));
+        assert!(e.contains("look alike"), "{a:?} {b:?}: {e}");
+    }
+}
+
+/// A name never holds a path's separators: it names a session, and may name a directory. The
+/// legacy form's `[data] user` follows the same rules.
+#[test]
+fn user_names_are_no_paths() {
+    for name in ["ma/rie", "ma\\rie", "ma:rie", "..", "a..b"] {
+        let quoted = toml::Value::String(name.to_owned());
+        let e = refused(&format!(
+            "{MIN}user = \"alix\"\n[users.alix]\nadmin = true\npassword = {{ file = \"p\" }}\n\
+             [users.{quoted}]\npassword = {{ file = \"q\" }}\n"
+        ));
+        assert!(e.contains("a user's name may not hold"), "{name:?}: {e}");
+        let e = refused(&format!("{MIN}user = {quoted}\n"));
+        assert!(
+            e.contains("[data] user: a user's name may not hold"),
+            "{name:?}: {e}"
+        );
+    }
+    for hidden in ["al\u{200b}ix", " alix"] {
+        let e = refused(&format!(
+            "{MIN}user = {}\n",
+            toml::Value::String(hidden.to_owned())
+        ));
+        assert!(e.contains("[data] user: a user's name"), "{hidden:?}: {e}");
     }
 }
 
@@ -1466,6 +1673,9 @@ fn agent_env_cannot_set_a_sign_in_variable() {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
     ] {
         for rest in ["", "oauth_token = { file = \"t\" }\n"] {
             let e = refused(&format!("{MIN}[agent]\n{rest}env = {{ {name} = \"x\" }}\n"));
@@ -1698,7 +1908,10 @@ fn accounts_belong_to_users() {
         accounts.replace("claude_marie", "claude_alix")
     )));
     assert!(
-        e.contains("[accounts.alix] and [accounts.marie] both read their token from the stored secret claude_alix"),
+        e.contains(
+            "[accounts.alix] oauth_token and [accounts.marie] oauth_token both read their \
+             secret from the stored secret claude_alix"
+        ),
         "{e}"
     );
 }

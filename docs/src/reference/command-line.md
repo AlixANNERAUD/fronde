@@ -83,9 +83,11 @@ until 16:40 (5-hour window past the reserve's line, 70%)` past `[threads] reserv
 claude: no reading yet; background work bounded by the daily counts` before Fronde's first turn,
 or `usage: cannot read (…)` when the stored reading does not read, and the check goes on (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)); the start log prints
 the same line; then who signs in, `users: alix (admin, account alix), marie (account marie), paul
-(no account: no agent)` (see [`[users.<name>]`](configuration.md#usersname); for the legacy form,
+(no account)` (see [`[users.<name>]`](configuration.md#usersname); for the legacy form,
 `users: alix (admin, account claude)`); then one line per [account](configuration.md#accountsname), never with its
-token: `account alix (claude, owner alix): stored secret claude_alix opens, for
+token (it first refuses, with `[accounts]`, a sign-in variable in its environment that no account
+names, and two people's credentials holding the same value, naming the keys):
+`account alix (claude, owner alix): stored secret claude_alix opens, for
 https://api.anthropic.com` (opened as the agent's start opens it, from the database read-only),
 `account alix (claude, owner alix): token from the file /run/secrets/claude, read` or `… from the
 environment variable CLAUDE_TOKEN, read`; for the [legacy form](configuration.md#the-legacy-form),

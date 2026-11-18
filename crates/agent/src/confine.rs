@@ -20,14 +20,13 @@ pub const SUBCOMMAND: &str = "__confine";
 /// The variables the agent keeps from Fronde's environment, by name or by prefix (ending in `*`):
 /// the `PATH`, the locale and time zone, Claude's own settings and token, proxies and CA
 /// certificates. Fronde sets `HOME` and `TMPDIR`; `[agent] env` adds its own names.
-pub const KEEP_ENV: [&str; 18] = [
+pub const KEEP_ENV: [&str; 17] = [
     "PATH",
     "LANG",
     "LANGUAGE",
     "LC_*",
     "TZ",
     "CLAUDE_*",
-    "ANTHROPIC_*",
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
@@ -73,7 +72,8 @@ pub struct Policy {
     pub cwd: PathBuf,
     /// Variables kept, by exact name or by a prefix ending in `*`; every other one is dropped.
     pub keep_env: Vec<String>,
-    /// Exact names dropped even when `keep_env` matches them: Fronde's `{ env }` secrets.
+    /// Names dropped even when `keep_env` matches them, exact or a prefix ending in `*`:
+    /// Fronde's `{ env }` secrets and the providers' sign-in variables.
     pub drop_env: Vec<String>,
     /// The Landlock sandbox; `None` (`[agent] sandbox = false`) runs the agent unconfined.
     pub sandbox: Option<Sandbox>,
@@ -105,14 +105,17 @@ impl Policy {
 
     /// Whether the agent gets the variable `name`.
     pub fn keeps(&self, name: &str) -> bool {
-        !self.drop_env.iter().any(|dropped| dropped == name)
-            && self
-                .keep_env
-                .iter()
-                .any(|pattern| match pattern.strip_suffix('*') {
-                    Some(prefix) => !prefix.is_empty() && name.starts_with(prefix),
-                    None => pattern == name,
-                })
+        !self.drop_env.iter().any(|dropped| matches(dropped, name))
+            && self.keep_env.iter().any(|pattern| matches(pattern, name))
+    }
+}
+
+/// Whether `name` is `pattern`, or starts with it when it ends in `*` (a lone `*` matches
+/// nothing).
+fn matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => !prefix.is_empty() && name.starts_with(prefix),
+        None => pattern == name,
     }
 }
 
@@ -225,7 +228,7 @@ impl Confine {
         let manager = |name: &str| {
             self.scope.is_some()
                 && MANAGER_ENV.contains(&name)
-                && !policy.drop_env.iter().any(|dropped| dropped == name)
+                && !policy.drop_env.iter().any(|dropped| matches(dropped, name))
         };
         for (name, _) in std::env::vars_os() {
             if let Some(name) = name.to_str()
@@ -1224,16 +1227,13 @@ mod tests {
     #[test]
     fn keep_env_is_an_allow_list() {
         let policy = confine(false).policy;
-        for kept in [
-            "PATH",
-            "LANG",
-            "LC_ALL",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-        ] {
+        for kept in ["PATH", "LANG", "LC_ALL", "CLAUDE_CODE_OAUTH_TOKEN"] {
             assert!(policy.keeps(kept), "{kept}");
         }
         for dropped in [
+            // Where the agent's API is, or its key: never from Fronde's environment.
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
             "XDG_RUNTIME_DIR",
             "DBUS_SESSION_BUS_ADDRESS",
             "CREDENTIALS_DIRECTORY",
@@ -1250,6 +1250,10 @@ mod tests {
         let mut policy = policy;
         policy.drop_env.push("CLAUDE_FRONDE_TOKEN".into());
         assert!(!policy.keeps("CLAUDE_FRONDE_TOKEN"));
+        // So is every variable a dropped prefix matches, and only those.
+        policy.drop_env.push("CLAUDE_CODE_USE_*".into());
+        assert!(!policy.keeps("CLAUDE_CODE_USE_BEDROCK"));
+        assert!(policy.keeps("CLAUDE_CODE_EXECUTABLE"));
         // A lone `*` keeps nothing.
         policy.keep_env = vec!["*".into()];
         assert!(!policy.keeps("PATH"));

@@ -349,8 +349,11 @@ web ones is refused by the configuration check: widening it is a deliberate code
 Fronde does not start the agent directly: it starts its own binary as `fronde __confine`, which
 prepares the process and then replaces itself with the agent, keeping the same process, pipes and
 process group. The agent does not inherit Fronde's environment. It keeps only an allow list:
-`PATH`, the locale and `TZ`, `CLAUDE_*` and `ANTHROPIC_*` (where the Claude token is), the proxy
-and CA certificate variables, and the names `[agent] env` sets. Fronde sets `HOME` to the agent's
+`PATH`, the locale and `TZ`, `CLAUDE_*`, the proxy and CA certificate variables, and the names
+`[agent] env` sets. It never inherits a variable that decides how it signs in:
+`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_*` (an API key, another address for the API),
+`CLAUDE_CODE_USE_*` (another cloud) and `AWS_BEARER_TOKEN_BEDROCK`; its token is only the one
+Fronde gives it, its account's. Fronde sets `HOME` to the agent's
 own home, its thread's (`<data>/home` for the main thread, `<data>/threads/<id>/home` for another),
 and `TMPDIR` to that home's `tmp`. Every other variable is dropped,
 among them `XDG_*` and `DBUS_*`, which point at your session's directories and buses,
@@ -361,8 +364,8 @@ paths only.
 
 Two secrets reach the agent, both through its environment, which only your user can read:
 
-- `[agent] oauth_token`, its Claude sign-in, as `CLAUDE_CODE_OAUTH_TOKEN`, read again at each
-  start;
+- its account's token (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)),
+  its Claude sign-in, as `CLAUDE_CODE_OAUTH_TOKEN`, read again at each start;
 - the token it calls the hub's `/mcp` with, as `FRONDE_HUB_TOKEN`: its own, made for this agent
   process (see [Threads](#threads)). The ACP adapter hands the session's MCP servers to Claude
   Code on its command line, which every user of the machine can read in `/proc`, so the header
@@ -404,8 +407,8 @@ thread's first message, with its own directories, its own sandbox and its own hu
   an agent can signal another (stop or kill a sibling), as it can Fronde itself; the start log's
   `agent sandbox:` line says which ABI applies.
 - **Sign-in.** A thread other than the main one has a fresh home, without a `/login` in it: the
-  token of `[agent] oauth_token` (or `CLAUDE_CODE_OAUTH_TOKEN` kept from Fronde's environment)
-  signs every thread in.
+  owner's account's token (`[accounts]`, or the legacy `[agent] oauth_token` or
+  `CLAUDE_CODE_OAUTH_TOKEN` read from Fronde's environment) signs every thread in.
 - **Token.** Each start of an agent process gets a new hub token, 256 random bits, only in
   memory and in that process's environment, never on a command line or in the log. The hub's
   gate knows the thread by this token and by nothing else: no argument, header, `clientInfo`
