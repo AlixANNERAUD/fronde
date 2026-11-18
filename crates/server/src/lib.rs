@@ -1066,7 +1066,6 @@ pub async fn start_signed_in_as(
              {{ env = \"CLAUDE_CODE_OAUTH_TOKEN\" }}"
         );
     }
-    let owner_token = owner_account.and_then(|account| Some((account.name, account.token?)));
     let budget = budget(&config);
     warn_if_keychain_off();
     let backends = config.master_key_backends()?;
@@ -1119,11 +1118,24 @@ pub async fn start_signed_in_as(
     // The chat's assistant and its requests come first: the hub's tools ask through them.
     let chat = match password {
         Some((password, secure_cookie)) => {
-            // The accounts the threads may spend: the owner's, the one user so far.
-            let accounts: Vec<String> = fronde_hub::config::PROVIDERS
-                .iter()
-                .map(|provider| Threads::account(&user, provider))
-                .collect();
+            // Each person's account per provider, its token read at each start of an agent of
+            // theirs. The configuration is read once per run: a reload would have to stop the
+            // agents of every person whose account changed.
+            let mut bindings = fronde_agent::threads::Accounts::default();
+            for account in config.accounts() {
+                let token = account.token.map(|token| {
+                    account_token(account.name.clone(), token, db.clone(), backends.clone())
+                });
+                bindings.insert(
+                    &account.owner,
+                    &account.provider,
+                    fronde_agent::threads::Binding {
+                        account: account.name,
+                        token,
+                    },
+                );
+            }
+            let accounts = bindings.names();
             let main = thread_dirs(&data_dir, ThreadId::MAIN);
             for dir in [&main.work, &main.home] {
                 fronde_hub::private::create_dir_all(dir).with_context(|| {
@@ -1142,20 +1154,22 @@ pub async fn start_signed_in_as(
                 home: main.home,
                 hub_url: format!("http://{}/mcp", reachable(addr)),
                 hub_token: SecretString::from(String::new()),
-                oauth_token: owner_token.map(|(account, token)| {
-                    account_token(account, token, db.clone(), backends.clone())
-                }),
+                // Each thread's is its owner's account's: see `Threads::open_for`.
+                oauth_token: None,
                 system_prompt: system_prompt(&user),
                 builtin_tools: agent.builtin_tools,
                 // The latest usage reading per account, from every agent process.
                 usage: Some(fronde_agent::usage::UsageBook::load(db.clone(), &accounts).await),
-                // `Threads::open_with` gives each thread its owner's.
-                account: accounts[0].clone(),
+                // `Threads::open_for` gives each thread its owner's.
+                account: String::new(),
             };
             if let Some(book) = &spec.usage {
                 let readings: Vec<_> = fronde_hub::config::PROVIDERS
                     .iter()
-                    .map(|provider| (*provider, book.get(&Threads::account(&user, provider))))
+                    .map(|provider| {
+                        let account = bindings.of(&user, provider).map(|b| b.account.as_str());
+                        (*provider, account.and_then(|account| book.get(account)))
+                    })
                     .collect();
                 tracing::info!(
                     "usage: {}",
@@ -1170,17 +1184,14 @@ pub async fn start_signed_in_as(
             // Each thread acts for its row's owner, among the configured users; the main thread
             // is the owner's, `[data] user`.
             let prompt: fronde_agent::threads::SystemPrompt = Arc::new(system_prompt);
-            let threads = Threads::open_for(
-                db.clone(),
-                &data_dir,
-                spec,
-                connector,
+            let people = fronde_agent::threads::People {
                 users,
-                &user,
-                Some(prompt),
-                budget,
-            )
-            .await?;
+                owner: user.clone(),
+                prompt: Some(prompt),
+                accounts: bindings,
+            };
+            let threads =
+                Threads::open_for(db.clone(), &data_dir, spec, connector, people, budget).await?;
             let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
             let requests = Requests::open_with(db.clone(), threads.clone(), Some(secrets)).await?;
             threads.set_requests(&requests).await;

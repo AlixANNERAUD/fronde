@@ -34,7 +34,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 pub use fronde_protocol::ThreadId;
 
-use crate::acp::{AgentSpec, Model};
+use crate::acp::{AgentSpec, Model, OauthToken};
 use crate::assistant::{self, Assistant, Connector, Shared, TOPIC};
 use crate::legacy;
 use crate::log::{Event, TurnOutcome, new_log_id, new_stream};
@@ -360,6 +360,81 @@ struct Tail {
     at: Option<DateTime<Utc>>,
 }
 
+/// Which thread a spec is bound for.
+struct Bound<'a> {
+    id: ThreadId,
+    owner: &'a str,
+    provider: &'a str,
+    sub_agent: bool,
+    /// Its own directories; `None` keeps the base's, the main thread's.
+    dirs: Option<ThreadDirs>,
+}
+
+/// `base` bound for one thread: its directories, its system prompt (a sub-agent's own, else
+/// `prompt` for its owner, else the base's) and its owner's account on its provider. Only that
+/// account's token signs it in. An owner who is not a user, or has no account there, gets a
+/// sign-in that fails before any process starts ([`NoOwner`], [`crate::acp::NoAccount`]):
+/// nothing falls back to anyone else's account.
+fn bound_spec(
+    base: &AgentSpec,
+    users: &Users,
+    accounts: &Accounts,
+    prompt: Option<&SystemPrompt>,
+    bound: Bound<'_>,
+) -> AgentSpec {
+    let Bound {
+        id,
+        owner,
+        provider,
+        sub_agent,
+        dirs,
+    } = bound;
+    let system_prompt = match (sub_agent, prompt) {
+        (true, _) => children::SYSTEM_PROMPT.to_owned(),
+        (false, Some(prompt)) => prompt(owner),
+        (false, None) => base.system_prompt.clone(),
+    };
+    let (oauth_token, account) = match (users.get(owner), accounts.of(owner, provider)) {
+        (None, _) => {
+            let owner = owner.to_owned();
+            (
+                Some(crate::acp::oauth_token(move || {
+                    let error = NoOwner(owner.clone());
+                    async move { Err(error.into()) }
+                })),
+                String::new(),
+            )
+        }
+        (Some(_), Some(binding)) => (binding.token.clone(), binding.account.clone()),
+        (Some(_), None) => {
+            let error = crate::acp::NoAccount {
+                owner: owner.to_owned(),
+                provider: provider.to_owned(),
+            };
+            (
+                Some(crate::acp::oauth_token(move || {
+                    let error = error.clone();
+                    async move { Err(error.into()) }
+                })),
+                String::new(),
+            )
+        }
+    };
+    let (cwd, home) = match dirs {
+        Some(ThreadDirs { work, home }) => (work, home),
+        None => (base.cwd.clone(), base.home.clone()),
+    };
+    AgentSpec {
+        thread: id,
+        cwd,
+        home,
+        system_prompt,
+        oauth_token,
+        account,
+        ..base.clone()
+    }
+}
+
 /// A thread's owner is no longer a configured user: its agent does not start, and nothing
 /// falls back to another person's.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,6 +500,68 @@ pub struct Holder {
 /// told whose assistant it is.
 pub type SystemPrompt = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+/// The account a person's agents of one provider sign in with: its name, which its usage is kept
+/// under, and its token, read again at each start (`None` only for the legacy form's owner
+/// account without a token: the agent starts unsigned).
+#[derive(Clone)]
+pub struct Binding {
+    pub account: String,
+    pub token: Option<OauthToken>,
+}
+
+impl std::fmt::Debug for Binding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Binding")
+            .field("account", &self.account)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+/// Each person's account per provider: the one lookup from a thread to the token its agent
+/// signs in with. Built once from the configuration; a person without an account for a
+/// provider has none, and nothing falls back to another's.
+#[derive(Clone, Debug, Default)]
+pub struct Accounts {
+    by_owner: HashMap<(String, String), Binding>,
+}
+
+impl Accounts {
+    /// `owner`'s account on `provider` is `binding`.
+    pub fn insert(&mut self, owner: &str, provider: &str, binding: Binding) {
+        self.by_owner
+            .insert((owner.to_owned(), provider.to_owned()), binding);
+    }
+
+    /// `owner`'s account on `provider`, if they have one.
+    pub fn of(&self, owner: &str, provider: &str) -> Option<&Binding> {
+        self.by_owner.get(&(owner.to_owned(), provider.to_owned()))
+    }
+
+    /// Every account's name.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .by_owner
+            .values()
+            .map(|binding| binding.account.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+/// Who the threads are for: the configured users, the owner of the main thread among them, the
+/// system prompt of a thread a user started, and each person's accounts.
+pub struct People {
+    pub users: Users,
+    /// `[data] user`: the main thread is theirs.
+    pub owner: String,
+    /// `None` keeps the base spec's prompt for every thread.
+    pub prompt: Option<SystemPrompt>,
+    pub accounts: Accounts,
+}
+
 /// The registry as every thread's assistant reaches it: set once it is made; weak, since it
 /// holds the assistants.
 pub(crate) type Registry = Arc<OnceLock<Weak<Threads>>>;
@@ -448,6 +585,8 @@ pub struct Threads {
     prompt: Option<SystemPrompt>,
     /// The owner of each thread opened so far, as [`Threads::user_of`] read it at its opening.
     owners: Mutex<HashMap<ThreadId, User>>,
+    /// Each person's account per provider.
+    accounts: Accounts,
     main: Arc<Assistant>,
     /// The threads opened so far, the main one among them. Locked while one is opened, so that
     /// a thread is never opened twice.
@@ -494,40 +633,70 @@ impl Threads {
         owner: User,
         budget: Budget,
     ) -> anyhow::Result<Arc<Self>> {
-        let name = owner.name.clone();
-        let users = std::iter::once(owner).collect();
-        Self::open_for(db, data_dir, spec, connector, users, &name, None, budget).await
+        // One person, whose account is the spec's own.
+        let mut accounts = Accounts::default();
+        accounts.insert(
+            &owner.name,
+            spec.provider.id,
+            Binding {
+                account: spec.account.clone(),
+                token: spec.oauth_token.clone(),
+            },
+        );
+        let people = People {
+            owner: owner.name.clone(),
+            users: std::iter::once(owner).collect(),
+            prompt: None,
+            accounts,
+        };
+        Self::open_for(db, data_dir, spec, connector, people, budget).await
     }
 
-    /// [`Threads::open_with`] for the people `users`, `owner` (the configuration makes them an
-    /// admin among them) owning the main thread: each thread acts for its row's owner, its root threads told so by `prompt`
-    /// when given. A thread whose owner is not in `users` opens read-only: its agent never
-    /// starts.
-    #[allow(clippy::too_many_arguments)]
+    /// [`Threads::open_with`] for `people`: each thread acts for its row's owner, its root
+    /// threads told so by `people.prompt` when given, and its agent signs in with that owner's
+    /// account for the thread's provider, looked up at each start: never another's. A thread
+    /// whose owner has no account starts no agent; one whose owner is not a user opens
+    /// read-only. `spec`'s own token is not used.
     pub async fn open_for(
         db: DatabaseConnection,
         data_dir: &Path,
         spec: AgentSpec,
         connector: Connector,
-        users: Users,
-        owner: &str,
-        prompt: Option<SystemPrompt>,
+        people: People,
         budget: Budget,
     ) -> anyhow::Result<Arc<Self>> {
+        let People {
+            users,
+            owner,
+            prompt,
+            accounts,
+        } = people;
+        let owner = owner.as_str();
         legacy::import(&db, data_dir, TOPIC, LEGACY_SESSION).await?;
         ensure_main(&db, owner, spec.provider.id)
             .await
             .context("cannot make the main thread in the database")?;
-        // The main thread is the owner's.
+        // The base every thread's spec is made from holds no token: each is its owner's.
         let spec = AgentSpec {
             thread: ThreadId::MAIN,
-            account: Self::account(owner, spec.provider.id),
-            system_prompt: match &prompt {
-                Some(prompt) => prompt(owner),
-                None => spec.system_prompt,
-            },
+            oauth_token: None,
+            account: String::new(),
             ..spec
         };
+        // The main thread is the owner's.
+        let main_spec = bound_spec(
+            &spec,
+            &users,
+            &accounts,
+            prompt.as_ref(),
+            Bound {
+                id: ThreadId::MAIN,
+                owner,
+                provider: spec.provider.id,
+                sub_agent: false,
+                dirs: None,
+            },
+        );
         let tokens = Tokens::new();
         let pool = Pool::new(budget);
         let changes = Changes::new();
@@ -546,7 +715,7 @@ impl Threads {
         let (main, _) = Assistant::open(
             ThreadId::MAIN,
             TOPIC.into(),
-            spec.clone(),
+            main_spec,
             shared,
             false,
             true,
@@ -571,6 +740,7 @@ impl Threads {
             )])),
             users,
             prompt,
+            accounts,
             open: tokio::sync::Mutex::new(HashMap::from([(ThreadId::MAIN, main.clone())])),
             main,
             requests: OnceLock::new(),
@@ -740,48 +910,38 @@ impl Threads {
     }
 
     /// The subscription account the threads `owner` owns spend on `provider`: the key of their
-    /// usage readings, of the owner's reserve and of the daily counts that stand in for it, and
-    /// the account their agents sign in with. The one lookup from a thread to its account. Today
-    /// a provider has one account, whose id is the provider's (`claude`), whoever the owner: the
-    /// readings stored before accounts still read. Per-person accounts replace this function.
-    pub fn account(owner: &str, provider: &str) -> String {
-        let _ = owner;
-        provider.to_owned()
+    /// usage readings, of the reserve kept for them and of the daily counts that stand in for
+    /// it, and the account their agents sign in with. The one lookup from a thread to its
+    /// account; `None` when `owner` has none on `provider`, and then nothing runs on any.
+    pub fn account(&self, owner: &str, provider: &str) -> Option<String> {
+        self.accounts
+            .of(owner, provider)
+            .map(|binding| binding.account.clone())
     }
 
-    /// How thread `row`'s agent starts: the main thread's spec, with another thread's own
-    /// directories and scope name, a sub-agent's own system prompt or its owner's, and its
-    /// owner's account. A thread whose owner is no longer configured gets a sign-in that fails
-    /// before any process starts.
+    /// Every configured account's name.
+    pub fn account_names(&self) -> Vec<String> {
+        self.accounts.names()
+    }
+
+    /// How thread `row`'s agent starts: the base spec, with the thread's own directories (the
+    /// base's for the main thread) and scope name, a sub-agent's own system prompt or its
+    /// owner's, and its owner's account for its provider: see [`bound_spec`].
     fn spec_for(&self, row: &ThreadRow) -> AgentSpec {
-        let id = row.id;
-        if id == ThreadId::MAIN {
-            return self.spec.clone();
-        }
-        let ThreadDirs { work, home } = thread_dirs(&self.data_dir, id);
-        let system_prompt = match (&row.parent, &self.prompt) {
-            (Some(_), _) => children::SYSTEM_PROMPT.to_owned(),
-            (None, Some(prompt)) => prompt(&row.owner),
-            (None, None) => self.spec.system_prompt.clone(),
-        };
-        let oauth_token = if self.configured(row) {
-            self.spec.oauth_token.clone()
-        } else {
-            let owner = row.owner.clone();
-            Some(crate::acp::oauth_token(move || {
-                let owner = owner.clone();
-                async move { Err(NoOwner(owner).into()) }
-            }))
-        };
-        AgentSpec {
-            thread: id,
-            cwd: work,
-            home,
-            system_prompt,
-            oauth_token,
-            account: Self::account(&row.owner, &row.provider),
-            ..self.spec.clone()
-        }
+        let dirs = (row.id != ThreadId::MAIN).then(|| thread_dirs(&self.data_dir, row.id));
+        bound_spec(
+            &self.spec,
+            &self.users,
+            &self.accounts,
+            self.prompt.as_ref(),
+            Bound {
+                id: row.id,
+                owner: &row.owner,
+                provider: &row.provider,
+                sub_agent: row.parent.is_some(),
+                dirs,
+            },
+        )
     }
 
     /// The thread whose agent process holds the hub token `given`, with its stream and running

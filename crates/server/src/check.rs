@@ -239,8 +239,17 @@ async fn stored_usage(
     };
     let mut readings = Vec::new();
     let mut failed = None;
+    let accounts = config.accounts();
     for provider in fronde_hub::config::PROVIDERS {
-        let account = fronde_agent::threads::Threads::account(&config.data.user, provider);
+        // The owner's account on this provider; without one, nothing of theirs runs on it.
+        let Some(account) = accounts
+            .iter()
+            .find(|account| account.owner == config.data.user && account.provider == provider)
+            .map(|account| account.name.clone())
+        else {
+            readings.push((provider, None));
+            continue;
+        };
         let reading = match &db {
             Some(db) => match fronde_agent::usage::read_usage(db, &account).await {
                 Ok(reading) => reading,

@@ -75,10 +75,12 @@ adapter's install, so `read` grants the directory the installed Claude Code live
    prints a long-lived token.
 2. Give it to the container as the `CLAUDE_CODE_OAUTH_TOKEN` environment variable, with
    `-e CLAUDE_CODE_OAUTH_TOKEN` as in [Run in Docker](run-in-docker.md), or through your
-   orchestrator's secrets. The agent keeps that variable from Fronde's environment. To name it
-   as a secret instead, so that Fronde reads it at each start, set
-   `oauth_token = { env = "CLAUDE_CODE_OAUTH_TOKEN" }` under `[agent]`, or use a mounted file
-   with `{ file = "…" }`.
+   orchestrator's secrets. Fronde reads it as your account's token at each start of an agent
+   (the agent never inherits it), and warns that you should name it: set
+   `oauth_token = { env = "CLAUDE_CODE_OAUTH_TOKEN" }` in your
+   [`[accounts.<name>]`](../reference/configuration.md#accountsname), or use a mounted file with
+   `{ file = "…" }`. With `[accounts]`, an inherited variable that no account names stops
+   Fronde at start.
 
 Never put the token in `fronde.toml`: `[agent] env` is written in plain text and is meant for
 settings, not secrets.

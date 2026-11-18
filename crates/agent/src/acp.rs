@@ -84,6 +84,27 @@ impl fmt::Display for SignInMissing {
 
 impl std::error::Error for SignInMissing {}
 
+/// The thread's owner has no account for its provider: no agent starts, and nothing falls back
+/// to another person's account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoAccount {
+    pub owner: String,
+    pub provider: String,
+}
+
+impl fmt::Display for NoAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} has no {} account: no agent starts for their threads; the admin adds one in \
+             [accounts]",
+            self.owner, self.provider
+        )
+    }
+}
+
+impl std::error::Error for NoAccount {}
+
 /// How to start the agent and what its session gets.
 #[derive(Clone)]
 pub struct AgentSpec {

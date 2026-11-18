@@ -519,6 +519,8 @@ pub enum Delegation {
     Provider { given: String, configured: String },
     /// The caller's turn that made the call ended before it went through.
     TurnOver,
+    /// The thread's owner has no account on the provider: no sub-agent runs for them.
+    NoAccount { owner: String, provider: String },
     /// The owner's reserve of a subscription window is reached (`[threads] reserve`): `window`,
     /// its use in percent and status as read, the reserve in percent and when the window resets.
     Reserve {
@@ -596,6 +598,11 @@ impl std::fmt::Display for Delegation {
             ),
             Self::TurnOver => f.write_str(
                 "your turn ended before this call went through: nothing was started or sent",
+            ),
+            Self::NoAccount { owner, provider } => write!(
+                f,
+                "{owner} has no {provider} account, so no sub-agent runs for this conversation; \
+                 do the task yourself"
             ),
             Self::Reserve {
                 window,
@@ -695,13 +702,22 @@ impl Threads {
         };
         self.providers()
             .into_iter()
-            .filter_map(|provider| book.get(&Self::account(user, provider)))
+            .filter_map(|provider| book.get(&self.account(user, provider)?))
             .collect()
     }
 
     /// Moves on each new usage reading; `None` without a usage book.
     pub fn usage_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         self.spec.usage.as_ref().map(|book| book.changes())
+    }
+
+    /// `owner`'s account on `provider`, or [`Delegation::NoAccount`].
+    fn account_or_refuse(&self, owner: &str, provider: &str) -> Result<String, Delegation> {
+        self.account(owner, provider)
+            .ok_or_else(|| Delegation::NoAccount {
+                owner: owner.to_owned(),
+                provider: provider.to_owned(),
+            })
     }
 
     /// Refuses background work past the owner's reserve of `account`; whether the daily counts
@@ -795,7 +811,7 @@ impl Threads {
             .await?;
         let on_account = started
             .iter()
-            .filter(|(owner, provider)| Self::account(owner, provider) == account)
+            .filter(|(owner, provider)| self.account(owner, provider).as_deref() == Some(account))
             .count();
         Ok(u64::try_from(on_account).unwrap_or(u64::MAX))
     }
@@ -822,7 +838,7 @@ impl Threads {
         if by_topic.is_empty() {
             return Ok(0);
         }
-        let accounts: HashMap<String, String> = threads::Entity::find()
+        let accounts: HashMap<String, Option<String>> = threads::Entity::find()
             .select_only()
             .column(threads::Column::Topic)
             .column(threads::Column::Owner)
@@ -832,11 +848,15 @@ impl Threads {
             .all(&self.db)
             .await?
             .into_iter()
-            .map(|(topic, owner, provider)| (topic, Self::account(&owner, &provider)))
+            .map(|(topic, owner, provider)| (topic, self.account(&owner, &provider)))
             .collect();
         Ok(by_topic
             .into_iter()
-            .filter(|(topic, _)| accounts.get(topic).is_some_and(|on| on == account))
+            .filter(|(topic, _)| {
+                accounts
+                    .get(topic)
+                    .is_some_and(|on| on.as_deref() == Some(account))
+            })
             .map(|(_, turns)| u64::try_from(turns).unwrap_or(0))
             .sum())
     }
@@ -983,8 +1003,9 @@ impl Threads {
         let origin = self.opened(parent).await?.origin_of(turn).await?;
         // Under the start lock: two starts never both pass. The owner's reserve first, from
         // Fronde's own book: nothing the agent says changes it.
-        // The sub-agent spends the account of its parent's owner on its provider.
-        let account = Self::account(&parent_row.owner, &provider);
+        // The sub-agent spends the account of its parent's owner on its provider, and runs on
+        // nothing when that owner has none.
+        let account = self.account_or_refuse(&parent_row.owner, &provider)?;
         let counts = self.check_reserve(&account)?;
         let limits = self.limits();
         let kept = self.kept_children(parent).await?;
@@ -1133,7 +1154,7 @@ impl Threads {
         // sub-agent itself is idle, or the send is refused below as busy.
         let _starting = self.children.starting.lock().await;
         self.check_delegate(caller).await?;
-        let account = Self::account(&row.owner, &row.provider);
+        let account = self.account_or_refuse(&row.owner, &row.provider)?;
         let counts = self.check_reserve(&account)?;
         let kept = self.kept_children(caller).await?;
         let limit = self.limits().children_running;

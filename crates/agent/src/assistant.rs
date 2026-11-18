@@ -35,6 +35,14 @@ const BUSY: &str = "Fronde répond encore ; attends la fin ou arrête-la.";
 const NEW_CONVERSATION: &str =
     "Nouvelle conversation avec l'agent : l'ancienne n'a pas pu être reprise.";
 const NO_START: &str = "L'agent ne répond pas au démarrage.";
+/// The thread's owner has no subscription of their own on its provider.
+pub const NO_ACCOUNT: &str =
+    "Aucun abonnement Claude n'est relié à ton compte : demande à l'administrateur.";
+/// The owner's subscription is named, its token not stored yet.
+pub const NOT_CONNECTED: &str =
+    "Ton abonnement Claude n'est pas encore connecté : demande à l'administrateur.";
+/// The thread's owner is no longer a user.
+pub const NO_OWNER: &str = "Cette conversation appartient à une personne qui n'a plus de compte : elle est en lecture seule.";
 const NOT_INSTALLED: &str = "Impossible de démarrer l'agent : lance `mise run agent` ou indique son chemin dans [agent] command.";
 const SIGNED_OUT: &str =
     "L'agent n'est pas connecté à Claude : voir le README (claude setup-token).";
@@ -1540,11 +1548,21 @@ impl Assistant {
                 })?;
             }
         }
+        // The owner's account's token, read at each start and before anything starts: without
+        // one (no account, not connected, an owner no longer configured), no hub token is
+        // made and no process starts.
+        let mut spec = self.spec.clone();
+        if let Some(read) = &self.spec.oauth_token {
+            let token = read().await?;
+            spec.oauth_token = Some(crate::acp::oauth_token(move || {
+                let token = token.clone();
+                async move { Ok(token) }
+            }));
+        }
         let saved = self.saved_session_id().await;
         // A new process holds no lasting permission yet.
         self.lasting.store(false, Ordering::SeqCst);
         let mut lease = self.tokens.issue(self.thread)?;
-        let mut spec = self.spec.clone();
         // Only the spec, dropped once the agent started, holds the token itself.
         spec.hub_token = lease
             .take_token()
@@ -1934,6 +1952,25 @@ fn duration_text(duration: Duration) -> String {
 fn notice_for(error: &anyhow::Error) -> String {
     if error.is::<StartTimeout>() {
         return NO_START.into();
+    }
+    // Who signs the agent in, said plainly to its owner.
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::acp::NoAccount>())
+    {
+        return NO_ACCOUNT.into();
+    }
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::acp::SignInMissing>())
+    {
+        return NOT_CONNECTED.into();
+    }
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::threads::NoOwner>())
+    {
+        return NO_OWNER.into();
     }
     // A limit says when turns run again.
     if let Some(limited) = error.downcast_ref::<crate::usage::RateLimited>() {

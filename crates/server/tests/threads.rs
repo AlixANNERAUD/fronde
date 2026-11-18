@@ -6,7 +6,7 @@ use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::{Assistant, Connector};
 use fronde_agent::fake::{FakeHandle, FakeScript, fake_agent, text_chunk};
 use fronde_agent::log::Event;
-use fronde_agent::threads::{Budget, StartedBy, ThreadId, Threads, thread_dirs};
+use fronde_agent::threads::{Budget, Limits, StartedBy, ThreadId, Threads, thread_dirs};
 use fronde_db::ephemeral::EphemeralSecrets;
 use fronde_db::master_key::Backends;
 use fronde_hub::Hub;
@@ -37,6 +37,9 @@ const CANARY: &str = "canary-thread-secret-51c2aa";
 
 type Client = RunningService<rmcp::RoleClient, ClientConfig>;
 
+/// Each agent start's thread, account and the token its sign-in read, in order.
+type SignIns = Arc<Mutex<Vec<(ThreadId, String, Option<String>)>>>;
+
 /// A hub served behind the real gate, with the threads of a data directory whose agents are fake,
 /// and two test tools: `test_whoami`, which returns its call's context, and `test_take_secret`,
 /// which takes an ephemeral secret for its caller.
@@ -54,6 +57,8 @@ struct Bench {
     fakes: Arc<Mutex<Vec<FakeHandle>>>,
     /// Each agent start's spec, in order.
     specs: Arc<Mutex<Vec<AgentSpec>>>,
+    /// Each agent start's thread, account and the token its sign-in read, in order.
+    sign_ins: SignIns,
     /// Releases the turns the fake agents hold open.
     gate: Arc<Notify>,
     /// The data directory.
@@ -77,6 +82,23 @@ fn marie() -> User {
         name: "marie".into(),
         admin: false,
     }
+}
+
+/// A family member without an account of her own.
+fn paul() -> User {
+    User {
+        name: "paul".into(),
+        admin: false,
+    }
+}
+
+/// The made-up tokens of the bench's accounts: the owner's, `claude`, and Marie's, `marie`.
+const ALIX_TOKEN: &str = "token-of-alix";
+const MARIE_TOKEN: &str = "token-of-marie";
+
+/// A sign-in that reads `value`, as an account's token reads.
+fn token_reading(value: &'static str) -> fronde_agent::acp::OauthToken {
+    fronde_agent::acp::oauth_token(move || async move { Ok(SecretString::from(value)) })
 }
 
 /// The system prompt of a thread a user started, as the bench's threads give it.
@@ -104,8 +126,10 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
     let starts: Arc<Mutex<Vec<(ThreadId, String)>>> = Arc::default();
     let fakes: Arc<Mutex<Vec<FakeHandle>>> = Arc::default();
     let specs: Arc<Mutex<Vec<AgentSpec>>> = Arc::default();
+    let sign_ins: SignIns = Arc::default();
     let connector: Connector = Arc::new({
         let (starts, fakes, specs) = (starts.clone(), fakes.clone(), specs.clone());
+        let sign_ins = sign_ins.clone();
         move |spec: &AgentSpec, resume, events| {
             starts
                 .lock()
@@ -117,8 +141,17 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
                 Some(child) if spec.system_prompt.contains("sub-agent") => child.clone(),
                 _ => script.clone(),
             };
-            let (spec, fakes) = (spec.clone(), fakes.clone());
+            let (spec, fakes, sign_ins) = (spec.clone(), fakes.clone(), sign_ins.clone());
             Box::pin(async move {
+                // What the agent's sign-in variable would hold.
+                let token = match &spec.oauth_token {
+                    Some(read) => Some(read().await?.expose_secret().to_owned()),
+                    None => None,
+                };
+                sign_ins
+                    .lock()
+                    .unwrap()
+                    .push((spec.thread, spec.account.clone(), token));
                 let (transport, handle) = fake_agent(script);
                 fakes.lock().unwrap().push(handle);
                 AgentClient::connect(transport, &spec, resume, events).await
@@ -142,20 +175,32 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         usage: Some(usage.clone()),
         account: "claude".into(),
     };
-    // The owner, an admin, and a family member.
+    // The owner, an admin, and two family members, one of whom has no account. The owner's
+    // account keeps the legacy name, which the usage readings stored before accounts have.
     let prompt: fronde_agent::threads::SystemPrompt = Arc::new(prompt_for);
-    let threads = Threads::open_for(
-        db.clone(),
-        &data,
-        spec,
-        connector,
-        [alix(), marie()].into_iter().collect(),
-        "alix",
-        Some(prompt),
-        budget,
-    )
-    .await
-    .unwrap();
+    let mut accounts = fronde_agent::threads::Accounts::default();
+    for (owner, account, token) in [
+        ("alix", "claude", ALIX_TOKEN),
+        ("marie", "marie", MARIE_TOKEN),
+    ] {
+        accounts.insert(
+            owner,
+            "claude",
+            fronde_agent::threads::Binding {
+                account: account.into(),
+                token: Some(token_reading(token)),
+            },
+        );
+    }
+    let people = fronde_agent::threads::People {
+        users: [alix(), marie(), paul()].into_iter().collect(),
+        owner: "alix".into(),
+        prompt: Some(prompt),
+        accounts,
+    };
+    let threads = Threads::open_for(db.clone(), &data, spec, connector, people, budget)
+        .await
+        .unwrap();
     let ephemeral = Arc::new(EphemeralSecrets::new());
     let store = SecretStore::new(
         Backends::file(dir.path().join("master.key")),
@@ -250,6 +295,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         starts,
         fakes,
         specs,
+        sign_ins,
         gate: Arc::new(Notify::new()),
         data,
         usage,
@@ -1802,7 +1848,7 @@ async fn children_running_at_once_are_capped() {
 
 #[tokio::test]
 async fn children_kept_are_capped() {
-    use fronde_agent::threads::{Delegation, Limits};
+    use fronde_agent::threads::Delegation;
     // The documented default is 200: a guard against clutter. A smaller one, configured, is
     // enforced the same way.
     assert_eq!(Limits::default().children_kept, 200);
@@ -2177,7 +2223,7 @@ fn the_limits_come_from_threads_config() {
 /// refusal names the setting.
 #[tokio::test]
 async fn max_depth_zero_turns_sub_agents_off() {
-    use fronde_agent::threads::{Delegation, Limits};
+    use fronde_agent::threads::Delegation;
     let bench = limited(
         None,
         Limits {
@@ -2209,7 +2255,7 @@ async fn max_depth_zero_turns_sub_agents_off() {
 /// A configured `children_running` is the cap, named in the refusal.
 #[tokio::test]
 async fn children_running_limit() {
-    use fronde_agent::threads::{Delegation, Limits};
+    use fronde_agent::threads::Delegation;
     let bench = limited(
         None,
         Limits {
@@ -2239,7 +2285,7 @@ async fn children_running_limit() {
 /// included: archiving frees no place in it.
 #[tokio::test]
 async fn children_per_day_limit() {
-    use fronde_agent::threads::{Delegation, Limits};
+    use fronde_agent::threads::Delegation;
     let bench = limited(
         None,
         Limits {
@@ -2345,7 +2391,7 @@ async fn child_turn_times_out() {
 /// its own, which may not.
 #[tokio::test]
 async fn cancel_reaches_grandchildren() {
-    use fronde_agent::threads::{Delegation, Limits};
+    use fronde_agent::threads::Delegation;
     let bench = limited(
         Some(asking()),
         Limits {
@@ -2778,7 +2824,7 @@ async fn archive_revokes_the_tokens_under_it() {
 /// place.
 #[tokio::test]
 async fn children_per_day_forgets_the_day_before() {
-    use fronde_agent::threads::{Delegation, Limits};
+    use fronde_agent::threads::Delegation;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
     let bench = limited(
         None,
@@ -2825,7 +2871,7 @@ async fn children_per_day_forgets_the_day_before() {
 /// much as a `threads_start`, over the last 24 hours.
 #[tokio::test]
 async fn child_turns_per_day_counts_each_send() {
-    use fronde_agent::threads::{Delegation, Limits};
+    use fronde_agent::threads::Delegation;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
     let quick = FakeScript {
         updates: vec![text_chunk("Fait.")],
@@ -3486,35 +3532,236 @@ async fn system_prompt_names_the_owner() {
     bench.gate.notify_waiters();
 }
 
-/// A thread whose owner is no longer a configured user is read-only: its agent's sign-in
-/// fails before any process starts, and its cards would be for nobody who can answer.
+/// Waits until thread `id`'s log holds the notice `text` and a failed turn's end.
+async fn failed_with(bench: &Bench, id: ThreadId, text: &str) {
+    let assistant = bench.assistant(id).await;
+    timeout(WAIT, async {
+        loop {
+            let events = events_of(&assistant);
+            let noticed = events
+                .iter()
+                .any(|event| matches!(event, Event::Notice { text: notice } if notice == text));
+            let failed = events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::TurnEnded {
+                        outcome: TurnOutcome::Error
+                    }
+                )
+            });
+            if noticed && failed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {text:?} in thread {id}: {:?}", events_of(&assistant)));
+}
+
+/// A thread whose owner is no longer a configured user is read-only: its sign-in fails before
+/// anything starts, and nothing falls back to another person's account.
 #[tokio::test]
 async fn a_removed_owners_thread_never_signs_in() {
     let bench = Bench::held().await;
-    let theirs = bench.new_thread_for("paul").await;
+    let theirs = bench.new_thread_for("zoe").await;
     let row = bench.threads.get(theirs).await.unwrap().unwrap();
     assert!(!bench.threads.configured(&row));
     assert_eq!(
-        bench.threads.user_of("paul"),
+        bench.threads.user_of("zoe"),
         User {
-            name: "paul".into(),
+            name: "zoe".into(),
             admin: false,
         }
     );
-    bench.start(theirs).await;
-    let spec = bench
-        .specs
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|spec| spec.thread == theirs)
-        .cloned()
-        .unwrap();
-    let read = spec.oauth_token.expect("a sign-in that fails");
-    let error = read().await.unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<fronde_agent::threads::NoOwner>(),
-        Some(&fronde_agent::threads::NoOwner("paul".into()))
+    bench.assistant(theirs).await.send("Salut".into()).await;
+    failed_with(&bench, theirs, fronde_agent::assistant::NO_OWNER).await;
+    assert!(bench.tokens_of(theirs).is_empty(), "an agent started");
+    assert_eq!(bench.threads.account("zoe", "claude"), None);
+}
+
+/// A person with no account on the thread's provider gets no agent: the connector is never
+/// called, no hub token is made, the notice says why and the turn fails. Their thread cannot
+/// start a sub-agent on anyone's account either.
+#[tokio::test]
+async fn no_account_starts_no_agent() {
+    let bench = Bench::held().await;
+    let his = bench.new_thread_for("paul").await;
+    bench.assistant(his).await.send("Salut".into()).await;
+    failed_with(&bench, his, fronde_agent::assistant::NO_ACCOUNT).await;
+    assert!(bench.tokens_of(his).is_empty(), "an agent started");
+    assert!(
+        !bench
+            .sign_ins
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(thread, ..)| *thread == his)
     );
+    assert_eq!(bench.threads.account("paul", "claude"), None);
+    // Again at the next message: still nothing, and still nobody else's.
+    bench.assistant(his).await.send("Encore".into()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(bench.tokens_of(his).is_empty(), "an agent started");
+}
+
+/// Every start reads its owner's account, and only that: the owner's main and other thread, a
+/// member's thread, her sub-agent and her wake turn. No start of hers ever reads the owner's
+/// token.
+#[tokio::test]
+async fn member_thread_never_gets_the_admin_token() {
+    let child_gate = Arc::new(Notify::new());
+    let bench = held_parent(held(&child_gate)).await;
+    let his = bench.new_thread().await;
+    bench.start(ThreadId::MAIN).await;
+    bench.start(his).await;
+    let hers = bench.new_thread_for("marie").await;
+    let token = bench.start(hers).await;
+    let client = bench.client(&token, "claude-code", &[]).await;
+    let child = start_child(&client, TASK).await;
+    timeout(WAIT, async {
+        while bench.tokens_of(child).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent never started");
+    assert_eq!(
+        bench.threads.get(child).await.unwrap().unwrap().owner,
+        "marie"
+    );
+    // Her turn ends and her agent stops; the sub-agent's result then wakes her thread, whose
+    // agent starts again for the wake turn.
+    let assistant = bench.assistant(hers).await;
+    timeout(WAIT, async {
+        loop {
+            bench.gate.notify_waiters();
+            if assistant.current_turn().await.is_none() && assistant.stop_agent().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("her turn never ended");
+    timeout(WAIT, async {
+        while bench.tokens_of(hers).len() < 2 {
+            child_gate.notify_waiters();
+            bench.gate.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the wake turn never started her agent");
+    let sign_ins = bench.sign_ins.lock().unwrap().clone();
+    let of = |id: ThreadId| -> Vec<(String, Option<String>)> {
+        sign_ins
+            .iter()
+            .filter(|(thread, ..)| *thread == id)
+            .map(|(_, account, token)| (account.clone(), token.clone()))
+            .collect()
+    };
+    let his_sign_in = ("claude".to_owned(), Some(ALIX_TOKEN.to_owned()));
+    let her_sign_in = ("marie".to_owned(), Some(MARIE_TOKEN.to_owned()));
+    assert_eq!(of(ThreadId::MAIN), std::slice::from_ref(&his_sign_in));
+    assert_eq!(of(his), [his_sign_in]);
+    assert_eq!(of(hers), [her_sign_in.clone(), her_sign_in.clone()]);
+    assert_eq!(of(child), [her_sign_in]);
+    let owners: HashMap<ThreadId, String> = [ThreadId::MAIN, his, hers, child]
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                if id == hers || id == child {
+                    "marie"
+                } else {
+                    "alix"
+                }
+                .to_owned(),
+            )
+        })
+        .collect();
+    for (thread, _, token) in &sign_ins {
+        if owners.get(thread).map(String::as_str) == Some("marie") {
+            assert_ne!(token.as_deref(), Some(ALIX_TOKEN), "thread {thread}");
+        }
+    }
+    child_gate.notify_waiters();
     bench.gate.notify_waiters();
+}
+
+/// A sub-agent's sub-agent runs on its root thread's owner's account.
+#[tokio::test]
+async fn sub_agent_keeps_its_root_owner() {
+    let gate = Arc::new(Notify::new());
+    let mut bench = bench_with(
+        held(&gate),
+        None,
+        Budget {
+            max_running: 8,
+            limits: Limits {
+                max_depth: 2,
+                ..Limits::default()
+            },
+            ..Budget::default()
+        },
+    )
+    .await;
+    bench.gate = gate;
+    let hers = bench.new_thread_for("marie").await;
+    let token = bench.start(hers).await;
+    let client = bench.client(&token, "claude-code", &[]).await;
+    let child = start_child(&client, TASK).await;
+    let child_token = token_of(&bench, child).await;
+    let child_client = bench.client(&child_token, "claude-code", &[]).await;
+    let grandchild = start_child(&child_client, TASK).await;
+    token_of(&bench, grandchild).await;
+    for id in [child, grandchild] {
+        assert_eq!(bench.threads.get(id).await.unwrap().unwrap().owner, "marie");
+    }
+    let sign_ins = bench.sign_ins.lock().unwrap().clone();
+    for id in [hers, child, grandchild] {
+        let read: Vec<_> = sign_ins
+            .iter()
+            .filter(|(thread, ..)| *thread == id)
+            .map(|(_, account, token)| (account.as_str(), token.as_deref()))
+            .collect();
+        assert_eq!(read, [("marie", Some(MARIE_TOKEN))], "thread {id}");
+    }
+    bench.gate.notify_waiters();
+}
+
+/// A usage reading from a member's agent is kept under her account, never the owner's.
+#[tokio::test]
+async fn readings_go_to_the_thread_account() {
+    let now = chrono::Utc::now().timestamp();
+    let bench = bench(FakeScript {
+        updates: vec![
+            text_chunk("Bonjour"),
+            fronde_agent::fake::usage_update(json!({
+                "status": "allowed",
+                "resetsAt": now + 7200,
+                "rateLimitType": "five_hour",
+                "utilization": 0.42,
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0.42, "resetsAt": now + 7200, "status": "allowed"},
+                    "seven_day": {"utilization": 0.18, "resetsAt": now + 86400, "status": "allowed"}
+                }
+            })),
+        ],
+        ..FakeScript::default()
+    })
+    .await;
+    let hers = bench.new_thread_for("marie").await;
+    bench.start(hers).await;
+    timeout(WAIT, async {
+        while bench.usage.get("marie").is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no reading under her account");
+    assert!(bench.usage.get("claude").is_none());
+    assert_eq!(bench.threads.usage_of("marie").len(), 1);
+    assert!(bench.threads.usage_of("alix").is_empty());
 }

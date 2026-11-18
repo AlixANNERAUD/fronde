@@ -20,13 +20,12 @@ pub const SUBCOMMAND: &str = "__confine";
 /// The variables the agent keeps from Fronde's environment, by name or by prefix (ending in `*`):
 /// the `PATH`, the locale and time zone, Claude's own settings and token, proxies and CA
 /// certificates. Fronde sets `HOME` and `TMPDIR`; `[agent] env` adds its own names.
-pub const KEEP_ENV: [&str; 17] = [
+pub const KEEP_ENV: [&str; 16] = [
     "PATH",
     "LANG",
     "LANGUAGE",
     "LC_*",
     "TZ",
-    "CLAUDE_*",
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
@@ -1227,11 +1226,15 @@ mod tests {
     #[test]
     fn keep_env_is_an_allow_list() {
         let policy = confine(false).policy;
-        for kept in ["PATH", "LANG", "LC_ALL", "CLAUDE_CODE_OAUTH_TOKEN"] {
+        for kept in ["PATH", "LANG", "LC_ALL"] {
             assert!(policy.keeps(kept), "{kept}");
         }
         for dropped in [
-            // Where the agent's API is, or its key: never from Fronde's environment.
+            // How the agent signs in, where its API is, or its settings: never from Fronde's
+            // environment, only from its spec and `[agent] env`.
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_EXECUTABLE",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_API_KEY",
             "XDG_RUNTIME_DIR",
@@ -1248,12 +1251,12 @@ mod tests {
         }
         // A secret's variable is dropped even when a kept prefix matches it.
         let mut policy = policy;
-        policy.drop_env.push("CLAUDE_FRONDE_TOKEN".into());
-        assert!(!policy.keeps("CLAUDE_FRONDE_TOKEN"));
+        policy.drop_env.push("LC_FRONDE_TOKEN".into());
+        assert!(!policy.keeps("LC_FRONDE_TOKEN"));
         // So is every variable a dropped prefix matches, and only those.
-        policy.drop_env.push("CLAUDE_CODE_USE_*".into());
-        assert!(!policy.keeps("CLAUDE_CODE_USE_BEDROCK"));
-        assert!(policy.keeps("CLAUDE_CODE_EXECUTABLE"));
+        policy.drop_env.push("LC_SECRET_*".into());
+        assert!(!policy.keeps("LC_SECRET_KEY"));
+        assert!(policy.keeps("LC_TIME"));
         // A lone `*` keeps nothing.
         policy.keep_env = vec!["*".into()];
         assert!(!policy.keeps("PATH"));

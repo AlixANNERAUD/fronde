@@ -349,8 +349,8 @@ web ones is refused by the configuration check: widening it is a deliberate code
 Fronde does not start the agent directly: it starts its own binary as `fronde __confine`, which
 prepares the process and then replaces itself with the agent, keeping the same process, pipes and
 process group. The agent does not inherit Fronde's environment. It keeps only an allow list:
-`PATH`, the locale and `TZ`, `CLAUDE_*`, the proxy and CA certificate variables, and the names
-`[agent] env` sets. It never inherits a variable that decides how it signs in:
+`PATH`, the locale and `TZ`, the proxy and CA certificate variables, and the names `[agent] env`
+sets (no `CLAUDE_*`, and never `CLAUDE_CONFIG_DIR`, which would give every thread one sign-in). It never inherits a variable that decides how it signs in:
 `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_*` (an API key, another address for the API),
 `CLAUDE_CODE_USE_*` (another cloud) and `AWS_BEARER_TOKEN_BEDROCK`; its token is only the one
 Fronde gives it, its account's. Fronde sets `HOME` to the agent's
@@ -429,8 +429,19 @@ thread's first message, with its own directories, its own sandbox and its own hu
   A thread whose owner is no longer a configured user is read-only: the page refuses a message
   to it, and its agent's sign-in fails before any process starts, without falling back to
   anyone else's. The main thread is always `[data] user`'s. (Each person signing in as
-  themselves, and their own subscription, are **planned**: until then only the owner signs in,
-  and every agent signs in with the owner's account.)
+  themselves is **planned**: until then only the owner signs in.)
+- **Which token reaches which agent.** A thread's account is its owner's account for the
+  thread's provider, looked up at each start and by nothing else: no argument, agent, card or
+  page chooses it, and the thread's row does not store it. A sub-agent's row carries its parent's
+  owner, so it runs on its root thread's account; a wake turn runs in its parent's own thread,
+  on the parent's. The token is read before anything starts: when the owner has no account on
+  the provider (or its stored token is not stored yet, or the owner is no longer a user), no hub
+  token is made, no process starts, the thread says why and the turn fails; nothing falls back to
+  another person's account, the owner's included. Only the legacy form's account, the owner's,
+  may lack a token, and its agent then starts unsigned as before. The agent never inherits a
+  sign-in variable from Fronde's environment (see [The agent's environment](#the-agents-environment)):
+  the account's token is the only `CLAUDE_CODE_OAUTH_TOKEN` it gets. Usage readings, the reserve
+  and the daily counts of sub-agents are kept per account.
 - **What a member's agent reaches.** Until each person has a memory and spaces of their own,
   memory, the calendar, every component's and upstream server's tools, and setting up an
   integration are the owner's. The agent of a member's thread (a user who is not an admin) is

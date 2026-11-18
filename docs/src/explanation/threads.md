@@ -224,9 +224,12 @@ The other limits (depth, at once, kept, time per turn, wakes without you) always
 bound concurrency, clutter, loops and time, not the quota. `threads_list` tells an agent whether
 background work may run before it tries.
 
-Readings, the reserve and the daily counts belong to a subscription account. Today each provider
-has one, the one Fronde signs in with, which every thread uses; an account per person is
-**planned**, each person's threads then spending their own.
+Readings, the reserve and the daily counts belong to a subscription account: the account of the
+thread's owner on its provider (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)).
+A sub-agent runs on its root thread's owner's account, never on another person's: its readings
+and its counts are that account's, and a person's background work stops at their own account's
+line. A thread whose owner has no account starts no sub-agent. Showing each person their own
+account's usage in the meter is **planned**; the meter shows the owner's.
 
 ## Stopping
 

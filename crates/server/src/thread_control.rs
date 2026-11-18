@@ -64,8 +64,12 @@ impl ThreadControl for ThreadBridge {
         };
         let mut providers = Vec::new();
         for id in self.0.providers() {
-            // The account a sub-agent of the caller would spend on this provider.
-            let account = Threads::account(&caller.owner, id);
+            // The account a sub-agent of the caller would spend on this provider: none, and
+            // no sub-agent runs there.
+            let background = match self.0.account(&caller.owner, id) {
+                Some(account) => background_text(&self.0.background(&account)),
+                None => "no account".to_owned(),
+            };
             let models = self.0.models(id).await.map_err(hub_error)?;
             providers.push(ProviderModels {
                 id: id.to_owned(),
@@ -73,7 +77,7 @@ impl ThreadControl for ThreadBridge {
                     .into_iter()
                     .map(|model| (model.id, model.name))
                     .collect(),
-                background: background_text(&self.0.background(&account)),
+                background,
             });
         }
         Ok(providers)

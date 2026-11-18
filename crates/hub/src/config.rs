@@ -855,10 +855,13 @@ impl Default for AgentConfig {
 }
 
 /// Variables `[agent] env` may not set: Fronde sets the agent's home and temporary directory,
-/// and the others point at the owner's session, its buses and the service's credentials.
+/// and the others point at the owner's session, its buses and the service's credentials, or at
+/// a Claude directory, which would hold one sign-in for every thread.
 fn reserved_agent_variable(name: &str) -> bool {
-    matches!(name, "HOME" | "TMPDIR" | "CREDENTIALS_DIRECTORY")
-        || name.starts_with("XDG_")
+    matches!(
+        name,
+        "HOME" | "TMPDIR" | "CREDENTIALS_DIRECTORY" | "CLAUDE_CONFIG_DIR"
+    ) || name.starts_with("XDG_")
         || name.starts_with("DBUS_")
 }
 
@@ -1298,8 +1301,9 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
         if reserved_agent_variable(name) {
             bail!(
                 "[agent] env: {name} cannot be set here: Fronde gives the agent its own HOME and \
-                 TMPDIR in the data directory, and never passes XDG_*, DBUS_* or \
-                 CREDENTIALS_DIRECTORY, which point at your session; remove it"
+                 TMPDIR in the data directory, with its own Claude directory, and never passes \
+                 XDG_*, DBUS_*, CREDENTIALS_DIRECTORY or CLAUDE_CONFIG_DIR, which point at your \
+                 session or one sign-in for every thread; remove it"
             );
         }
     }

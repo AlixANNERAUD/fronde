@@ -5,7 +5,8 @@ use fronde_agent::fake::{
 };
 use fronde_agent::log::{ConversationLog, Event, TurnOutcome};
 use fronde_agent::threads::{
-    Budget, ChildEnd, ChildTask, Delegation, Limits, Pause, Refusal, StartedBy, ThreadId, Threads,
+    Accounts, Binding, Budget, ChildEnd, ChildTask, Delegation, Limits, Pause, People, Refusal,
+    StartedBy, ThreadId, Threads,
 };
 use fronde_agent::usage::UsageBook;
 use fronde_protocol::usage::{LimitStatus, Window, WindowKind};
@@ -3565,18 +3566,15 @@ async fn the_main_thread_follows_the_owner() {
     drop(threads);
 
     let db = fronde_db::open(dir.path()).await.unwrap();
-    let threads = Threads::open_for(
-        db,
-        dir.path(),
-        spec(),
-        connector,
-        [alix()].into_iter().collect(),
-        "alix",
-        None,
-        Budget::default(),
-    )
-    .await
-    .unwrap();
+    let people = People {
+        users: [alix()].into_iter().collect(),
+        owner: "alix".into(),
+        prompt: None,
+        accounts: Accounts::default(),
+    };
+    let threads = Threads::open_for(db, dir.path(), spec(), connector, people, Budget::default())
+        .await
+        .unwrap();
     let main = threads.get(ThreadId::MAIN).await.unwrap().unwrap();
     assert_eq!(main.owner, "alix");
     assert!(threads.configured(&main));
@@ -3585,4 +3583,86 @@ async fn the_main_thread_follows_the_owner() {
     assert!(!threads.configured(&other));
     // The owner, an admin, still sees it.
     assert!(other.visible_to(&alix()));
+}
+
+/// Who an account belongs to is read from the configuration at each run, never stored with
+/// the thread: a member's account changed between two runs over one data directory signs her
+/// next start in with the new token, and the old one is read no more.
+#[tokio::test]
+async fn remapped_owner_applies_at_the_next_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let read: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let connector: Connector = Arc::new({
+        let read = read.clone();
+        move |spec: &AgentSpec, resume, events| {
+            let (spec, read) = (spec.clone(), read.clone());
+            Box::pin(async move {
+                let token = spec.oauth_token.as_ref().expect("her account's token")().await?;
+                read.lock()
+                    .unwrap()
+                    .push((spec.account.clone(), token.expose_secret().to_owned()));
+                let (transport, _handle) = fake_agent(FakeScript::default());
+                AgentClient::connect(transport, &spec, resume, events).await
+            })
+        }
+    });
+    let people = |account: &str, token: &'static str| {
+        let mut accounts = Accounts::default();
+        accounts.insert(
+            "marie",
+            "claude",
+            Binding {
+                account: account.into(),
+                token: Some(fronde_agent::acp::oauth_token(move || async move {
+                    Ok(secrecy::SecretString::from(token))
+                })),
+            },
+        );
+        People {
+            users: [
+                alix(),
+                User {
+                    name: "marie".into(),
+                    admin: false,
+                },
+            ]
+            .into_iter()
+            .collect(),
+            owner: "alix".into(),
+            prompt: None,
+            accounts,
+        }
+    };
+    let open = |people: People| {
+        let (dir, connector) = (dir.path().to_path_buf(), connector.clone());
+        async move {
+            let db = fronde_db::open(&dir).await.unwrap();
+            Threads::open_for(db, &dir, spec(), connector, people, Budget::default())
+                .await
+                .unwrap()
+        }
+    };
+    let threads = open(people("marie", "first-token-of-marie")).await;
+    let hers = threads
+        .create("marie", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    let assistant = threads.assistant(hers).await.unwrap().unwrap();
+    assistant.send("Salut".into()).await;
+    wait_for_turns(&assistant, 1).await;
+    drop(assistant);
+    drop(threads);
+
+    let threads = open(people("marie_pro", "second-token-of-marie")).await;
+    let assistant = threads.assistant(hers).await.unwrap().unwrap();
+    assistant.send("Encore".into()).await;
+    wait_for_turns(&assistant, 2).await;
+    assert_eq!(
+        *read.lock().unwrap(),
+        [
+            ("marie".to_owned(), "first-token-of-marie".to_owned()),
+            ("marie_pro".to_owned(), "second-token-of-marie".to_owned()),
+        ]
+    );
 }

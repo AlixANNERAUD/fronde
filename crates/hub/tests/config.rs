@@ -872,6 +872,7 @@ fn agent_env_cannot_point_the_agent_at_the_session() {
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
         "CREDENTIALS_DIRECTORY",
+        "CLAUDE_CONFIG_DIR",
     ] {
         let error = load_str(&format!("{MIN}[agent]\nenv = {{ {name} = \"x\" }}\n"))
             .unwrap_err()

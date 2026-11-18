@@ -104,8 +104,11 @@ its use unknown (shown so, never as 0 %) until the next reading. Windows of kind
 name for are kept, four at most, and dropped when a reading of both the 5-hour and the weekly
 window no longer lists them.
 
-Readings belong to a subscription account: today each provider has one, the one Fronde signs in
-with, whose id is the provider's (`claude`). An account per person is **planned**.
+Readings belong to a subscription account, the one the agent that sent them signs in with: its
+thread's owner's (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)). The
+legacy form's account is named `claude`, as readings were stored before accounts; a reading kept
+under another name is not carried over to a new account, whose first reading comes with its next
+turn, the daily counts deciding until then.
 
 Fronde keeps a share of each window for your own turns: past `[threads] reserve` (30 % by
 default), sub-agents are neither started nor sent messages, and their results wait for your next
