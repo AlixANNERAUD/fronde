@@ -81,8 +81,11 @@ impl ToolOutput {
 #[derive(Debug, Clone)]
 pub struct CallContext {
     pub caller: Caller,
-    /// The user the caller acts for.
+    /// The user the caller acts for: a thread's owner, from the thread's row; an outside
+    /// client's is the owner, `[data] user`.
     pub user: String,
+    /// Whether that user is an admin. A member's calls reach only [`member_may_use`]'s tools.
+    pub admin: bool,
     /// The stream where that user sees what the call asks.
     pub topic: String,
     /// The seq of the user message of the turn calling, for a thread's agent.
@@ -101,6 +104,19 @@ impl CallContext {
             topic: self.topic.clone(),
             asker: self.caller.id(),
         }
+    }
+}
+
+/// Whether a member (a user who is not an admin) may be offered and call `tool`. Until each
+/// person has spaces of their own, everything but the hub's own tools is the owner's: memory,
+/// the calendar and every component's or upstream server's tools, and setting up integrations,
+/// which only an admin grants. A member keeps the cards (`user_*`), their own sub-agents
+/// (`threads_*`, which check the caller themselves), `search_tools` and `use_tool` over what
+/// they may use, and `code_run_python`, which reaches nothing.
+pub fn member_may_use(tool: &ToolDef) -> bool {
+    match tool.source.as_str() {
+        "hub" => !tool.name.starts_with("memory_") && !tool.name.starts_with("integrations_"),
+        source => source == crate::config::PYTHON_SOURCE,
     }
 }
 
@@ -368,20 +384,32 @@ impl Registry {
         }
     }
 
-    /// Calls the tool `name` on behalf of `context`.
+    /// Calls the tool `name` on behalf of `context`. A member's call to a tool they may not use
+    /// ([`member_may_use`]) is refused, whichever way it comes (directly or through
+    /// `use_tool`).
     pub async fn call_as(&self, context: &CallContext, name: &str, args: Value) -> ToolOutput {
-        match self.handler(name) {
-            Ok(h) => h.call_as(context, args).await,
+        match self.entry(name) {
+            Ok((def, _)) if !context.admin && !member_may_use(&def) => ToolOutput::error(format!(
+                "{name} is not available in {}'s conversations: memory, the calendar, \
+                     integrations and the other services are the owner's for now; answer \
+                     without it",
+                context.user
+            )),
+            Ok((_, h)) => h.call_as(context, args).await,
             Err(unknown) => unknown,
         }
     }
 
     fn handler(&self, name: &str) -> Result<Arc<dyn ToolHandler>, ToolOutput> {
+        self.entry(name).map(|(_, h)| h)
+    }
+
+    fn entry(&self, name: &str) -> Result<Entry, ToolOutput> {
         self.tools
             .read()
             .expect("registry lock")
             .get(name)
-            .map(|(_, h)| h.clone())
+            .cloned()
             .ok_or_else(|| {
                 ToolOutput::error(format!(
                     "unknown tool {name:?}; call search_tools with your need to find the right one"
@@ -389,6 +417,9 @@ impl Registry {
             })
     }
 }
+
+/// How many matches a member's search ranks before keeping those they may use.
+const MEMBER_SEARCH_DEPTH: usize = 1_000;
 
 #[derive(serde::Deserialize, JsonSchema)]
 struct SearchArgs {
@@ -452,16 +483,27 @@ struct SearchTools {
 }
 
 impl SearchTools {
-    /// The tools matching `a.need`; with `integrations` (a thread's agent calls), the shipped
-    /// components not set up yet it may be about too.
-    async fn search(&self, a: SearchArgs, integrations: bool) -> ToolOutput {
+    /// The tools matching `a.need`, only those a member may use when `admin` is false; with
+    /// `integrations` (a thread's agent calls), the shipped components not set up yet it may be
+    /// about too.
+    async fn search(&self, a: SearchArgs, admin: bool, integrations: bool) -> ToolOutput {
         let Some(r) = self.registry.upgrade() else {
             return ToolOutput::error("hub is shutting down");
         };
         let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
-        let mut found: Vec<Value> = r
-            .search(&a.need, limit)
-            .await
+        // A member's search ranks only what they may use: the owner's tools would push theirs
+        // out of the limit.
+        let matched = if admin {
+            r.search(&a.need, limit).await
+        } else {
+            r.search(&a.need, MEMBER_SEARCH_DEPTH)
+                .await
+                .into_iter()
+                .filter(member_may_use)
+                .take(limit)
+                .collect()
+        };
+        let mut found: Vec<Value> = matched
             .into_iter()
             .map(|d| json!({"name": d.name, "description": d.description, "input_schema": d.input_schema}))
             .collect();
@@ -501,21 +543,23 @@ impl SearchTools {
 impl ToolHandler for SearchTools {
     async fn call(&self, args: Value) -> ToolOutput {
         match parse::<SearchArgs>(args) {
-            Ok(a) => self.search(a, false).await,
+            Ok(a) => self.search(a, true, false).await,
             Err(error) => error,
         }
     }
 
-    /// Only the agent of a thread the owner talks to may set an integration up: anyone else (an
-    /// outside client, a sub-agent) is not told of them.
+    /// Only the agent of an admin's thread that is not a sub-agent may set an integration up:
+    /// anyone else (an outside client, a sub-agent, a member's thread) is not told of them.
     async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
         match parse::<SearchArgs>(args) {
             Ok(a) => {
                 let told = match (&context.caller, &self.threads) {
-                    (Caller::Thread(thread), Some(threads)) => !threads.is_sub_agent(*thread).await,
+                    (Caller::Thread(thread), Some(threads)) if context.admin => {
+                        !threads.is_sub_agent(*thread).await
+                    }
                     _ => false,
                 };
-                self.search(a, told).await
+                self.search(a, context.admin, told).await
             }
             Err(error) => error,
         }

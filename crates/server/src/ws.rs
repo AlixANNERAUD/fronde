@@ -362,11 +362,15 @@ impl Talk<'_> {
         Ok((row, assistant))
     }
 
-    /// Thread `id`'s assistant, if the page's user may write to it: theirs, and not archived.
+    /// Thread `id`'s assistant, if the page's user may write to it: theirs, not archived, and
+    /// owned by a configured user.
     async fn writable(&self, id: ThreadId) -> anyhow::Result<Arc<Assistant>> {
         let (row, assistant) = self.assistant(id).await?;
         if row.archived_at.is_some() {
             bail!(Refusal::Archived);
+        }
+        if !self.web.threads.configured(&row) {
+            bail!(Refusal::NoOwner);
         }
         Ok(assistant)
     }

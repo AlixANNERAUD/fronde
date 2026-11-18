@@ -1369,6 +1369,7 @@ mod tests {
             let context = CallContext {
                 caller: Caller::Thread(fronde_requests::ThreadId::MAIN),
                 user: "alix".into(),
+                admin: true,
                 topic: "conversation".into(),
                 turn: Some(1),
                 cancelled: CancellationToken::new(),
@@ -1395,6 +1396,7 @@ mod tests {
             CallContext {
                 caller,
                 user: "alix".into(),
+                admin: true,
                 topic: "conversation".into(),
                 turn,
                 cancelled: CancellationToken::new(),

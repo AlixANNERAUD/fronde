@@ -1177,8 +1177,8 @@ impl Assistant {
     /// are: a turn that ends or is stopped meanwhile waits for the card and cancels it with its
     /// other requests, before its end is logged. `None`, with nothing asked, once that turn is
     /// over or ending: its card would outlive it. In a turn of wake origin, the card says so, as
-    /// the agent's own do, and a secret card or an admin's card is refused; a sub-agent's
-    /// admin's card is refused whatever its turn.
+    /// the agent's own do, and a secret card or an admin's card is refused; a sub-agent's or a
+    /// member's thread's admin's card is refused whatever its turn.
     pub async fn ask_during(&self, ask: Ask) -> anyhow::Result<Option<Waiter>> {
         anyhow::ensure!(
             ask.topic == self.topic && ask.caller == Caller::Thread(self.thread),
@@ -1208,6 +1208,12 @@ impl Assistant {
         // grants is asked by the agent the owner talks to.
         if self.parent.is_some() && ask.admin_only {
             return Err(AdminFromSubAgent.into());
+        }
+        // Nor does a thread whose owner is not an admin: it acts for them, and they grant
+        // nothing lasting.
+        let admin = self.requests.get().is_some_and(|(_, owner)| owner.admin);
+        if ask.admin_only && !admin {
+            return Err(AdminFromMember.into());
         }
         let waiter = requests.ask(ask).await?;
         drop(turn);
@@ -1852,6 +1858,21 @@ impl std::fmt::Display for AdminFromSubAgent {
 }
 
 impl std::error::Error for AdminFromSubAgent {}
+
+/// The agent of a thread whose owner is not an admin asked for something only an admin grants
+/// (an integration's setup): refused, whatever its turn. The text is for the agent.
+#[derive(Debug)]
+pub struct AdminFromMember;
+
+impl std::fmt::Display for AdminFromMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this conversation's owner is not an admin, and only an admin grants a lasting change such as setting up an integration; answer without it",
+        )
+    }
+}
+
+impl std::error::Error for AdminFromMember {}
 
 /// The agent did not start within [`START_TIMEOUT`].
 #[derive(Debug)]

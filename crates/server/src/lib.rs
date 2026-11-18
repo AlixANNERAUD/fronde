@@ -208,6 +208,7 @@ async fn require_token(
             id: holder.thread,
             topic: holder.topic,
             turn: holder.turn,
+            user: holder.owner,
         },
         (true, None) => McpCaller::Outside,
         (false, None) => return Err(StatusCode::UNAUTHORIZED),
@@ -972,6 +973,7 @@ pub async fn start_signed_in_as(
     let listen = config.server.listen;
     let data_dir = config.data.dir.clone();
     let user = config.data.user.clone();
+    let users = config.users();
     let timezone = config.data.timezone;
     let agent = config.agent.clone();
     // The owner's Claude account signs the agents in, as the one token did: every thread is the
@@ -1075,13 +1077,20 @@ pub async fn start_signed_in_as(
                     )
                 );
             }
-            // The one user so far is the owner, an admin.
-            let owner = fronde_requests::User {
-                name: user.clone(),
-                admin: true,
-            };
-            let threads =
-                Threads::open_with(db.clone(), &data_dir, spec, connector, owner, budget).await?;
+            // Each thread acts for its row's owner, among the configured users; the main thread
+            // is the owner's, `[data] user`.
+            let prompt: fronde_agent::threads::SystemPrompt = Arc::new(system_prompt);
+            let threads = Threads::open_for(
+                db.clone(),
+                &data_dir,
+                spec,
+                connector,
+                users,
+                &user,
+                Some(prompt),
+                budget,
+            )
+            .await?;
             let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
             let requests = Requests::open_with(db.clone(), threads.clone(), Some(secrets)).await?;
             threads.set_requests(&requests).await;

@@ -2,7 +2,7 @@
 //! on `fronde-agent`, so the server hands it [`ThreadBridge`] over [`Threads`].
 
 use async_trait::async_trait;
-use fronde_agent::assistant::{AdminFromSubAgent, LastingInWake, SecretInWake};
+use fronde_agent::assistant::{AdminFromMember, AdminFromSubAgent, LastingInWake, SecretInWake};
 use fronde_agent::threads::{Background, ChildEnd, ChildTask, Delegation, ThreadId, Threads};
 use fronde_hub::threads::{
     Child, NewChild, ProviderModels, ReadThread, Started, ThreadControl, ThreadError, Waited,
@@ -25,6 +25,9 @@ fn hub_error(error: anyhow::Error) -> ThreadError {
         return ThreadError::Refused(refused.to_string());
     }
     if let Some(refused) = error.downcast_ref::<AdminFromSubAgent>() {
+        return ThreadError::Refused(refused.to_string());
+    }
+    if let Some(refused) = error.downcast_ref::<AdminFromMember>() {
         return ThreadError::Refused(refused.to_string());
     }
     match error.downcast_ref::<Delegation>() {

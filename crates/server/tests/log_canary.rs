@@ -1122,6 +1122,7 @@ fn setup_context() -> fronde_hub::tools::CallContext {
     fronde_hub::tools::CallContext {
         caller: fronde_requests::Caller::Thread(fronde_protocol::ThreadId::MAIN),
         user: "alix".into(),
+        admin: true,
         topic: "conversation".into(),
         turn: Some(3),
         cancelled: tokio_util::sync::CancellationToken::new(),

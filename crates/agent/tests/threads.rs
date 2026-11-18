@@ -3541,3 +3541,48 @@ async fn the_hold_names_its_cause() {
         "{shown:?}"
     );
 }
+
+/// The main thread is `[data] user`'s: a row made for an earlier name is given to the owner
+/// when it changes, while another thread keeps the person it was made for, who, no longer
+/// configured, owns it read-only.
+#[tokio::test]
+async fn the_main_thread_follows_the_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector(FakeScript::default());
+    let me = User {
+        name: "me".into(),
+        admin: true,
+    };
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let threads = Threads::open(db, dir.path(), spec(), connector.clone(), me)
+        .await
+        .unwrap();
+    let other = threads
+        .create("me", StartedBy::User, None, "Une autre")
+        .await
+        .unwrap()
+        .id;
+    drop(threads);
+
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let threads = Threads::open_for(
+        db,
+        dir.path(),
+        spec(),
+        connector,
+        [alix()].into_iter().collect(),
+        "alix",
+        None,
+        Budget::default(),
+    )
+    .await
+    .unwrap();
+    let main = threads.get(ThreadId::MAIN).await.unwrap().unwrap();
+    assert_eq!(main.owner, "alix");
+    assert!(threads.configured(&main));
+    let other = threads.get(other).await.unwrap().unwrap();
+    assert_eq!(other.owner, "me");
+    assert!(!threads.configured(&other));
+    // The owner, an admin, still sees it.
+    assert!(other.visible_to(&alix()));
+}

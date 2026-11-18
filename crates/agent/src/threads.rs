@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_entity::{stream_entries, streams, threads};
 use fronde_protocol::{Card, Outcome, RequestId, ThreadSummary};
-use fronde_requests::{Ask, Caller, Journal, LateAnswer, Requests, User, Waiter};
+use fronde_requests::{Ask, Caller, Journal, LateAnswer, Requests, User, Users, Waiter};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
@@ -360,6 +360,23 @@ struct Tail {
     at: Option<DateTime<Utc>>,
 }
 
+/// A thread's owner is no longer a configured user: its agent does not start, and nothing
+/// falls back to another person's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoOwner(pub String);
+
+impl std::fmt::Display for NoOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this thread belongs to {}, who is no longer a user of this Fronde: it is read-only",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NoOwner {}
+
 /// Why a page's thread was refused. An unknown thread and one the user may not see are the
 /// same refusal, so that a page learns nothing of other users' threads.
 #[derive(Debug, PartialEq, Eq)]
@@ -372,6 +389,8 @@ pub enum Refusal {
     Main,
     /// The page's `client_id` names another user's thread.
     Taken,
+    /// The thread's owner is no longer a configured user: read-only.
+    NoOwner,
 }
 
 impl std::fmt::Display for Refusal {
@@ -381,6 +400,9 @@ impl std::fmt::Display for Refusal {
             Self::Archived => "Cette conversation est archivée : elle ne reçoit plus de message.",
             Self::Main => "La conversation principale ne s'archive pas.",
             Self::Taken => "Cet identifiant de conversation est déjà pris.",
+            Self::NoOwner => {
+                "Cette conversation appartient à une personne qui n'a plus de compte : elle est en lecture seule."
+            }
         })
     }
 }
@@ -395,7 +417,13 @@ pub struct Holder {
     pub topic: String,
     /// The seq of the thread's running turn's user message.
     pub turn: Option<u64>,
+    /// The thread's owner, from its row: whom its agent acts for.
+    pub owner: User,
 }
+
+/// The system prompt of a thread a user started, for the user it names: each thread's agent is
+/// told whose assistant it is.
+pub type SystemPrompt = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// The registry as every thread's assistant reaches it: set once it is made; weak, since it
 /// holds the assistants.
@@ -412,8 +440,14 @@ pub struct Threads {
     tokens: Tokens,
     /// The agent processes that may run at once.
     pool: Arc<Pool>,
-    /// The user the threads are for: the owner, the one user so far.
-    owner: User,
+    /// The people threads are for, by name: a thread's cards, hub calls and system prompt are
+    /// its row's owner's.
+    users: Users,
+    /// The system prompt of a thread a user started, for its owner; `None` keeps the main
+    /// thread's spec's for every thread.
+    prompt: Option<SystemPrompt>,
+    /// The owner of each thread opened so far, as [`Threads::user_of`] read it at its opening.
+    owners: Mutex<HashMap<ThreadId, User>>,
     main: Arc<Assistant>,
     /// The threads opened so far, the main one among them. Locked while one is opened, so that
     /// a thread is never opened twice.
@@ -460,14 +494,38 @@ impl Threads {
         owner: User,
         budget: Budget,
     ) -> anyhow::Result<Arc<Self>> {
+        let name = owner.name.clone();
+        let users = std::iter::once(owner).collect();
+        Self::open_for(db, data_dir, spec, connector, users, &name, None, budget).await
+    }
+
+    /// [`Threads::open_with`] for the people `users`, `owner` (the configuration makes them an
+    /// admin among them) owning the main thread: each thread acts for its row's owner, its root threads told so by `prompt`
+    /// when given. A thread whose owner is not in `users` opens read-only: its agent never
+    /// starts.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_for(
+        db: DatabaseConnection,
+        data_dir: &Path,
+        spec: AgentSpec,
+        connector: Connector,
+        users: Users,
+        owner: &str,
+        prompt: Option<SystemPrompt>,
+        budget: Budget,
+    ) -> anyhow::Result<Arc<Self>> {
         legacy::import(&db, data_dir, TOPIC, LEGACY_SESSION).await?;
-        ensure_main(&db, &owner.name, spec.provider.id)
+        ensure_main(&db, owner, spec.provider.id)
             .await
             .context("cannot make the main thread in the database")?;
         // The main thread is the owner's.
         let spec = AgentSpec {
             thread: ThreadId::MAIN,
-            account: Self::account(&owner.name, spec.provider.id),
+            account: Self::account(owner, spec.provider.id),
+            system_prompt: match &prompt {
+                Some(prompt) => prompt(owner),
+                None => spec.system_prompt,
+            },
             ..spec
         };
         let tokens = Tokens::new();
@@ -504,7 +562,15 @@ impl Threads {
             connector,
             tokens,
             pool,
-            owner,
+            owners: Mutex::new(HashMap::from([(
+                ThreadId::MAIN,
+                users.get(owner).cloned().unwrap_or_else(|| User {
+                    name: owner.to_owned(),
+                    admin: false,
+                }),
+            )])),
+            users,
+            prompt,
             open: tokio::sync::Mutex::new(HashMap::from([(ThreadId::MAIN, main.clone())])),
             main,
             requests: OnceLock::new(),
@@ -567,9 +633,32 @@ impl Threads {
             tracing::warn!("the threads' requests were already set");
             return;
         }
-        for assistant in open.values() {
-            assistant.set_requests(requests, self.owner.clone());
+        for (id, assistant) in open.iter() {
+            assistant.set_requests(requests, self.owner_of(*id));
         }
+    }
+
+    /// The user named `name`; one no longer configured reads as a user who is not an admin, so
+    /// that nothing of theirs grants an admin's rights. See [`Threads::configured`].
+    pub fn user_of(&self, name: &str) -> User {
+        self.users.get(name).cloned().unwrap_or_else(|| User {
+            name: name.to_owned(),
+            admin: false,
+        })
+    }
+
+    /// Whether `row`'s owner is a configured user: a thread whose owner is not is read-only,
+    /// its agent never starting.
+    pub fn configured(&self, row: &ThreadRow) -> bool {
+        self.users.get(&row.owner).is_some()
+    }
+
+    /// The owner of thread `id`, open: as read when it opened.
+    fn owner_of(&self, id: ThreadId) -> User {
+        lock(&self.owners)
+            .get(&id)
+            .cloned()
+            .expect("an open thread's owner is kept when it opens")
     }
 
     /// The assistant of thread `id`, opened now if it was not; `None` when there is no such
@@ -641,8 +730,10 @@ impl Threads {
         )
         .await?;
         self.pool.register(&assistant);
+        let owner = self.user_of(&row.owner);
+        lock(&self.owners).insert(id, owner.clone());
         if let Some(requests) = self.requests.get().and_then(Weak::upgrade) {
-            assistant.set_requests(&requests, self.owner.clone());
+            assistant.set_requests(&requests, owner);
         }
         open.insert(id, assistant.clone());
         Ok(Some((assistant, interrupted.filter(|_| parent.is_some()))))
@@ -659,23 +750,35 @@ impl Threads {
     }
 
     /// How thread `row`'s agent starts: the main thread's spec, with another thread's own
-    /// directories and scope name, a sub-agent's own system prompt, and its owner's account.
+    /// directories and scope name, a sub-agent's own system prompt or its owner's, and its
+    /// owner's account. A thread whose owner is no longer configured gets a sign-in that fails
+    /// before any process starts.
     fn spec_for(&self, row: &ThreadRow) -> AgentSpec {
         let id = row.id;
         if id == ThreadId::MAIN {
             return self.spec.clone();
         }
         let ThreadDirs { work, home } = thread_dirs(&self.data_dir, id);
-        let system_prompt = if row.parent.is_some() {
-            children::SYSTEM_PROMPT.to_owned()
+        let system_prompt = match (&row.parent, &self.prompt) {
+            (Some(_), _) => children::SYSTEM_PROMPT.to_owned(),
+            (None, Some(prompt)) => prompt(&row.owner),
+            (None, None) => self.spec.system_prompt.clone(),
+        };
+        let oauth_token = if self.configured(row) {
+            self.spec.oauth_token.clone()
         } else {
-            self.spec.system_prompt.clone()
+            let owner = row.owner.clone();
+            Some(crate::acp::oauth_token(move || {
+                let owner = owner.clone();
+                async move { Err(NoOwner(owner).into()) }
+            }))
         };
         AgentSpec {
             thread: id,
             cwd: work,
             home,
             system_prompt,
+            oauth_token,
             account: Self::account(&row.owner, &row.provider),
             ..self.spec.clone()
         }
@@ -692,6 +795,7 @@ impl Threads {
             thread,
             topic: assistant.topic().to_owned(),
             turn: assistant.current_turn().await,
+            owner: self.owner_of(thread),
         })
     }
 
@@ -1122,7 +1226,8 @@ fn move_aside_leftover(data_dir: &Path, id: ThreadId) -> anyhow::Result<()> {
 
 /// Makes the main thread's stream and row when missing, and moves the agent's session id from
 /// the key-value table to the row, in one transaction: the row is then the only place it is
-/// kept.
+/// kept. The main thread is `owner`'s, `[data] user`: a row made for an earlier name is given to
+/// it.
 async fn ensure_main(db: &DatabaseConnection, owner: &str, provider: &str) -> anyhow::Result<()> {
     let transaction = fronde_db::begin_write(db).await?;
     if streams::Entity::find_by_id(TOPIC)
@@ -1134,11 +1239,23 @@ async fn ensure_main(db: &DatabaseConnection, owner: &str, provider: &str) -> an
             .exec(&transaction)
             .await?;
     }
-    if threads::Entity::find_by_id(ThreadId::MAIN.0)
+    let main = threads::Entity::find_by_id(ThreadId::MAIN.0)
         .one(&transaction)
-        .await?
-        .is_none()
+        .await?;
+    if let Some(main) = &main
+        && main.owner != owner
     {
+        tracing::info!(
+            "the main thread was {}'s: it is now {owner}'s, [data] user",
+            main.owner
+        );
+        threads::Entity::update_many()
+            .col_expr(threads::Column::Owner, Expr::value(owner.to_owned()))
+            .filter(threads::Column::Id.eq(ThreadId::MAIN.0))
+            .exec(&transaction)
+            .await?;
+    }
+    if main.is_none() {
         let now = Utc::now();
         threads::Entity::insert(threads::ActiveModel {
             id: Set(ThreadId::MAIN.0),

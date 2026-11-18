@@ -3,8 +3,8 @@
 use crate::Hub;
 use crate::guide::instructions;
 use crate::tools::CallContext;
-use crate::tools::ToolDef;
-use fronde_requests::{Caller, ThreadId};
+use crate::tools::{ToolDef, member_may_use};
+use fronde_requests::{Caller, ThreadId, User};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
@@ -24,11 +24,13 @@ pub const TOPIC: &str = "conversation";
 pub enum McpCaller {
     /// The agent of thread `id`, known by the token its process was given; `topic` is the
     /// thread's stream and `turn` the seq of its running turn's user message. Nothing else in a
-    /// request (arguments, headers, `clientInfo`, `_meta`) names a thread.
+    /// request (arguments, headers, `clientInfo`, `_meta`) names a thread. `user` is the
+    /// thread's owner, from its row: the agent acts for them.
     Thread {
         id: ThreadId,
         topic: String,
         turn: Option<u64>,
+        user: User,
     },
     /// Any other MCP client, holding `server.token`.
     Outside,
@@ -56,8 +58,13 @@ impl HubServer {
             .and_then(|parts| parts.extensions.get::<McpCaller>())
             .cloned()
             .unwrap_or(McpCaller::Outside);
-        let (caller, topic, turn) = match holder {
-            McpCaller::Thread { id, topic, turn } => (Caller::Thread(id), topic, turn),
+        let (caller, topic, turn, user) = match holder {
+            McpCaller::Thread {
+                id,
+                topic,
+                turn,
+                user,
+            } => (Caller::Thread(id), topic, turn, user),
             McpCaller::Outside => {
                 let name = context
                     .peer
@@ -65,15 +72,30 @@ impl HubServer {
                     .map(|info| info.client_info.name.trim().to_owned())
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| "MCP".to_owned());
-                (Caller::Mcp(name), TOPIC.to_owned(), None)
+                (Caller::Mcp(name), TOPIC.to_owned(), None, self.owner())
             }
         };
         CallContext {
             caller,
-            user: self.hub.config.data.user.clone(),
+            user: user.name,
+            admin: user.admin,
             topic,
             turn,
             cancelled: context.ct.clone(),
+        }
+    }
+
+    /// The owner, `[data] user`, an admin: whom `server.token` acts for.
+    fn owner(&self) -> User {
+        let name = &self.hub.config.data.user;
+        User {
+            name: name.clone(),
+            admin: self
+                .hub
+                .config
+                .users()
+                .get(name)
+                .is_none_or(|user| user.admin),
         }
     }
 
@@ -85,23 +107,30 @@ impl HubServer {
         }
     }
 
-    /// The tools `caller` is offered among `tools`.
-    async fn offered(&self, caller: &Caller, tools: Vec<ToolDef>) -> Vec<ToolDef> {
-        let delegates = self.delegates(caller).await;
+    /// The tools `context` is offered among `tools`: a member only those
+    /// [`member_may_use`] allows, which the registry checks again at the call.
+    async fn offered(&self, context: &CallContext, tools: Vec<ToolDef>) -> Vec<ToolDef> {
+        let delegates = self.delegates(&context.caller).await;
         tools
             .into_iter()
-            .filter(|d| Self::offers(&d.name, caller, delegates))
+            .filter(|d| Self::offers(&d.name, &context.caller, delegates))
+            .filter(|d| context.admin || member_may_use(d))
             .collect()
     }
 
-    /// The hub's instructions, from the tools `caller` is offered.
-    async fn instructions_for(&self, caller: &Caller) -> String {
-        let tools = self.offered(caller, self.hub.registry.all()).await;
-        instructions(
-            &self.hub.config.data.user,
-            &tools,
-            &self.hub.memory.core_now(),
-        )
+    /// The hub's instructions for the user `context` acts for, from the tools it is offered: an
+    /// admin's hold the memory, which is the owner's and names them; a member's hold none of it.
+    async fn instructions_for(&self, context: &CallContext) -> String {
+        let tools = self.offered(context, self.hub.registry.all()).await;
+        if context.admin {
+            instructions(
+                &self.hub.config.data.user,
+                &tools,
+                &self.hub.memory.core_now(),
+            )
+        } else {
+            crate::guide::member_instructions(&context.user, &tools)
+        }
     }
 
     /// Whether `caller` is offered the tool `name`: the `threads_*` and `integrations_*` tools
@@ -151,7 +180,7 @@ impl ServerHandler for HubServer {
     ) -> Result<InitializeResult, ErrorData> {
         context.peer.set_peer_info(request.clone());
         let mut result = self.negotiate_initialize(&request)?;
-        let caller = self.call_context(&context).caller;
+        let caller = self.call_context(&context);
         result.instructions = Some(self.instructions_for(&caller).await);
         Ok(result)
     }
@@ -161,7 +190,7 @@ impl ServerHandler for HubServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let caller = self.call_context(&context).caller;
+        let caller = self.call_context(&context);
         let tools = self
             .offered(&caller, self.hub.registry.visible())
             .await

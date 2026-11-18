@@ -186,6 +186,7 @@ fn context(user: &str) -> CallContext {
     CallContext {
         caller: Caller::Thread(ThreadId::MAIN),
         user: user.into(),
+        admin: true,
         topic: "conversation".into(),
         turn: Some(3),
         cancelled: tokio_util::sync::CancellationToken::new(),
@@ -555,11 +556,41 @@ async fn setup_secret_fields_reach_the_store_only() {
     );
 }
 
-/// A family member's agent asks: the card goes to the admin, says so, and only the admin
-/// answers it.
+/// Another admin's agent asks: the card goes to the owner, says so, and only the owner answers
+/// it. A family member who is not an admin cannot ask at all: only an admin grants what lasts.
 #[tokio::test]
 async fn family_setup_goes_to_admin() {
     let mut bench = bench().await;
+    let member = CallContext {
+        admin: false,
+        ..context("lea")
+    };
+    for refused in [
+        bench
+            .hub
+            .registry
+            .call_as(&member, TOOL, json!({"integration": "echo"}))
+            .await,
+        bench
+            .hub
+            .registry
+            .call_as(
+                &member,
+                "use_tool",
+                json!({"name": TOOL, "arguments": {"integration": "echo"}}),
+            )
+            .await,
+    ] {
+        assert!(refused.is_error, "{}", refused.to_text());
+        assert!(
+            refused
+                .to_text()
+                .contains("not available in lea's conversations"),
+            "{}",
+            refused.to_text()
+        );
+    }
+    bench.no_card();
     let call = bench.call(context("lea"), json!({"integration": "echo"}));
     let shown = bench.card().await;
     assert!(

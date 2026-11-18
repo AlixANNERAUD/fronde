@@ -617,6 +617,15 @@ async fn request_setup(setup: &Setup, context: CallContext, args: SetupArgs) -> 
             "integrations_request_setup needs Fronde's threads, which are not running; the owner adds a [[sources]] entry to fronde.toml instead",
         );
     }
+    // Only an admin grants what lasts: a member's thread is not offered the tool, and its call
+    // is refused here too.
+    if !context.admin {
+        return ToolOutput::error(format!(
+            "only an admin's conversations may ask for an integration's setup, and {} is not an \
+             admin; answer without it",
+            context.user
+        ));
+    }
     match &context.caller {
         Caller::Thread(_) if context.turn.is_some() => {}
         Caller::Thread(_) => {

@@ -227,8 +227,9 @@ What it may change is narrow:
   agent's arguments, each value the agent suggested marked so on the card. The card is
   `admin_only`, refused in a turn a sub-agent's result started (as a secret card and a lasting
   permission are), refused to a sub-agent whatever its turn, refused outside the caller's turn,
-  and never offered to an outside MCP client; `search_tools` tells neither it nor a sub-agent of
-  the integrations. Only the threads check the turn, so the tool is served only with them.
+  refused to a thread whose owner is not an admin (the tool is not offered there either), and
+  never offered to an outside MCP client; `search_tools` tells neither it, a sub-agent nor a
+  member's thread of the integrations. Only the threads check the turn, so the tool is served only with them.
 - **Secrets.** A password or token is typed in a secret field of that card. Such a field is
   accepted only in a card this tool builds: a request refuses one from `user_ask`, an elicitation
   or anyone else, and for anyone but an admin. The value goes from the page to the requests, then
@@ -417,6 +418,23 @@ thread's first message, with its own directories, its own sandbox and its own hu
   at once), its connection ending (the process exited or crashed), or Fronde stopping. After that,
   `/mcp` answers 401 to it, even within an MCP session opened before. An MCP session is also tied
   to the token that opened it: another valid token, `server.token` included, gets 403 in it.
+- **Whose it is.** A thread is its row's owner's: the person it was made for, a sub-agent its
+  parent's. Its agent acts for them, and for nobody else: its system prompt names them, its
+  cards (permissions, questions, secrets) are for them alone, so an admin cannot answer a
+  member's card any more than she can his, and its calls to the hub carry them, from the token,
+  never from anything in the request. An outside MCP client acts for the owner, `[data] user`.
+  A thread whose owner is no longer a configured user is read-only: the page refuses a message
+  to it, and its agent's sign-in fails before any process starts, without falling back to
+  anyone else's. The main thread is always `[data] user`'s. (Each person signing in as
+  themselves, and their own subscription, are **planned**: until then only the owner signs in,
+  and every agent signs in with the owner's account.)
+- **What a member's agent reaches.** Until each person has a memory and spaces of their own,
+  memory, the calendar, every component's and upstream server's tools, and setting up an
+  integration are the owner's. The agent of a member's thread (a user who is not an admin) is
+  neither offered nor allowed them, whether it calls them directly, through `use_tool` or finds
+  them with `search_tools`, and its hub instructions hold none of the owner's memory. It keeps
+  its own cards, its own sub-agents, `search_tools`, `use_tool` and `code_run_python`. A card
+  only an admin answers (an integration's setup) is refused to it as well, before it is shown.
 - **Unknown askers.** A request whose stored asker this version does not know (neither a thread,
   an outside client nor a server, nor the `assistant` of rows from before threads) is never read
   as a thread's: Fronde cancels it at start, and it can never be answered or own a secret.

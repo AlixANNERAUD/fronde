@@ -52,6 +52,8 @@ struct Bench {
     starts: Arc<Mutex<Vec<(ThreadId, String)>>>,
     /// Each agent start's fake agent, in order.
     fakes: Arc<Mutex<Vec<FakeHandle>>>,
+    /// Each agent start's spec, in order.
+    specs: Arc<Mutex<Vec<AgentSpec>>>,
     /// Releases the turns the fake agents hold open.
     gate: Arc<Notify>,
     /// The data directory.
@@ -67,6 +69,19 @@ fn alix() -> User {
         name: "alix".into(),
         admin: true,
     }
+}
+
+/// A family member: a configured user who is not an admin.
+fn marie() -> User {
+    User {
+        name: "marie".into(),
+        admin: false,
+    }
+}
+
+/// The system prompt of a thread a user started, as the bench's threads give it.
+fn prompt_for(user: &str) -> String {
+    format!("You are {user}'s assistant.")
 }
 
 async fn bench(script: FakeScript) -> Bench {
@@ -88,13 +103,15 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
     let db = fronde_db::open(&data).await.unwrap();
     let starts: Arc<Mutex<Vec<(ThreadId, String)>>> = Arc::default();
     let fakes: Arc<Mutex<Vec<FakeHandle>>> = Arc::default();
+    let specs: Arc<Mutex<Vec<AgentSpec>>> = Arc::default();
     let connector: Connector = Arc::new({
-        let (starts, fakes) = (starts.clone(), fakes.clone());
+        let (starts, fakes, specs) = (starts.clone(), fakes.clone(), specs.clone());
         move |spec: &AgentSpec, resume, events| {
             starts
                 .lock()
                 .unwrap()
                 .push((spec.thread, spec.hub_token.expose_secret().to_owned()));
+            specs.lock().unwrap().push(spec.clone());
             // A sub-agent is told it is one in its system prompt.
             let script = match &child {
                 Some(child) if spec.system_prompt.contains("sub-agent") => child.clone(),
@@ -125,9 +142,20 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         usage: Some(usage.clone()),
         account: "claude".into(),
     };
-    let threads = Threads::open_with(db.clone(), &data, spec, connector, alix(), budget)
-        .await
-        .unwrap();
+    // The owner, an admin, and a family member.
+    let prompt: fronde_agent::threads::SystemPrompt = Arc::new(prompt_for);
+    let threads = Threads::open_for(
+        db.clone(),
+        &data,
+        spec,
+        connector,
+        [alix(), marie()].into_iter().collect(),
+        "alix",
+        Some(prompt),
+        budget,
+    )
+    .await
+    .unwrap();
     let ephemeral = Arc::new(EphemeralSecrets::new());
     let store = SecretStore::new(
         Backends::file(dir.path().join("master.key")),
@@ -168,6 +196,24 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         },
     );
     hub.registry.register(def, handler).unwrap();
+    let (def, handler) = typed_tool_with_context(
+        "test_who",
+        "Whom the call acts for.",
+        false,
+        |context: CallContext, _: Value| async move {
+            ToolOutput::ok(json!({"user": context.user, "admin": context.admin}))
+        },
+    );
+    hub.registry.register(def, handler).unwrap();
+    // A tool of an upstream server: the owner's, like the calendar.
+    let (mut def, handler) = typed_tool_with_context(
+        "mcphub_echo",
+        "Echo a word back from the shopping list service.",
+        true,
+        |_: CallContext, _: Value| async move { ToolOutput::ok("echo") },
+    );
+    def.source = "mcphub".into();
+    hub.registry.register(def, handler).unwrap();
     let (def, handler) = typed_tool_with_context("test_take_secret", "Takes a secret.", false, {
         let ephemeral = ephemeral.clone();
         move |context: CallContext, args: Value| {
@@ -203,6 +249,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         registry,
         starts,
         fakes,
+        specs,
         gate: Arc::new(Notify::new()),
         data,
         usage,
@@ -300,8 +347,13 @@ impl Bench {
     }
 
     async fn new_thread(&self) -> ThreadId {
+        self.new_thread_for("alix").await
+    }
+
+    /// A thread `owner` started.
+    async fn new_thread_for(&self, owner: &str) -> ThreadId {
         self.threads
-            .create("alix", StartedBy::User, None, "Une autre")
+            .create(owner, StartedBy::User, None, "Une autre")
             .await
             .unwrap()
             .id
@@ -2481,6 +2533,7 @@ fn call_in_turn(
         let context = CallContext {
             caller: Caller::Thread(ThreadId::MAIN),
             user: "alix".into(),
+            admin: true,
             topic: "conversation".into(),
             turn,
             cancelled: tokio_util::sync::CancellationToken::new(),
@@ -3206,4 +3259,262 @@ async fn a_setup_confirmation_after_the_turn_ended_is_refused() {
             .unwrap(),
         None
     );
+}
+
+/// A member's thread asks: the card is hers, and the owner, an admin, cannot answer it. Nor may
+/// her thread ask for what only an admin grants.
+#[tokio::test]
+async fn member_cards_are_for_the_member() {
+    let bench = Bench::held().await;
+    let hers = bench.new_thread_for("marie").await;
+    let token = bench.start(hers).await;
+    let assistant = bench.assistant(hers).await;
+    let client = bench.client(&token, "claude-code", &[]).await;
+    let question = json!({"questions": [{
+        "question": "Quelle soupe ?",
+        "header": "Soupe",
+        "options": [
+            {"label": "Courge", "description": "Douce"},
+            {"label": "Poireaux", "description": "Classique"},
+        ],
+    }]});
+    let asked = call_in_background(&client, "user_ask", question);
+    let (id, _) = next_request(&assistant, 0).await;
+    let answer = || Response::Form {
+        values: [(
+            "q1".to_owned(),
+            ChoiceAnswer {
+                selected: vec!["Courge".into()],
+                ..Default::default()
+            }
+            .into(),
+        )]
+        .into(),
+    };
+    assert_eq!(
+        bench.requests.answer(id, answer(), &alix()).await,
+        Err(fronde_requests::Refusal::NotYours)
+    );
+    bench.requests.answer(id, answer(), &marie()).await.unwrap();
+    let result = timeout(WAIT, asked).await.unwrap().unwrap();
+    assert_eq!(result["result"]["status"], "answered", "{result}");
+
+    // A card only an admin answers, asked from her thread's turn: refused before it is shown.
+    let turn = assistant.current_turn().await;
+    let ask = fronde_requests::Ask {
+        topic: assistant.topic().to_owned(),
+        turn,
+        caller: Caller::Thread(hers),
+        client_request_id: None,
+        card: Card::Form {
+            message: "Installer ?".into(),
+            fields: Vec::new(),
+            submit: None,
+            truncated: false,
+            replaced: false,
+            during: Vec::new(),
+        },
+        for_user: "alix".into(),
+        admin_only: true,
+        timeout: WAIT,
+        tied: true,
+        secret_fields: false,
+    };
+    let refused = bench.threads.ask_during(hers, ask).await.unwrap_err();
+    assert!(
+        refused
+            .downcast_ref::<fronde_agent::assistant::AdminFromMember>()
+            .is_some(),
+        "{refused:#}"
+    );
+    bench.gate.notify_waiters();
+}
+
+/// A thread's hub calls act for its row's owner: a member's for her, the owner's for him, and
+/// an outside client's for the owner.
+#[tokio::test]
+async fn member_calls_act_for_the_member() {
+    let bench = Bench::held().await;
+    let hers = bench.new_thread_for("marie").await;
+    let her_token = bench.start(hers).await;
+    let his_token = bench.start(ThreadId::MAIN).await;
+    let hers = bench.client(&her_token, "claude-code", &[]).await;
+    let his = bench.client(&his_token, "claude-code", &[]).await;
+    // Nothing in the request names the user: only the token.
+    let posing = json!({"arguments": {"user": "alix", "admin": true}, "_meta": {"user": "alix"}});
+    assert_eq!(
+        call(&hers, "test_who", posing.clone()).await,
+        json!({"result": {"user": "marie", "admin": false}})
+    );
+    assert_eq!(
+        call(&his, "test_who", posing).await,
+        json!({"result": {"user": "alix", "admin": true}})
+    );
+    bench.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn outside_client_acts_for_the_owner() {
+    let bench = Bench::held().await;
+    let outside = bench.client(TOKEN, "Codex", &[]).await;
+    assert_eq!(
+        call(&outside, "test_who", json!({"arguments": {}})).await,
+        json!({"result": {"user": "alix", "admin": true}})
+    );
+}
+
+/// Until each person has spaces of their own, a member's agent is neither offered nor allowed
+/// the owner's memory, integrations or services, directly, through `use_tool` or found with
+/// `search_tools`; its instructions hold none of the owner's memory. It keeps its cards, its
+/// sub-agents and the meta tools.
+#[tokio::test]
+async fn member_agent_is_offered_no_owner_tools() {
+    let bench = Bench::held().await;
+    bench
+        .registry
+        .call(
+            "memory_add",
+            json!({"file": "memory", "text": "aime le thé vert"}),
+        )
+        .await;
+    let hers = bench.new_thread_for("marie").await;
+    let her_token = bench.start(hers).await;
+    let his_token = bench.start(ThreadId::MAIN).await;
+    let client = bench.client(&her_token, "claude-code", &[]).await;
+    let owner = bench.client(&his_token, "claude-code", &[]).await;
+
+    let names = tool_names(&client).await;
+    for kept in [
+        "user_ask",
+        "user_secret",
+        "threads_list",
+        "search_tools",
+        "use_tool",
+    ] {
+        assert!(names.iter().any(|name| name == kept), "{kept}: {names:?}");
+    }
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("memory_") || name.starts_with("integrations_")),
+        "{names:?}"
+    );
+    let his_names = tool_names(&owner).await;
+    assert!(
+        his_names.iter().any(|name| name == "memory_search")
+            && his_names
+                .iter()
+                .any(|name| name == "integrations_request_setup"),
+        "{his_names:?}"
+    );
+
+    let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
+    assert!(
+        !instructions.contains("thé vert") && !instructions.contains("mcphub_echo"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("Tools hub for marie"),
+        "{instructions}"
+    );
+    let his_instructions = owner.peer_info().unwrap().instructions.clone().unwrap();
+    assert!(
+        his_instructions.contains("thé vert") && his_instructions.contains("mcphub_echo"),
+        "{his_instructions}"
+    );
+
+    for (tool, arguments) in [
+        ("memory_search", json!({"query": "thé"})),
+        ("mcphub_echo", json!({})),
+        ("integrations_request_setup", json!({"integration": "echo"})),
+    ] {
+        for refused in [
+            call(&client, tool, json!({"arguments": arguments})).await,
+            call(
+                &client,
+                "use_tool",
+                json!({"arguments": {"name": tool, "arguments": arguments}}),
+            )
+            .await,
+        ] {
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("not available in marie's conversations")),
+                "{tool}: {refused}"
+            );
+        }
+    }
+    let found = call(
+        &client,
+        "search_tools",
+        json!({"arguments": {"need": "shopping list echo"}}),
+    )
+    .await;
+    assert!(!found.to_string().contains("mcphub_echo"), "{found}");
+    assert!(!found.to_string().contains("integration"), "{found}");
+    let his_found = call(
+        &owner,
+        "search_tools",
+        json!({"arguments": {"need": "shopping list echo"}}),
+    )
+    .await;
+    assert!(his_found.to_string().contains("mcphub_echo"), "{his_found}");
+    bench.gate.notify_waiters();
+}
+
+/// Each thread a user started tells its agent whose assistant it is; a sub-agent keeps its own
+/// prompt.
+#[tokio::test]
+async fn system_prompt_names_the_owner() {
+    let bench = Bench::held().await;
+    let hers = bench.new_thread_for("marie").await;
+    let his = bench.new_thread().await;
+    for id in [ThreadId::MAIN, his, hers] {
+        bench.start(id).await;
+    }
+    let prompts: HashMap<ThreadId, String> = bench
+        .specs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|spec| (spec.thread, spec.system_prompt.clone()))
+        .collect();
+    assert_eq!(prompts[&ThreadId::MAIN], prompt_for("alix"));
+    assert_eq!(prompts[&his], prompt_for("alix"));
+    assert_eq!(prompts[&hers], prompt_for("marie"));
+    bench.gate.notify_waiters();
+}
+
+/// A thread whose owner is no longer a configured user is read-only: its agent's sign-in
+/// fails before any process starts, and its cards would be for nobody who can answer.
+#[tokio::test]
+async fn a_removed_owners_thread_never_signs_in() {
+    let bench = Bench::held().await;
+    let theirs = bench.new_thread_for("paul").await;
+    let row = bench.threads.get(theirs).await.unwrap().unwrap();
+    assert!(!bench.threads.configured(&row));
+    assert_eq!(
+        bench.threads.user_of("paul"),
+        User {
+            name: "paul".into(),
+            admin: false,
+        }
+    );
+    bench.start(theirs).await;
+    let spec = bench
+        .specs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|spec| spec.thread == theirs)
+        .cloned()
+        .unwrap();
+    let read = spec.oauth_token.expect("a sign-in that fails");
+    let error = read().await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<fronde_agent::threads::NoOwner>(),
+        Some(&fronde_agent::threads::NoOwner("paul".into()))
+    );
+    bench.gate.notify_waiters();
 }

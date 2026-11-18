@@ -143,6 +143,14 @@ only during one of its turns: its token lives while its agent idles, and a proce
 started holds it too, but neither has a turn. An outside MCP client gets no `threads_*` tools
 (letting one start threads of its own is **planned**).
 
+A thread acts for the person it belongs to: the one it was made for, and for a sub-agent the
+owner of its parent. Its agent's system prompt names them, its cards are theirs to answer, and
+its calls to the hub act for them. A member's thread (someone who is not an admin, see
+[`[users.<name>]`](../reference/configuration.md#usersname)) is not offered the owner's memory,
+calendar, integrations or other services until each person has spaces of their own (**planned**);
+it keeps its cards, its sub-agents and `code_run_python`. See
+[Security model](security.md#threads).
+
 ## Limits
 
 The real risk of sub-agents is your subscription's quota. A sub-agent spends it in the
