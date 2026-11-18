@@ -84,8 +84,11 @@ pub struct CallContext {
     /// The user the caller acts for: a thread's owner, from the thread's row; an outside
     /// client's is the owner, `[data] user`.
     pub user: String,
-    /// Whether that user is an admin. A member's calls reach only [`member_may_use`]'s tools.
+    /// Whether that user is an admin: only an admin's cards grant what lasts.
     pub admin: bool,
+    /// Whether that user is the owner, `[data] user`: until each person has spaces of their
+    /// own, only the owner's calls reach the owner's data ([`anyone_may_use`]).
+    pub owner: bool,
     /// The stream where that user sees what the call asks.
     pub topic: String,
     /// The seq of the user message of the turn calling, for a thread's agent.
@@ -107,17 +110,27 @@ impl CallContext {
     }
 }
 
-/// Whether a member (a user who is not an admin) may be offered and call `tool`. Until each
+/// Whether anyone but the owner (`[data] user`) may be offered and call `tool`. Until each
 /// person has spaces of their own, everything but the hub's own tools is the owner's: memory,
 /// the calendar and every component's or upstream server's tools, and setting up integrations,
-/// which only an admin grants. A member keeps the cards (`user_*`), their own sub-agents
+/// which brings more of them. Anyone else keeps the cards (`user_*`), their own sub-agents
 /// (`threads_*`, which check the caller themselves), `search_tools` and `use_tool` over what
-/// they may use, and `code_run_python`, which reaches nothing.
-pub fn member_may_use(tool: &ToolDef) -> bool {
+/// they may use, and `code_run_python`, which reaches nothing: that one tool of the
+/// [`PYTHON_SOURCE`](crate::config::PYTHON_SOURCE), whose name no other source may take.
+pub fn anyone_may_use(tool: &ToolDef) -> bool {
     match tool.source.as_str() {
         "hub" => !tool.name.starts_with("memory_") && !tool.name.starts_with("integrations_"),
-        source => source == crate::config::PYTHON_SOURCE,
+        crate::config::PYTHON_SOURCE => tool.name == "code_run_python",
+        _ => false,
     }
+}
+
+/// What the registry answers for a tool it does not have, or that the caller may not use: the
+/// same, so that a call learns nothing of the owner's tools.
+fn unknown_tool(name: &str) -> ToolOutput {
+    ToolOutput::error(format!(
+        "unknown tool {name:?}; call search_tools with your need to find the right one"
+    ))
 }
 
 #[async_trait]
@@ -384,17 +397,12 @@ impl Registry {
         }
     }
 
-    /// Calls the tool `name` on behalf of `context`. A member's call to a tool they may not use
-    /// ([`member_may_use`]) is refused, whichever way it comes (directly or through
-    /// `use_tool`).
+    /// Calls the tool `name` on behalf of `context`. A call of anyone but the owner to a tool
+    /// only the owner may use ([`anyone_may_use`]) is answered as an unknown tool, whichever
+    /// way it comes (directly or through `use_tool`).
     pub async fn call_as(&self, context: &CallContext, name: &str, args: Value) -> ToolOutput {
         match self.entry(name) {
-            Ok((def, _)) if !context.admin && !member_may_use(&def) => ToolOutput::error(format!(
-                "{name} is not available in {}'s conversations: memory, the calendar, \
-                     integrations and the other services are the owner's for now; answer \
-                     without it",
-                context.user
-            )),
+            Ok((def, _)) if !context.owner && !anyone_may_use(&def) => unknown_tool(name),
             Ok((_, h)) => h.call_as(context, args).await,
             Err(unknown) => unknown,
         }
@@ -410,11 +418,7 @@ impl Registry {
             .expect("registry lock")
             .get(name)
             .cloned()
-            .ok_or_else(|| {
-                ToolOutput::error(format!(
-                    "unknown tool {name:?}; call search_tools with your need to find the right one"
-                ))
-            })
+            .ok_or_else(|| unknown_tool(name))
     }
 }
 
@@ -483,23 +487,23 @@ struct SearchTools {
 }
 
 impl SearchTools {
-    /// The tools matching `a.need`, only those a member may use when `admin` is false; with
+    /// The tools matching `a.need`, only those anyone may use when `owner` is false; with
     /// `integrations` (a thread's agent calls), the shipped components not set up yet it may be
     /// about too.
-    async fn search(&self, a: SearchArgs, admin: bool, integrations: bool) -> ToolOutput {
+    async fn search(&self, a: SearchArgs, owner: bool, integrations: bool) -> ToolOutput {
         let Some(r) = self.registry.upgrade() else {
             return ToolOutput::error("hub is shutting down");
         };
         let limit = a.limit.unwrap_or(5).clamp(1, 10) as usize;
-        // A member's search ranks only what they may use: the owner's tools would push theirs
-        // out of the limit.
-        let matched = if admin {
+        // Anyone else's search ranks only what they may use: the owner's tools would push
+        // theirs out of the limit.
+        let matched = if owner {
             r.search(&a.need, limit).await
         } else {
             r.search(&a.need, MEMBER_SEARCH_DEPTH)
                 .await
                 .into_iter()
-                .filter(member_may_use)
+                .filter(anyone_may_use)
                 .take(limit)
                 .collect()
         };
@@ -548,18 +552,18 @@ impl ToolHandler for SearchTools {
         }
     }
 
-    /// Only the agent of an admin's thread that is not a sub-agent may set an integration up:
-    /// anyone else (an outside client, a sub-agent, a member's thread) is not told of them.
+    /// Only the agent of an owner's thread that is not a sub-agent may set an integration up:
+    /// anyone else (an outside client, a sub-agent, anyone else's thread) is not told of them.
     async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
         match parse::<SearchArgs>(args) {
             Ok(a) => {
                 let told = match (&context.caller, &self.threads) {
-                    (Caller::Thread(thread), Some(threads)) if context.admin => {
+                    (Caller::Thread(thread), Some(threads)) if context.owner => {
                         !threads.is_sub_agent(*thread).await
                     }
                     _ => false,
                 };
-                self.search(a, context.admin, told).await
+                self.search(a, context.owner, told).await
             }
             Err(error) => error,
         }

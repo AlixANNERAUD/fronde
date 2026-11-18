@@ -145,10 +145,10 @@ started holds it too, but neither has a turn. An outside MCP client gets no `thr
 
 A thread acts for the person it belongs to: the one it was made for, and for a sub-agent the
 owner of its parent. Its agent's system prompt names them, its cards are theirs to answer, and
-its calls to the hub act for them. A member's thread (someone who is not an admin, see
-[`[users.<name>]`](../reference/configuration.md#usersname)) is not offered the owner's memory,
-calendar, integrations or other services until each person has spaces of their own (**planned**);
-it keeps its cards, its sub-agents and `code_run_python`. See
+its calls to the hub act for them. Anyone's thread but the owner's (`[data] user`, see
+[`[users.<name>]`](../reference/configuration.md#usersname)), another admin's included, is not
+offered the owner's memory, calendar, integrations or other services until each person has spaces
+of their own (**planned**); it keeps its cards, its sub-agents and `code_run_python`. See
 [Security model](security.md#threads).
 
 ## Limits

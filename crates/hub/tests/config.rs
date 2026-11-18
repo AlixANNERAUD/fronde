@@ -84,7 +84,7 @@ fn rejects_unsafe_builtin_tool() {
 #[test]
 fn loads_web_and_agent() {
     let s = format!(
-        "{MIN}\n[web]\npassword = {{ env = \"P\" }}\nsecure_cookie = true\n[agent]\ncommand = [\"npx\", \"claude-agent-acp\"]\nenv = {{ CLAUDE_CODE_OAUTH_TOKEN_FILE = \"/run/secrets/claude\" }}\n"
+        "{MIN}\n[web]\npassword = {{ env = \"P\" }}\nsecure_cookie = true\n[agent]\ncommand = [\"npx\", \"claude-agent-acp\"]\nenv = {{ CLAUDE_CODE_EXECUTABLE = \"/opt/claude/bin/claude\" }}\n"
     );
     let c = load_str(&s).unwrap();
     let web = c.web.unwrap();
@@ -94,9 +94,9 @@ fn loads_web_and_agent() {
     assert_eq!(
         c.agent
             .env
-            .get("CLAUDE_CODE_OAUTH_TOKEN_FILE")
+            .get("CLAUDE_CODE_EXECUTABLE")
             .map(String::as_str),
-        Some("/run/secrets/claude")
+        Some("/opt/claude/bin/claude")
     );
     let s = format!("{MIN}\n[web]\npassword = {{ env = \"P\" }}\n");
     assert!(!load_str(&s).unwrap().web.unwrap().secure_cookie);
@@ -734,7 +734,9 @@ fn integrations_prefix_is_reserved() {
 fn python_source_name_is_taken_when_python_is_on() {
     let entry =
         "[[sources]]\nkind = \"mcp\"\nname = \"python\"\nurl = \"http://127.0.0.1:1/mcp\"\n";
-    assert!(load_str(&format!("{MIN}\n{entry}")).is_ok());
+    // Reserved even without [python]: see `python_source_name_is_always_reserved`.
+    let e = load_str(&format!("{MIN}\n{entry}")).unwrap_err();
+    assert!(format!("{e:#}").contains("reserved"), "{e:#}");
     let e = load_str(&format!("{MIN}\n[python]\ndir = \"/app/python\"\n{entry}")).unwrap_err();
     assert!(format!("{e:#}").contains("taken by [python]"), "{e:#}");
 }
@@ -1677,6 +1679,9 @@ fn agent_env_cannot_set_a_sign_in_variable() {
         "AWS_BEARER_TOKEN_BEDROCK",
         "ANTHROPIC_BASE_URL",
         "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+        "CLAUDE_CODE_CLIENT_CERT",
     ] {
         for rest in ["", "oauth_token = { file = \"t\" }\n"] {
             let e = refused(&format!("{MIN}[agent]\n{rest}env = {{ {name} = \"x\" }}\n"));
@@ -1915,4 +1920,51 @@ fn accounts_belong_to_users() {
         ),
         "{e}"
     );
+}
+
+/// `python` names `[python]`'s source, whose one tool, `code_run_python`, anyone may use: no
+/// other source may take that name, with `[python]` or without.
+#[test]
+fn python_source_name_is_always_reserved() {
+    let e = refused(&format!(
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"python\"\ncommand = [\"x\"]\n"
+    ));
+    assert!(
+        e.contains("source name \"python\" is reserved") && e.contains("pick another name"),
+        "{e}"
+    );
+}
+
+/// An unconfined agent reads everything Fronde can: never once someone who is not an admin
+/// signs in.
+#[test]
+fn no_unconfined_agent_for_members() {
+    let e = refused(&owned_by_alix(&format!(
+        "[agent]\nsandbox = false\n{USERS}"
+    )));
+    assert!(
+        e.contains("[agent] sandbox = false with [users.marie], who is not an admin"),
+        "{e}"
+    );
+    // With admins only, the owner may still choose it.
+    let admins = USERS.replace("[users.marie]\n", "[users.marie]\nadmin = true\n");
+    load_str(&owned_by_alix(&format!(
+        "[agent]\nsandbox = false\n{admins}"
+    )))
+    .unwrap();
+}
+
+/// Full case folding: names that differ only by a letter's folded form look alike.
+#[test]
+fn user_names_fold_fully() {
+    for (a, b) in [("Straße", "STRASSE"), ("ǅana", "džana")] {
+        let e = refused(&format!(
+            "{MIN}user = {}\n[users.{}]\nadmin = true\npassword = {{ file = \"p\" }}\n\
+             [users.{}]\npassword = {{ file = \"q\" }}\n",
+            toml::Value::String(a.to_owned()),
+            toml::Value::String(a.to_owned()),
+            toml::Value::String(b.to_owned()),
+        ));
+        assert!(e.contains("look alike"), "{a:?} {b:?}: {e}");
+    }
 }

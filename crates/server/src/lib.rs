@@ -493,13 +493,25 @@ pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> 
         for dir in [&main.work, &main.home] {
             write_grant(dir, &protected)?;
         }
-        Some(agent_sandbox(config, &[])?)
+        Some(agent_sandbox(config, &[], &[])?)
     } else {
         tracing::warn!(
             "[agent] sandbox = false: the agent runs unconfined, with access to every file your \
              user can read and write, Fronde's data and configuration included"
         );
         None
+    };
+    // `[agent] read` is the owner's to grant to their own agents: anyone else's get only the
+    // system's, their program's and their thread's own. Checked as every grant is.
+    let owner_read = match &sandbox {
+        Some(base) if !config.agent.read.is_empty() => {
+            let with = agent_sandbox(config, &[], &config.agent.read)?;
+            with.read
+                .into_iter()
+                .filter(|dir| !base.read.contains(dir))
+                .collect()
+        }
+        _ => Vec::new(),
     };
     Ok(Confine {
         helper: helper.to_path_buf(),
@@ -512,6 +524,7 @@ pub fn agent_confine(config: &Config, helper: &Path) -> anyhow::Result<Confine> 
         protected,
         // `start` adds it: whether systemd-run is there is the machine's, not the configuration's.
         scope: None,
+        owner_read,
     })
 }
 
@@ -797,7 +810,7 @@ fn protected_paths(config: &Config) -> Vec<PathBuf> {
     protected
 }
 
-fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> {
+fn agent_sandbox(config: &Config, write: &[PathBuf], extra: &[PathBuf]) -> anyhow::Result<Sandbox> {
     let system = SYSTEM_READ.map(PathBuf::from);
     let path = agent_variable(config, "PATH");
     let program = config.agent.command.first().map_or("", String::as_str);
@@ -809,7 +822,7 @@ fn agent_sandbox(config: &Config, write: &[PathBuf]) -> anyhow::Result<Sandbox> 
         program,
         // `[agent]` is Claude's, the only provider so far.
         install: fronde_agent::provider::Provider::CLAUDE.install,
-        extra: &config.agent.read,
+        extra,
         write,
         protected: &protected,
         home: home.as_deref(),
@@ -1161,6 +1174,7 @@ pub async fn start_signed_in_as(
                 // The latest usage reading per account, from every agent process.
                 usage: Some(fronde_agent::usage::UsageBook::load(db.clone(), &accounts).await),
                 // `Threads::open_for` gives each thread its owner's.
+                owners_grants: true,
                 account: String::new(),
             };
             if let Some(book) = &spec.usage {

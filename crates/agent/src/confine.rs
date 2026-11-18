@@ -102,8 +102,16 @@ impl Policy {
         serde_json::from_str(arg).context("invalid --policy")
     }
 
-    /// Whether the agent gets the variable `name`.
+    /// Whether the agent gets the variable `name`: never one `drop_env` names exactly; one
+    /// `keep_env` names exactly (a variable Fronde sets for it) even when a dropped prefix
+    /// matches it; else one a kept prefix matches and no dropped prefix does.
     pub fn keeps(&self, name: &str) -> bool {
+        if self.drop_env.iter().any(|dropped| dropped == name) {
+            return false;
+        }
+        if self.keep_env.iter().any(|kept| kept == name) {
+            return true;
+        }
         !self.drop_env.iter().any(|dropped| matches(dropped, name))
             && self.keep_env.iter().any(|pattern| matches(pattern, name))
     }
@@ -133,6 +141,9 @@ pub struct Confine {
     /// The systemd scope that caps the agent's resources, when `systemd-run` is there; whether
     /// the user manager answers is checked at each start ([`Confine::ready`]).
     pub scope: Option<Scope>,
+    /// Read grants for the owner's agents only (`[agent] read`), canonical: an agent whose spec
+    /// has `owners_grants` gets them besides the policy's, any other none of them.
+    pub owner_read: Vec<PathBuf>,
 }
 
 /// The command that starts an agent through the helper.
@@ -204,10 +215,16 @@ impl Confine {
             .collect();
         let mut policy = self.policy.clone();
         policy.cwd = spec.cwd.clone();
-        // The agent writes its thread's directories, and no other thread's.
+        // The agent writes its thread's directories, and no other thread's; it reads what only
+        // the owner granted when its thread is the owner's.
         if let Some(sandbox) = &mut policy.sandbox {
             for dir in [&spec.cwd, &spec.home] {
                 push(&mut sandbox.write, write_grant(dir, &self.protected)?);
+            }
+            if spec.owners_grants {
+                for dir in &self.owner_read {
+                    push(&mut sandbox.read, dir.clone());
+                }
             }
         }
         for (name, _) in &env {
@@ -987,6 +1004,7 @@ mod tests {
             system_prompt: String::new(),
             builtin_tools: Vec::new(),
             usage: None,
+            owners_grants: true,
             account: "claude".into(),
         }
     }
@@ -1006,6 +1024,7 @@ mod tests {
             },
             protected: Vec::new(),
             scope: None,
+            owner_read: Vec::new(),
         }
     }
 

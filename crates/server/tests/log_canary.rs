@@ -526,6 +526,7 @@ async fn every_threads_token_never_appears() {
     let data = dir.path().join("data");
     let config: Config = toml::from_str(&format!(
         "[server]\ntoken = {{ env = \"UNUSED\" }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
+         user = \"alix\"\n\
          [memory]\ngit = false\n[secrets]\nbackend = \"file\"\nmaster_key = {{ file = {:?} }}\n",
         data.display().to_string(),
         dir.path().join("master.key").display().to_string(),
@@ -562,6 +563,7 @@ async fn every_threads_token_never_appears() {
         system_prompt: String::new(),
         builtin_tools: Vec::new(),
         usage: None,
+        owners_grants: true,
         account: "claude".into(),
     };
     let owner = fronde_requests::User {
@@ -1123,6 +1125,7 @@ fn setup_context() -> fronde_hub::tools::CallContext {
         caller: fronde_requests::Caller::Thread(fronde_protocol::ThreadId::MAIN),
         user: "alix".into(),
         admin: true,
+        owner: true,
         topic: "conversation".into(),
         turn: Some(3),
         cancelled: tokio_util::sync::CancellationToken::new(),

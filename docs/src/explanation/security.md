@@ -426,9 +426,13 @@ thread's first message, with its own directories, its own sandbox and its own hu
   cards (permissions, questions, secrets) are for them alone, so an admin cannot answer a
   member's card any more than she can his, and its calls to the hub carry them, from the token,
   never from anything in the request. An outside MCP client acts for the owner, `[data] user`.
-  A thread whose owner is no longer a configured user is read-only: the page refuses a message
-  to it, and its agent's sign-in fails before any process starts, without falling back to
-  anyone else's. The main thread is always `[data] user`'s. (Each person signing in as
+  A thread whose owner is no longer a configured user is read-only: at start, Fronde gives it
+  (and that person's pending cards) to `removed:<name>`, a name no one can have since `:` is
+  never in a user's name, and says so in its log; a person later configured under the same name
+  starts with none of them. The page refuses a message to such a thread, nothing starts or drives
+  a sub-agent of it, and its agent's sign-in fails before any process starts, without falling
+  back to anyone else's. The main thread is always `[data] user`'s, and its sub-agents go with
+  it when `[data] user` changes. (Each person signing in as
   themselves is **planned**: until then only the owner signs in.)
 - **Which token reaches which agent.** A thread's account is its owner's account for the
   thread's provider, looked up at each start and by nothing else: no argument, agent, card or
@@ -442,13 +446,19 @@ thread's first message, with its own directories, its own sandbox and its own hu
   sign-in variable from Fronde's environment (see [The agent's environment](#the-agents-environment)):
   the account's token is the only `CLAUDE_CODE_OAUTH_TOKEN` it gets. Usage readings, the reserve
   and the daily counts of sub-agents are kept per account.
-- **What a member's agent reaches.** Until each person has a memory and spaces of their own,
+- **What anyone else's agent reaches.** Until each person has a memory and spaces of their own,
   memory, the calendar, every component's and upstream server's tools, and setting up an
-  integration are the owner's. The agent of a member's thread (a user who is not an admin) is
-  neither offered nor allowed them, whether it calls them directly, through `use_tool` or finds
-  them with `search_tools`, and its hub instructions hold none of the owner's memory. It keeps
-  its own cards, its own sub-agents, `search_tools`, `use_tool` and `code_run_python`. A card
-  only an admin answers (an integration's setup) is refused to it as well, before it is shown.
+  integration are the owner's, `[data] user`'s, not every admin's. The agent of anyone else's
+  thread, another admin's included, is neither offered nor allowed them, whether it calls them
+  directly, through `use_tool` or finds them with `search_tools`: such a call is answered exactly
+  as a tool that does not exist, and its hub instructions hold none of the owner's memory. It
+  keeps its own cards, its own sub-agents, `search_tools`, `use_tool` and `code_run_python` (that
+  one tool of the `python` source, a name no other source may take). Its `user_secret` keeps a
+  secret for the conversation only, never in the store, and tells nothing of the names stored.
+  A card only an admin answers (an integration's setup) is refused to a member's thread as well,
+  before it is shown. `[agent] read` is the owner's to grant: only the owner's agents get it.
+  An unconfined agent (`[agent] sandbox = false`) is refused once someone who is not an admin is
+  configured. Of the agent slots, the one kept is for the owner's own threads only.
 - **Unknown askers.** A request whose stored asker this version does not know (neither a thread,
   an outside client nor a server, nor the `assistant` of rows from before threads) is never read
   as a thread's: Fronde cancels it at start, and it can never be answered or own a secret.

@@ -81,6 +81,8 @@ unicode-properties = { version = "0.1.5", default-features = false, features = [
 # A confusable skeleton (UTS #39) and NFKC, to read a form field's name as a person would.
 unicode-security = "0.1"
 unicode-normalization = "0.1"
+# Full Unicode case folding (ß and ss alike), to tell two user names that look alike.
+unicase = "2.8"
 tw_merge = "0.1"
 wiremock = "0.6"
 uuid = { version = "1", features = ["v4"] }

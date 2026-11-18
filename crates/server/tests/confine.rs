@@ -101,6 +101,7 @@ impl Setup {
             system_prompt: String::new(),
             builtin_tools: Vec::new(),
             usage: None,
+            owners_grants: true,
             account: "claude".into(),
         }
     }
@@ -180,6 +181,10 @@ fn check_environment(sandbox: bool) {
         ("ANTHROPIC_API_KEY", "inherited-api-key-value"),
         ("ANTHROPIC_BASE_URL", "https://elsewhere.example"),
         ("CLAUDE_CODE_USE_BEDROCK", "1"),
+        // Nor a Claude directory, which would sign every thread in alike, nor other settings.
+        ("CLAUDE_CONFIG_DIR", "/home/owner/.claude"),
+        ("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "1"),
+        ("CLAUDE_CODE_ENTRYPOINT", "cli"),
         ("LANG", "fr_FR.UTF-8"),
     ];
     // The account's token, as Fronde gives it from the agent's spec.
@@ -206,6 +211,9 @@ fn check_environment(sandbox: bool) {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
         "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+        "CLAUDE_CODE_ENTRYPOINT",
     ] {
         assert!(
             !env.contains_key(absent),
@@ -235,6 +243,39 @@ fn check_environment(sandbox: bool) {
             "{name} is not on the allow list:\n{text}"
         );
     }
+    // Without a token given (the legacy form's unsigned agent), none reaches it at all.
+    let output = setup.run(&spec, &parent);
+    assert!(output.status.success(), "{output:?}");
+    let text = std::fs::read_to_string(setup.data.join("agent/env.txt")).unwrap();
+    assert!(
+        !variables(&text).contains_key("CLAUDE_CODE_OAUTH_TOKEN"),
+        "an inherited token reached the agent:\n{text}"
+    );
+}
+
+/// `[agent] read` is the owner's to grant: only an agent whose thread is the owner's reads it.
+#[test]
+fn agent_read_is_for_the_owners_agents_only() {
+    let granted = tempfile::tempdir().unwrap();
+    let setup = setup(&format!(
+        "read = [{:?}]",
+        granted.path().display().to_string()
+    ));
+    let dir = granted.path().canonicalize().unwrap();
+    let mut spec = setup.spec(&shell("true"), &[]);
+    let reads = |spec: &AgentSpec| {
+        setup
+            .confine
+            .command(spec)
+            .unwrap()
+            .policy
+            .sandbox
+            .unwrap()
+            .read
+    };
+    assert!(reads(&spec).contains(&dir));
+    spec.owners_grants = false;
+    assert!(!reads(&spec).contains(&dir));
 }
 
 #[test]

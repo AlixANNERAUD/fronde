@@ -477,6 +477,23 @@ async fn connect(
         .map_err(|_| anyhow::anyhow!("timed out after {}s", CONNECT_TIMEOUT.as_secs()))?
 }
 
+/// The variables a server run as a command keeps from Fronde's environment: what finds programs,
+/// the home and the language. Nothing else, so that no secret's variable, sign-in variable or
+/// session's bus reaches it.
+const STDIO_KEEP_ENV: [&str; 3] = ["PATH", "HOME", "LANG"];
+
+/// An upstream server's command, with a cleared environment but [`STDIO_KEEP_ENV`].
+fn stdio_command(program: &str, args: &[String]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args).env_clear();
+    for name in STDIO_KEEP_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+    cmd
+}
+
 async fn open(
     cfg: &UpstreamConfig,
     token: Option<SecretString>,
@@ -491,9 +508,9 @@ async fn open(
             .serve(StreamableHttpClientTransport::from_config(config))
             .await?)
     } else if let Some([program, args @ ..]) = cfg.command.as_deref() {
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args);
-        Ok(handler.serve(TokioChildProcess::new(cmd)?).await?)
+        Ok(handler
+            .serve(TokioChildProcess::new(stdio_command(program, args))?)
+            .await?)
     } else {
         anyhow::bail!("mcp {:?}: set exactly one of url or command", cfg.name)
     }
@@ -737,6 +754,32 @@ pub(crate) mod test_server {
 
 #[cfg(test)]
 mod tests {
+    /// A server run as a command gets a cleared environment: only `PATH`, `HOME` and `LANG`
+    /// from Fronde's, whatever else Fronde holds.
+    #[tokio::test]
+    async fn a_command_gets_a_cleared_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let mut cmd = super::stdio_command(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                format!("env > {:?}", out.display().to_string()),
+            ],
+        );
+        let status = cmd.status().await.unwrap();
+        assert!(status.success());
+        let text = std::fs::read_to_string(&out).unwrap();
+        for line in text.lines() {
+            let name = line.split('=').next().unwrap();
+            assert!(
+                super::STDIO_KEEP_ENV.contains(&name)
+                    || ["PWD", "SHLVL", "_", "OLDPWD"].contains(&name),
+                "{name} reached the server:\n{text}"
+            );
+        }
+    }
+
     use super::*;
     use crate::source::Supervisor;
     use crate::tools::Registry;
@@ -1370,6 +1413,7 @@ mod tests {
                 caller: Caller::Thread(fronde_requests::ThreadId::MAIN),
                 user: "alix".into(),
                 admin: true,
+                owner: true,
                 topic: "conversation".into(),
                 turn: Some(1),
                 cancelled: CancellationToken::new(),
@@ -1397,6 +1441,7 @@ mod tests {
                 caller,
                 user: "alix".into(),
                 admin: true,
+                owner: true,
                 topic: "conversation".into(),
                 turn,
                 cancelled: CancellationToken::new(),

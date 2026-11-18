@@ -328,6 +328,7 @@ fn no_secret_in_debug() {
         system_prompt: "You are Fronde.".into(),
         builtin_tools: Vec::new(),
         usage: None,
+        owners_grants: true,
         account: "claude".into(),
     };
 

@@ -2596,6 +2596,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "unicase",
  "unicode-normalization",
  "unicode-security",
  "url",

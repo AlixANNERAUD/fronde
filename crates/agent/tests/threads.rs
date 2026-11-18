@@ -43,6 +43,7 @@ fn spec() -> AgentSpec {
         system_prompt: "You are Fronde.".into(),
         builtin_tools: Vec::new(),
         usage: None,
+        owners_grants: true,
         account: "claude".into(),
     }
 }
@@ -3578,8 +3579,9 @@ async fn the_main_thread_follows_the_owner() {
     let main = threads.get(ThreadId::MAIN).await.unwrap().unwrap();
     assert_eq!(main.owner, "alix");
     assert!(threads.configured(&main));
+    // Given to a name no one can have: read-only for good, never a later "me"'s.
     let other = threads.get(other).await.unwrap().unwrap();
-    assert_eq!(other.owner, "me");
+    assert_eq!(other.owner, "removed:me");
     assert!(!threads.configured(&other));
     // The owner, an admin, still sees it.
     assert!(other.visible_to(&alix()));
@@ -3665,4 +3667,48 @@ async fn remapped_owner_applies_at_the_next_start() {
             ("marie_pro".to_owned(), "second-token-of-marie".to_owned()),
         ]
     );
+}
+
+/// A person removed from the configuration leaves their threads to a name no one can have: a
+/// new user later given the same name starts with none of them.
+#[tokio::test]
+async fn a_recycled_name_gets_no_old_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector(FakeScript::default());
+    let paul = User {
+        name: "paul".into(),
+        admin: false,
+    };
+    let open = |users: Vec<User>| {
+        let (dir, connector) = (dir.path().to_path_buf(), connector.clone());
+        async move {
+            let db = fronde_db::open(&dir).await.unwrap();
+            let people = People {
+                users: users.into_iter().collect(),
+                owner: "alix".into(),
+                prompt: None,
+                accounts: Accounts::default(),
+            };
+            Threads::open_for(db, &dir, spec(), connector, people, Budget::default())
+                .await
+                .unwrap()
+        }
+    };
+    let threads = open(vec![alix(), paul.clone()]).await;
+    let his = threads
+        .create("paul", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    assert!(threads.visible(his, &paul).await.is_ok());
+    drop(threads);
+    // Paul leaves; another Paul comes later.
+    drop(open(vec![alix()]).await);
+    let threads = open(vec![alix(), paul.clone()]).await;
+    let row = threads.get(his).await.unwrap().unwrap();
+    assert_eq!(row.owner, "removed:paul");
+    assert!(threads.visible(his, &paul).await.is_err());
+    assert!(threads.summaries(&paul).await.unwrap().is_empty());
+    // The owner still sees it.
+    assert!(threads.visible(his, &alix()).await.is_ok());
 }

@@ -368,6 +368,8 @@ struct Bound<'a> {
     sub_agent: bool,
     /// Its own directories; `None` keeps the base's, the main thread's.
     dirs: Option<ThreadDirs>,
+    /// Whether its owner is `[data] user`, whose agents alone get `[agent] read`.
+    owners_grants: bool,
 }
 
 /// `base` bound for one thread: its directories, its system prompt (a sub-agent's own, else
@@ -388,6 +390,7 @@ fn bound_spec(
         provider,
         sub_agent,
         dirs,
+        owners_grants,
     } = bound;
     let system_prompt = match (sub_agent, prompt) {
         (true, _) => children::SYSTEM_PROMPT.to_owned(),
@@ -431,6 +434,7 @@ fn bound_spec(
         system_prompt,
         oauth_token,
         account,
+        owners_grants,
         ..base.clone()
     }
 }
@@ -587,6 +591,9 @@ pub struct Threads {
     owners: Mutex<HashMap<ThreadId, User>>,
     /// Each person's account per provider.
     accounts: Accounts,
+    /// `[data] user`: the main thread is theirs, their threads have the pool's last slot, and
+    /// only their agents get the owner's grants (`[agent] read`).
+    owner: String,
     main: Arc<Assistant>,
     /// The threads opened so far, the main one among them. Locked while one is opened, so that
     /// a thread is never opened twice.
@@ -676,10 +683,14 @@ impl Threads {
         ensure_main(&db, owner, spec.provider.id)
             .await
             .context("cannot make the main thread in the database")?;
+        bury_removed(&db, &users)
+            .await
+            .context("cannot mark the threads of people no longer configured")?;
         // The base every thread's spec is made from holds no token: each is its owner's.
         let spec = AgentSpec {
             thread: ThreadId::MAIN,
             oauth_token: None,
+            owners_grants: true,
             account: String::new(),
             ..spec
         };
@@ -695,6 +706,7 @@ impl Threads {
                 provider: spec.provider.id,
                 sub_agent: false,
                 dirs: None,
+                owners_grants: true,
             },
         );
         let tokens = Tokens::new();
@@ -741,6 +753,7 @@ impl Threads {
             users,
             prompt,
             accounts,
+            owner: owner.to_owned(),
             open: tokio::sync::Mutex::new(HashMap::from([(ThreadId::MAIN, main.clone())])),
             main,
             requests: OnceLock::new(),
@@ -894,7 +907,8 @@ impl Threads {
             self.spec_for(&row),
             shared,
             row.archived_at.is_some(),
-            row.started_by == StartedBy::User,
+            // Only the owner's own threads have the pool's last slot.
+            row.started_by == StartedBy::User && row.owner == self.owner,
             parent,
             turn_timeout,
         )
@@ -940,6 +954,7 @@ impl Threads {
                 provider: &row.provider,
                 sub_agent: row.parent.is_some(),
                 dirs,
+                owners_grants: row.owner == self.owner,
             },
         )
     }
@@ -1384,6 +1399,49 @@ fn move_aside_leftover(data_dir: &Path, id: ThreadId) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The prefix of an owner who is no longer a user: `:` is never in a user's name, so a person
+/// configured later under the same name never gets their threads.
+pub const REMOVED: &str = "removed:";
+
+/// Gives the threads (and the pending cards) of every owner who is not in `users` to
+/// `removed:<name>`, in one transaction: read-only for good, an admin still seeing them, and a
+/// new user of that name starting with none of them.
+async fn bury_removed(db: &DatabaseConnection, users: &Users) -> anyhow::Result<()> {
+    let transaction = fronde_db::begin_write(db).await?;
+    let owners: Vec<String> = threads::Entity::find()
+        .select_only()
+        .column(threads::Column::Owner)
+        .distinct()
+        .into_tuple()
+        .all(&transaction)
+        .await?;
+    for owner in owners {
+        if owner.starts_with(REMOVED) || users.get(&owner).is_some() {
+            continue;
+        }
+        let buried = format!("{REMOVED}{owner}");
+        tracing::warn!(
+            "{owner} is no longer a user: their threads are now {buried}'s, read-only; an admin \
+             still sees them"
+        );
+        threads::Entity::update_many()
+            .col_expr(threads::Column::Owner, Expr::value(buried.clone()))
+            .filter(threads::Column::Owner.eq(owner.clone()))
+            .exec(&transaction)
+            .await?;
+        fronde_entity::requests::Entity::update_many()
+            .col_expr(
+                fronde_entity::requests::Column::ForUser,
+                Expr::value(buried),
+            )
+            .filter(fronde_entity::requests::Column::ForUser.eq(owner))
+            .exec(&transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 /// Makes the main thread's stream and row when missing, and moves the agent's session id from
 /// the key-value table to the row, in one transaction: the row is then the only place it is
 /// kept. The main thread is `owner`'s, `[data] user`: a row made for an earlier name is given to
@@ -1406,12 +1464,26 @@ async fn ensure_main(db: &DatabaseConnection, owner: &str, provider: &str) -> an
         && main.owner != owner
     {
         tracing::info!(
-            "the main thread was {}'s: it is now {owner}'s, [data] user",
+            "the main thread was {}'s: it is now {owner}'s, [data] user, with its sub-agents",
             main.owner
         );
+        // Its sub-agents, all the way down, go with it: a sub-agent is its root's owner's.
+        let mut tree = vec![ThreadId::MAIN.0];
+        let mut level = tree.clone();
+        while !level.is_empty() {
+            level = threads::Entity::find()
+                .select_only()
+                .column(threads::Column::Id)
+                .filter(threads::Column::ParentId.is_in(level))
+                .into_tuple::<i64>()
+                .all(&transaction)
+                .await?;
+            level.retain(|id| !tree.contains(id));
+            tree.extend(&level);
+        }
         threads::Entity::update_many()
             .col_expr(threads::Column::Owner, Expr::value(owner.to_owned()))
-            .filter(threads::Column::Id.eq(ThreadId::MAIN.0))
+            .filter(threads::Column::Id.is_in(tree))
             .exec(&transaction)
             .await?;
     }

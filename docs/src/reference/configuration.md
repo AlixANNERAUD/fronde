@@ -134,7 +134,7 @@ Optional.
 Zero or more sources of tools besides Fronde's own (memory and tool search), each an upstream
 MCP server or a tool component. `kind` says which. Every source has a `name`, unique among all
 sources, matching `^[a-z][a-z0-9_]{0,63}$`, and not `hub`, which is reserved for Fronde's own
-tools. With `[python]`, `python` is taken too.
+tools, nor `python`, `[python]`'s, with `[python]` or without.
 
 Earlier versions had `[calendar]` and `[[mcp]]`: Fronde now refuses them and says what to write
 instead. The calendar is a component (see
@@ -289,7 +289,11 @@ With `[users]`, `[web]` may be left empty (`[web]` alone) to serve the chat.
 Optional. The people who sign in to Fronde, one section per person, the section's name being
 theirs. Signing in by name, each person to their own conversations, is **planned**: until then,
 only the owner, `[data] user`, signs in, with their own password, and the others' sections are
-only checked.
+only checked. Until each person has spaces of their own, the memory, the calendar, the
+integrations and every other service are the owner's, not every admin's (see
+[Security model](../explanation/security.md#threads)). Once someone is no longer listed, Fronde
+gives their threads to `removed:<name>` at start, read-only for good: a person later listed
+under the same name starts with none of them.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -399,9 +403,9 @@ Codex and Gemini/Antigravity are planned".
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `command` | array of strings | `["claude-agent-acp"]` | Program and arguments. A bare name is looked up on the `PATH`, which does not include `agent/node_modules/.bin` outside `mise exec`: use the adapter's full path (`fronde init` writes it when it finds it). `fronde check` warns when the program is not found. |
-| `env` | table of strings | `{}` | Extra environment variables, in plain text: never a secret. The agent does not inherit Fronde's environment: it gets `PATH`, the locale (`LANG`, `LANGUAGE`, `LC_*`), `TZ`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in either case) and CA variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) when set, these, and `HOME` and `TMPDIR`, which Fronde sets to its own home (see [Data directory](data-directory.md)). Never a `{ env = "…" }` secret's variable, even one whose name matches. No `CLAUDE_*` variable is inherited: set the ones the agent needs here (`CLAUDE_CODE_EXECUTABLE`). `HOME`, `TMPDIR`, `CREDENTIALS_DIRECTORY`, `CLAUDE_CONFIG_DIR` (one Claude directory would sign every thread in alike), `XDG_*` and `DBUS_*` cannot be set here, nor the variables that decide how an agent signs in (`CLAUDE_CODE_OAUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, any `ANTHROPIC_*` or `CLAUDE_CODE_USE_*`): only an account's `oauth_token` signs an agent in. |
-| `sandbox` | boolean | `true` | Confine the agent with Landlock and seccomp (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)). On a kernel that cannot (no Landlock, or ABI 1 or 2, before Linux 6.2), the agent does not start. `false` runs it unconfined, with access to everything your user can read and write, and Fronde logs a warning at every start. |
-| `read` | array of paths | `[]` | More directories the confined agent may read and run programs from, besides the system's, its `PATH` and the adapter's install. A relative path is read from the configuration file's directory. One that equals or contains the data directory, the configuration's directory, a secret file or systemd's credentials is an error. Use it for a Claude Code installed elsewhere (`CLAUDE_CODE_EXECUTABLE`) or a Node.js outside the `PATH`. |
+| `env` | table of strings | `{}` | Extra environment variables, in plain text: never a secret. The agent does not inherit Fronde's environment: it gets `PATH`, the locale (`LANG`, `LANGUAGE`, `LC_*`), `TZ`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in either case) and CA variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) when set, these, and `HOME` and `TMPDIR`, which Fronde sets to its own home (see [Data directory](data-directory.md)). Never a `{ env = "…" }` secret's variable, even one whose name matches. No `CLAUDE_*` variable is inherited: set the ones the agent needs here (`CLAUDE_CODE_EXECUTABLE`). `HOME`, `TMPDIR`, `CREDENTIALS_DIRECTORY`, `CLAUDE_CONFIG_DIR` (one Claude directory would sign every thread in alike), `XDG_*` and `DBUS_*` cannot be set here, nor the variables that decide how an agent signs in (`CLAUDE_CODE_OAUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, any `ANTHROPIC_*`, `CLAUDE_CODE_USE_*`, `CLAUDE_CODE_OAUTH_*`, `CLAUDE_CODE_API_KEY_*` or `CLAUDE_CODE_CLIENT_*`): only an account's `oauth_token` signs an agent in. |
+| `sandbox` | boolean | `true` | Confine the agent with Landlock and seccomp (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)). On a kernel that cannot (no Landlock, or ABI 1 or 2, before Linux 6.2), the agent does not start. `false` runs it unconfined, with access to everything your user can read and write, and Fronde logs a warning at every start; it is refused once `[users]` lists someone who is not an admin. |
+| `read` | array of paths | `[]` | More directories the confined agent may read and run programs from, besides the system's, its `PATH` and the adapter's install. A relative path is read from the configuration file's directory. One that equals or contains the data directory, the configuration's directory, a secret file or systemd's credentials is an error. Use it for a Claude Code installed elsewhere (`CLAUDE_CODE_EXECUTABLE`) or a Node.js outside the `PATH`. Only the owner's agents (`[data] user`'s threads) get it. |
 | `oauth_token` | secret | none | The legacy form of the owner's account (see [The legacy form](#the-legacy-form)): the token `claude setup-token` prints, as `{ file = "…" }`, `{ env = "…" }` or `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`). Fronde reads it at each start of the agent and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through its environment only. Refused with `[accounts]`. See [Sign Fronde in to Claude](../how-to/sign-in-to-claude.md). |
 | `builtin_tools` | array of strings | `["WebSearch", "WebFetch"]` | Claude Code's own tools the agent may use besides the hub's. Only `WebSearch` and `WebFetch` are allowed; `[]` for none. `AskUserQuestion` is always on, never allowed up front: it asks you through a card. |
 

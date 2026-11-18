@@ -132,6 +132,9 @@ pub struct AgentSpec {
     /// Where the usage readings the agent sends go, read with its provider's
     /// [`UsageSource`](crate::usage::UsageSource): the server's one book. `None` drops them.
     pub usage: Option<Arc<UsageBook>>,
+    /// Whether the agent's thread is the owner's (`[data] user`): only then does it get the
+    /// owner's grants, `[agent] read` ([`Confine::owner_read`](crate::confine::Confine)).
+    pub owners_grants: bool,
     /// The subscription account the agent signs in with, which its readings are kept under
     /// ([`Threads::account`](crate::threads::Threads::account)).
     pub account: String,
@@ -155,6 +158,7 @@ impl fmt::Debug for AgentSpec {
             .field("system_prompt", &self.system_prompt)
             .field("builtin_tools", &self.builtin_tools)
             .field("usage", &self.usage)
+            .field("owners_grants", &self.owners_grants)
             .field("account", &self.account)
             .finish()
     }

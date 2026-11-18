@@ -3,7 +3,7 @@
 use crate::Hub;
 use crate::guide::instructions;
 use crate::tools::CallContext;
-use crate::tools::{ToolDef, member_may_use};
+use crate::tools::{ToolDef, anyone_may_use};
 use fronde_requests::{Caller, ThreadId, User};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
@@ -75,10 +75,12 @@ impl HubServer {
                 (Caller::Mcp(name), TOPIC.to_owned(), None, self.owner())
             }
         };
+        let owner = user.name == self.hub.config.data.user;
         CallContext {
             caller,
             user: user.name,
             admin: user.admin,
+            owner,
             topic,
             turn,
             cancelled: context.ct.clone(),
@@ -107,27 +109,23 @@ impl HubServer {
         }
     }
 
-    /// The tools `context` is offered among `tools`: a member only those
-    /// [`member_may_use`] allows, which the registry checks again at the call.
+    /// The tools `context` is offered among `tools`: anyone but the owner only those
+    /// [`anyone_may_use`] allows, which the registry checks again at the call.
     async fn offered(&self, context: &CallContext, tools: Vec<ToolDef>) -> Vec<ToolDef> {
         let delegates = self.delegates(&context.caller).await;
         tools
             .into_iter()
             .filter(|d| Self::offers(&d.name, &context.caller, delegates))
-            .filter(|d| context.admin || member_may_use(d))
+            .filter(|d| context.owner || anyone_may_use(d))
             .collect()
     }
 
-    /// The hub's instructions for the user `context` acts for, from the tools it is offered: an
-    /// admin's hold the memory, which is the owner's and names them; a member's hold none of it.
+    /// The hub's instructions for the user `context` acts for, from the tools it is offered: the
+    /// owner's hold the memory, which is theirs; anyone else's hold none of it.
     async fn instructions_for(&self, context: &CallContext) -> String {
         let tools = self.offered(context, self.hub.registry.all()).await;
-        if context.admin {
-            instructions(
-                &self.hub.config.data.user,
-                &tools,
-                &self.hub.memory.core_now(),
-            )
+        if context.owner {
+            instructions(&context.user, &tools, &self.hub.memory.core_now())
         } else {
             crate::guide::member_instructions(&context.user, &tools)
         }

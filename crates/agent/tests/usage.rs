@@ -35,6 +35,7 @@ fn spec(usage: Option<Arc<UsageBook>>) -> AgentSpec {
         system_prompt: "You are Fronde.".into(),
         builtin_tools: Vec::new(),
         usage,
+        owners_grants: true,
         account: "claude".into(),
     }
 }
@@ -136,6 +137,7 @@ async fn readings_go_to_the_agents_account() {
         ..FakeScript::default()
     };
     let spec = AgentSpec {
+        owners_grants: true,
         account: "claude:lea".into(),
         ..spec(Some(book.clone()))
     };

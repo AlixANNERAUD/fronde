@@ -84,7 +84,15 @@ fn marie() -> User {
     }
 }
 
-/// A family member without an account of her own.
+/// A second admin, who is not the owner.
+fn lea() -> User {
+    User {
+        name: "lea".into(),
+        admin: true,
+    }
+}
+
+/// A family member without an account of his own.
 fn paul() -> User {
     User {
         name: "paul".into(),
@@ -95,6 +103,7 @@ fn paul() -> User {
 /// The made-up tokens of the bench's accounts: the owner's, `claude`, and Marie's, `marie`.
 const ALIX_TOKEN: &str = "token-of-alix";
 const MARIE_TOKEN: &str = "token-of-marie";
+const LEA_TOKEN: &str = "token-of-lea";
 
 /// A sign-in that reads `value`, as an account's token reads.
 fn token_reading(value: &'static str) -> fronde_agent::acp::OauthToken {
@@ -173,6 +182,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         system_prompt: String::new(),
         builtin_tools: Vec::new(),
         usage: Some(usage.clone()),
+        owners_grants: true,
         account: "claude".into(),
     };
     // The owner, an admin, and two family members, one of whom has no account. The owner's
@@ -182,6 +192,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
     for (owner, account, token) in [
         ("alix", "claude", ALIX_TOKEN),
         ("marie", "marie", MARIE_TOKEN),
+        ("lea", "lea", LEA_TOKEN),
     ] {
         accounts.insert(
             owner,
@@ -193,7 +204,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         );
     }
     let people = fronde_agent::threads::People {
-        users: [alix(), marie(), paul()].into_iter().collect(),
+        users: [alix(), marie(), paul(), lea()].into_iter().collect(),
         owner: "alix".into(),
         prompt: Some(prompt),
         accounts,
@@ -259,6 +270,18 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
     );
     def.source = "mcphub".into();
     hub.registry.register(def, handler).unwrap();
+    // `code_run_python`, which anyone may use, and another tool of its source, which no one
+    // but the owner may: only that one tool is everyone's.
+    for name in ["code_run_python", "python_other"] {
+        let (mut def, handler) = typed_tool_with_context(
+            name,
+            "Runs Python.",
+            false,
+            |_: CallContext, _: Value| async move { ToolOutput::ok("ran") },
+        );
+        def.source = fronde_hub::config::PYTHON_SOURCE.into();
+        hub.registry.register(def, handler).unwrap();
+    }
     let (def, handler) = typed_tool_with_context("test_take_secret", "Takes a secret.", false, {
         let ephemeral = ephemeral.clone();
         move |context: CallContext, args: Value| {
@@ -2580,6 +2603,7 @@ fn call_in_turn(
             caller: Caller::Thread(ThreadId::MAIN),
             user: "alix".into(),
             admin: true,
+            owner: true,
             topic: "conversation".into(),
             turn,
             cancelled: tokio_util::sync::CancellationToken::new(),
@@ -3429,16 +3453,28 @@ async fn member_agent_is_offered_no_owner_tools() {
     let client = bench.client(&her_token, "claude-code", &[]).await;
     let owner = bench.client(&his_token, "claude-code", &[]).await;
 
-    let names = tool_names(&client).await;
-    for kept in [
-        "user_ask",
-        "user_secret",
-        "threads_list",
-        "search_tools",
-        "use_tool",
-    ] {
-        assert!(names.iter().any(|name| name == kept), "{kept}: {names:?}");
-    }
+    // Exactly these: the hub's own but memory and integrations (the bench's test tools are
+    // the hub's too), and `code_run_python`, not another tool of its source.
+    let mut names = tool_names(&client).await;
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "code_run_python",
+            "search_tools",
+            "test_take_secret",
+            "test_who",
+            "test_whoami",
+            "threads_cancel",
+            "threads_list",
+            "threads_read",
+            "threads_send",
+            "threads_start",
+            "use_tool",
+            "user_ask",
+            "user_secret",
+        ]
+    );
     assert!(
         !names
             .iter()
@@ -3472,6 +3508,7 @@ async fn member_agent_is_offered_no_owner_tools() {
     for (tool, arguments) in [
         ("memory_search", json!({"query": "thé"})),
         ("mcphub_echo", json!({})),
+        ("python_other", json!({})),
         ("integrations_request_setup", json!({"integration": "echo"})),
     ] {
         for refused in [
@@ -3483,10 +3520,12 @@ async fn member_agent_is_offered_no_owner_tools() {
             )
             .await,
         ] {
-            assert!(
-                refused["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("not available in marie's conversations")),
+            // Answered as a tool that does not exist: nothing tells her it is there.
+            assert_eq!(
+                refused["error"],
+                format!(
+                    "unknown tool {tool:?}; call search_tools with your need to find the right one"
+                ),
                 "{tool}: {refused}"
             );
         }
@@ -3764,4 +3803,97 @@ async fn readings_go_to_the_thread_account() {
     assert!(bench.usage.get("claude").is_none());
     assert_eq!(bench.threads.usage_of("marie").len(), 1);
     assert!(bench.threads.usage_of("alix").is_empty());
+}
+
+/// A member's sub-agent acts for her: not an admin, not the owner.
+#[tokio::test]
+async fn member_sub_agent_acts_for_her() {
+    let child_gate = Arc::new(Notify::new());
+    let bench = held_parent(held(&child_gate)).await;
+    let hers = bench.new_thread_for("marie").await;
+    let token = bench.start(hers).await;
+    let client = bench.client(&token, "claude-code", &[]).await;
+    let child = start_child(&client, TASK).await;
+    let child_token = token_of(&bench, child).await;
+    let child_client = bench.client(&child_token, "claude-code", &[]).await;
+    assert_eq!(
+        call(&child_client, "test_who", json!({"arguments": {}})).await,
+        json!({"result": {"user": "marie", "admin": false}})
+    );
+    child_gate.notify_waiters();
+    bench.gate.notify_waiters();
+}
+
+/// A member's agent reaches no one else's threads through `threads_*`: the owner's are as if
+/// they did not exist.
+#[tokio::test]
+async fn member_reaches_no_one_elses_threads() {
+    let bench = held_bench().await;
+    let his = bench.new_thread().await;
+    bench.start(his).await;
+    let hers = bench.new_thread_for("marie").await;
+    let token = bench.start(hers).await;
+    let client = bench.client(&token, "claude-code", &[]).await;
+    for target in [ThreadId::MAIN, his] {
+        let refused = refusals(&client, target.0).await;
+        assert_eq!(refused.len(), 4, "thread {target}");
+        for refused in refused {
+            assert_eq!(refused, no_such_thread(), "thread {target}");
+        }
+    }
+    bench.gate.notify_waiters();
+}
+
+/// `code_run_python` reaches nothing of anyone's: a member's agent may run it.
+#[tokio::test]
+async fn code_run_python_is_everyones() {
+    let bench = Bench::held().await;
+    let hers = bench.new_thread_for("marie").await;
+    let token = bench.start(hers).await;
+    let client = bench.client(&token, "claude-code", &[]).await;
+    assert_eq!(
+        call(&client, "code_run_python", json!({"arguments": {}})).await,
+        json!({"result": "ran"})
+    );
+    bench.gate.notify_waiters();
+}
+
+/// The owner's data is the owner's, not every admin's: another admin's agent gets neither the
+/// memory, nor its tools, nor the services', nor an integration's setup; its calls act for her.
+#[tokio::test]
+async fn another_admin_gets_no_owner_data() {
+    let bench = Bench::held().await;
+    bench
+        .registry
+        .call(
+            "memory_add",
+            json!({"file": "memory", "text": "aime le thé vert"}),
+        )
+        .await;
+    let hers = bench.new_thread_for("lea").await;
+    let token = bench.start(hers).await;
+    let client = bench.client(&token, "claude-code", &[]).await;
+    assert_eq!(
+        call(&client, "test_who", json!({"arguments": {}})).await,
+        json!({"result": {"user": "lea", "admin": true}})
+    );
+    let names = tool_names(&client).await;
+    assert!(
+        !names.iter().any(|name| name.starts_with("memory_")
+            || name.starts_with("integrations_")
+            || name == "mcphub_echo"),
+        "{names:?}"
+    );
+    let instructions = client.peer_info().unwrap().instructions.clone().unwrap();
+    assert!(!instructions.contains("thé vert"), "{instructions}");
+    for tool in ["memory_search", "mcphub_echo", "integrations_request_setup"] {
+        let refused = call(&client, tool, json!({"arguments": {}})).await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("unknown tool")),
+            "{tool}: {refused}"
+        );
+    }
+    bench.gate.notify_waiters();
 }

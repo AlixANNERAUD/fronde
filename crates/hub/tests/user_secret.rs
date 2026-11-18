@@ -84,6 +84,7 @@ fn context() -> CallContext {
         caller: Caller::Thread(fronde_requests::ThreadId::MAIN),
         user: "alix".into(),
         admin: true,
+        owner: true,
         topic: "conversation".into(),
         turn: Some(3),
         cancelled: tokio_util::sync::CancellationToken::new(),

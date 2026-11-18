@@ -165,7 +165,14 @@ impl Provider {
             "ANTHROPIC_AUTH_TOKEN",
             "AWS_BEARER_TOKEN_BEDROCK",
         ],
-        sign_in_prefixes: &["ANTHROPIC_", "CLAUDE_CODE_USE_"],
+        sign_in_prefixes: &[
+            "ANTHROPIC_",
+            "CLAUDE_CODE_USE_",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_",
+            "CLAUDE_CODE_API_KEY_",
+            "CLAUDE_CODE_CLIENT_",
+        ],
         permissions: PermissionRules {
             mode_switch_prefix: Some(CLAUDE_EXIT_PLAN),
             mode_switch_options: CLAUDE_MODE_SWITCH_OPTIONS,

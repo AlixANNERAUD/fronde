@@ -521,6 +521,8 @@ pub enum Delegation {
     TurnOver,
     /// The thread's owner has no account on the provider: no sub-agent runs for them.
     NoAccount { owner: String, provider: String },
+    /// The thread's owner is no longer a user: it is read-only.
+    NoOwner,
     /// The owner's reserve of a subscription window is reached (`[threads] reserve`): `window`,
     /// its use in percent and status as read, the reserve in percent and when the window resets.
     Reserve {
@@ -598,6 +600,9 @@ impl std::fmt::Display for Delegation {
             ),
             Self::TurnOver => f.write_str(
                 "your turn ended before this call went through: nothing was started or sent",
+            ),
+            Self::NoOwner => f.write_str(
+                "this thread belongs to someone who is no longer a user: it is read-only",
             ),
             Self::NoAccount { owner, provider } => write!(
                 f,
@@ -757,6 +762,9 @@ impl Threads {
     /// Whether thread `row` may start and drive sub-agents: neither it nor a thread above it
     /// is archived, and it is less deep than [`Threads::max_depth`].
     async fn delegates(&self, row: &ThreadRow) -> anyhow::Result<()> {
+        if !self.configured(row) {
+            bail!(Delegation::NoOwner);
+        }
         if row.archived_at.is_some() || self.chain_archived(row.id).await? {
             bail!(Delegation::CallerArchived);
         }
@@ -932,6 +940,10 @@ impl Threads {
         let row = self.reachable(caller, target).await?;
         if row.id == caller {
             bail!(Delegation::Itself);
+        }
+        // Read-only: nothing drives a thread whose owner is no longer a user.
+        if !self.configured(&row) {
+            bail!(Delegation::NoOwner);
         }
         Ok(row)
     }

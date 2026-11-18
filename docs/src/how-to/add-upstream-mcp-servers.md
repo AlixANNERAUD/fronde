@@ -46,7 +46,8 @@ command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/srv/shared"
 ```
 
 Fronde starts the command and talks MCP over its standard input and output. The command runs with
-Fronde's rights and environment, so only run programs you trust.
+Fronde's rights, so only run programs you trust. Its environment is cleared: it gets only `PATH`,
+`HOME` and `LANG` from Fronde's, never a secret's or a sign-in variable.
 
 ## Names
 

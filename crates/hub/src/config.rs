@@ -294,6 +294,11 @@ fn table_key(name: &str) -> String {
     }
 }
 
+/// Whether two names as [`look`] reads them are the same under full Unicode case folding.
+fn looks_alike(a: &str, b: &str) -> bool {
+    unicase::UniCase::unicode(a) == unicase::UniCase::unicode(b)
+}
+
 /// The characters a user's name may not hold: it names a session, and may name a directory.
 const FORBIDDEN_IN_NAMES: [char; 3] = ['/', '\\', ':'];
 
@@ -322,8 +327,9 @@ fn check_user_name(name: &str, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A name as two names are compared for looking alike: NFKC, case-folded, then its UTS #39
-/// confusable skeleton (a Cyrillic `а` reads as a Latin `a`), NFKC and case-folded again.
+/// A name as two names are compared for looking alike: NFKC, lower case, then its UTS #39
+/// confusable skeleton (a Cyrillic `а` reads as a Latin `a`), NFKC and lower case again; two
+/// of these are then compared with full Unicode case folding ([`looks_alike`]).
 fn look(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     let folded: String = name.nfkc().flat_map(char::to_lowercase).collect();
@@ -399,7 +405,14 @@ pub fn sign_in_vars(provider: &str) -> &'static [&'static str] {
 /// `fronde_agent::provider::Provider::sign_in_prefixes` lists the same.
 pub fn sign_in_prefixes(provider: &str) -> &'static [&'static str] {
     match provider {
-        "claude" => &["ANTHROPIC_", "CLAUDE_CODE_USE_"],
+        "claude" => &[
+            "ANTHROPIC_",
+            "CLAUDE_CODE_USE_",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_",
+            "CLAUDE_CODE_API_KEY_",
+            "CLAUDE_CODE_CLIENT_",
+        ],
         _ => &[],
     }
 }
@@ -1290,20 +1303,20 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
     }
     check_sources(&config.sources)?;
     for name in config.agent.env.keys() {
-        if let Some(provider) = signs_in(name) {
-            bail!(
-                "[agent] env sets {name}, which decides how {provider}'s agent signs in: Fronde \
-                 gives each agent its own account's token and nothing else; name the token in \
-                 [accounts.<name>] oauth_token (or the legacy [agent] oauth_token), never in \
-                 fronde.toml, and remove {name} from env"
-            );
-        }
         if reserved_agent_variable(name) {
             bail!(
                 "[agent] env: {name} cannot be set here: Fronde gives the agent its own HOME and \
                  TMPDIR in the data directory, with its own Claude directory, and never passes \
                  XDG_*, DBUS_*, CREDENTIALS_DIRECTORY or CLAUDE_CONFIG_DIR, which point at your \
                  session or one sign-in for every thread; remove it"
+            );
+        }
+        if let Some(provider) = signs_in(name) {
+            bail!(
+                "[agent] env sets {name}, which decides how {provider}'s agent signs in: Fronde \
+                 gives each agent its own account's token and nothing else; name the token in \
+                 [accounts.<name>] oauth_token (or the legacy [agent] oauth_token), never in \
+                 fronde.toml, and remove {name} from env"
             );
         }
     }
@@ -1323,6 +1336,16 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
     }
     check_shared_secrets(&config)?;
     check_accounts(&config)?;
+    if !config.agent.sandbox
+        && let Some(member) = config.users.iter().find(|(_, user)| !user.admin)
+    {
+        bail!(
+            "[agent] sandbox = false with [users.{}], who is not an admin: an unconfined agent of \
+             theirs could read everything Fronde can, your data and secrets included; keep the \
+             sandbox on",
+            table_key(member.0)
+        );
+    }
     // Read once, here: `Config::accounts` stays pure, and `serve` and `check` refuse what
     // `check_inherited` finds.
     config.inherited = PROVIDERS
@@ -1370,12 +1393,13 @@ fn check_users(config: &mut Config, base: &Path) -> anyhow::Result<()> {
             table_key(&owner)
         );
     }
-    // A name as it looks -> the name: two that look alike are refused.
-    let mut looks: BTreeMap<String, &str> = BTreeMap::new();
+    // Each name as it looks: two that look alike are refused.
+    let mut looks: Vec<(String, &str)> = Vec::new();
     for name in config.users.keys() {
         let key = table_key(name);
         check_user_name(name, &format!("[users.{key}]"))?;
-        if let Some(other) = looks.insert(look(name), name) {
+        let looked = look(name);
+        if let Some((_, other)) = looks.iter().find(|(seen, _)| looks_alike(seen, &looked)) {
             bail!(
                 "[users.{}] and [users.{key}] look alike (in case, accents or letters of \
                  another script that look the same): two people never have names that could \
@@ -1383,6 +1407,7 @@ fn check_users(config: &mut Config, base: &Path) -> anyhow::Result<()> {
                 table_key(other)
             );
         }
+        looks.push((looked, name));
     }
     for (name, user) in &mut config.users {
         let key = table_key(name);
@@ -1753,6 +1778,13 @@ fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
         let name = source.name();
         if name == "hub" {
             bail!("source name \"hub\" is reserved for the hub's own tools; pick another name");
+        }
+        // Whether [python] is on or not: its one tool is the only one anyone may use.
+        if name == PYTHON_SOURCE {
+            bail!(
+                "source name \"{PYTHON_SOURCE}\" is reserved for [python]'s code_run_python; pick \
+                 another name"
+            );
         }
         // A server's form is headed with its name: never one that reads as Fronde's own.
         if matches!(name, "fronde" | "assistant") {

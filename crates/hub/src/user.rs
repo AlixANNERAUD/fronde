@@ -229,6 +229,13 @@ async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) ->
         Ok(checked) => checked,
         Err(message) => return ToolOutput::error(message),
     };
+    // The stored secrets serve the owner's components: anyone else's secret is kept for the
+    // conversation only, and their agent learns nothing of the names stored.
+    if !context.owner
+        && let Card::Secret { remember, .. } = &mut card
+    {
+        *remember = None;
+    }
     if let Card::Secret {
         remember: Some(remember),
         ..

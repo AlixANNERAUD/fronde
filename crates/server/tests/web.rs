@@ -2701,3 +2701,65 @@ async fn usage_not_sent_to_a_family_member() {
     .await
     .expect("the reading was never kept");
 }
+
+/// A thread whose owner is no longer a user is read-only on the page: a message to it is
+/// refused, saying why, while the owner's own threads, thread 1 among them, take messages.
+#[tokio::test]
+async fn a_removed_owners_thread_refuses_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    // First run: the legacy form, its one user "Alix", who starts a thread.
+    let (connector, _) = fake_connector();
+    let (addr, server) = timeout(
+        WAIT,
+        fronde::start_with(config(path, true), connector, &site(path)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    let theirs = create(&mut socket, "client-1", "Salut").await;
+    drop(socket);
+    server.abort();
+    let _ = server.await;
+
+    // Second run: the owner is now "alix", in [users]; "Alix" is no one.
+    let config = fronde_hub::config::load_str(
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = { file = \"token\" }\n\
+         [data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\nuser = \"alix\"\n\
+         [memory]\ngit = false\n\
+         [secrets]\nbackend = \"file\"\nmaster_key = { file = \"master.key\" }\n\
+         [web]\n\
+         [users.alix]\nadmin = true\npassword = { file = \"password\" }\n",
+        path,
+    )
+    .unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(config, connector, &site(path)).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Encore".into(),
+            thread: Some(theirs),
+        },
+    )
+    .await;
+    let (thread, _, reason) = next_thread_refusal(&mut socket).await;
+    assert_eq!(thread, Some(theirs));
+    assert_eq!(reason, fronde_agent::threads::Refusal::NoOwner.to_string());
+    // Thread 1 followed the owner: it takes messages.
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    until_turn_ended(&mut socket).await;
+}
