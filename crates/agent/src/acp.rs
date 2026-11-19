@@ -136,8 +136,9 @@ pub struct AgentSpec {
     /// owner's grants, `[agent] read` ([`Confine::owner_read`](crate::confine::Confine)).
     pub owners_grants: bool,
     /// The subscription account the agent signs in with, which its readings are kept under
-    /// ([`Threads::account`](crate::threads::Threads::account)).
-    pub account: String,
+    /// ([`Threads::account`](crate::threads::Threads::account)); `None` when its thread's owner
+    /// has none (no agent starts) or is no longer a user: its readings, if any, are dropped.
+    pub account: Option<String>,
 }
 
 impl fmt::Debug for AgentSpec {

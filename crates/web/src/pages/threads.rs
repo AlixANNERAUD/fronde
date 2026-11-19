@@ -153,9 +153,7 @@ pub fn Workspace(
     // The shown thread's open cards from its chat, the others' from the list.
     let tray = model.tray(current);
     let title = tab_title(tray.count());
-    let usage = model
-        .usage()
-        .map(|(usage, reserve)| (usage.clone(), reserve));
+    let usage = model.usage().cloned();
     let list = rsx! {
         ThreadList { rows, archived, current, open, on_go, on_send }
     };

@@ -597,7 +597,7 @@ async fn every_threads_token_never_appears() {
         builtin_tools: Vec::new(),
         usage: None,
         owners_grants: true,
-        account: "claude".into(),
+        account: Some("claude".into()),
     };
     let owner = fronde_requests::User {
         name: "alix".into(),

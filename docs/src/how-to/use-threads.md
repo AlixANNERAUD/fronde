@@ -103,8 +103,11 @@ how old the reading is (« relevé il y a 12 min »), and whether background wor
 30 %) », or, when no reading decides, that the daily counts limit it. Escape or a tap elsewhere
 closes it. The pill follows each new reading without reloading the page.
 
-The meter shows the signed-in user's own subscription and, for now, only to an admin: the one
-subscription is the owner's. Without a reading yet, there is no pill.
+The pill is the signed-in person's own subscription: a family member sees her own account's
+windows and no one else's. An admin's panel also lists every other account's windows, under
+« Compte marie » and so on, each with its use, its resets and whether background work runs on
+it; an admin whose own account has no reading yet gets a « Abonnements » pill that opens them.
+Without a reading the person may see, there is no pill.
 
 ## Change the limits on sub-agents
 

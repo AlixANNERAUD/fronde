@@ -366,7 +366,7 @@ where
 #[derive(Clone)]
 pub(crate) struct Capture {
     provider: &'static str,
-    account: String,
+    account: Option<String>,
     source: UsageSource,
     book: Option<Arc<UsageBook>>,
 }
@@ -407,16 +407,14 @@ impl Capture {
             .iter()
             .map(|window| window.kind.to_string())
             .collect();
-        match &self.book {
-            Some(book) => {
-                let changed = book.record(&self.account, windows);
-                tracing::debug!(account = %self.account, ?kinds, changed, "usage reading");
+        match (&self.book, self.account.as_deref()) {
+            (Some(book), Some(account)) => {
+                let changed = book.record(account, windows);
+                tracing::debug!(account, ?kinds, changed, "usage reading");
             }
-            None => tracing::debug!(
-                account = %self.account,
-                ?kinds,
-                "usage reading not kept: no book"
-            ),
+            // Never kept under another account, nor under one shared by all without one.
+            (Some(_), None) => tracing::warn!(?kinds, "usage reading not kept: no account"),
+            (None, account) => tracing::debug!(account, ?kinds, "usage reading not kept: no book"),
         }
     }
 }

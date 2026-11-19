@@ -329,7 +329,7 @@ fn no_secret_in_debug() {
         builtin_tools: Vec::new(),
         usage: None,
         owners_grants: true,
-        account: "claude".into(),
+        account: Some("claude".into()),
     };
 
     let all_canaries = [

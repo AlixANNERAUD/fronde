@@ -37,7 +37,7 @@ fn spec() -> AgentSpec {
         builtin_tools: vec!["WebSearch".into(), "WebFetch".into()],
         usage: None,
         owners_grants: true,
-        account: "claude".into(),
+        account: Some("claude".into()),
     }
 }
 

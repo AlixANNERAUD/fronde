@@ -1103,18 +1103,29 @@ fn usage_printed(out: &std::process::Output) -> String {
         .to_owned()
 }
 
-/// Stores `windows` as Claude's reading in the database of `data`, as the server keeps it.
+/// Stores `windows` as the reading of the legacy form's account, `claude`, in the database of
+/// `data`, as the server keeps it.
 async fn store_reading(data: &std::path::Path, windows: Vec<fronde_protocol::usage::Window>) {
+    store_reading_in(data, "account/claude", "claude", windows).await;
+}
+
+/// Stores `windows` as `account`'s reading under `scope` in the database of `data`.
+async fn store_reading_in(
+    data: &std::path::Path,
+    scope: &str,
+    account: &str,
+    windows: Vec<fronde_protocol::usage::Window>,
+) {
     fronde_hub::private::create_dir_all(data).unwrap();
     let db = fronde_db::open(data).await.unwrap();
     let usage = fronde_protocol::usage::ProviderUsage {
-        provider: "claude".into(),
+        account: account.into(),
         known_since: chrono::Utc::now() - chrono::TimeDelta::minutes(12),
         windows,
     };
     fronde_db::kv::set(
         &db,
-        "provider/claude",
+        scope,
         "usage",
         serde_json::to_vec(&usage).unwrap(),
         None,
@@ -1283,22 +1294,116 @@ async fn check_prints_reset_since_reading() {
     );
 }
 
-/// A stored reading that does not read is said, and the check goes on.
+/// A stored reading that does not read is said, and the check goes on: under the account's
+/// scope, or under the legacy one before the server moved it.
 #[tokio::test]
 async fn check_says_when_usage_cannot_be_read() {
+    for scope in ["account/claude", "provider/claude"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data) = with_web(dir.path());
+        fronde_hub::private::create_dir_all(&data).unwrap();
+        let db = fronde_db::open(&data).await.unwrap();
+        fronde_db::kv::set(&db, scope, "usage", b"not json".to_vec(), None)
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+        let before = database_files(&data);
+        let line = usage_printed(&run_check(&path));
+        assert!(line.starts_with("cannot read ("), "{scope}: {line}");
+        assert!(line.contains("does not read"), "{scope}: {line}");
+        assert!(line.contains("the usage of claude"), "{scope}: {line}");
+        assert_eq!(changed_files(&data, &before), Vec::<String>::new());
+    }
+}
+
+/// A reading stored before the `account/` scope, which the server has not moved yet, is read
+/// where it is: `fronde check` after the upgrade, before the first start, still shows a pause.
+#[tokio::test]
+async fn check_reads_a_reading_stored_before_accounts() {
+    use fronde_protocol::usage::WindowKind;
     let dir = tempfile::tempdir().unwrap();
     let (path, data) = with_web(dir.path());
-    fronde_hub::private::create_dir_all(&data).unwrap();
-    let db = fronde_db::open(&data).await.unwrap();
-    fronde_db::kv::set(&db, "provider/claude", "usage", b"not json".to_vec(), None)
-        .await
-        .unwrap();
-    db.close().await.unwrap();
+    let resets_at = chrono::DateTime::parse_from_rfc3339("2100-01-04T16:40:00+01:00")
+        .unwrap()
+        .to_utc();
+    store_reading_in(
+        &data,
+        "provider/claude",
+        "claude",
+        vec![
+            window(WindowKind::Session, 0.75, resets_at),
+            window(WindowKind::Weekly, 0.18, resets_at),
+        ],
+    )
+    .await;
     let before = database_files(&data);
     let line = usage_printed(&run_check(&path));
-    assert!(line.starts_with("cannot read ("), "{line}");
-    assert!(line.contains("does not read"), "{line}");
+    assert!(line.starts_with("claude: 5 h 75 %"), "{line}");
+    assert!(line.contains("background work paused until"), "{line}");
     assert_eq!(changed_files(&data, &before), Vec::<String>::new());
+}
+
+/// `fronde check` prints one usage line per account, each from that account's own reading,
+/// and no token.
+#[tokio::test]
+async fn check_prints_usage_per_account() {
+    use fronde_protocol::usage::WindowKind;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    fronde_hub::private::write(path.join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(path.join("alix.password"), "correct horse battery staple\n")
+        .unwrap();
+    fronde_hub::private::write(path.join("marie.password"), "un autre mot de passe\n").unwrap();
+    fronde_hub::private::write(path.join("alix.token"), "token-of-alix\n").unwrap();
+    fronde_hub::private::write(path.join("marie.token"), "token-of-marie\n").unwrap();
+    let data = path.join("data");
+    let config = path.join("fronde.toml");
+    let text = format!(
+        "[server]\ntoken = {{ file = \"token\" }}\n[data]\ndir = {:?}\nuser = \"alix\"\n\
+             timezone = \"Europe/Paris\"\n\
+             [secrets]\nbackend = \"file\"\nmaster_key = {{ file = \"master.key\" }}\n[web]\n\
+             [users.alix]\nadmin = true\npassword = {{ file = \"alix.password\" }}\n\
+             [users.marie]\npassword = {{ file = \"marie.password\" }}\n\
+             [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n\
+             oauth_token = {{ file = \"alix.token\" }}\n\
+             [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+             oauth_token = {{ file = \"marie.token\" }}\n",
+        data.display().to_string(),
+    );
+    let resets_at = chrono::DateTime::parse_from_rfc3339("2100-01-04T16:40:00+01:00")
+        .unwrap()
+        .to_utc();
+    store_reading_in(
+        &data,
+        "account/marie",
+        "marie",
+        vec![
+            window(WindowKind::Session, 0.42, resets_at),
+            window(WindowKind::Weekly, 0.18, resets_at),
+        ],
+    )
+    .await;
+    // The legacy account's reading is no account's here: no `claude` account is configured.
+    store_reading(&data, vec![window(WindowKind::Session, 0.9, resets_at)]).await;
+    // Without an inherited sign-in variable, which accounts would refuse.
+    let (code, stdout) = check_with(&config, &text, None);
+    assert_eq!(code, Some(0), "{stdout}");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("usage: "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "alix: no reading yet; background work bounded by the daily counts",
+            "marie: 5 h 42 % (resets Mon 04 Jan 16:40), week 18 % (resets Mon 04 Jan 16:40), \
+             read 12 min ago; background work allowed below 70%",
+        ],
+        "{stdout}"
+    );
+    for token in ["token-of-alix", "token-of-marie"] {
+        assert!(!stdout.contains(token), "{stdout}");
+    }
 }
 
 /// `fronde check` with `fronde.toml` holding `text`, Fronde's environment holding

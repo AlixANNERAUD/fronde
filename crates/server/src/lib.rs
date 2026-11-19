@@ -607,10 +607,10 @@ pub fn children_line(config: &Config) -> String {
     )
 }
 
-/// The subscription's usage, for the start log and `fronde check`, one part per provider:
+/// A subscription account's usage, for the start log and `fronde check`, one line per account:
 /// `claude: 5 h 42 % (resets 16:40), week 18 % (resets Mon 09:00), read 12 min ago; background
-/// work allowed below 70 %`, or `claude: no reading yet; background work bounded by the daily
-/// counts`. `readings`: each provider's reading of the owner's account, if any; times in `tz`.
+/// work allowed below 70 %`, or `marie: no reading yet; background work bounded by the daily
+/// counts`. `readings`: each account's name and reading, if any, one part each; times in `tz`.
 pub fn usage_line(
     readings: &[(&str, Option<ProviderUsage>)],
     reserve: u8,
@@ -1193,25 +1193,21 @@ pub async fn start_with(
                 usage: Some(fronde_agent::usage::UsageBook::load(db.clone(), &accounts).await),
                 // `Threads::open_for` gives each thread its owner's.
                 owners_grants: true,
-                account: String::new(),
+                account: None,
             };
+            // One line per account, each its own subscription.
             if let Some(book) = &spec.usage {
-                let readings: Vec<_> = fronde_hub::config::PROVIDERS
-                    .iter()
-                    .map(|provider| {
-                        let account = bindings.of(&user, provider).map(|b| b.account.as_str());
-                        (*provider, account.and_then(|account| book.get(account)))
-                    })
-                    .collect();
-                tracing::info!(
-                    "usage: {}",
-                    usage_line(
-                        &readings,
-                        budget.limits.reserve,
-                        chrono::Utc::now(),
-                        timezone
-                    )
-                );
+                for account in &accounts {
+                    tracing::info!(
+                        "usage: {}",
+                        usage_line(
+                            &[(account.as_str(), book.get(account))],
+                            budget.limits.reserve,
+                            chrono::Utc::now(),
+                            timezone
+                        )
+                    );
+                }
             }
             // Each thread acts for its row's owner, among the configured users; the main thread
             // is the owner's, `[data] user`.

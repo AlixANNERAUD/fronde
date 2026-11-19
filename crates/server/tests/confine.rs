@@ -102,7 +102,7 @@ impl Setup {
             builtin_tools: Vec::new(),
             usage: None,
             owners_grants: true,
-            account: "claude".into(),
+            account: Some("claude".into()),
         }
     }
 

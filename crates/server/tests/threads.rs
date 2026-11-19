@@ -157,10 +157,11 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
                     Some(read) => Some(read().await?.expose_secret().to_owned()),
                     None => None,
                 };
-                sign_ins
-                    .lock()
-                    .unwrap()
-                    .push((spec.thread, spec.account.clone(), token));
+                sign_ins.lock().unwrap().push((
+                    spec.thread,
+                    spec.account.clone().unwrap_or_default(),
+                    token,
+                ));
                 let (transport, handle) = fake_agent(script);
                 fakes.lock().unwrap().push(handle);
                 AgentClient::connect(transport, &spec, resume, events).await
@@ -183,7 +184,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         builtin_tools: Vec::new(),
         usage: Some(usage.clone()),
         owners_grants: true,
-        account: "claude".into(),
+        account: Some("claude".into()),
     };
     // The owner, an admin, and two family members, one of whom has no account. The owner's
     // account keeps the legacy name, which the usage readings stored before accounts have.
@@ -1712,7 +1713,7 @@ async fn threads_list_shows_children_and_models() {
     assert!(children[0]["status"].is_string());
     assert_eq!(
         listed["result"]["providers"],
-        json!([{"id": "claude", "background": "unknown", "models": [
+        json!([{"id": "claude", "background": "unknown", "account": "claude", "models": [
             {"id": "fake-small", "name": "fake small"},
             {"id": "fake-large", "name": "fake large"},
         ]}])
@@ -3108,6 +3109,8 @@ async fn threads_list_says_whether_background_may_run() {
     let background = |listed: &Value| listed["result"]["providers"][0]["background"].clone();
     let listed = call(&main, "threads_list", json!({})).await;
     assert_eq!(background(&listed), "unknown", "{listed}");
+    // The caller's own account, whose reserve it reads.
+    assert_eq!(listed["result"]["providers"][0]["account"], "claude");
     let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
     bench.usage.record("claude", reading(0.1, 0.2, resets_at));
     let listed = call(&main, "threads_list", json!({})).await;
@@ -3125,9 +3128,10 @@ async fn threads_list_says_whether_background_may_run() {
     bench.gate.notify_waiters();
 }
 
-/// Only an admin's page gets the meter's usage, and only their own accounts', once read.
+/// A page gets the meter's usage only once there is a reading its user may see: their own
+/// accounts', and for an admin every other's too.
 #[tokio::test]
-async fn usage_sent_to_admins_only() {
+async fn usage_waits_for_a_reading_the_user_may_see() {
     let bench = bench(FakeScript::default()).await;
     assert_eq!(
         fronde::usage_message(&bench.threads, &alix()),
@@ -3137,20 +3141,241 @@ async fn usage_sent_to_admins_only() {
     let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
     let windows = reading(0.42, 0.18, resets_at);
     bench.usage.record("claude", windows.clone());
-    let Some(fronde_protocol::ServerMsg::Usage { reserve, usage }) =
-        fronde::usage_message(&bench.threads, &alix())
+    let Some(fronde_protocol::ServerMsg::Usage {
+        reserve,
+        usage,
+        others,
+    }) = fronde::usage_message(&bench.threads, &alix())
     else {
         panic!("the admin gets the usage");
     };
     assert_eq!(reserve, 30);
     assert_eq!(usage.len(), 1);
-    assert_eq!(usage[0].provider, "claude");
+    assert_eq!(usage[0].account, "claude");
     assert_eq!(usage[0].windows, windows);
-    let family = User {
-        name: "lea".into(),
+    assert!(others.is_empty());
+    // Not someone else's: a family member without a reading of her own gets none.
+    for user in [marie(), paul()] {
+        assert_eq!(
+            fronde::usage_message(&bench.threads, &user),
+            None,
+            "{user:?}"
+        );
+    }
+}
+
+/// A member's page gets her own account's usage, never another's: not the owner's, not
+/// another member's; one without an account gets none.
+#[tokio::test]
+async fn member_gets_only_her_account_usage() {
+    let bench = bench(FakeScript::default()).await;
+    let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+    let (owners, hers) = (reading(0.75, 0.5, resets_at), reading(0.1, 0.2, resets_at));
+    bench.usage.record("claude", owners);
+    bench.usage.record("lea", reading(0.3, 0.3, resets_at));
+    assert_eq!(fronde::usage_message(&bench.threads, &marie()), None);
+    bench.usage.record("marie", hers.clone());
+    let Some(fronde_protocol::ServerMsg::Usage {
+        reserve,
+        usage,
+        others,
+    }) = fronde::usage_message(&bench.threads, &marie())
+    else {
+        panic!("she gets her own usage");
+    };
+    assert_eq!(reserve, 30);
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].account, "marie");
+    assert_eq!(usage[0].windows, hers);
+    assert!(others.is_empty(), "{others:?}");
+    // Paul has no account: nothing, whatever the others read.
+    assert_eq!(fronde::usage_message(&bench.threads, &paul()), None);
+    // A user the configuration does not know gets nothing either.
+    let stranger = User {
+        name: "claude".into(),
         admin: false,
     };
-    assert_eq!(fronde::usage_message(&bench.threads, &family), None);
+    assert_eq!(fronde::usage_message(&bench.threads, &stranger), None);
+}
+
+/// An admin's page gets their own account's usage for the pill and every other account's by
+/// name for the panel.
+#[tokio::test]
+async fn admin_gets_every_account_usage() {
+    let bench = bench(FakeScript::default()).await;
+    let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+    bench.usage.record("marie", reading(0.1, 0.2, resets_at));
+    // The owner has no reading yet: the others still come.
+    let Some(fronde_protocol::ServerMsg::Usage { usage, others, .. }) =
+        fronde::usage_message(&bench.threads, &alix())
+    else {
+        panic!("the admin gets the others' usage");
+    };
+    assert!(usage.is_empty());
+    let names: Vec<_> = others.iter().map(|usage| usage.account.as_str()).collect();
+    assert_eq!(names, ["marie"]);
+    bench.usage.record("claude", reading(0.42, 0.18, resets_at));
+    bench.usage.record("lea", reading(0.3, 0.3, resets_at));
+    let Some(fronde_protocol::ServerMsg::Usage { usage, others, .. }) =
+        fronde::usage_message(&bench.threads, &alix())
+    else {
+        panic!("the admin gets the usage");
+    };
+    let names: Vec<_> = usage.iter().map(|usage| usage.account.as_str()).collect();
+    assert_eq!(names, ["claude"]);
+    let names: Vec<_> = others.iter().map(|usage| usage.account.as_str()).collect();
+    assert_eq!(names, ["lea", "marie"]);
+    // Another admin: her own for the pill, the others, the owner's among them, in the panel.
+    let Some(fronde_protocol::ServerMsg::Usage { usage, others, .. }) =
+        fronde::usage_message(&bench.threads, &lea())
+    else {
+        panic!("an admin gets the usage");
+    };
+    let names: Vec<_> = usage.iter().map(|usage| usage.account.as_str()).collect();
+    assert_eq!(names, ["lea"]);
+    let names: Vec<_> = others.iter().map(|usage| usage.account.as_str()).collect();
+    assert_eq!(names, ["claude", "marie"]);
+}
+
+/// The reserve is each account's: the owner's account past its line stops his background work
+/// and not a member's, whose own line stops hers and not his.
+#[tokio::test]
+async fn reserve_is_per_account() {
+    let bench = held_bench().await;
+    let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+    bench.usage.record("claude", reading(0.75, 0.2, resets_at));
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let hers = bench.new_thread_for("marie").await;
+    let client = bench
+        .client(&bench.start(hers).await, "claude-code", &[])
+        .await;
+    let refused = call(&main, "threads_start", json!({"arguments": {"task": TASK}})).await;
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("reserve of the 5-hour window"),
+        "{refused}"
+    );
+    // Her account has no reading: the owner's says nothing of it.
+    start_child(&client, TASK).await;
+    let listed = call(&client, "threads_list", json!({})).await;
+    assert_eq!(listed["result"]["providers"][0]["account"], "marie");
+    assert_eq!(listed["result"]["providers"][0]["background"], "unknown");
+
+    // The owner's window starts again, hers is past her line.
+    let later = resets_at + chrono::TimeDelta::hours(5);
+    bench.usage.record("claude", reading(0.1, 0.2, later));
+    bench.usage.record("marie", reading(0.8, 0.2, later));
+    let refused = call(
+        &client,
+        "threads_start",
+        json!({"arguments": {"task": TASK}}),
+    )
+    .await;
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("reserve of the 5-hour window"),
+        "{refused}"
+    );
+    let listed = call(&client, "threads_list", json!({})).await;
+    assert_eq!(
+        listed["result"]["providers"][0]["background"],
+        "paused until 2100-01-01 05:00 UTC"
+    );
+    start_child(&main, TASK).await;
+    assert_eq!(children_of(&bench, hers).await.len(), 1);
+    assert_eq!(children_of(&bench, ThreadId::MAIN).await.len(), 1);
+    bench.gate.notify_waiters();
+}
+
+/// The daily counts that stand in for a reading are each account's: the sub-agents and their
+/// turns on the owner's account never use up a member's, nor do threads without an account.
+#[tokio::test]
+async fn daily_counts_are_per_account() {
+    use fronde_agent::threads::{Delegation, Limits};
+    let bench = limited(
+        None,
+        Limits {
+            children_per_day: 2,
+            ..Limits::default()
+        },
+    )
+    .await;
+    // Two sub-agents on the owner's account today, and two of a person with no account.
+    let other = bench.new_thread().await;
+    let pauls = bench.new_thread_for("paul").await;
+    for (owner, parent) in [
+        ("alix", other),
+        ("alix", other),
+        ("paul", pauls),
+        ("paul", pauls),
+    ] {
+        bench
+            .threads
+            .create(owner, StartedBy::Thread(parent), Some(parent), "Hier")
+            .await
+            .unwrap();
+    }
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    let refused = call(&main, "threads_start", json!({"arguments": {"task": TASK}})).await;
+    assert_eq!(
+        refused,
+        json!({"error": Delegation::TooManyToday { limit: 2 }.to_string()})
+    );
+    let hers = bench.new_thread_for("marie").await;
+    let client = bench
+        .client(&bench.start(hers).await, "claude-code", &[])
+        .await;
+    start_child(&client, TASK).await;
+    start_child(&client, "Une autre.").await;
+    let refused = call(
+        &client,
+        "threads_start",
+        json!({"arguments": {"task": "Une de trop."}}),
+    )
+    .await;
+    assert_eq!(
+        refused,
+        json!({"error": Delegation::TooManyToday { limit: 2 }.to_string()})
+    );
+    bench.gate.notify_waiters();
+
+    // The turns of sub-agents too.
+    let bench = limited(
+        None,
+        Limits {
+            child_turns_per_day: 1,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    start_child(&main, TASK).await;
+    let refused = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": "Encore."}}),
+    )
+    .await;
+    assert_eq!(
+        refused,
+        json!({"error": Delegation::TooManyTurnsToday { limit: 1 }.to_string()})
+    );
+    let hers = bench.new_thread_for("marie").await;
+    let client = bench
+        .client(&bench.start(hers).await, "claude-code", &[])
+        .await;
+    start_child(&client, TASK).await;
+    bench.gate.notify_waiters();
 }
 
 /// A setup card is tied to its call: the client cutting the call cancels the card at once,

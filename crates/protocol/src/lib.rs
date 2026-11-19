@@ -400,12 +400,17 @@ pub enum ServerMsg {
         reason: String,
     },
     /// How much of the page's user's own subscription accounts is used, one reading per
-    /// account read so far, and the share of each window kept for the owner
-    /// (`[threads] reserve`, in percent): after a hello, and on each new reading. Sent to
-    /// admins only, and only once there is a reading.
+    /// account read so far, and the share of each window kept for each account's owner
+    /// (`[threads] reserve`, in percent): after a hello, and when a reading the page is shown
+    /// changes. Sent once there is a reading the page's user may see: their own accounts',
+    /// and for an admin every other account's too, in `others`, each by its name.
     Usage {
         reserve: u8,
         usage: Vec<usage::ProviderUsage>,
+        /// Every other configured account's reading, for an admin only: empty for anyone
+        /// else.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        others: Vec<usage::ProviderUsage>,
     },
 }
 

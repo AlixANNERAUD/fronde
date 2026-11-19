@@ -699,15 +699,40 @@ impl Threads {
         fronde_protocol::usage::background(usage.as_ref(), self.limits().reserve, Utc::now())
     }
 
-    /// The latest usage of `user`'s own subscription accounts, one per configured provider read
-    /// so far: what the chat's meter shows that user. Empty without a usage book or a reading.
+    /// The latest usage of `user`'s own subscription accounts ([`Threads::usage_is_own`]), one
+    /// per configured provider read so far: what the chat's meter shows that user. Empty
+    /// without a usage book or a reading, and for a user without an account.
     pub fn usage_of(&self, user: &str) -> Vec<fronde_protocol::usage::ProviderUsage> {
+        self.usage_where(|account| self.usage_is_own(user, account))
+    }
+
+    /// The latest usage of every configured account but `user`'s own
+    /// ([`Threads::usage_is_own`]), by account name: what an admin's meter lists besides their
+    /// own. Never ask it for anyone else.
+    pub fn usage_of_others(&self, user: &str) -> Vec<fronde_protocol::usage::ProviderUsage> {
+        self.usage_where(|account| !self.usage_is_own(user, account))
+    }
+
+    /// Whether `account` is one of `user`'s own, whose usage their meter's pill shows: the one
+    /// predicate [`Threads::usage_of`] and [`Threads::usage_of_others`] split the accounts by.
+    fn usage_is_own(&self, user: &str, account: &str) -> bool {
+        self.providers()
+            .into_iter()
+            .any(|provider| self.account(user, provider).as_deref() == Some(account))
+    }
+
+    /// The latest reading of each configured account `keep` keeps, by account name.
+    fn usage_where(
+        &self,
+        keep: impl Fn(&str) -> bool,
+    ) -> Vec<fronde_protocol::usage::ProviderUsage> {
         let Some(book) = &self.spec.usage else {
             return Vec::new();
         };
-        self.providers()
+        self.account_names()
             .into_iter()
-            .filter_map(|provider| book.get(&self.account(user, provider)?))
+            .filter(|account| keep(account))
+            .filter_map(|account| book.get(&account))
             .collect()
     }
 

@@ -823,8 +823,10 @@ impl Assistant {
     /// may run or no reading decides (then only the wake budget holds results).
     fn reserve_hold(&self) -> Option<HoldReason> {
         let book = self.spec.usage.as_ref()?;
-        // The account its agent signs in with: the thread's (`AgentSpec::account`).
-        let usage = book.get(&self.spec.account);
+        // The account its agent signs in with: the thread's (`AgentSpec::account`). A thread
+        // without one holds nothing here: its agent cannot start, and its turn fails before
+        // spending any account.
+        let usage = book.get(self.spec.account.as_deref()?);
         match fronde_protocol::usage::background(usage.as_ref(), self.limits.reserve, Utc::now()) {
             Background::Paused(pause) => Some(HoldReason::Reserve {
                 used: pause.used_percent(),

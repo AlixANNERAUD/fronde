@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fronde_protocol::usage::ProviderUsage;
+use crate::usage::Usage;
 use fronde_protocol::{ClientMsg, ServerMsg, ThreadId, ThreadSummary, check_title};
 
 use crate::Chat;
@@ -41,9 +41,9 @@ pub struct Threads {
     /// it is.
     creating: Option<(String, String)>,
     refusal: Option<ThreadRefusal>,
-    /// The latest usage of the page's user's own accounts, and the reserve: only an admin's
-    /// page gets one.
-    usage: Option<(Vec<ProviderUsage>, u8)>,
+    /// The latest usage the page's user may see: their own accounts', and for an admin every
+    /// other's; none before a reading.
+    usage: Option<Usage>,
 }
 
 impl Default for Threads {
@@ -66,11 +66,11 @@ impl Threads {
         }
     }
 
-    /// The usage the meter shows, the first account's (one per provider, Claude's today), and
-    /// the reserve in percent; `None` until the server sent a reading.
-    pub fn usage(&self) -> Option<(&ProviderUsage, u8)> {
-        let (usage, reserve) = self.usage.as_ref()?;
-        usage.first().map(|usage| (usage, *reserve))
+    /// The usage the meter shows: the page's user's own accounts' (one per provider, Claude's
+    /// today; the pill is the first's), an admin's others, and the reserve in percent; `None`
+    /// until the server sent a reading.
+    pub fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
     }
 
     /// The thread the page shows.
@@ -267,7 +267,17 @@ impl Threads {
                 }
             }
             ServerMsg::Threads { threads } => self.list = threads.clone(),
-            ServerMsg::Usage { reserve, usage } => self.usage = Some((usage.clone(), *reserve)),
+            ServerMsg::Usage {
+                reserve,
+                usage,
+                others,
+            } => {
+                self.usage = Some(Usage {
+                    reserve: *reserve,
+                    own: usage.clone(),
+                    others: others.clone(),
+                })
+            }
             ServerMsg::Created { client_id, thread } => {
                 if self.creating.as_ref().map(|(id, _)| id) == Some(client_id) {
                     self.creating = None;
@@ -539,8 +549,8 @@ mod tests {
         let mut threads = Threads::default();
         assert!(threads.usage().is_none());
         let at = "2026-11-17T12:00:00Z".parse().unwrap();
-        let reading = ProviderUsage {
-            provider: "claude".into(),
+        let reading = fronde_protocol::usage::ProviderUsage {
+            account: "claude".into(),
             known_since: at,
             windows: vec![Window {
                 kind: WindowKind::Session,
@@ -554,8 +564,24 @@ mod tests {
         let message = ServerMsg::Usage {
             reserve: 30,
             usage: vec![reading.clone()],
+            others: Vec::new(),
         };
         assert_eq!(threads.apply(&message), None);
-        assert_eq!(threads.usage(), Some((&reading, 30)));
+        let usage = threads.usage().unwrap();
+        assert_eq!(usage.own, std::slice::from_ref(&reading));
+        assert_eq!(usage.reserve, 30);
+        assert!(usage.others.is_empty());
+        // An admin's page also gets every other account's, by name.
+        let hers = fronde_protocol::usage::ProviderUsage {
+            account: "marie".into(),
+            ..reading.clone()
+        };
+        let message = ServerMsg::Usage {
+            reserve: 30,
+            usage: vec![reading.clone()],
+            others: vec![hers.clone()],
+        };
+        assert_eq!(threads.apply(&message), None);
+        assert_eq!(threads.usage().unwrap().others, [hers]);
     }
 }

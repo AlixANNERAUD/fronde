@@ -119,10 +119,12 @@ pub struct ProviderModels {
     pub id: String,
     /// `(id, name)`.
     pub models: Vec<(String, String)>,
-    /// Whether sub-agents may run on it now, under the owner's reserve of its subscription:
-    /// `allowed`, `paused until <time>` or `unknown` (no usage reading: the daily counts
-    /// decide).
+    /// Whether sub-agents may run on it now, under the reserve of the caller's own account:
+    /// `allowed`, `paused until <time>`, `unknown` (no usage reading: the daily counts decide)
+    /// or `no account`.
     pub background: String,
+    /// The caller's own account on it, whose reserve `background` reads, if they have one.
+    pub account: Option<String>,
 }
 
 /// A thread as `threads_read` gets it.
@@ -686,7 +688,7 @@ async fn list(control: &dyn ThreadControl, context: CallContext) -> ToolOutput {
     let providers: Vec<Value> = providers
         .into_iter()
         .map(|provider| {
-            json!({
+            let mut value = json!({
                 "id": provider.id,
                 "background": provider.background,
                 "models": provider
@@ -694,7 +696,11 @@ async fn list(control: &dyn ThreadControl, context: CallContext) -> ToolOutput {
                     .into_iter()
                     .map(|(id, name)| json!({"id": id, "name": name}))
                     .collect::<Vec<_>>(),
-            })
+            });
+            if let Some(account) = provider.account {
+                value["account"] = account.into();
+            }
+            value
         })
         .collect();
     let mut value = json!({"children": children, "providers": providers});

@@ -44,7 +44,7 @@ fn spec() -> AgentSpec {
         builtin_tools: Vec::new(),
         usage: None,
         owners_grants: true,
-        account: "claude".into(),
+        account: Some("claude".into()),
     }
 }
 
@@ -3386,6 +3386,40 @@ async fn reserve_holds_wakes() {
     assert_eq!(woken_count(&events(&main)), 0);
 }
 
+/// The line is each account's: another account past its own holds none of this thread's
+/// results, which wake it as usual.
+#[tokio::test]
+async fn another_accounts_reserve_holds_no_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = UsageBook::in_memory();
+    let (threads, pooled, _requests) = open_reserved(dir.path(), Limits::default(), &book).await;
+    pooled.gate(ThreadId(2));
+    let (child, _) = child_of(&threads, ThreadId::MAIN, "Mesure la porte").await;
+    pooled.until_held(child.thread()).await;
+    read(&book, 0.1, 0.1);
+    book.record(
+        "marie",
+        vec![
+            window(WindowKind::Session, Some(0.95), LimitStatus::Rejected),
+            window(WindowKind::Weekly, Some(0.95), LimitStatus::Allowed),
+        ],
+    );
+    pooled.open(child.thread());
+    until_done(&child).await;
+    let main = threads.main();
+    wait_until(&main, "the parent was never woken", |events| {
+        woken_count(events) == 1
+    })
+    .await;
+    assert!(
+        !events(&main)
+            .iter()
+            .any(|event| matches!(event, Event::WakesHeld { .. })),
+        "{:?}",
+        events(&main)
+    );
+}
+
 /// A result waiting for the parent's turn is held at that turn's end once the line is passed.
 #[tokio::test]
 async fn reserve_holds_wakes_at_a_turns_end() {
@@ -3600,9 +3634,10 @@ async fn remapped_owner_applies_at_the_next_start() {
             let (spec, read) = (spec.clone(), read.clone());
             Box::pin(async move {
                 let token = spec.oauth_token.as_ref().expect("her account's token")().await?;
-                read.lock()
-                    .unwrap()
-                    .push((spec.account.clone(), token.expose_secret().to_owned()));
+                read.lock().unwrap().push((
+                    spec.account.clone().unwrap_or_default(),
+                    token.expose_secret().to_owned(),
+                ));
                 let (transport, _handle) = fake_agent(FakeScript::default());
                 AgentClient::connect(transport, &spec, resume, events).await
             })

@@ -7,6 +7,18 @@ use fronde_protocol::usage::{
     self, Background, GUARDED, LimitStatus, ProviderUsage, Window, WindowKind, percent,
 };
 
+/// What the server last said of the subscriptions the page's user may see: their own
+/// accounts', which the pill shows, and for an admin every other account's, by name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Usage {
+    /// The share of each window kept for its account's owner, in percent.
+    pub reserve: u8,
+    /// The page's user's own accounts' readings, one per provider: the pill is the first's.
+    pub own: Vec<ProviderUsage>,
+    /// Every other account's reading, by its name: an admin's page only.
+    pub others: Vec<ProviderUsage>,
+}
+
 /// A window's short name, as the chat shows it: « 5 h », « semaine ».
 pub fn window_label(kind: &WindowKind) -> String {
     match kind {
@@ -262,7 +274,7 @@ mod tests {
 
     fn reading(windows: Vec<Window>) -> ProviderUsage {
         ProviderUsage {
-            provider: "claude".into(),
+            account: "claude".into(),
             known_since: now() - Duration::minutes(12),
             windows,
         }

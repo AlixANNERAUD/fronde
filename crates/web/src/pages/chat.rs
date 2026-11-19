@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use dioxus::html::{ScrollBehavior, geometry::PixelsVector2D};
 use dioxus::prelude::*;
+use fronde_client::usage::Usage;
 use fronde_client::{Chat, Elsewhere, Item, PermissionStatus, Threads, ToolStatus, Tray};
-use fronde_protocol::usage::ProviderUsage;
 use fronde_protocol::{ClientMsg, ThreadId, ThreadSummary, TurnOutcome};
 
 use crate::{
@@ -104,10 +104,10 @@ pub fn ChatView(
     /// The other threads with cards waiting for an answer, for the tray.
     #[props(default)]
     elsewhere: Vec<Elsewhere>,
-    /// The page's user's subscription usage and the reserve in percent, for the meter: only an
-    /// admin's page has it.
+    /// The subscription usage the page's user may see, for the meter: their own accounts', and
+    /// for an admin every other's.
     #[props(default)]
-    usage: Option<(ProviderUsage, u8)>,
+    usage: Option<Usage>,
 ) -> Element {
     let open = status == Status::Open;
     let tray = Tray {
@@ -177,8 +177,8 @@ pub fn ChatView(
                     }
                     {title}
                     div { class: "ml-auto flex items-center gap-1",
-                        if let Some((usage, reserve)) = usage {
-                            UsageMeter { usage, reserve }
+                        if let Some(usage) = usage {
+                            UsageMeter { usage }
                         }
                         if let Some(on_go) = on_go.filter(|_| !new) {
                             PlaceLink {

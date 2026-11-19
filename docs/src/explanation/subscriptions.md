@@ -59,7 +59,7 @@ a mode switch: a new provider never inherits Claude's lists.
 
 A subscription has two usage windows: one of 5 hours and one of a week. Fronde reads how much
 of each is used from what the Claude adapter already sends during a turn, and keeps the latest
-reading per provider in `fronde.db`, so that it survives a restart. It makes no request of its
+reading per subscription account in `fronde.db`, so that it survives a restart. It makes no request of its
 own for it: no call to an Anthropic endpoint, no `/usage` turn.
 
 What the adapter sends:
@@ -104,18 +104,33 @@ its use unknown (shown so, never as 0 %) until the next reading. Windows of kind
 name for are kept, four at most, and dropped when a reading of both the 5-hour and the weekly
 window no longer lists them.
 
-Readings belong to a subscription account, the one the agent that sent them signs in with: its
-thread's owner's (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)). The
-legacy form's account is named `claude`, as readings were stored before accounts; a reading kept
-under another name is not carried over to a new account, whose first reading comes with its next
-turn, the daily counts deciding until then.
+### One subscription per person
 
-Fronde keeps a share of each window for your own turns: past `[threads] reserve` (30 % by
-default), sub-agents are neither started nor sent messages, and their results wait for your next
-message (see [What background work may spend](threads.md#what-background-work-may-spend)).
-The chat's header shows the windows as a meter, to an admin (see
-[Use several conversations](../how-to/use-threads.md#see-how-much-of-your-subscription-is-used)),
-and `fronde check` and the start log print them on a `usage:` line (see
+Readings belong to a subscription account, the one the agent that sent them signs in with: its
+thread's owner's (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)), kept
+under that account's name. A reading from an agent without an account (its owner has none, or
+is no longer a user, so it never starts) is kept nowhere: never under another account, never
+under one name shared by everyone without one.
+
+Readings were first kept under the provider's name, then under each account's name in the same
+place. Fronde moves such a reading to its account at the next start (the legacy form's account
+is named `claude`, as its readings were), and `fronde check` reads it where it is until then, so
+that a pause it holds is not lost at an upgrade. A reading kept under a name no account has any
+more is not given to another account: a new account's first reading comes with its next turn,
+the daily counts deciding until then.
+
+Fronde keeps a share of each window for the account's owner: past `[threads] reserve` (30 % by
+default) of an account, sub-agents on that account are neither started nor sent messages, and
+their results wait for its owner's next message (see
+[What background work may spend](threads.md#what-background-work-may-spend)). The line is each
+account's: your windows past it stop your background work, never a family member's, and hers
+past it never stop yours. The daily counts that stand in when no reading decides are each
+account's too.
+
+The chat's header shows each person their own account's windows as a meter, and an admin also
+every other account's, by name (see
+[Use several conversations](../how-to/use-threads.md#see-how-much-of-your-subscription-is-used));
+`fronde check` and the start log print one `usage:` line per account (see
 [Command line](../reference/command-line.md)).
 
 ## Why MCP for the tools

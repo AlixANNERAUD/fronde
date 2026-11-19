@@ -228,8 +228,10 @@ Readings, the reserve and the daily counts belong to a subscription account: the
 thread's owner on its provider (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)).
 A sub-agent runs on its root thread's owner's account, never on another person's: its readings
 and its counts are that account's, and a person's background work stops at their own account's
-line. A thread whose owner has no account starts no sub-agent. Showing each person their own
-account's usage in the meter is **planned**; the meter shows the owner's.
+line, never at another's. A thread whose owner has no account starts no sub-agent, and its
+threads count on no one's account. `threads_list` names the caller's own account beside each
+provider's `background`. The meter shows each person their own account's usage, and an admin
+every account's.
 
 ## Stopping
 

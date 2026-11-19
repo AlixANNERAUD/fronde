@@ -74,15 +74,17 @@ own threads), stopped after 10m idle, 4 GiB for all of them (2 GiB each)`, then 
 sub-agents: `sub-agents: your threads may start sub-agents, theirs may not; 3 running at once per
 thread, 200 kept per thread, 30m per turn, 10 wakes in a row without you; 30% of each subscription
 window kept for you; 30 a day in all (100 turns), daily counts apply only without a usage
-reading`, then the latest usage reading of your subscription, read from the database opened
-read-only: `usage: claude: 5 h 42 % (resets 16:40), week 18 % (resets Mon 24 Nov 09:00), read 12
-min ago; background work allowed below 70%` (times in `[data] timezone`, the day added when it is
+reading`, then one line per [account](configuration.md#accountsname) with its latest usage
+reading, named by the account, read from the database opened read-only (a reading stored before
+the `account/` scope included, which the next start moves): `usage: claude: 5 h 42 % (resets
+16:40), week 18 % (resets Mon 24 Nov 09:00), read 12 min ago; background work allowed below 70%` (times in `[data] timezone`, the day added when it is
 not today, rounded up to the minute; `use unknown (reset since the reading)` once a reset time has
 passed; `background work paused
 until 16:40 (5-hour window past the reserve's line, 70%)` past `[threads] reserve`), or `usage:
-claude: no reading yet; background work bounded by the daily counts` before Fronde's first turn,
-or `usage: cannot read (…)` when the stored reading does not read, and the check goes on (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)); the start log prints
-the same line; then who signs in, `users: alix (admin, account alix), marie (account marie), paul
+marie: no reading yet; background work bounded by the daily counts` before that account's first
+turn, or `usage: cannot read (the usage of marie: …)` when its stored reading does not read, and
+the check goes on (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)); the
+start log prints the same lines; then who signs in, `users: alix (admin, account alix), marie (account marie), paul
 (no account)` (see [`[users.<name>]`](configuration.md#usersname); for the legacy form,
 `users: alix (admin, account claude)`); then one line per [account](configuration.md#accountsname), never with its
 token (it first refuses, with `[accounts]`, a sign-in variable in its environment that no account

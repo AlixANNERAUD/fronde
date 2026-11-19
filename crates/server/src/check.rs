@@ -104,7 +104,9 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         writeln!(out, "agent limits: {limits}")?;
         writeln!(out, "agents: {}", crate::pool_line(config, scope.as_ref()))?;
         writeln!(out, "sub-agents: {}", crate::children_line(config))?;
-        writeln!(out, "usage: {}", usage_check_line(config).await)?;
+        for line in usage_check_lines(config).await {
+            writeln!(out, "usage: {line}")?;
+        }
         writeln!(out, "users: {}", users_line(config))?;
         for account in config.accounts() {
             writeln!(out, "{}", account_line(config, &account, &checks.secrets)?)?;
@@ -210,65 +212,54 @@ fn account_line(
     Ok(format!("{head}: token from {source}, read{legacy}"))
 }
 
-/// [`crate::usage_line`] from the owner's readings stored in the database, opened read-only:
-/// never created, migrated or written. A data directory without a database has no reading. A
-/// database or a row that cannot be read is said, `cannot read (…)`, and the check goes on.
-async fn usage_check_line(config: &Config) -> String {
-    match stored_usage(config).await {
-        Ok(readings) => crate::usage_line(
-            &readings,
-            config.threads.reserve.0,
-            chrono::Utc::now(),
-            config.data.timezone,
-        ),
-        Err(error) => format!("cannot read ({error:#})"),
-    }
-}
-
-/// The owner's reading of each provider stored in the database, if any.
-async fn stored_usage(
-    config: &Config,
-) -> anyhow::Result<Vec<(&'static str, Option<fronde_protocol::usage::ProviderUsage>)>> {
+/// [`crate::usage_line`] of each configured account, one line each, from the readings stored
+/// in the database, opened read-only: never created, migrated or written. A data directory
+/// without a database has no reading. A database that cannot be read is said once,
+/// `cannot read (…)`; a row that cannot be read is said on its account's line, and the check
+/// goes on.
+async fn usage_check_lines(config: &Config) -> Vec<String> {
     let file = fronde_db::path(&config.data.dir);
-    let exists = file
-        .try_exists()
-        .with_context(|| format!("cannot look for the database {}", file.display()))?;
-    let db = match exists {
-        true => Some(fronde_db::open_read_only(&config.data.dir).await?),
-        false => None,
+    let db = match file.try_exists() {
+        Ok(true) => match fronde_db::open_read_only(&config.data.dir).await {
+            Ok(db) => Some(db),
+            Err(error) => return vec![format!("cannot read ({error:#})")],
+        },
+        Ok(false) => None,
+        Err(error) => {
+            return vec![format!(
+                "cannot read (cannot look for the database {}: {error})",
+                file.display()
+            )];
+        }
     };
-    let mut readings = Vec::new();
-    let mut failed = None;
-    let accounts = config.accounts();
-    for provider in fronde_hub::config::PROVIDERS {
-        // The owner's account on this provider; without one, nothing of theirs runs on it.
-        let Some(account) = accounts
-            .iter()
-            .find(|account| account.owner == config.data.user && account.provider == provider)
-            .map(|account| account.name.clone())
-        else {
-            readings.push((provider, None));
-            continue;
-        };
+    let mut lines = Vec::new();
+    for account in config.accounts() {
         let reading = match &db {
-            Some(db) => match fronde_agent::usage::read_usage(db, &account).await {
-                Ok(reading) => reading,
-                Err(error) => {
-                    failed = Some(error.context(format!("the usage of {account}")));
-                    break;
-                }
-            },
-            None => None,
+            Some(db) => fronde_agent::usage::read_usage(db, &account.name).await,
+            None => Ok(None),
         };
-        readings.push((provider, reading));
+        lines.push(match reading {
+            Ok(reading) => crate::usage_line(
+                &[(account.name.as_str(), reading)],
+                config.threads.reserve.0,
+                chrono::Utc::now(),
+                config.data.timezone,
+            ),
+            Err(error) => format!(
+                "cannot read ({:#})",
+                error.context(format!("the usage of {}", account.name))
+            ),
+        });
     }
-    if let Some(db) = db {
-        db.close().await?;
+    if let Some(db) = db
+        && let Err(error) = db.close().await
+    {
+        lines.push(format!("cannot read ({error:#})"));
     }
-    match failed {
-        Some(error) => Err(error),
-        None => Ok(readings),
+    if lines.is_empty() {
+        lines.push("no account: no agent runs".to_owned());
     }
+    lines
 }
 
 /// The checks serving would make. The database is read, never created, migrated or written: a

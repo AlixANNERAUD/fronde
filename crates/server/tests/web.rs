@@ -2653,7 +2653,7 @@ async fn usage_pushed_on_change() {
     let mut seen = Vec::new();
     let usage = loop {
         match next_message(&mut socket).await {
-            ServerMsg::Usage { reserve, usage } => break (reserve, usage),
+            ServerMsg::Usage { reserve, usage, .. } => break (reserve, usage),
             other => seen.push(other),
         }
     };
@@ -2670,7 +2670,7 @@ async fn usage_pushed_on_change() {
     let (reserve, usage) = usage;
     assert_eq!(reserve, 30);
     assert_eq!(usage.len(), 1);
-    assert_eq!(usage[0].provider, "claude");
+    assert_eq!(usage[0].account, "claude");
     let session = usage[0]
         .window(&fronde_protocol::usage::WindowKind::Session)
         .unwrap();
@@ -2687,10 +2687,62 @@ async fn usage_pushed_on_change() {
     assert_eq!(again, usage);
 }
 
-/// A family member's page never gets the meter's usage: not after a reading, not after a later
-/// hello.
+/// Stores a reading of `account` (its 5-hour window at `session`) in the database of `data`,
+/// as the server keeps it, before the server starts.
+async fn store_reading(data: &Path, account: &str, session: f64) {
+    use fronde_protocol::usage::{LimitStatus, ProviderUsage, Window, WindowKind};
+    fronde_hub::private::create_dir_all(data).unwrap();
+    let db = fronde_db::open(data).await.unwrap();
+    let now = chrono::Utc::now();
+    let usage = ProviderUsage {
+        account: account.into(),
+        known_since: now,
+        windows: vec![Window {
+            kind: WindowKind::Session,
+            used: Some(session),
+            status: Some(LimitStatus::Allowed),
+            resets_at: Some(now + chrono::TimeDelta::hours(2)),
+            as_of: now,
+            reset_since_reading: false,
+        }],
+    };
+    fronde_db::kv::set(
+        &db,
+        &format!("account/{account}"),
+        "usage",
+        serde_json::to_vec(&usage).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+}
+
+/// Every message `socket` gets until a quiet moment.
+async fn until_quiet(socket: &mut Socket) -> Vec<ServerMsg> {
+    let mut seen = Vec::new();
+    drain(socket, &mut seen, Duration::from_millis(300)).await;
+    seen
+}
+
+/// The usage messages among `messages`: the accounts of each one's own readings and others'.
+fn usages(messages: &[ServerMsg]) -> Vec<(Vec<String>, Vec<String>)> {
+    let names = |usage: &[fronde_protocol::usage::ProviderUsage]| {
+        usage.iter().map(|usage| usage.account.clone()).collect()
+    };
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            ServerMsg::Usage { usage, others, .. } => Some((names(usage), names(others))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A family member's page gets her own account's usage, never another account's: nothing while
+/// only the owner's is read, hers once her agent reports, and hers alone after a later hello.
 #[tokio::test]
-async fn usage_not_sent_to_a_family_member() {
+async fn family_member_gets_only_her_own_usage() {
     let dir = tempfile::tempdir().unwrap();
     let (connector, _) = fake_connector_with(FakeScript {
         updates: vec![
@@ -2699,7 +2751,10 @@ async fn usage_not_sent_to_a_family_member() {
         ],
         ..FakeScript::default()
     });
-    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let config = two_people(dir.path());
+    // The owner's account was read before the start: someone else's for her page.
+    store_reading(&dir.path().join("data"), "alix", 0.9).await;
+    let addr = start_with(config, connector, &site(dir.path())).await;
     let cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
     let mut socket = open_chat(addr, &cookie).await;
     // Her own thread: thread 1 is the owner's.
@@ -2721,32 +2776,22 @@ async fn usage_not_sent_to_a_family_member() {
         }
     }
     // Whatever was still on its way.
-    while let Ok(Some(Ok(Message::Text(text)))) =
-        timeout(Duration::from_millis(300), socket.next()).await
-    {
-        seen.push(serde_json::from_str(&text).unwrap());
+    seen.extend(until_quiet(&mut socket).await);
+    let got = usages(&seen);
+    assert!(!got.is_empty(), "her own reading never came: {seen:?}");
+    for (own, others) in got {
+        assert_eq!(own, ["marie"], "{seen:?}");
+        assert_eq!(others, Vec::<String>::new(), "{seen:?}");
     }
-    assert!(
-        !seen
-            .iter()
-            .any(|message| matches!(message, ServerMsg::Usage { .. })),
-        "{seen:?}"
-    );
     let mut later = open_chat(addr, &cookie).await;
     hello_thread(&mut later, theirs, 0, None).await;
-    let mut after = Vec::new();
-    while let Ok(Some(Ok(Message::Text(text)))) =
-        timeout(Duration::from_millis(300), later.next()).await
-    {
-        after.push(serde_json::from_str::<ServerMsg>(&text).unwrap());
-    }
-    assert!(
-        !after
-            .iter()
-            .any(|message| matches!(message, ServerMsg::Usage { .. })),
+    let after = until_quiet(&mut later).await;
+    assert_eq!(
+        usages(&after),
+        [(vec!["marie".to_owned()], Vec::new())],
         "{after:?}"
     );
-    // Not for want of a reading: the server kept it.
+    // The server kept her reading under her account.
     let db = fronde_db::open_read_only(&dir.path().join("data"))
         .await
         .unwrap();
@@ -2761,6 +2806,53 @@ async fn usage_not_sent_to_a_family_member() {
     })
     .await
     .expect("the reading was never kept");
+}
+
+/// An admin's page gets every account's usage: the others' at once after its hello, by name,
+/// and its own account's for the pill once its agent reports.
+#[tokio::test]
+async fn admin_page_gets_every_account_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        updates: vec![
+            text_chunk("Bonjour"),
+            fronde_agent::fake::usage_update(rate_limit(0.42)),
+        ],
+        ..FakeScript::default()
+    });
+    let config = two_people(dir.path());
+    store_reading(&dir.path().join("data"), "marie", 0.9).await;
+    let addr = start_with(config, connector, &site(dir.path())).await;
+    let cookie = sign_in_as(addr, "Alix", PASSWORD).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello(&mut socket, 0, None).await;
+    let before = until_quiet(&mut socket).await;
+    assert_eq!(
+        usages(&before),
+        [(Vec::new(), vec!["marie".to_owned()])],
+        "{before:?}"
+    );
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    let (own, others) = loop {
+        if let ServerMsg::Usage { usage, others, .. } = next_message(&mut socket).await {
+            break (usage, others);
+        }
+    };
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].account, "alix");
+    assert_eq!(others.len(), 1);
+    assert_eq!(others[0].account, "marie");
+    let session = others[0]
+        .window(&fronde_protocol::usage::WindowKind::Session)
+        .unwrap();
+    assert_eq!(session.used, Some(0.9));
 }
 
 /// A thread whose owner is no longer a user is read-only on the page: a message to it is
@@ -3092,7 +3184,13 @@ async fn member_session_is_the_member() {
                 threads.iter().all(|thread| thread.id == *marie_thread),
                 "{threads:?}"
             ),
-            ServerMsg::Usage { .. } => panic!("marie got the owner's usage"),
+            // Her own account's, at most: never the owner's or anyone else's.
+            ServerMsg::Usage { usage, others, .. } => {
+                assert!(
+                    usage.iter().all(|usage| usage.account == "marie") && others.is_empty(),
+                    "marie got another account's usage: {usage:?} {others:?}"
+                );
+            }
             ServerMsg::Hello { user, admin, .. } => {
                 assert_eq!((user.as_deref(), *admin), (Some("marie"), false));
             }

@@ -445,8 +445,9 @@ thread's first message, with its own directories, its own sandbox and its own hu
   a sub-agent of it, and its agent's sign-in fails before any process starts, without falling
   back to anyone else's. The main thread is always `[data] user`'s, and its sub-agents go with
   it when `[data] user` changes. Each person signs in as themselves: their page lists, opens and
-  writes to their own threads only, answers their own cards only, and gets no usage reading of
-  anyone's (a member's own meter is **planned**); an admin's page sees every thread.
+  writes to their own threads only, answers their own cards only, and gets the usage readings of
+  their own account only, never anyone else's; an admin's page sees every thread and every
+  account's readings.
 - **Which token reaches which agent.** A thread's account is its owner's account for the
   thread's provider, looked up at each start and by nothing else: no argument, agent, card or
   page chooses it, and the thread's row does not store it. A sub-agent's row carries its parent's
@@ -458,7 +459,9 @@ thread's first message, with its own directories, its own sandbox and its own hu
   may lack a token, and its agent then starts unsigned as before. The agent never inherits a
   sign-in variable from Fronde's environment (see [The agent's environment](#the-agents-environment)):
   the account's token is the only `CLAUDE_CODE_OAUTH_TOKEN` it gets. Usage readings, the reserve
-  and the daily counts of sub-agents are kept per account.
+  and the daily counts of sub-agents are kept per account; a reading from an agent without an
+  account is kept nowhere. The meter shows each person their own account's usage only, and an
+  admin every account's.
 - **What anyone else's agent reaches.** Until each person has a memory and spaces of their own,
   memory, the calendar, every component's and upstream server's tools, and setting up an
   integration are the owner's, `[data] user`'s, not every admin's. The agent of anyone else's

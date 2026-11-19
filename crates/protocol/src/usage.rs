@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// The latest windows read for one provider.
+/// The latest windows read for one subscription account (one provider's, a person's).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct ProviderUsage {
-    /// The provider's id, as `threads.provider` stores it (`claude`).
-    pub provider: String,
+    /// The account's name (`[accounts.<name>]`, `claude` for the legacy form's): whose
+    /// subscription the windows are. Read from `provider` too, as readings were first stored.
+    #[serde(alias = "provider")]
+    pub account: String,
     /// When the latest reading that changed these windows was received: how old they are.
     pub known_since: DateTime<Utc>,
     /// At most one per [`WindowKind`].
@@ -400,7 +402,7 @@ mod tests {
 
     fn reading(windows: Vec<Window>) -> ProviderUsage {
         ProviderUsage {
-            provider: "claude".into(),
+            account: "claude".into(),
             known_since: at(1_000),
             windows,
         }
@@ -612,7 +614,7 @@ mod tests {
     #[test]
     fn provider_usage_reads_its_windows_now() {
         let usage = ProviderUsage {
-            provider: "claude".into(),
+            account: "claude".into(),
             known_since: at(1_000),
             windows: vec![window(Some(2_000))],
         };
@@ -624,5 +626,26 @@ mod tests {
         );
         assert_eq!(now.window(&WindowKind::Weekly), None);
         assert_eq!(now.known_since, usage.known_since);
+    }
+
+    /// A reading names its account; one stored before accounts, under `provider`, reads the
+    /// same.
+    #[test]
+    fn a_reading_names_its_account() {
+        let usage = ProviderUsage {
+            account: "marie".into(),
+            known_since: at(1_000),
+            windows: vec![window(Some(2_000))],
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["account"], "marie");
+        assert!(json.get("provider").is_none());
+        let mut legacy = json.clone();
+        let account = legacy.as_object_mut().unwrap().remove("account").unwrap();
+        legacy["provider"] = account;
+        assert_eq!(
+            serde_json::from_value::<ProviderUsage>(legacy).unwrap(),
+            usage
+        );
     }
 }

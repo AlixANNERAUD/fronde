@@ -405,10 +405,10 @@ fn bound_spec(
                     let error = NoOwner(owner.clone());
                     async move { Err(error.into()) }
                 })),
-                String::new(),
+                None,
             )
         }
-        (Some(_), Some(binding)) => (binding.token.clone(), binding.account.clone()),
+        (Some(_), Some(binding)) => (binding.token.clone(), Some(binding.account.clone())),
         (Some(_), None) => {
             let error = crate::acp::NoAccount {
                 owner: owner.to_owned(),
@@ -419,7 +419,7 @@ fn bound_spec(
                     let error = error.clone();
                     async move { Err(error.into()) }
                 })),
-                String::new(),
+                None,
             )
         }
     };
@@ -548,6 +548,7 @@ impl Accounts {
             .by_owner
             .values()
             .map(|binding| binding.account.clone())
+            .filter(|account| !account.is_empty())
             .collect();
         names.sort();
         names.dedup();
@@ -640,16 +641,18 @@ impl Threads {
         owner: User,
         budget: Budget,
     ) -> anyhow::Result<Arc<Self>> {
-        // One person, whose account is the spec's own.
+        // One person, whose account is the spec's own, if it names one.
         let mut accounts = Accounts::default();
-        accounts.insert(
-            &owner.name,
-            spec.provider.id,
-            Binding {
-                account: spec.account.clone(),
-                token: spec.oauth_token.clone(),
-            },
-        );
+        if let Some(account) = spec.account.clone() {
+            accounts.insert(
+                &owner.name,
+                spec.provider.id,
+                Binding {
+                    account,
+                    token: spec.oauth_token.clone(),
+                },
+            );
+        }
         let people = People {
             owner: owner.name.clone(),
             users: std::iter::once(owner).collect(),
@@ -691,7 +694,7 @@ impl Threads {
             thread: ThreadId::MAIN,
             oauth_token: None,
             owners_grants: true,
-            account: String::new(),
+            account: None,
             ..spec
         };
         // The main thread is the owner's.
@@ -931,6 +934,8 @@ impl Threads {
         self.accounts
             .of(owner, provider)
             .map(|binding| binding.account.clone())
+            // An empty name is no account: never one that every account-less thread shares.
+            .filter(|account| !account.is_empty())
     }
 
     /// Every configured account's name.

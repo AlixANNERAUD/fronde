@@ -72,6 +72,7 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User) {
         list: None,
         shown: None,
         usage: None,
+        usage_sent: None,
     };
     loop {
         tokio::select! {
@@ -151,21 +152,25 @@ struct Talk<'a> {
     list: Option<watch::Receiver<u64>>,
     /// The thread list last sent.
     shown: Option<Vec<ThreadSummary>>,
-    /// The usage book's changes, once a hello came, for a user who sees the meter.
+    /// The usage book's changes, once a hello came.
     usage: Option<watch::Receiver<u64>>,
+    /// The meter's usage last sent: a change of a reading the page is not shown sends nothing.
+    usage_sent: Option<ServerMsg>,
 }
 
-/// The usage `user` is sent for the meter: their own accounts' readings and the reserve, to an
-/// admin only for now (a member's own meter comes with usage per account), and only once there
-/// is a reading.
+/// The usage `user` is sent for the meter, keyed by who views it: their own accounts' readings,
+/// and for an admin every other account's too, by name; and the reserve. Only once there is a
+/// reading they may see.
 pub fn usage_message(threads: &Threads, user: &User) -> Option<ServerMsg> {
-    if !user.admin {
-        return None;
-    }
     let usage = threads.usage_of(&user.name);
-    (!usage.is_empty()).then(|| ServerMsg::Usage {
+    let others = match user.admin {
+        true => threads.usage_of_others(&user.name),
+        false => Vec::new(),
+    };
+    (!usage.is_empty() || !others.is_empty()).then(|| ServerMsg::Usage {
         reserve: threads.limits().reserve,
         usage,
+        others,
     })
 }
 
@@ -300,18 +305,24 @@ impl Talk<'_> {
         }
         self.replay(socket).await?;
         // After the log: the meter, again at each hello, and on each new reading from then on.
-        if self.user.admin && self.usage.is_none() {
+        if self.usage.is_none() {
             self.usage = self.web.threads.usage_changes();
         }
+        self.usage_sent = None;
         self.send_usage(socket).await
     }
 
-    /// Sends the meter's usage, if the page's user gets one.
+    /// Sends the meter's usage, if the page's user gets one and it changed since last sent.
     async fn send_usage(&mut self, socket: &mut WebSocket) -> Result<(), ()> {
-        match usage_message(&self.web.threads, self.user) {
-            Some(message) => send(socket, &message).await,
-            None => Ok(()),
+        let Some(message) = usage_message(&self.web.threads, self.user) else {
+            return Ok(());
+        };
+        if self.usage_sent.as_ref() == Some(&message) {
+            return Ok(());
         }
+        send(socket, &message).await?;
+        self.usage_sent = Some(message);
+        Ok(())
     }
 
     /// Makes the thread the page asked for with its first message, says which, and sends the
