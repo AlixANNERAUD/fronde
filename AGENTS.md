@@ -139,4 +139,5 @@ Pinned in `Cargo.toml`; `crates/web` is the app, `crates/client` its framework-f
 - Work and push directly on `main`. Commits follow Conventional Commits (`feat:`, `fix:`, `test:`,
   `build:`, `ci:`, `docs:`, `chore:`), imperative, in English. Do not mention AI tools and add no
   `Co-Authored-By` or "Generated with" lines.
+- Any change to text the driven agents read (the persona, the hub's MCP `instructions`, tool descriptions, refusals and hints returned to the agent, wake prompts) adds or extends an entry in `docs/src/reference/instruction-journal.md` in the same commit. Fill in the observed effect later, when it is known.
 - Working notes (`docs/superpowers/`) stay local and are never committed.

@@ -27,6 +27,7 @@
 - [Command line](reference/command-line.md)
 - [Pages and endpoints](reference/endpoints.md)
 - [Tools](reference/tools.md)
+- [Instruction journal](reference/instruction-journal.md)
 - [Data directory](reference/data-directory.md)
 - [Component interface (WIT)](reference/wit-interface.md)
 - [Component manifest](reference/component-manifest.md)
