@@ -223,12 +223,8 @@ fn account_line(
 /// goes on.
 async fn usage_check_lines(config: &Config) -> Vec<String> {
     let file = fronde_db::path(&config.data.dir);
-    let db = match file.try_exists() {
-        Ok(true) => match fronde_db::open_read_only(&config.data.dir).await {
-            Ok(db) => Some(db),
-            Err(error) => return vec![format!("cannot read ({error:#})")],
-        },
-        Ok(false) => None,
+    let exists = match file.try_exists() {
+        Ok(exists) => exists,
         Err(error) => {
             return vec![format!(
                 "cannot read (cannot look for the database {}: {error})",
@@ -236,13 +232,28 @@ async fn usage_check_lines(config: &Config) -> Vec<String> {
             )];
         }
     };
-    let mut lines = Vec::new();
-    for account in config.accounts() {
-        let reading = match &db {
-            Some(db) => fronde_agent::usage::read_usage(db, &account.name).await,
-            None => Ok(None),
-        };
-        lines.push(match reading {
+    let accounts = config.accounts();
+    let readings = match exists {
+        true => {
+            fronde_db::read_only(&config.data.dir, async |db| {
+                let mut readings = Vec::new();
+                for account in &accounts {
+                    readings.push(fronde_agent::usage::read_usage(db, &account.name).await);
+                }
+                Ok(readings)
+            })
+            .await
+        }
+        false => Ok(accounts.iter().map(|_| Ok(None)).collect()),
+    };
+    let readings = match readings {
+        Ok(readings) => readings,
+        Err(error) => return vec![format!("cannot read ({error:#})")],
+    };
+    accounts
+        .iter()
+        .zip(readings)
+        .map(|(account, reading)| match reading {
             Ok(reading) => crate::usage_line(
                 &[(account.name.as_str(), reading)],
                 config.threads.reserve.0,
@@ -253,15 +264,8 @@ async fn usage_check_lines(config: &Config) -> Vec<String> {
                 "cannot read ({:#})",
                 error.context(format!("the usage of {}", account.name))
             ),
-        });
-    }
-    // Read only: a failed close loses nothing, and is no account's usage.
-    if let Some(db) = db
-        && let Err(error) = db.close().await
-    {
-        tracing::debug!("cannot close the database read for the usage: {error:#}");
-    }
-    lines
+        })
+        .collect()
 }
 
 /// The checks serving would make. The database is read, never created, migrated or written: a
@@ -277,24 +281,43 @@ async fn approval_checks(config: &Config) -> anyhow::Result<fronde_wasm::Checks>
     if !exists {
         return Ok(checks);
     }
-    let db = fronde_db::open_read_only(&config.data.dir).await?;
     let unreadable = || format!("cannot read the database {}", file.display());
-    if fronde_db::approvals::table_exists(&db)
-        .await
-        .with_context(unreadable)?
-    {
-        checks.approvals.stored = fronde_wasm::stored_approvals(&db).await?;
+    // Every row is read first, and the database let go, before any key backend is asked: a
+    // keychain may take seconds, and the read may have to run again (see `read_only`).
+    let (stored, secrets) = fronde_db::read_only(&config.data.dir, async |db| {
+        let stored = match fronde_db::approvals::table_exists(db)
+            .await
+            .with_context(unreadable)?
+        {
+            true => Some(fronde_wasm::stored_approvals(db).await?),
+            false => None,
+        };
+        let secrets = match fronde_db::secrets::table_exists(db)
+            .await
+            .with_context(unreadable)?
+        {
+            true => {
+                // Where serving would read the key, without moving one an earlier version left
+                // in the data directory: serving moves it.
+                let key_file =
+                    fronde_db::master_key::locate(config.master_key_file()?, &config.data.dir)?;
+                let backends = config.master_key_backends()?.with_file(key_file);
+                let recorded = backends.record(db).await?;
+                let sealed =
+                    fronde_db::secrets::load_sealed(db, fronde_db::secrets::SOURCES).await?;
+                Some((backends, recorded, sealed))
+            }
+            false => None,
+        };
+        Ok((stored, secrets))
+    })
+    .await?;
+    if let Some(stored) = stored {
+        checks.approvals.stored = stored;
     }
-    if fronde_db::secrets::table_exists(&db)
-        .await
-        .with_context(unreadable)?
-    {
-        // Where serving would read the key, without moving one an earlier version left in the
-        // data directory: serving moves it.
-        let key_file = fronde_db::master_key::locate(config.master_key_file()?, &config.data.dir)?;
-        let backends = config.master_key_backends()?.with_file(key_file);
-        checks.secrets = fronde_wasm::StoredSecrets::load(&db, &backends).await?;
+    if let Some((backends, recorded, sealed)) = secrets {
+        checks.secrets =
+            fronde_wasm::StoredSecrets::load_recorded(&recorded, sealed, &backends).await?;
     }
-    db.close().await?;
     Ok(checks)
 }

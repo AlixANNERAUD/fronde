@@ -72,8 +72,9 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<DatabaseConnection> {
         .connect_timeout(BUSY_TIMEOUT)
         .sqlx_logging(false)
         .map_sqlx_sqlite_opts(move |options| {
-            // The path itself, exact even when it is not UTF-8. Never created here: SQLite would
-            // follow the umask, the file made above does not.
+            // The path itself, not a URL, so that no character in it is read as part of one
+            // (sqlx refuses a path that is not UTF-8). Never created here: SQLite would follow
+            // the umask, the file made above does not.
             options
                 .filename(&filename)
                 .create_if_missing(false)
@@ -97,11 +98,59 @@ pub async fn open(data_dir: &Path) -> anyhow::Result<DatabaseConnection> {
     Ok(db)
 }
 
-/// Open `<data_dir>/fronde.db`, which must exist, to read only: no migration, no write, no file
-/// created or changed. For `fronde check`, which must decide what serving would without touching
-/// the database. The schema is the one the last Fronde to open it left: a table added since may
-/// be missing.
+/// Open `<data_dir>/fronde.db`, which must exist, to read only: no migration, no write. The
+/// schema is the one the last Fronde to open it left: a table added since may be missing. A
+/// read-only connection to a write-ahead-logged database creates SQLite's `-wal` and `-shm`
+/// files when they are missing, and cannot remove them when it closes: to leave the data
+/// directory as it was when Fronde is not running, use [`read_only`].
 pub async fn open_read_only(data_dir: &Path) -> anyhow::Result<DatabaseConnection> {
+    connect_read_only(data_dir, false).await
+}
+
+/// Runs `read` on `<data_dir>/fronde.db`, which must exist, opened to read only as
+/// [`open_read_only`] does, and closes it. For `fronde check`, which must decide what serving
+/// would without touching the database: when Fronde is not running, it leaves the data
+/// directory as it was, creating no `-wal` or `-shm`.
+///
+/// When the database [`is_at_rest`], it is first read as immutable: SQLite then reads the main
+/// file alone, takes no lock and creates nothing. Immutable, it must not read a file another
+/// process writes meanwhile, which `fronde.lock` cannot rule out: `fronde secret` writes
+/// without it. One that opens the database while `read` runs writes to a new `-wal`, and
+/// writes the main file only at a checkpoint, at its close at the latest. So once `read` is
+/// done, the database must still be at rest, its file the same as before (size, times, inode):
+/// otherwise what was read is dropped, and `read` runs again on a plain read-only connection,
+/// which reads beside a writer as any reader does, through the `-wal` and `-shm`. `read` may
+/// therefore run twice: it only reads, and should not wait on anything but the database.
+pub async fn read_only<T>(
+    data_dir: &Path,
+    read: impl AsyncFn(&DatabaseConnection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if let Some(before) = Rest::now(data_dir) {
+        let db = connect_read_only(data_dir, true).await?;
+        let result = read(&db).await;
+        let closed = db.close().await;
+        if closed.is_ok() && Rest::now(data_dir).as_ref() == Some(&before) {
+            return result;
+        }
+        tracing::debug!(
+            "the database {} changed while it was read as immutable: read again",
+            path(data_dir).display()
+        );
+    }
+    let db = connect_read_only(data_dir, false).await?;
+    let result = read(&db).await;
+    // Read only: a failed close loses nothing.
+    if let Err(error) = db.close().await {
+        tracing::debug!(
+            "cannot close the database {} read only: {error:#}",
+            path(data_dir).display()
+        );
+    }
+    result
+}
+
+/// The connection of [`open_read_only`], immutable or not.
+async fn connect_read_only(data_dir: &Path, immutable: bool) -> anyhow::Result<DatabaseConnection> {
     let file = path(data_dir);
     let mut options = ConnectOptions::new(url(&file));
     let filename = file.clone();
@@ -114,6 +163,7 @@ pub async fn open_read_only(data_dir: &Path) -> anyhow::Result<DatabaseConnectio
             options
                 .filename(&filename)
                 .read_only(true)
+                .immutable(immutable)
                 .create_if_missing(false)
                 .busy_timeout(BUSY_TIMEOUT)
         });
@@ -124,6 +174,63 @@ pub async fn open_read_only(data_dir: &Path) -> anyhow::Result<DatabaseConnectio
             file.display()
         )
     })
+}
+
+/// The database file of a database at rest, as [`read_only`] compares it before and after an
+/// immutable read: a checkpoint, or a new file under the name, changes one of these.
+#[derive(Debug, PartialEq, Eq)]
+struct Rest {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64),
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl Rest {
+    /// The database file now, if the database [`is_at_rest`].
+    fn now(data_dir: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path(data_dir)).ok()?;
+        if !is_at_rest(data_dir) {
+            return None;
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            #[cfg(unix)]
+            inode: (metadata.dev(), metadata.ino()),
+        })
+    }
+}
+
+/// Whether nothing has `<data_dir>/fronde.db` open now: it is in write-ahead-logging mode, as
+/// [`open`] leaves it, neither its `-wal` nor its `-shm` exists (every connection to such a
+/// database keeps both while it is open, and the last to close removes them; a commit a crash
+/// left in a `-wal` keeps it from being at rest, so it is never missed), and no `fronde serve`
+/// holds the data directory ([`running::is_free`]). `false` when any of it cannot be told. A
+/// database in another journal mode is written in place: it is never at rest, and its readers
+/// create no file anyway. Something may open it the moment after: see [`read_only`].
+pub fn is_at_rest(data_dir: &Path) -> bool {
+    let file = path(data_dir);
+    let mut header = [0u8; 20];
+    let wal = std::fs::File::open(&file)
+        .and_then(|mut opened| std::io::Read::read_exact(&mut opened, &mut header))
+        .is_ok_and(|()| header[18] == 2 && header[19] == 2);
+    let quiet = ["-wal", "-shm"].iter().all(|suffix| {
+        let mut sibling = file.clone().into_os_string();
+        sibling.push(suffix);
+        // Present, or unknown: in use, as far as this can tell.
+        matches!(
+            std::fs::symlink_metadata(PathBuf::from(sibling)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    });
+    wal && quiet && running::is_free(data_dir)
 }
 
 /// Applies the pending migrations in one transaction. sea-orm-migration runs a SQLite migration

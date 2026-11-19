@@ -12,6 +12,11 @@ use std::path::Path;
 /// The lock file, in the data directory.
 pub const FILE: &str = "fronde.lock";
 
+/// How often, and how long apart, [`claim`] tries a lock held for an instant again: 100 ms in
+/// all.
+const BRIEF_TRIES: u32 = 10;
+const BRIEF_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// The data directory, held until dropped.
 #[derive(Debug)]
 #[must_use = "the data directory is released when this is dropped"]
@@ -30,7 +35,17 @@ pub fn claim(data_dir: &Path, what: &str) -> anyhow::Result<Running> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("cannot open the lock file {shown}"))?;
-    match file.try_lock() {
+    // `fronde check` locks the file shared for an instant to see whether it is held
+    // ([`is_free`]): a lock refused for that long is tried again before naming a holder.
+    let mut locked = file.try_lock();
+    for _ in 0..BRIEF_TRIES {
+        if !matches!(locked, Err(std::fs::TryLockError::WouldBlock)) {
+            break;
+        }
+        std::thread::sleep(BRIEF_WAIT);
+        locked = file.try_lock();
+    }
+    match locked {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
             let mut holder = String::new();
@@ -58,4 +73,14 @@ pub fn claim(data_dir: &Path, what: &str) -> anyhow::Result<Running> {
         .and_then(|()| writeln!(file, "{} {what}", std::process::id()));
     written.with_context(|| format!("cannot write to the lock file {shown}"))?;
     Ok(Running { _file: file })
+}
+
+/// Whether no process holds `data_dir` now, told without creating or writing anything: the lock
+/// file, if there is one, is opened to read and locked shared for an instant. `false` when it
+/// cannot be told.
+pub fn is_free(data_dir: &Path) -> bool {
+    match std::fs::File::open(data_dir.join(FILE)) {
+        Ok(file) => file.try_lock_shared().is_ok(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }

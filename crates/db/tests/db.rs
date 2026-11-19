@@ -348,3 +348,141 @@ async fn approvals_refuse_what_is_not_a_sha256() {
         .unwrap();
     assert_eq!(approvals::all(&db).await.unwrap().len(), 1);
 }
+
+/// Every file of `dir` with its content, by name.
+fn files(dir: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Nothing uses the database: reading it creates no `-wal` or `-shm` and changes no byte, even
+/// under a directory whose name holds URL characters.
+#[tokio::test]
+async fn read_only_leaves_the_files_as_they_were() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("a?mode=ro%20#b");
+    std::fs::create_dir(&dir).unwrap();
+    let db = fronde_db::open(&dir).await.unwrap();
+    kv::set(&db, "s", "k", vec![1], None).await.unwrap();
+    db.close().await.unwrap();
+    // As a stopped `fronde serve` leaves it.
+    let _ = fronde_db::running::claim(&dir, "fronde serve").unwrap();
+    let before = files(&dir);
+    let read = fronde_db::read_only(&dir, async |db| Ok(kv::get(db, "s", "k").await?))
+        .await
+        .unwrap();
+    assert_eq!(read, Some(vec![1]));
+    let after = files(&dir);
+    let names = |files: &[(std::ffi::OsString, Vec<u8>)]| {
+        files
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&after), names(&before));
+    assert!(after == before, "the read changed a file");
+}
+
+/// While `fronde serve` runs, a read sees what it committed, its latest commits included, which
+/// are still in its write-ahead log.
+#[tokio::test]
+async fn read_only_sees_a_running_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let _running = fronde_db::running::claim(dir.path(), "fronde serve").unwrap();
+    let writer = fronde_db::open(dir.path()).await.unwrap();
+    kv::set(&writer, "s", "k", vec![1], None).await.unwrap();
+    let read = fronde_db::read_only(dir.path(), async |reader| {
+        let first = kv::get(reader, "s", "k").await?;
+        kv::set(&writer, "s", "k", vec![2], None).await?;
+        Ok((first, kv::get(reader, "s", "k").await?))
+    })
+    .await
+    .unwrap();
+    assert_eq!(read, (Some(vec![1]), Some(vec![2])));
+    assert_eq!(kv::get(&writer, "s", "k").await.unwrap(), Some(vec![2]));
+}
+
+/// A writer that stopped without closing (a crash) left its commits in the write-ahead log:
+/// a read sees them.
+#[tokio::test]
+async fn read_only_reads_what_a_crash_left_in_the_log() {
+    let t = tempfile::tempdir().unwrap();
+    let (live, crashed) = (t.path().join("live"), t.path().join("crashed"));
+    std::fs::create_dir(&live).unwrap();
+    std::fs::create_dir(&crashed).unwrap();
+    let writer = fronde_db::open(&live).await.unwrap();
+    kv::set(&writer, "s", "k", vec![1], None).await.unwrap();
+    // The files as a crash would leave them now.
+    for (name, bytes) in files(&live) {
+        std::fs::write(crashed.join(name), bytes).unwrap();
+    }
+    assert!(crashed.join("fronde.db-wal").metadata().unwrap().len() > 0);
+    let read = fronde_db::read_only(
+        &crashed,
+        async |reader| Ok(kv::get(reader, "s", "k").await?),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read, Some(vec![1]));
+    writer.close().await.unwrap();
+}
+
+/// The database is at rest only when nothing may write it: never while `fronde serve` holds the
+/// data directory, even before it opened the database, nor while a connection is open.
+#[tokio::test]
+async fn at_rest_only_when_nothing_may_write() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(fronde_db::running::is_free(dir.path()), "no lock file yet");
+    assert!(!fronde_db::is_at_rest(dir.path()), "no database");
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    assert!(!fronde_db::is_at_rest(dir.path()), "a connection is open");
+    db.close().await.unwrap();
+    assert!(fronde_db::is_at_rest(dir.path()));
+    let running = fronde_db::running::claim(dir.path(), "fronde serve").unwrap();
+    assert!(!fronde_db::running::is_free(dir.path()));
+    assert!(
+        !fronde_db::is_at_rest(dir.path()),
+        "serve holds the directory"
+    );
+    drop(running);
+    assert!(fronde_db::running::is_free(dir.path()));
+    assert!(fronde_db::is_at_rest(dir.path()));
+}
+
+/// A writer that does not hold `fronde.lock`, such as `fronde secret set`, opens the database,
+/// writes and closes while a read of it at rest runs: its close checkpoints into the database
+/// file, which the immutable read may have half seen. That read is dropped, and the read runs
+/// again beside nothing, seeing the write.
+#[tokio::test]
+async fn read_only_reads_again_after_a_writer_came_and_went() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    kv::set(&db, "s", "k", vec![1], None).await.unwrap();
+    db.close().await.unwrap();
+    assert!(fronde_db::is_at_rest(dir.path()));
+    let runs = AtomicUsize::new(0);
+    let read = fronde_db::read_only(dir.path(), async |reader| {
+        if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+            let writer = fronde_db::open(dir.path()).await?;
+            kv::set(&writer, "s", "k", vec![2], None).await?;
+            writer.close().await?;
+            assert!(
+                fronde_db::is_at_rest(dir.path()),
+                "the writer left its files"
+            );
+        }
+        Ok(kv::get(reader, "s", "k").await?)
+    })
+    .await
+    .unwrap();
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert_eq!(read, Some(vec![2]));
+}

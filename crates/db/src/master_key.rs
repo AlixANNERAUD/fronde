@@ -18,7 +18,7 @@ mod rotation;
 mod systemd;
 
 pub(crate) use backends::parse_recorded;
-pub use backends::{Backends, Choice, KeyLock, LOCK_FILE};
+pub use backends::{Backends, Choice, KeyLock, LOCK_FILE, Recorded};
 #[cfg(feature = "testing")]
 pub use keychain::FakeKeychain;
 pub use keychain::Keychain;

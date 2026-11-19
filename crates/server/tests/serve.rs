@@ -1150,10 +1150,8 @@ fn window(
     }
 }
 
-/// The database files of `data` that differ from `before`: changed, gone, or new. A read-only
-/// connection to a WAL database leaves SQLite's own `-shm` index and an empty `-wal` behind (it
-/// may not remove them: another process may be opening the database); those alone are not
-/// counted, as long as the `-wal` holds no page.
+/// The database files of `data` that differ from `before`: changed, gone, or new. With nothing
+/// using the database, a read must leave no `-wal` or `-shm` behind, not even empty ones.
 fn changed_files(data: &std::path::Path, before: &[(String, Vec<u8>)]) -> Vec<String> {
     let after = database_files(data);
     let mut changed: Vec<String> = before
@@ -1165,11 +1163,6 @@ fn changed_files(data: &std::path::Path, before: &[(String, Vec<u8>)]) -> Vec<St
         after
             .iter()
             .filter(|(name, _)| !before.iter().any(|(n, _)| n == name))
-            .filter(|(name, bytes)| match name.as_str() {
-                "fronde.db-shm" => false,
-                "fronde.db-wal" => !bytes.is_empty(),
-                _ => true,
-            })
             .map(|(name, _)| format!("{name} (new)")),
     );
     changed
@@ -1263,6 +1256,42 @@ async fn check_prints_no_reading() {
     assert_eq!(usage_printed(&run_check(&path)), expected);
     assert_eq!(changed_files(&data, &before), Vec::<String>::new());
     assert!(!before.is_empty());
+}
+
+/// While `fronde serve` runs, `fronde check` reads beside it what it committed, commits still
+/// in its write-ahead log included, and adds no file: the `-wal` and `-shm` it reads through
+/// are serve's, and the database file keeps every byte. Readers share serve's `-shm` index, so
+/// its bytes are not compared.
+#[tokio::test]
+async fn check_reads_beside_a_running_serve() {
+    use fronde_protocol::usage::WindowKind;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    fronde_hub::private::create_dir_all(&data).unwrap();
+    let _running = fronde_db::running::claim(&data, "fronde serve").unwrap();
+    let serve = fronde_db::open(&data).await.unwrap();
+    let resets_at = chrono::DateTime::parse_from_rfc3339("2100-01-04T16:40:00+01:00")
+        .unwrap()
+        .to_utc();
+    // Committed while serve holds the database: in the log, not yet in the database file.
+    store_reading(&data, vec![window(WindowKind::Session, 0.42, resets_at)]).await;
+    let before = database_files(&data);
+    let names = |files: &[(String, Vec<u8>)]| {
+        files
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&before),
+        ["fronde.db", "fronde.db-shm", "fronde.db-wal"]
+    );
+    let line = usage_printed(&run_check(&path));
+    assert!(line.starts_with("claude: 5 h 42 %"), "{line}");
+    let after = database_files(&data);
+    assert_eq!(names(&after), names(&before), "check added a file");
+    assert!(after[0] == before[0], "check changed the database file");
+    serve.close().await.unwrap();
 }
 
 /// A window whose reset time passed since its reading reads as reset, and decides nothing.

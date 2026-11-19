@@ -32,6 +32,17 @@ impl StoredSecrets {
         Ok(Self { key, sealed })
     }
 
+    /// [`StoredSecrets::load`] from `recorded` and `sealed`, read with the database before it was
+    /// let go: only the key comes from `backends` now, which may take seconds (a keychain).
+    pub async fn load_recorded(
+        recorded: &fronde_db::master_key::Recorded,
+        sealed: Vec<Sealed>,
+        backends: &Backends,
+    ) -> anyhow::Result<Self> {
+        let key = backends.load_recorded(recorded).await?;
+        Ok(Self { key, sealed })
+    }
+
     /// Where the master key came from, if one was read.
     pub fn key_backend(&self) -> Option<Backend> {
         self.key.as_ref().map(|key| key.backend())

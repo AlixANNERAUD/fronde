@@ -339,21 +339,35 @@ fn opens(key: &MasterKey, check: &[u8]) -> anyhow::Result<bool> {
 /// Check that `key` is the one that sealed the stored secrets. With nothing stored, any key is.
 /// Secrets stored without a key check cannot be checked and are refused.
 pub async fn check_key<C: ConnectionTrait>(db: &C, key: &MasterKey) -> anyhow::Result<()> {
-    match stored_check(db).await? {
-        Some(check) => opens(key, &check).map(drop),
-        None => {
-            let rows = secrets::Entity::find()
-                .count(db)
-                .await
-                .context("cannot read the stored secrets")?;
-            if rows > 0 {
-                bail!(
-                    "the database holds stored secrets but no key check, so no key can be \
-                     trusted to open them; restore the data directory from a backup"
-                );
-            }
-            Ok(())
-        }
+    let (check, rows) = stored_key_check(db).await?;
+    check_recorded(key, check.as_deref(), rows)
+}
+
+/// The stored key check, if any, and how many secrets are stored: what [`check_key`] reads.
+pub(crate) async fn stored_key_check<C: ConnectionTrait>(
+    db: &C,
+) -> anyhow::Result<(Option<Vec<u8>>, u64)> {
+    let check = stored_check(db).await?;
+    let rows = secrets::Entity::find()
+        .count(db)
+        .await
+        .context("cannot read the stored secrets")?;
+    Ok((check, rows))
+}
+
+/// [`check_key`] against what [`stored_key_check`] read.
+pub(crate) fn check_recorded(
+    key: &MasterKey,
+    check: Option<&[u8]>,
+    rows: u64,
+) -> anyhow::Result<()> {
+    match check {
+        Some(check) => opens(key, check).map(drop),
+        None if rows > 0 => bail!(
+            "the database holds stored secrets but no key check, so no key can be trusted to \
+             open them; restore the data directory from a backup"
+        ),
+        None => Ok(()),
     }
 }
 

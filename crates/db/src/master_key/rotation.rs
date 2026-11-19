@@ -98,7 +98,9 @@ pub struct Moved {
 }
 
 /// The backend of a rotation under way, as recorded at its first step; `None` when there is none.
-pub(crate) async fn interrupted(db: &DatabaseConnection) -> anyhow::Result<Option<Backend>> {
+pub(crate) async fn interrupted<C: sea_orm::ConnectionTrait>(
+    db: &C,
+) -> anyhow::Result<Option<Backend>> {
     crate::kv::get(db, crate::secrets::CHECK_SCOPE, ROTATION_KEY)
         .await
         .context("cannot read whether a rotation of the master key is under way")?

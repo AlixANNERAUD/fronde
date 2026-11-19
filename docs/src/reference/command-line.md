@@ -58,9 +58,14 @@ approvals and secrets stored in `fronde.db` when the data directory has one, and
 key against them, from the backend `serve` would use, as `serve` does at start; when secrets are
 stored it prints `secrets: master key from <place> (<backend>), opens the stored secrets` (a key an earlier version left in the data directory
 is read there and not moved: `serve` moves it), and never creates, updates or writes the
-database: it
-opens it read-only, and a database an older Fronde left without the approvals or secrets table
-has no stored approval or secret, which is what `serve` would find after updating it. With
+database: it opens it read-only, reads every row it needs, then lets it go before it asks the
+key's backend. When Fronde is not running and SQLite's `-wal` and `-shm` files are absent, it
+reads the database file alone, as immutable, and leaves no file behind; should another command
+(`fronde secret set`, say) write the database meanwhile, it reads it again the usual way, which
+may leave an empty `-wal` and a `-shm` behind. Otherwise it reads through the `-wal` and `-shm`
+already there, beside the running Fronde. A database an older Fronde left without the approvals
+or secrets table has no stored approval or secret, which is what `serve` would find after
+updating it. With
 `[python]`, it checks that `python.wasm` is the pinned build and compiles it, then prints
 `python: approved (CPython 3.15.2)`. With `[web]`, it prints what the agent's sandbox covers on
 this kernel, such as `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, device ioctls,

@@ -10,7 +10,7 @@
 use super::keychain::KeychainError;
 use super::{Backend, Keychain, MasterKey, systemd};
 use anyhow::{Context as _, bail};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,6 +88,37 @@ pub struct Backends {
     keychain: Keychain,
 }
 
+/// What the database says of the stored secrets' master key, read by [`Backends::record`].
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    /// The key check, if one is stored.
+    check: Option<Vec<u8>>,
+    /// How many secrets are stored.
+    rows: u64,
+    /// The keychain entry's user.
+    entry: String,
+    /// The backend recorded with the first secret.
+    recorded: Backend,
+    /// The backend of a rotation under way, if any.
+    interrupted: Option<Backend>,
+}
+
+impl Recorded {
+    /// Whether anything is sealed: a secret, or the key check alone.
+    fn stored(&self) -> bool {
+        self.rows > 0 || self.check.is_some()
+    }
+}
+
+/// What [`Backends::find`] found.
+enum Found {
+    Key(Arc<MasterKey>),
+    /// Nothing is sealed.
+    Nothing,
+    /// Secrets are sealed, and this backend holds no key.
+    Missing(Backend),
+}
+
 impl Backends {
     /// The backends: `choice`, the key file `file`, the service's credentials directory, if
     /// any, and the keychain.
@@ -152,58 +183,98 @@ impl Backends {
     /// while they are, or a key that does not open them, is an error that says so, and names the
     /// recorded backend when `[secrets] backend` names another; another backend is never tried.
     pub async fn load(&self, db: &DatabaseConnection) -> anyhow::Result<Option<Arc<MasterKey>>> {
-        if !crate::secrets::any_stored(db).await? {
-            return Ok(None);
+        let recorded = self.record(db).await?;
+        match self.find(&recorded).await? {
+            Found::Key(key) => Ok(Some(key)),
+            Found::Nothing => Ok(None),
+            // The last secret was removed since.
+            Found::Missing(_) if !crate::secrets::any_stored(db).await? => Ok(None),
+            Found::Missing(backend) => Err(self.missing_for(backend, &recorded)),
         }
-        let entry = self.entry(db).await?;
-        // Secrets stored before backends were recorded were sealed with the key file.
-        let recorded = crate::secrets::recorded_backend(db)
-            .await?
-            .unwrap_or(Backend::File);
+    }
+
+    /// What [`Backends::load`] reads from the database, read at once: so that a reader can let
+    /// the database go before asking a backend, which may take seconds (a keychain), then
+    /// [`Backends::load_recorded`].
+    pub async fn record<C: ConnectionTrait>(&self, db: &C) -> anyhow::Result<Recorded> {
+        let (check, rows) = crate::secrets::stored_key_check(db).await?;
+        Ok(Recorded {
+            check,
+            rows,
+            entry: self.entry(db).await?,
+            // Secrets stored before backends were recorded were sealed with the key file.
+            recorded: crate::secrets::recorded_backend(db)
+                .await?
+                .unwrap_or(Backend::File),
+            // Only for a message: a record that does not read says nothing of a rotation.
+            interrupted: super::rotation::interrupted(db).await.ok().flatten(),
+        })
+    }
+
+    /// [`Backends::load`] from what [`Backends::record`] read, without the database.
+    pub async fn load_recorded(
+        &self,
+        recorded: &Recorded,
+    ) -> anyhow::Result<Option<Arc<MasterKey>>> {
+        match self.find(recorded).await? {
+            Found::Key(key) => Ok(Some(key)),
+            Found::Nothing => Ok(None),
+            Found::Missing(backend) => Err(self.missing_for(backend, recorded)),
+        }
+    }
+
+    /// The key `recorded` asks for, from the backend in use, checked against `recorded`.
+    async fn find(&self, recorded: &Recorded) -> anyhow::Result<Found> {
+        if !recorded.stored() {
+            return Ok(Found::Nothing);
+        }
         let backend = match self.choice {
             Choice::Only(chosen) => chosen,
-            Choice::Auto => recorded,
+            Choice::Auto => recorded.recorded,
         };
         // A named backend that is not the recorded one is read all the same: the owner may have
         // moved the key there, and the record then follows it ([`crate::secrets::set`]).
-        self.load_from(db, backend, &entry)
+        let named = |e: anyhow::Error| self.named_context(e, backend, recorded);
+        let key = self
+            .read(backend, &recorded.entry)
             .await
-            .map_err(|e| match backend == recorded {
-                true => e,
-                false => e.context(self.contradicts(backend, recorded, &entry)),
-            })
+            .map_err(|e| named(self.unavailable(backend, &recorded.entry, e)))?;
+        let Some(key) = key else {
+            return Ok(Found::Missing(backend));
+        };
+        if let Err(e) =
+            crate::secrets::check_recorded(&key, recorded.check.as_deref(), recorded.rows)
+        {
+            let e = e.context(format!("master key {}", self.place_of(&key)));
+            // Read-only callers such as `fronde check` cannot finish it themselves.
+            let e = match recorded.interrupted {
+                Some(_) => e.context(
+                    "a rotation of the master key was interrupted: `fronde serve` or `fronde \
+                     secret rotate-key` finishes it",
+                ),
+                None => e,
+            };
+            return Err(named(e));
+        }
+        Ok(Found::Key(Arc::new(key)))
     }
 
-    /// [`Backends::load`] from `backend`, while secrets are stored.
-    async fn load_from(
+    /// `e`, naming the recorded backend when `backend`, the one read, is another.
+    fn named_context(
         &self,
-        db: &DatabaseConnection,
+        e: anyhow::Error,
         backend: Backend,
-        entry: &str,
-    ) -> anyhow::Result<Option<Arc<MasterKey>>> {
-        let key = self
-            .read(backend, entry)
-            .await
-            .map_err(|e| self.unavailable(backend, entry, e))?;
-        match key {
-            Some(key) => {
-                if let Err(e) = crate::secrets::check_key(db, &key).await {
-                    let e = e.context(format!("master key {}", self.place_of(&key)));
-                    // Read-only callers such as `fronde check` cannot finish it themselves.
-                    return Err(match super::rotation::interrupted(db).await {
-                        Ok(Some(_)) => e.context(
-                            "a rotation of the master key was interrupted: `fronde serve` or \
-                             `fronde secret rotate-key` finishes it",
-                        ),
-                        _ => e,
-                    });
-                }
-                Ok(Some(Arc::new(key)))
-            }
-            // The last secret was removed since.
-            None if !crate::secrets::any_stored(db).await? => Ok(None),
-            None => Err(self.missing(backend, entry)),
+        recorded: &Recorded,
+    ) -> anyhow::Error {
+        match backend == recorded.recorded {
+            true => e,
+            false => e.context(self.contradicts(backend, recorded.recorded, &recorded.entry)),
         }
+    }
+
+    /// No key in `backend` while `recorded` says secrets are stored.
+    fn missing_for(&self, backend: Backend, recorded: &Recorded) -> anyhow::Error {
+        self.named_context(self.missing(backend, &recorded.entry), backend, recorded)
     }
 
     /// [`Backends::load`], or, when nothing is sealed, the key in the backend in use, made there
@@ -288,7 +359,7 @@ impl Backends {
 
     /// The keychain entry's user: the one recorded with the first secret, else the one this data
     /// directory's path gives.
-    pub(super) async fn entry(&self, db: &DatabaseConnection) -> anyhow::Result<String> {
+    pub(super) async fn entry<C: ConnectionTrait>(&self, db: &C) -> anyhow::Result<String> {
         Ok(crate::secrets::recorded_keychain_entry(db)
             .await?
             .unwrap_or_else(|| self.keychain.user()))
