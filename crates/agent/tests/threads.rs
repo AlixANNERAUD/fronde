@@ -3038,6 +3038,151 @@ async fn a_late_answer_waiting_survives_a_restart() {
     }
 }
 
+/// A late answer waiting for a turn's end is dropped when the owner archives the thread, and it
+/// stays dropped: bringing the thread back, then a restart, gives it to no agent. The drop is
+/// written in the stream at the archive, where the owner sees it, so it holds whether the
+/// archived turn ended while Fronde ran or Fronde stopped first; and when Fronde stopped
+/// between marking the thread archived and dropping the answer, bringing the thread back drops
+/// it. The thread is never opened by hand while archived: Fronde does not open it either.
+#[tokio::test]
+async fn a_late_answer_dropped_by_an_archive_stays_dropped() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Stop {
+        /// No stop: the archived turn ends, the thread is brought back, then Fronde restarts.
+        AfterTheTurnEnded,
+        /// Fronde stops after the archive, before the turn it cancels has ended.
+        BeforeTheTurnEnded,
+        /// Fronde stops after marking the thread archived, before dropping the answer.
+        BeforeTheDrop,
+    }
+    for stop in [
+        Stop::AfterTheTurnEnded,
+        Stop::BeforeTheTurnEnded,
+        Stop::BeforeTheDrop,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (threads, pooled, requests) =
+                open_woken_with(dir.path(), Limits::default(), |pooled| {
+                    pooled.gate(ThreadId(2))
+                })
+                .await;
+            let second = new_thread(&threads, StartedBy::User).await;
+            second.send("Va".into()).await;
+            pooled.until_held(ThreadId(2)).await;
+            let id = requests
+                .ask(late_ask(ThreadId(2), "thread:2", 1))
+                .await
+                .unwrap()
+                .id();
+            requests.answer(id, perso(), &alix()).await.unwrap();
+            wait_until(&second, "the late answer was never logged", |events| {
+                events.iter().any(
+                    |event| matches!(event, Event::LateAnswer { request, .. } if *request == id),
+                )
+            })
+            .await;
+            if stop != Stop::BeforeTheDrop {
+                threads.set_archived(ThreadId(2), true).await.unwrap();
+                // Dropped at the archive, before the turn's end.
+                assert!(
+                    events(&second).contains(&Event::LateDropped { count: 1 }),
+                    "{stop:?}: {:?}",
+                    events(&second)
+                );
+            }
+            if stop == Stop::AfterTheTurnEnded {
+                pooled.open(ThreadId(2));
+                wait_until(&second, "the archived turn never ended", |events| {
+                    events
+                        .iter()
+                        .any(|event| matches!(event, Event::TurnEnded { .. }))
+                })
+                .await;
+                until_done(&second).await;
+                threads.set_archived(ThreadId(2), false).await.unwrap();
+            }
+        }
+        if stop == Stop::BeforeTheDrop {
+            use sea_orm::QueryFilter;
+            let db = fronde_db::open(dir.path()).await.unwrap();
+            fronde_entity::threads::Entity::update_many()
+                .col_expr(
+                    fronde_entity::threads::Column::ArchivedAt,
+                    sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+                )
+                .filter(sea_orm::ColumnTrait::eq(
+                    &fronde_entity::threads::Column::Id,
+                    2,
+                ))
+                .exec(&db)
+                .await
+                .unwrap();
+        }
+        if stop != Stop::AfterTheTurnEnded {
+            // Fronde starts again, the thread archived and not open; the owner brings it back.
+            let (threads, pooled, _requests) =
+                open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+            threads.set_archived(ThreadId(2), false).await.unwrap();
+            drop((threads, pooled));
+        }
+        let (threads, pooled, _requests) =
+            open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+        let second = threads.assistant(ThreadId(2)).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        until_done(&second).await;
+        let shown = events(&second);
+        assert!(!shown.contains(&user(PERSO)), "{stop:?}: {shown:?}");
+        assert!(prompts(&pooled, ThreadId(2)).is_empty(), "{stop:?}");
+        let dropped = Event::Notice {
+            text: fronde_agent::assistant::LATE_DROPPED.into(),
+        };
+        let at = shown.iter().position(|event| *event == dropped);
+        assert!(
+            at.is_some_and(|at| shown[at - 1] == Event::LateDropped { count: 1 }),
+            "{stop:?}: {shown:?}"
+        );
+        assert_eq!(
+            shown.iter().filter(|event| **event == dropped).count(),
+            1,
+            "{stop:?}: {shown:?}"
+        );
+        drop((threads, second, pooled));
+    }
+}
+
+/// An answer that comes late to an archived thread's card goes to no agent, and the owner is
+/// told so in the thread.
+#[tokio::test]
+async fn a_late_answer_to_an_archived_thread_is_dropped_visibly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (threads, pooled, requests) = open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+    let second = new_thread(&threads, StartedBy::User).await;
+    let id = requests
+        .ask(late_ask(ThreadId(2), "thread:2", 1))
+        .await
+        .unwrap()
+        .id();
+    threads.set_archived(ThreadId(2), true).await.unwrap();
+    requests.answer(id, perso(), &alix()).await.unwrap();
+    let dropped = Event::Notice {
+        text: fronde_agent::assistant::LATE_DROPPED.into(),
+    };
+    wait_until(&second, "the drop was never shown", |events| {
+        events.contains(&dropped)
+    })
+    .await;
+    let shown = events(&second);
+    assert!(!shown.contains(&user(PERSO)), "{shown:?}");
+    assert!(
+        !shown
+            .iter()
+            .any(|event| matches!(event, Event::LateAnswer { .. })),
+        "{shown:?}"
+    );
+    assert!(prompts(&pooled, ThreadId(2)).is_empty());
+}
+
 // The owner's reserve: background work stops at the line of a subscription window.
 
 /// Pooled agents for every thread, with the requests set, on a spec reading its usage from

@@ -177,6 +177,12 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// The thread was archived while `count` [`Event::LateAnswer`] entries waited: those are
+    /// never given, a restart or bringing the thread back included. Pages show nothing of it:
+    /// the notice logged with it says so.
+    LateDropped {
+        count: u32,
+    },
 }
 
 fn is_zero(count: &u32) -> bool {
@@ -877,6 +883,10 @@ mod tests {
             r#"{"type":"late_answer","request":3,"text":"Réponse"}"#
         );
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), late);
+        let dropped = Event::LateDropped { count: 2 };
+        let json = serde_json::to_string(&dropped).unwrap();
+        assert_eq!(json, r#"{"type":"late_dropped","count":2}"#);
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), dropped);
         let archived = serde_json::to_string(&TurnOutcome::Archived).unwrap();
         assert_eq!(archived, r#""archived""#);
     }

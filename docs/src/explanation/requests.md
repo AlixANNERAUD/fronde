@@ -283,10 +283,18 @@ goes when that turn ends, even after *Stop*, before any sub-agent's result waiti
 are then held and go with it. Like your own message, it carries the sub-agents' results held for
 you and starts the count of [wake turns](threads.md) again. Several late answers waiting go in
 one message. The agent gets them between two lines its text cannot know, marked as data, never as
-instructions, with how long a `secret_ref` lasts. An archived thread gets nothing. An answer that
+instructions, with how long a `secret_ref` lasts. An answer that
 waits for a turn's end is written in the thread's stream (shown as nothing but the notice): if
 Fronde stops before it went out, the next start gives it to the agent, once, before any
 sub-agent's result, whether the stop cut the turn or came just after its end.
+
+An archived thread gets nothing: the thread says *Conversation archivée : ta réponse arrivée
+après coup ne partira pas à l'agent.*, whether you answered after the archive or the answer was
+waiting for the turn the archive stopped. An answer that was waiting is dropped at the archive
+itself, in the archived thread and in the sub-agents under it, and the drop is written in the
+stream, so neither bringing the thread back nor restarting Fronde gives it later, even when
+Fronde stopped before the stopped turn ended. If Fronde stopped before it could write the drop,
+bringing the thread back writes it.
 
 Only these two kinds of cards get a late answer. An integration's setup card (see
 [Tools](../reference/tools.md#setting-up-an-integration)) does not: only its call acts on the

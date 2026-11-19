@@ -21,7 +21,10 @@
 //!   it is closed as interrupted, as a user's turn is, and the wakes after it run in order;
 //! - the owner's late answers waiting for a turn's end are in the stream too
 //!   ([`Event::LateAnswer`]), until the owner's message that gives them: at the next start, those
-//!   still waiting go first, as at a turn's end.
+//!   still waiting go first, as at a turn's end. Archiving a thread drops those waiting in it and
+//!   in every thread under it at once, each stream noting [`Event::LateDropped`]: never given,
+//!   the thread brought back and restarted included. Those a stop left without that entry are
+//!   dropped when the thread opens archived, which bringing it back does first.
 //!
 //! So a result reaches the parent at most once: a stop between the `Woken` entry and the prompt,
 //! between a message carrying held results and its prompt, or between a sub-agent's end and its
@@ -177,6 +180,8 @@ pub(crate) fn replay(entries: &[Entry], wakes_without_owner: usize) -> Replay {
                 text: text.clone(),
                 note: note.clone(),
             }),
+            // Dropped by an archive: never given, whatever comes next.
+            Event::LateDropped { .. } => replay.late.clear(),
             Event::ChildEnded { .. } => {
                 let Some(wake) = Wake::of(entry) else {
                     continue;
@@ -616,6 +621,17 @@ mod tests {
         // Logged during a wake's turn, it waits too.
         let woken = [child(1, 7), woken(2, 1), late(3, 4)];
         assert_eq!(super::replay(&woken, 10).late.len(), 1);
+    }
+
+    /// Late answers an archive dropped are never given; one logged after the drop waits.
+    #[test]
+    fn late_answers_dropped_are_not_given() {
+        let dropped = entry(4, Event::LateDropped { count: 2 });
+        let entries = [user(1), late(2, 4), late(3, 5), dropped.clone(), ended(5)];
+        assert!(replay(&entries, 10).late.is_empty());
+        let after = [user(1), late(2, 4), dropped, late(5, 6)];
+        let requests: Vec<u64> = replay(&after, 10).late.iter().map(|l| l.request).collect();
+        assert_eq!(requests, [6]);
     }
 
     /// The owner archived a sub-agent: its parent is told, not woken.

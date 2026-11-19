@@ -1284,6 +1284,9 @@ impl Threads {
         archived: bool,
         starting: &tokio::sync::MutexGuard<'_, ()>,
     ) -> anyhow::Result<()> {
+        if !archived {
+            self.drop_late_before_unarchive(id).await?;
+        }
         let at = archived.then(Utc::now);
         self.update(id, threads::Column::ArchivedAt, Expr::value(at))
             .await?;
@@ -1296,6 +1299,24 @@ impl Threads {
             self.stop_tree(id, true, starting).await?;
         }
         self.changes.notify();
+        Ok(())
+    }
+
+    /// Before thread `id` is brought back: when it is archived, not open, and its stream holds
+    /// late answers a stop left waiting (Fronde stopped before the archive dropped them), it
+    /// opens while still archived, which drops them in its stream ([`Assistant::open`]), so
+    /// that no later start gives them.
+    async fn drop_late_before_unarchive(&self, id: ThreadId) -> anyhow::Result<()> {
+        if self.open.lock().await.contains_key(&id) {
+            return Ok(());
+        }
+        let Some(row) = self.get(id).await? else {
+            return Ok(());
+        };
+        if row.archived_at.is_some() && left_waiting(&self.db, &row.topic).await? {
+            // A turn a stop left open is closed now; an archived thread's end tells no parent.
+            self.open_assistant(id).await?;
+        }
         Ok(())
     }
 
@@ -1627,19 +1648,21 @@ async fn read_tail(db: &DatabaseConnection, topic: &str) -> anyhow::Result<Tail>
 /// Whether the stream `topic` ends in a turn a stop left open, or holds late answers of the
 /// owner's that no message gave yet, reading from its newest entry back to its last message.
 /// A late answer is logged during a turn and given by the next message, logged as soon as
-/// that turn ends: one after the last message is waiting.
+/// that turn ends: one after the last message is waiting, unless an archive dropped it since.
 async fn left_waiting(db: &DatabaseConnection, topic: &str) -> anyhow::Result<bool> {
     let mut pages = stream_entries::Entity::find()
         .filter(stream_entries::Column::Topic.eq(topic))
         .order_by_desc(stream_entries::Column::Seq)
         .paginate(db, SCAN_PAGE);
     let mut ended = false;
+    let mut dropped = false;
     while let Some(rows) = pages.fetch_and_next().await? {
         for row in rows {
             let event: Event = serde_json::from_value(row.event)
                 .with_context(|| format!("entry {} of {topic} is not readable", row.seq))?;
             match event {
-                Event::LateAnswer { .. } => return Ok(true),
+                Event::LateAnswer { .. } if !dropped => return Ok(true),
+                Event::LateDropped { .. } => dropped = true,
                 Event::User { .. } => return Ok(!ended),
                 Event::TurnEnded { .. } => ended = true,
                 _ => {}

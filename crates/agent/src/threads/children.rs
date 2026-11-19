@@ -1310,7 +1310,8 @@ impl Threads {
     /// with their pending cards and the wakes waiting for them; none of those turns wakes its
     /// parent. Deepest first, so that a result coming up meanwhile finds its parent's turn
     /// still to be stopped. With `retire`, as an archive does, each agent is also let go, its
-    /// token revoked, and the secrets given "for this conversation" in each thread forgotten.
+    /// token revoked, the late answers waiting for its turn dropped, and the secrets given "for
+    /// this conversation" in each thread forgotten.
     /// Whether `root` was in a turn. `starting` is held throughout: no sub-agent starts, and
     /// none is sent a message, while the tree stops.
     pub(super) async fn stop_tree(
@@ -1337,6 +1338,8 @@ impl Threads {
                 continue;
             };
             let was_running = if retire {
+                // Before the turn is stopped: its end may never be logged.
+                assistant.drop_waiting_late().await;
                 assistant.retire().await
             } else {
                 assistant.cancel_quietly().await

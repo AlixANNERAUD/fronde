@@ -320,6 +320,8 @@ impl Chat {
             // A late answer waiting for the turn's end: the notice logged with it says so, and
             // the owner's message that gives it shows it.
             Event::LateAnswer { .. } => {}
+            // Late answers an archive dropped: the notice logged with it says so.
+            Event::LateDropped { .. } => {}
             Event::WakesHeld { count, reason, .. } => {
                 // Every result waiting is held, a wake turn that never gave its prompt included.
                 self.wakes = 0;
