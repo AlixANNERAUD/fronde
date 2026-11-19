@@ -150,7 +150,11 @@ The user picks how long the secret is kept:
   origin is refused, before the card is shown and again when the answer comes: a stored secret is
   never moved to another origin behind the owner's back. The error says only that the name is
   already used, never for which origin. The same name for the same origin replaces the value, and
-  the card says so to the owner.
+  the card says so to the owner. A provider account's sign-in is never kept from a card: a
+  `name` that an `[accounts.<name>]` token uses as `{ stored = "…" }`, and Claude's origin
+  (`https://api.anthropic.com`), are refused before any card, and again when the answer comes
+  (a card asked before the name became an account's); store such a token with
+  [`fronde secret set`](command-line.md).
 
 The value never reaches the agent, the conversation, the request's row, a log or any file but the
 sealed row. Declined, expired and cancelled calls return as `user_ask`'s do, and so does a call

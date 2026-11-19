@@ -143,6 +143,89 @@ async fn sign_in(addr: SocketAddr) -> String {
     cookie.split(';').next().unwrap().to_owned()
 }
 
+const MARIE_PASSWORD: &str = "password-of-marie";
+
+/// `[users]` Alix, the owner and an admin, with [`PASSWORD`], and marie, a member, with
+/// [`MARIE_PASSWORD`], each with a Claude account of their own, checked as `fronde serve` loads
+/// the file.
+fn two_people(dir: &Path) -> fronde_hub::config::Config {
+    people(dir, true)
+}
+
+/// [`two_people`], marie left out of `[users]` (and her account with her) unless `marie`.
+fn people(dir: &Path, marie: bool) -> fronde_hub::config::Config {
+    // Writes the server's token and the owner's password.
+    config(dir, false);
+    for (file, value) in [
+        ("marie.password", MARIE_PASSWORD),
+        ("alix.token", "token-of-alix"),
+        ("marie.token", "token-of-marie"),
+    ] {
+        fronde_hub::private::write(dir.join(file), value).unwrap();
+    }
+    let mut toml = "[server]\nlisten = \"127.0.0.1:0\"\ntoken = { file = \"token\" }\n\
+         [data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n\
+         [memory]\ngit = false\n\
+         [secrets]\nbackend = \"file\"\nmaster_key = { file = \"master.key\" }\n\
+         [web]\n\
+         [users.Alix]\nadmin = true\npassword = { file = \"password\" }\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"Alix\"\n\
+         oauth_token = { file = \"alix.token\" }\n"
+        .to_owned();
+    if marie {
+        toml.push_str(
+            "[users.marie]\npassword = { file = \"marie.password\" }\n\
+             [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+             oauth_token = { file = \"marie.token\" }\n",
+        );
+    }
+    fronde_hub::config::load_str(&toml, dir).unwrap()
+}
+
+/// Posts the sign-in form with `name` and `password`.
+async fn post_sign_in(addr: SocketAddr, name: &str, password: &str) -> reqwest::Response {
+    let body = form_body(&[("name", name), ("password", password)]);
+    timeout(
+        WAIT,
+        client()
+            .post(format!("http://{addr}/auth/sign-in"))
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+/// `pairs` as a form body.
+fn form_body(pairs: &[(&str, &str)]) -> String {
+    let encode = |text: &str| {
+        text.bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                b' ' => "+".to_owned(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect::<String>()
+    };
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Signs in as `name` and returns the session cookie (`name=value`).
+async fn sign_in_as(addr: SocketAddr, name: &str, password: &str) -> String {
+    let response = post_sign_in(addr, name, password).await;
+    assert_eq!(response.headers()[LOCATION], "/", "{name} did not sign in");
+    let cookie = response.headers()[SET_COOKIE].to_str().unwrap();
+    cookie.split(';').next().unwrap().to_owned()
+}
+
 async fn get(addr: SocketAddr, path: &str, cookie: Option<&str>) -> reqwest::Response {
     let mut request = client().get(format!("http://{addr}{path}"));
     if let Some(cookie) = cookie {
@@ -306,45 +389,27 @@ async fn sign_in_sets_session_and_wrong_password_refused() {
     assert_eq!(get(addr, "/", Some(cookie)).await.status(), 303);
 }
 
-/// With `[users]` and `[accounts]`, only the owner signs in so far, with the owner's own
-/// password, and the agents sign in with the owner's account: nobody else's password opens the
-/// page, and no other account's token reaches an agent.
+/// With `[users]` and `[accounts]`, a password opens only its own person's name: marie's
+/// password without her name, or with the owner's, opens nothing, and the owner's agents sign in
+/// with the owner's account.
 #[tokio::test]
-async fn only_the_owner_signs_in_until_names_exist() {
+async fn a_password_signs_in_only_its_own_person() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();
-    // Writes the server's token and the owner's password.
-    config(path, false);
-    for (file, value) in [
-        ("marie.password", "password-of-marie"),
-        ("alix.token", "token-of-alix"),
-        ("marie.token", "token-of-marie"),
-    ] {
-        fronde_hub::private::write(path.join(file), value).unwrap();
-    }
-    // Every check `fronde serve` makes of the file.
-    let config = fronde_hub::config::load_str(
-        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = { file = \"token\" }\n\
-             [data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n\
-             [memory]\ngit = false\n\
-             [secrets]\nbackend = \"file\"\nmaster_key = { file = \"master.key\" }\n\
-             [web]\n\
-             [users.Alix]\nadmin = true\npassword = { file = \"password\" }\n\
-             [users.marie]\npassword = { file = \"marie.password\" }\n\
-             [accounts.alix]\nprovider = \"claude\"\nowner = \"Alix\"\n\
-             oauth_token = { file = \"alix.token\" }\n\
-             [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
-             oauth_token = { file = \"marie.token\" }\n",
-        path,
-    )
-    .unwrap();
     let (connector, seen) = fake_connector();
-    let addr = start_with(config, connector, &site(path)).await;
+    let addr = start_with(two_people(path), connector, &site(path)).await;
 
-    let member = post_password(addr, "password-of-marie").await;
-    assert_eq!(member.headers()[LOCATION], "/sign-in?error=1");
-    assert!(member.headers().get(SET_COOKIE).is_none());
-    let cookie = sign_in(addr).await;
+    for (name, password) in [
+        ("", MARIE_PASSWORD),
+        ("Alix", MARIE_PASSWORD),
+        ("", PASSWORD),
+    ] {
+        let refused = post_sign_in(addr, name, password).await;
+        assert_eq!(refused.headers()[LOCATION], "/sign-in?error=1", "{name:?}");
+        assert!(refused.headers().get(SET_COOKIE).is_none());
+    }
+    sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let cookie = sign_in_as(addr, "Alix", PASSWORD).await;
     let mut socket = open_chat(addr, &cookie).await;
     hello(&mut socket, 0, None).await;
     say(
@@ -1080,15 +1145,27 @@ async fn session_rows(dir: &Path) -> i64 {
         .unwrap()
 }
 
-/// Writes a signed-in session that expires at `expiry_date` straight into the database, and
-/// returns its cookie.
+/// Writes a session signed in as Alix that expires at `expiry_date` straight into the database,
+/// and returns its cookie.
 async fn plant_session(dir: &Path, id: i128, expiry_date: OffsetDateTime) -> String {
+    plant_session_holding(dir, id, expiry_date, "user", "Alix".into()).await
+}
+
+/// Writes a session holding `key = value` alone, that expires at `expiry_date`, straight into the
+/// database, and returns its cookie.
+async fn plant_session_holding(
+    dir: &Path,
+    id: i128,
+    expiry_date: OffsetDateTime,
+    key: &str,
+    value: serde_json::Value,
+) -> String {
     let db = database(dir).await;
     let store = session_store(&db);
     store.migrate().await.unwrap();
     let record = Record {
         id: Id(id),
-        data: [("signed_in".to_owned(), serde_json::Value::Bool(true))].into(),
+        data: [(key.to_owned(), value)].into(),
         expiry_date,
     };
     store.save(&record).await.unwrap();
@@ -1889,7 +1966,8 @@ async fn hello_thread(
                 assert_eq!(named, Some(thread));
                 break (log_id, last_seq);
             }
-            ServerMsg::Entry(_) | ServerMsg::Threads { .. } => {}
+            // As are the meter's readings, sent after each hello's replay.
+            ServerMsg::Entry(_) | ServerMsg::Threads { .. } | ServerMsg::Usage { .. } => {}
             other => panic!("expected the server's hello, got {other:?}"),
         }
     };
@@ -2621,29 +2699,12 @@ async fn usage_not_sent_to_a_family_member() {
         ],
         ..FakeScript::default()
     });
-    let (addr, _server) = timeout(
-        WAIT,
-        fronde::start_signed_in_as(
-            config(dir.path(), true),
-            connector,
-            &site(dir.path()),
-            false,
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let cookie = sign_in(addr).await;
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
     let mut socket = open_chat(addr, &cookie).await;
-    hello(&mut socket, 0, None).await;
-    say(
-        &mut socket,
-        ClientMsg::Send {
-            text: "Salut".into(),
-            thread: None,
-        },
-    )
-    .await;
+    // Her own thread: thread 1 is the owner's.
+    let theirs = create(&mut socket, "client-1", "Salut").await;
+    hello_thread(&mut socket, theirs, 0, None).await;
     let mut seen = Vec::new();
     loop {
         let message = next_message(&mut socket).await;
@@ -2672,7 +2733,7 @@ async fn usage_not_sent_to_a_family_member() {
         "{seen:?}"
     );
     let mut later = open_chat(addr, &cookie).await;
-    hello(&mut later, 0, None).await;
+    hello_thread(&mut later, theirs, 0, None).await;
     let mut after = Vec::new();
     while let Ok(Some(Ok(Message::Text(text)))) =
         timeout(Duration::from_millis(300), later.next()).await
@@ -2690,7 +2751,7 @@ async fn usage_not_sent_to_a_family_member() {
         .await
         .unwrap();
     timeout(WAIT, async {
-        while fronde_agent::usage::read_usage(&db, "claude")
+        while fronde_agent::usage::read_usage(&db, "marie")
             .await
             .unwrap()
             .is_none()
@@ -2762,4 +2823,615 @@ async fn a_removed_owners_thread_refuses_messages() {
     )
     .await;
     until_turn_ended(&mut socket).await;
+}
+
+/// Every message `socket` gets until `done` returns true for one, kept in `seen`; the one that
+/// satisfied it is returned.
+async fn gather(
+    socket: &mut Socket,
+    seen: &mut Vec<ServerMsg>,
+    done: impl Fn(&ServerMsg) -> bool,
+) -> ServerMsg {
+    loop {
+        let message = next_message(socket).await;
+        seen.push(message.clone());
+        if done(&message) {
+            return message;
+        }
+    }
+}
+
+/// Every message `socket` gets within `quiet` of the one before, kept in `seen`.
+async fn drain(socket: &mut Socket, seen: &mut Vec<ServerMsg>, quiet: Duration) {
+    while let Ok(Some(Ok(message))) = timeout(quiet, socket.next()).await {
+        if let Message::Text(text) = message {
+            seen.push(serde_json::from_str(&text).unwrap());
+        }
+    }
+}
+
+/// Alix and marie signed in on a server with both, each with a socket; Alix's thread 2 made and
+/// streamed, marie's own thread made. Alix's agent sends a usage reading at each turn.
+struct TwoPages {
+    addr: SocketAddr,
+    alix: Socket,
+    marie: Socket,
+    alix_thread: ThreadId,
+    marie_thread: ThreadId,
+    /// Everything marie's socket got.
+    seen: Vec<ServerMsg>,
+    _dir: tempfile::TempDir,
+}
+
+async fn two_pages() -> TwoPages {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        updates: vec![
+            text_chunk("Bonjour"),
+            fronde_agent::fake::usage_update(rate_limit(0.42)),
+        ],
+        ..FakeScript::default()
+    });
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let alix_cookie = sign_in_as(addr, "Alix", PASSWORD).await;
+    let mut alix = open_chat(addr, &alix_cookie).await;
+    hello_thread(&mut alix, ThreadId::MAIN, 0, None).await;
+    let alix_thread = create(&mut alix, "alix-1", "message-of-alix").await;
+
+    let marie_cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let mut marie = open_chat(addr, &marie_cookie).await;
+    let mut seen = Vec::new();
+    // Her `/` names thread 1, the owner's: refused as any thread not hers, the list following
+    // so that her page offers her own.
+    say(
+        &mut marie,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: Some(ThreadId::MAIN),
+        },
+    )
+    .await;
+    let refused = gather(&mut marie, &mut seen, |m| {
+        matches!(m, ServerMsg::ThreadRefused { .. })
+    })
+    .await;
+    assert_eq!(
+        refused,
+        ServerMsg::ThreadRefused {
+            thread: Some(ThreadId::MAIN),
+            client_id: None,
+            reason: NOT_FOUND.into(),
+        }
+    );
+    let list = gather(&mut marie, &mut seen, |m| {
+        matches!(m, ServerMsg::Threads { .. })
+    })
+    .await;
+    assert_eq!(list, ServerMsg::Threads { threads: vec![] });
+    say(
+        &mut marie,
+        ClientMsg::Create {
+            client_id: "marie-1".into(),
+            text: "message-of-marie".into(),
+        },
+    )
+    .await;
+    let ServerMsg::Created {
+        thread: marie_thread,
+        ..
+    } = gather(&mut marie, &mut seen, |m| {
+        matches!(m, ServerMsg::Created { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    say(
+        &mut marie,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: Some(marie_thread),
+        },
+    )
+    .await;
+    let hello = gather(&mut marie, &mut seen, |m| {
+        matches!(m, ServerMsg::Hello { .. })
+    })
+    .await;
+    let ServerMsg::Hello {
+        user,
+        admin,
+        thread,
+        ..
+    } = hello
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (user.as_deref(), admin, thread),
+        (Some("marie"), false, Some(marie_thread))
+    );
+    TwoPages {
+        addr,
+        alix,
+        marie,
+        alix_thread,
+        marie_thread,
+        seen,
+        _dir: dir,
+    }
+}
+
+/// A member's session is hers alone: her list holds her threads only; she cannot open, send to,
+/// stop, rename or archive the owner's threads, nor answer his cards; and her socket never gets
+/// his entries, his cards or his usage, while he chats, gets a card and a reading.
+#[tokio::test]
+async fn member_session_is_the_member() {
+    let mut pages = two_pages().await;
+    let TwoPages {
+        addr,
+        alix,
+        marie,
+        alix_thread,
+        marie_thread,
+        seen,
+        ..
+    } = &mut pages;
+    // The owner chats in thread 1, gets a reading and a card there.
+    hello_thread(alix, ThreadId::MAIN, 0, None).await;
+    say(
+        alix,
+        ClientMsg::Send {
+            text: "message-of-alix".into(),
+            thread: None,
+        },
+    )
+    .await;
+    loop {
+        if let ServerMsg::Usage { .. } = next_message(alix).await {
+            break;
+        }
+    }
+    let client = mcp_client(*addr, TOKEN, "Codex").await;
+    let asked = ask_in_background(&client);
+    let (card, _) = next_request(alix).await;
+
+    // Marie's turn ended; whatever else she gets meanwhile is kept.
+    gather(marie, seen, |m| {
+        matches!(
+            m,
+            ServerMsg::Entry(Entry {
+                event: Event::TurnEnded { .. },
+                ..
+            })
+        )
+    })
+    .await;
+    for id in [ThreadId::MAIN, *alix_thread] {
+        for message in [
+            ClientMsg::Hello {
+                last_seq: 0,
+                log_id: None,
+                thread: Some(id),
+            },
+            ClientMsg::Send {
+                text: "from-marie".into(),
+                thread: Some(id),
+            },
+            ClientMsg::Cancel { thread: Some(id) },
+            ClientMsg::Rename {
+                thread: id,
+                title: "Pris".into(),
+            },
+            ClientMsg::Archive {
+                thread: id,
+                archived: true,
+            },
+        ] {
+            say(marie, message).await;
+            let refused = gather(marie, seen, |m| {
+                matches!(m, ServerMsg::ThreadRefused { .. })
+            })
+            .await;
+            assert_eq!(
+                refused,
+                ServerMsg::ThreadRefused {
+                    thread: Some(id),
+                    client_id: None,
+                    reason: NOT_FOUND.into(),
+                }
+            );
+        }
+    }
+    // A send without a thread is the main thread's, refused alike.
+    say(
+        marie,
+        ClientMsg::Send {
+            text: "from-marie".into(),
+            thread: None,
+        },
+    )
+    .await;
+    gather(marie, seen, |m| {
+        matches!(m, ServerMsg::ThreadRefused { .. })
+    })
+    .await;
+    say(
+        marie,
+        ClientMsg::Answer {
+            id: card,
+            response: choose("Seerr"),
+        },
+    )
+    .await;
+    let refused = gather(marie, seen, |m| matches!(m, ServerMsg::Refused { .. })).await;
+    assert!(matches!(refused, ServerMsg::Refused { id, .. } if id == card));
+    // The card is still his to answer.
+    say(
+        alix,
+        ClientMsg::Answer {
+            id: card,
+            response: choose("Mealie"),
+        },
+    )
+    .await;
+    let answer = timeout(WAIT, asked).await.unwrap().unwrap();
+    assert!(answer.to_string().contains("Mealie"), "{answer}");
+    drain(marie, seen, Duration::from_millis(300)).await;
+
+    for message in seen.iter() {
+        match message {
+            ServerMsg::Entry(entry) => match &entry.event {
+                Event::User { text, .. } => assert_eq!(text, "message-of-marie"),
+                Event::Request { .. } => panic!("marie got a card: {entry:?}"),
+                _ => {}
+            },
+            ServerMsg::Threads { threads } => assert!(
+                threads.iter().all(|thread| thread.id == *marie_thread),
+                "{threads:?}"
+            ),
+            ServerMsg::Usage { .. } => panic!("marie got the owner's usage"),
+            ServerMsg::Hello { user, admin, .. } => {
+                assert_eq!((user.as_deref(), *admin), (Some("marie"), false));
+            }
+            ServerMsg::Refused { .. }
+            | ServerMsg::ThreadRefused { .. }
+            | ServerMsg::Created { .. } => {}
+        }
+    }
+    // Nothing of his changed.
+    let (_, _, threads) = hello_thread(alix, ThreadId::MAIN, 0, None).await;
+    let his = listed(&threads, *alix_thread).unwrap();
+    assert!(!his.archived);
+    assert_ne!(his.title, "Pris");
+}
+
+/// The answer to [`ask_in_background`]'s question: `label`.
+fn choose(label: &str) -> Response {
+    Response::Form {
+        values: [(
+            "q1".to_owned(),
+            fronde_protocol::ChoiceAnswer {
+                selected: vec![label.into()],
+                ..Default::default()
+            }
+            .into(),
+        )]
+        .into(),
+    }
+}
+
+/// An admin's session sees every thread, a member's included, and may open it.
+#[tokio::test]
+async fn admin_session_sees_every_thread() {
+    let mut pages = two_pages().await;
+    let (_, _, threads) = hello_thread(&mut pages.alix, pages.marie_thread, 0, None).await;
+    for id in [ThreadId::MAIN, pages.alix_thread, pages.marie_thread] {
+        assert!(listed(&threads, id).is_some(), "{id:?} in {threads:?}");
+    }
+    let entry = next_entry(&mut pages.alix).await;
+    assert_eq!(
+        entry.event,
+        Event::User {
+            text: "message-of-marie".into(),
+            by: None,
+        }
+    );
+}
+
+/// An unknown name and a known name's wrong password get the same answer, after the same delay;
+/// so does the right password typed under another name.
+#[tokio::test]
+async fn wrong_name_and_wrong_password_look_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let attempts = [
+        ("zoe", PASSWORD),
+        ("marie", "nope"),
+        ("Alix", MARIE_PASSWORD),
+        ("ALIX", PASSWORD),
+        ("", MARIE_PASSWORD),
+    ];
+    let answers = futures::future::join_all(attempts.iter().map(|(name, password)| async move {
+        let before = std::time::Instant::now();
+        let response = post_sign_in(addr, name, password).await;
+        let elapsed = before.elapsed();
+        let status = response.status();
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| *name != reqwest::header::DATE)
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        headers.sort();
+        let body = response.bytes().await.unwrap();
+        (status, headers, body, elapsed)
+    }))
+    .await;
+    let first = &answers[0];
+    assert_eq!(first.0, 303);
+    assert!(
+        first
+            .1
+            .contains(&("location".to_owned(), "/sign-in?error=1".to_owned())),
+        "{:?}",
+        first.1
+    );
+    assert!(!first.1.iter().any(|(name, _)| name == "set-cookie"));
+    for (answer, (name, _)) in answers.iter().zip(attempts) {
+        assert_eq!(
+            (&answer.0, &answer.1, &answer.2),
+            (&first.0, &first.1, &first.2),
+            "{name:?}"
+        );
+        // Each waits the failure's second, whether the name is someone's or not.
+        assert!(
+            answer.3 >= Duration::from_secs(1),
+            "{name:?}: {:?}",
+            answer.3
+        );
+        assert!(
+            answer.3 < Duration::from_secs(5),
+            "{name:?}: {:?}",
+            answer.3
+        );
+    }
+}
+
+/// Five wrong passwords lock that name out, and that name only: the others still sign in, and a
+/// name that is no one's is told the same as anyone's.
+#[tokio::test]
+async fn one_name_locked_out_leaves_others_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    for name in ["marie", "zoe"] {
+        let wrong = futures::future::join_all(
+            (0..5).map(|_| async move { post_sign_in(addr, name, "nope").await }),
+        )
+        .await;
+        for response in wrong {
+            assert_eq!(response.headers()[LOCATION], "/sign-in?error=1");
+        }
+    }
+    for (name, password) in [("marie", MARIE_PASSWORD), ("zoe", "nope")] {
+        let locked = post_sign_in(addr, name, password).await;
+        assert_eq!(locked.headers()[LOCATION], "/sign-in?error=2", "{name}");
+        assert!(locked.headers().get(SET_COOKIE).is_none());
+    }
+    sign_in_as(addr, "Alix", PASSWORD).await;
+    let other = post_sign_in(addr, "paul", "nope").await;
+    assert_eq!(other.headers()[LOCATION], "/sign-in?error=1");
+}
+
+/// A session from before names (`signed_in` alone) signs no one in: one in the database at the
+/// upgrade is deleted at start, one written later is refused at its first request.
+#[tokio::test]
+async fn old_session_signs_in_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fronde_hub::private::prepare_data_dir(&data).unwrap();
+    let later = OffsetDateTime::now_utc() + time::Duration::days(1);
+    let before = plant_session_holding(dir.path(), 1, later, "signed_in", true.into()).await;
+    let (addr, _) = start(dir.path()).await;
+    assert_eq!(session_rows(dir.path()).await, 0);
+    let after = plant_session_holding(dir.path(), 2, later, "signed_in", true.into()).await;
+    for cookie in [&before, &after] {
+        let page = get(addr, "/", Some(cookie)).await;
+        assert_eq!(page.status(), 303);
+        assert_eq!(page.headers()[LOCATION], "/sign-in");
+        let mut socket = connect(addr, Some(cookie), Some(&format!("http://{addr}")))
+            .await
+            .unwrap();
+        assert_eq!(close_code(&mut socket).await, 4401);
+    }
+    // Signing in again opens the chat.
+    let cookie = sign_in(addr).await;
+    assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 200);
+}
+
+/// Starts `config` with a fake agent; the server task is returned to stop it.
+async fn run(
+    config: fronde_hub::config::Config,
+    dir: &Path,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let (connector, _) = fake_connector();
+    timeout(WAIT, fronde::start_with(config, connector, &site(dir)))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn stop(server: tokio::task::JoinHandle<()>) {
+    server.abort();
+    let _ = server.await;
+}
+
+/// Whether `cookie` opens the chat: the page, and a socket that is not closed at once.
+async fn opens(addr: SocketAddr, cookie: &str) -> bool {
+    let page = get(addr, "/", Some(cookie)).await.status() == 200;
+    let mut socket = connect(addr, Some(cookie), Some(&format!("http://{addr}")))
+        .await
+        .unwrap();
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: None,
+        },
+    )
+    .await;
+    let socket_opens = match timeout(WAIT, socket.next()).await.unwrap() {
+        Some(Ok(Message::Close(Some(frame)))) => {
+            assert_eq!(u16::from(frame.code), 4401);
+            false
+        }
+        Some(Ok(_)) => true,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(page, socket_opens);
+    page
+}
+
+/// A person removed from `[users]` is signed out: their session is refused and deleted at the
+/// next start, so it never comes back, not even when someone is configured again under that name.
+#[tokio::test]
+async fn removed_user_is_signed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let (addr, server) = run(people(path, true), path).await;
+    let marie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let alix = sign_in_as(addr, "Alix", PASSWORD).await;
+    assert!(opens(addr, &marie).await);
+    stop(server).await;
+
+    let (addr, server) = run(people(path, false), path).await;
+    assert_eq!(session_rows(path).await, 1);
+    assert!(!opens(addr, &marie).await);
+    assert!(opens(addr, &alix).await);
+    stop(server).await;
+
+    // Configured again under the same name: the old session is gone for good.
+    let (addr, _server) = run(people(path, true), path).await;
+    assert!(!opens(addr, &marie).await);
+    assert!(opens(addr, &alix).await);
+    sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+}
+
+/// When `[data] user` changes (Alix, then bob, in the legacy form), Alix's session never acts as
+/// bob: it is signed out, and bob signs in himself.
+#[tokio::test]
+async fn a_renamed_owners_session_never_acts_as_the_new_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let (addr, server) = run(config(path, true), path).await;
+    let alix = sign_in(addr).await;
+    assert!(opens(addr, &alix).await);
+    stop(server).await;
+
+    let mut renamed = config(path, true);
+    renamed.data.user = "bob".into();
+    let (addr, _server) = run(renamed, path).await;
+    assert_eq!(session_rows(path).await, 0);
+    assert!(!opens(addr, &alix).await);
+    let bob = sign_in(addr).await;
+    let mut socket = open_chat(addr, &bob).await;
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: None,
+        },
+    )
+    .await;
+    let ServerMsg::Hello { user, admin, .. } = next_message(&mut socket).await else {
+        panic!("no hello");
+    };
+    assert_eq!((user.as_deref(), admin), (Some("bob"), true));
+}
+
+/// With a single person (the legacy form), the form without a name still signs in, as do their
+/// name and the name with spaces around it; another name does not, even with the right password.
+#[tokio::test]
+async fn single_user_signs_in_without_a_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    for name in ["", "Alix", "  Alix "] {
+        let cookie = sign_in_as(addr, name, PASSWORD).await;
+        let mut socket = open_chat(addr, &cookie).await;
+        say(
+            &mut socket,
+            ClientMsg::Hello {
+                last_seq: 0,
+                log_id: None,
+                thread: None,
+            },
+        )
+        .await;
+        let ServerMsg::Hello { user, admin, .. } = next_message(&mut socket).await else {
+            panic!("no hello");
+        };
+        assert_eq!((user.as_deref(), admin), (Some("Alix"), true), "{name:?}");
+    }
+    let other = post_sign_in(addr, "Bob", PASSWORD).await;
+    assert_eq!(other.headers()[LOCATION], "/sign-in?error=1");
+    assert!(other.headers().get(SET_COOKIE).is_none());
+}
+
+/// `fronde serve` keeps the accounts' stored tokens out of every card: an outside client (acting
+/// for the owner, an admin) cannot offer to keep a secret under an account's stored name or for
+/// Claude's sign-in origin.
+#[tokio::test]
+async fn no_card_keeps_an_account_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    people(path, false);
+    let config = fronde_hub::config::load_str(
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = { file = \"token\" }\n\
+         [data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n\
+         [memory]\ngit = false\n\
+         [secrets]\nbackend = \"file\"\nmaster_key = { file = \"master.key\" }\n\
+         [web]\n\
+         [users.Alix]\nadmin = true\npassword = { file = \"password\" }\n\
+         [users.marie]\npassword = { file = \"marie.password\" }\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"Alix\"\n\
+         oauth_token = { file = \"alix.token\" }\n\
+         [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+         oauth_token = { stored = \"claude_marie\" }\n",
+        path,
+    )
+    .unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(config, connector, &site(path)).await;
+    let client = mcp_client(addr, TOKEN, "Codex").await;
+    for remember in [
+        serde_json::json!({"name": "claude_marie", "origin": "https://cloud.example"}),
+        serde_json::json!({"name": "anthropic", "origin": "https://api.anthropic.com"}),
+    ] {
+        let args = serde_json::json!({
+            "label": "Jeton",
+            "reason": "Pour te connecter.",
+            "remember": remember,
+        });
+        let result = timeout(
+            WAIT,
+            client.peer().call_tool(
+                rmcp::model::CallToolRequestParams::new("user_secret")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let rmcp::model::ContentBlock::Text(text) = &result.content[0] else {
+            panic!("{result:?}");
+        };
+        assert!(text.text.contains("account's sign-in"), "{}", text.text);
+    }
 }

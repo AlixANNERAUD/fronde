@@ -1998,4 +1998,76 @@ mod secrets {
         );
         assert_eq!(row(dir.path(), waiter.id()).await.status, "pending");
     }
+
+    /// A person's provider sign-in is never kept, replaced or removed from a card: not a card
+    /// asking to keep it under an account's stored name or for Claude's origin, not a card that
+    /// asked before the name was an account's (answered after a restart), not a setup's
+    /// `keep_secret` or `forget_secret`.
+    #[tokio::test]
+    async fn account_tokens_are_never_written_from_a_card() {
+        const CLAUDE: &str = "https://api.anthropic.com";
+        let bench = bench().await;
+        // Asked while `nextcloud` was nobody's sign-in; still pending at the restart.
+        let early = bench.requests.ask(ask_secret(true)).await.unwrap().id();
+        let db = fronde_db::open(&bench.data()).await.unwrap();
+        let store = SecretStore::new(Backends::file(&bench.key_file), bench.ephemeral.clone())
+            .reserving(["nextcloud".to_owned()], [CLAUDE.to_owned()]);
+        let requests = Requests::open_with(db, bench.journal.clone(), Some(store))
+            .await
+            .unwrap();
+        assert!(requests.reserved("nextcloud", "https://cloud.example"));
+        assert!(requests.reserved("anything", CLAUDE));
+        assert!(!requests.reserved("anything", "https://cloud.example"));
+
+        let refused = requests
+            .answer(early, secret(CANARY, Keep::Stored), &alix())
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("jeton de connexion"),
+            "{refused}"
+        );
+        assert_eq!(requests.stored_origin("nextcloud").await.unwrap(), None);
+        // For the conversation it is still taken.
+        requests
+            .answer(early, secret(CANARY, Keep::Conversation), &alix())
+            .await
+            .unwrap();
+
+        for remember in [
+            Remember {
+                name: "nextcloud".into(),
+                origin: "https://cloud.example".into(),
+                replaces: false,
+            },
+            Remember {
+                name: "claude_marie".into(),
+                origin: CLAUDE.into(),
+                replaces: false,
+            },
+        ] {
+            let mut ask = ask_secret(true);
+            let Card::Secret { remember: kept, .. } = &mut ask.card else {
+                unreachable!()
+            };
+            *kept = Some(remember);
+            let error = requests.ask(ask).await.unwrap_err().to_string();
+            assert!(error.contains("account's sign-in"), "{error}");
+        }
+
+        let value = secrecy::SecretString::from(CANARY);
+        for (name, origin) in [
+            ("nextcloud", "https://cloud.example"),
+            ("claude_marie", CLAUDE),
+        ] {
+            assert!(
+                requests
+                    .keep_secret(name, origin, &value, true)
+                    .await
+                    .is_err()
+            );
+            assert!(requests.forget_secret(name, origin).await.is_err());
+            assert_eq!(requests.stored_origin(name).await.unwrap(), None);
+        }
+    }
 }

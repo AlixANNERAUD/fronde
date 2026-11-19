@@ -287,13 +287,12 @@ With `[users]`, `[web]` may be left empty (`[web]` alone) to serve the chat.
 ## `[users.<name>]`
 
 Optional. The people who sign in to Fronde, one section per person, the section's name being
-theirs. Signing in by name, each person to their own conversations, is **planned**: until then,
-only the owner, `[data] user`, signs in, with their own password, and the others' sections are
-only checked. Until each person has spaces of their own, the memory, the calendar, the
+theirs: each signs in with that name and their own password, and sees their own threads (an admin
+sees everyone's; see [Sign in to the chat](../how-to/sign-in-to-the-chat.md)). Until each person has spaces of their own, the memory, the calendar, the
 integrations and every other service are the owner's, not every admin's (see
 [Security model](../explanation/security.md#threads)). Once someone is no longer listed, Fronde
-gives their threads to `removed:<name>` at start, read-only for good: a person later listed
-under the same name starts with none of them.
+gives their threads to `removed:<name>` at start, read-only for good, and deletes their web
+sessions: a person later listed under the same name starts with none of them.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |

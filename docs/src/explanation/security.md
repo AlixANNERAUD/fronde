@@ -235,7 +235,10 @@ What it may change is narrow:
   or anyone else, and for anyone but an admin. The value goes from the page to the requests, then
   to the tool in memory, then to the sealed store: the request's row keeps the other answers only,
   and the value never reaches the agent, the conversation, a summary, a log or a `Debug` print.
-  The entry names it as `{ stored = "…" }`, sealed for the origin it is sent to.
+  The entry names it as `{ stored = "…" }`, sealed for the origin it is sent to. No card, this
+  setup's or `user_secret`'s, keeps, replaces or removes a provider account's sign-in token: a
+  name an account's `{ stored = "…" }` token uses, or a secret for Claude's origin, is refused
+  wherever a card would write it; only `fronde secret set` stores those.
 - **Origins.** Where each secret goes follows from the URL settings, and the card says it. When
   the answer sends a secret or allows an origin the card did not show, a second card asks the
   admin to confirm, before anything is kept; so does ticking the toggle for local addresses
@@ -302,16 +305,25 @@ encrypted: see above, and below.
   *Fronde* or *assistant*, one with a name over 40 characters, or one whose name holds a control
   character; a name is never what makes a caller one of Fronde's agents, only its token is. `/mcp` skips the `Host` check against DNS
   rebinding: a page that rebinds a name to Fronde still cannot send a token.
-- **The chat** needs the password. A wrong one is answered after a second, and five in a row lock
-  sign-in for a minute for everyone: there is a single password to guess, so the throttle is
-  global. Passwords are compared as SHA-256 digests in constant time, so neither their content
-  nor their length leaks through timing. Signing in issues a new session id, so an id planted
-  before sign-in is worthless after it.
+- **The chat** needs a person's name and their own password: one person's password never opens
+  another's name. A wrong one is answered after a second, and five in a row for one name lock
+  sign-in under that name for a minute, whoever tries; the others still sign in. A name that is
+  no one's gets the same answer after the same second, its typed password compared with a random
+  stand-in made at each start, and is counted and locked out like anyone's, so neither the
+  answer, its timing nor the lockout tells which names exist. Passwords are compared as SHA-256
+  digests in constant time, so neither their content nor their length leaks through timing.
+  The typed name is never logged (a password may be typed there by mistake) and is wiped with the
+  password; the throttle keeps names by their SHA-256 only. Signing in issues a new session id,
+  so an id planted before sign-in is worthless after it.
 
 ## The browser
 
-The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` behind https. Sessions live in
-`fronde.db`, so a restart signs no one out. Their ids are stored hashed (SHA-256): a copy of that
+The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` behind https. A session names
+the person who signed in, and is the only thing a page, its socket or a form is read as: never
+a field the page sends. A session whose person is no longer configured is refused at its next
+request and deleted at the next start, so a person later configured under that name (or the
+new `[data] user`, should it change) never inherits it; sessions from before names were signed
+out once, at the upgrade. Sessions live in `fronde.db`, so a restart signs no one out. Their ids are stored hashed (SHA-256): a copy of that
 file, a backup for instance, does not let anyone take over a signed-in browser. Fronde never logs
 a session id. Signing out deletes the session at once. A session is refused as soon as it expires,
 after 30 days without use, and its row is deleted within the hour. Only a successful sign-in
@@ -432,8 +444,9 @@ thread's first message, with its own directories, its own sandbox and its own hu
   starts with none of them. The page refuses a message to such a thread, nothing starts or drives
   a sub-agent of it, and its agent's sign-in fails before any process starts, without falling
   back to anyone else's. The main thread is always `[data] user`'s, and its sub-agents go with
-  it when `[data] user` changes. (Each person signing in as
-  themselves is **planned**: until then only the owner signs in.)
+  it when `[data] user` changes. Each person signs in as themselves: their page lists, opens and
+  writes to their own threads only, answers their own cards only, and gets no usage reading of
+  anyone's (a member's own meter is **planned**); an admin's page sees every thread.
 - **Which token reaches which agent.** A thread's account is its owner's account for the
   thread's provider, looked up at each start and by nothing else: no argument, agent, card or
   page chooses it, and the thread's row does not store it. A sub-agent's row carries its parent's
@@ -804,7 +817,9 @@ needs write access to the installation, which would also allow replacing the `fr
 
 ## What is out of scope
 
-- Several users: there is one password and one conversation.
+- Several users beyond signing in: each person signs in to their own threads, but the memory,
+  the calendar and the integrations are the owner's, and only the owner's agents reach them,
+  until each person has spaces of their own (**planned**).
 - Encryption at rest, beyond stored secrets: file modes keep other users out, but not someone
   with the disk, who finds the memory, the conversation and, with the file backend and unless it
   is kept on another disk, the master key that opens the stored secrets. Protect the data

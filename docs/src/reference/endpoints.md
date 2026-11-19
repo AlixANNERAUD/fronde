@@ -14,12 +14,12 @@ another site cannot know.
 
 | Method and path | Answer |
 | --- | --- |
-| `GET /` | The chat of the main thread. Without a session, a redirect to `/sign-in`. |
+| `GET /` | The chat of the main thread, the owner's. Without a session, a redirect to `/sign-in`. |
 | `GET /t/<id>` | The chat of thread `<id>`. Without a session, a redirect to `/sign-in`. |
 | `GET /threads` | The thread list, full screen (on a wide screen it also sits beside the chat). Without a session, a redirect to `/sign-in`. |
 | `GET /new` | An empty chat whose first message starts a thread. Without a session, a redirect to `/sign-in`. |
 | `GET /sign-in` | The sign-in page. |
-| `POST /auth/sign-in` | Form field `password`. Right: a new session and a redirect to `/`. Wrong: a redirect to `/sign-in?error=1`, after one second. |
+| `POST /auth/sign-in` | Form fields `name` and `password`. The person named `name` (spaces around it ignored, compared exactly) and their own password: a new session for them and a redirect to `/`. With a single person (the legacy form), `name` may be empty or left out. Anything else, a name that is no one's included: a redirect to `/sign-in?error=1`, after one second, the same answer either way. |
 | `POST /auth/sign-out` | Ends the session, then redirects to `/sign-in`. |
 | `GET /ws` | The chat's WebSocket, described below. |
 | `GET /assets/…` | The interface's files, cached for a year: their names change with their content. |
@@ -31,15 +31,25 @@ compressed with Brotli or gzip when the browser accepts it.
 
 ### Sign-in throttle
 
-After 5 wrong passwords in a row, sign-in is refused for 60 seconds, for every client at once,
-with a redirect to `/sign-in?error=2`. There is one password, so the count is global.
+After 5 wrong passwords in a row for one name, sign-in under that name is refused for 60
+seconds, for every client at once, with a redirect to `/sign-in?error=2`; the other names still
+sign in. A name that is no one's is counted the same way, so neither the answer, its delay nor
+the lockout tells whether a name is someone's. Names are counted by their SHA-256, for at most
+4096 names at once: past that, the one whose last mistake is the oldest is forgotten, a name
+locked out last.
 
 ### Sessions
 
 The session cookie is `fronde_session`: `HttpOnly`, `SameSite=Lax`, and `Secure` when
-`secure_cookie = true`. A session ends after 30 days without a signed-in request; each request
-renews it. Sessions are kept in `fronde.db`, so they survive a restart. Signing out deletes the
-session; an expired one is refused at once and its row deleted within the hour.
+`secure_cookie = true`. A session names the person who signed in, and every page, socket and
+form takes the user from it alone. A session ends after 30 days without a signed-in request; each
+request renews it. Sessions are kept in `fronde.db`, so they survive a restart. Signing out
+deletes the session; an expired one is refused at once and its row deleted within the hour.
+
+A session whose person is no longer configured (removed from `[users]`, renamed, or `[data] user`
+changed in the legacy form) is refused at once, and deleted at the next start, so a person later
+configured under that name never gets it. Sessions from before names, which held no name, are
+deleted at the first start of this version: everyone signs in once again after the upgrade.
 
 ### Security headers
 
@@ -64,9 +74,12 @@ A socket streams one **thread** at a time, the one its last `hello` named. Every
 is optional where shown so: without it, a message is for the main thread (thread 1), so a page
 that knows nothing of threads talks to the main thread as before, and never gets a thread
 message. A thread id is only a selector: each one is checked against the signed-in user, and a
-thread that does not exist is refused exactly like one the user may not see. The signed-in owner
-is an admin and sees every thread; a user who is not an admin would see only the threads that are
-for them (family users are planned).
+thread that does not exist is refused exactly like one the user may not see. An admin sees every
+thread; a member sees only the threads that are hers, and the main thread is the owner's. A
+`hello` that names a thread the user may not see is refused with `thread_refused`, then, as for
+any `hello` naming a thread, the thread list follows: a member's `/` names the main thread, so
+her page shows « Conversation introuvable. » with her own threads to open, or *Nouvelle
+conversation* (a conversation of her own at `/` is **planned**).
 
 From the page:
 
@@ -84,7 +97,7 @@ From the server:
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
-| `hello` | `log_id`, `last_seq`, `user`, optional `admin`, optional `thread` | The answer to the page's `hello`, before any entry. `user` is whom the page is signed in as: a closed card names who answered only when it was someone else. `thread` repeats the thread the page named; the entries that follow are its. |
+| `hello` | `log_id`, `last_seq`, `user`, optional `admin`, optional `thread` | The answer to the page's `hello`, before any entry. `user` is whom the page is signed in as, from the session, and `admin` whether they are one: a closed card names who answered only when it was someone else. `thread` repeats the thread the page named; the entries that follow are its. |
 | `entry` | `seq`, `at`, `event` | One numbered, timestamped event of the thread streamed: a user message (`user`: `text`, optional `by` naming who wrote it when it was not the page's user, such as a parent thread for a sub-agent's task), an assistant text chunk, a tool call, a permission request or answer from before permissions were cards (kept so old logs replay), a request to the user (`request`: `id`, `card` of kind `permission`, `form` or `secret`, optional `from`) or its end (`request_closed`: `id`, `outcome`, optional `by`; a card the thread's agent asked closes before its turn's end), the end of a turn, or a notice (among them « En attente : d'autres conversations utilisent l'agent. » when a message waits for an agent, and « Ta réponse partira à l'agent à la fin du tour en cours. » when a late answer waits for the running turn). A late answer shows as a `user` entry without `by`: « Réponse à ta question « … » : … » or « Secret enregistré : … ». |
 | `refused` | `id`, `reason` | The page's answer to the request `id` was refused, and the request did not change: it is not this user's, it is closed already, or the answer does not fit the card (`reason` says what to fix, in French). Sent to that page only; never logged. |
 | `threads` | `threads` | The threads the user may see, archived ones included, oldest first, each `{ id, title, parent?, status, open_requests, updated_at, archived? }`. Sent after a `hello` that named a thread, then whenever the list changes: a thread made, renamed or archived, a turn started, queued or ended, a card opened or closed. `status` is `idle` (no turn yet), `queued` (waiting for an agent), `running`, or how the last turn ended: `done`, `failed` or `cancelled`. `open_requests` counts the cards waiting for an answer: the « attend ta réponse » badge, the tray's other threads and, with the open cards of the thread shown, the tab's title « (N) Fronde ». `updated_at` is the thread's newest entry or last change. |

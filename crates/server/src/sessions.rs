@@ -6,13 +6,16 @@ use sha2::{Digest, Sha256};
 use tower_sessions::session::{Id, Record};
 use tower_sessions::session_store::{self, ExpiredDeletion, SessionStore};
 use tower_sessions_sqlx_store::SqliteStore;
-use tower_sessions_sqlx_store::sqlx::SqlitePool;
+use tower_sessions_sqlx_store::sqlx::{self, SqlitePool};
+
+/// The session's key naming the user it is signed in as.
+pub const USER: &str = "user";
 
 /// Sessions in the table `tower_sessions`, each row keyed by the hash of its id
 /// ([`stored_id`]). A cookie's id is random and 128 bits long, so a plain hash is enough: there
 /// is nothing to guess from.
 #[derive(Clone, Debug)]
-pub struct Sessions(SqliteStore);
+pub struct Sessions(SqliteStore, SqlitePool);
 
 /// The id a session's row is stored under: the first 16 bytes of the SHA-256 of its real id.
 pub fn stored_id(id: &Id) -> Id {
@@ -32,7 +35,45 @@ fn stored(record: &Record) -> Record {
 
 impl Sessions {
     pub fn new(pool: SqlitePool) -> Self {
-        Self(SqliteStore::new(pool))
+        Self(SqliteStore::new(pool.clone()), pool)
+    }
+
+    /// Deletes every session that is not signed in as someone `is_user` names: those from before
+    /// names (which held `signed_in` alone), those of a person no longer configured and those that
+    /// do not read. Run at start, so that a person configured later under a name someone had
+    /// never gets that person's sessions. Returns how many it deleted.
+    pub async fn keep_signed_in(&self, is_user: impl Fn(&str) -> bool) -> anyhow::Result<usize> {
+        // The store's own table, not an entity: its rows are read through the store.
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM tower_sessions")
+            .fetch_all(&self.1)
+            .await?;
+        let mut deleted = 0;
+        for stored in ids {
+            let Ok(id) = stored.parse::<Id>() else {
+                sqlx::query("DELETE FROM tower_sessions WHERE id = ?")
+                    .bind(&stored)
+                    .execute(&self.1)
+                    .await?;
+                deleted += 1;
+                continue;
+            };
+            // The rows are keyed by the hashed id already: the inner store reads them as they are.
+            let keep = match self.0.load(&id).await {
+                Ok(Some(record)) => record
+                    .data
+                    .get(USER)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(&is_user),
+                // Expired: the purge deletes it too.
+                Ok(None) | Err(session_store::Error::Decode(_)) => false,
+                Err(error) => return Err(error.into()),
+            };
+            if !keep {
+                self.0.delete(&id).await?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Creates the table when missing.
@@ -163,5 +204,38 @@ mod tests {
         );
         assert_eq!(sessions.load(&second.id).await.unwrap(), Some(second));
         assert_eq!(sessions.load(&Id(1)).await.unwrap(), Some(first));
+    }
+
+    #[tokio::test]
+    async fn only_sessions_of_configured_users_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, sessions) = sessions(dir.path()).await;
+        let mut kept = Vec::new();
+        for (n, user) in [Some("alix"), Some("marie"), None, Some("removed:paul")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut record = record(n as i128 + 1);
+            if let Some(user) = user {
+                record.data = [(USER.to_owned(), serde_json::Value::from(user))].into();
+            }
+            sessions.create(&mut record).await.unwrap();
+            if user == Some("alix") {
+                kept.push(stored_id(&record.id).to_string());
+            }
+        }
+        let deleted = sessions
+            .keep_signed_in(|name| name == "alix")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(stored_ids(&db).await, kept);
+        assert_eq!(
+            sessions
+                .keep_signed_in(|name| name == "alix")
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

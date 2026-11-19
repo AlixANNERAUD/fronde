@@ -933,6 +933,23 @@ pub(crate) fn readable_credentials(
     values
 }
 
+/// The stored names of the accounts' tokens: no card may keep, replace or remove them.
+fn account_secrets(config: &Config) -> Vec<String> {
+    config
+        .accounts()
+        .into_iter()
+        .filter_map(|account| match account.token {
+            Some(fronde_hub::config::Secret::Stored { stored }) => Some(stored),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Claude's sign-in origin, canonical as a card's: no card keeps a secret for it.
+fn claude_origin() -> anyhow::Result<String> {
+    Ok(fronde_hub::origin::Origin::parse(fronde_hub::config::CLAUDE_ORIGIN)?.to_string())
+}
+
 /// The token of the account `account`, read at each start of the agent: a file or a variable as
 /// any secret, or a secret stored for Claude's API, opened with the master key. A stored one
 /// that is not stored yet fails with [`fronde_agent::acp::SignInMissing`].
@@ -1025,32 +1042,21 @@ pub async fn start_with(
     connector: Connector,
     site_root: &Path,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    start_signed_in_as(config, connector, site_root, true).await
-}
-
-/// [`start_with`], whoever signs in with the password being an admin or not: for tests of what
-/// a family member's page gets, before family members sign in on their own.
-#[doc(hidden)]
-pub async fn start_signed_in_as(
-    config: Config,
-    connector: Connector,
-    site_root: &Path,
-    admin: bool,
-) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let token = config.server.token.resolve().context("server.token")?;
     check_token(&token)?;
-    // Only the owner signs in so far, with the owner's password.
+    // Each person signs in with their own password, read once here.
     let password = match &config.web {
         Some(web) => {
-            let (key, password) = config.password_of(&config.data.user).with_context(|| {
-                format!(
-                    "the owner, {}, has no password to sign in with",
-                    config.data.user
-                )
-            })?;
-            let password = password.resolve().context(key.clone())?;
-            check_password(&password, &key)?;
-            Some((password, web.secure_cookie))
+            let mut by_name = std::collections::HashMap::new();
+            for person in config.users().iter() {
+                let (key, password) = config
+                    .password_of(&person.name)
+                    .with_context(|| format!("{} has no password to sign in with", person.name))?;
+                let password = password.resolve().context(key.clone())?;
+                check_password(&password, &key)?;
+                by_name.insert(person.name.clone(), password);
+            }
+            Some((web::Passwords::new(by_name)?, web.secure_cookie))
         }
         None => None,
     };
@@ -1115,6 +1121,18 @@ pub async fn start_signed_in_as(
             fronde_db::path(&data_dir).display()
         )
     })?;
+    // Everyone signs in as a configured person: a session from before names, or of a person no
+    // longer configured, is deleted, so that nobody later configured under that name gets it.
+    let signed_out = sessions
+        .keep_signed_in(|name| users.get(name).is_some())
+        .await
+        .context("cannot read the web sessions")?;
+    if signed_out > 0 {
+        tracing::info!(
+            "{signed_out} web session(s) signed out: from before names, or of someone no longer \
+             in [users]; they sign in again"
+        );
+    }
     // Secrets given in a card "for this conversation": in memory only.
     let ephemeral = Arc::new(EphemeralSecrets::new());
     purge_expired(&db, &sessions, &ephemeral).await;
@@ -1199,14 +1217,15 @@ pub async fn start_signed_in_as(
             // is the owner's, `[data] user`.
             let prompt: fronde_agent::threads::SystemPrompt = Arc::new(system_prompt);
             let people = fronde_agent::threads::People {
-                users,
+                users: users.clone(),
                 owner: user.clone(),
                 prompt: Some(prompt),
                 accounts: bindings,
             };
             let threads =
                 Threads::open_for(db.clone(), &data_dir, spec, connector, people, budget).await?;
-            let secrets = SecretStore::new(backends.clone(), ephemeral.clone());
+            let secrets = SecretStore::new(backends.clone(), ephemeral.clone())
+                .reserving(account_secrets(&config), [claude_origin()?]);
             let requests = Requests::open_with(db.clone(), threads.clone(), Some(secrets)).await?;
             threads.set_requests(&requests).await;
             Some((threads, requests, password, secure_cookie))
@@ -1251,9 +1270,8 @@ pub async fn start_signed_in_as(
             web::Web {
                 threads,
                 requests,
-                user,
-                admin,
-                password,
+                users,
+                passwords: password,
                 throttle: Default::default(),
             },
             sessions,

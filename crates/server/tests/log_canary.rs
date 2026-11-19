@@ -26,6 +26,10 @@ const SETUP_CANARY: &str = "canary-setup-secret-3b9d1e";
 const CONFIG_CANARY: &str = "canary-config-line-5e2f81";
 const ACCOUNT_CANARY: &str = "canary-account-token-8c1d4e";
 const USER_CANARY: &str = "canary-user-password-2d7f3a";
+const MEMBER_CANARY: &str = "canary-member-password-6e0b8c";
+/// A password typed in the name's box, and one typed wrong.
+const NAME_CANARY: &str = "canary-typed-as-a-name-1f4a9d";
+const WRONG_CANARY: &str = "canary-wrong-password-7c3e5b";
 
 fn dist(file: &str) -> PathBuf {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -312,8 +316,8 @@ async fn log_canary_never_appears() {
 
 /// The assistant's own `/mcp` token, made at each start and kept in memory, is never logged:
 /// not at start, not when the agent gets it, not when the assistant calls the hub with it. Nor
-/// is the owner's account token, read at the agent's start, nor the owner's password from
-/// `[users]`, given to sign in.
+/// is the owner's account token, read at the agent's start, nor any person's password from
+/// `[users]`, given to sign in, nor a password typed in the name's box or typed wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assistant_token_never_appears() {
     use fronde_agent::acp::{AgentClient, AgentSpec};
@@ -327,9 +331,16 @@ async fn assistant_token_never_appears() {
     let _serial = SERIAL.lock().await;
     let scanner = capture();
     *scanner.0.lock().unwrap() = Scan {
-        secrets: [MCP_CANARY, USER_CANARY, ACCOUNT_CANARY]
-            .map(String::from)
-            .to_vec(),
+        secrets: [
+            MCP_CANARY,
+            USER_CANARY,
+            ACCOUNT_CANARY,
+            MEMBER_CANARY,
+            NAME_CANARY,
+            WRONG_CANARY,
+        ]
+        .map(String::from)
+        .to_vec(),
         wanted: vec!["memory_search".to_string(), "user_ask".to_string()],
         keep: true,
         ..Scan::default()
@@ -342,17 +353,21 @@ async fn assistant_token_never_appears() {
     fronde_hub::private::write(&token_file, MCP_CANARY).unwrap();
     fronde_hub::private::write(&user_file, USER_CANARY).unwrap();
     fronde_hub::private::write(&account_file, ACCOUNT_CANARY).unwrap();
+    let member_file = dir.path().join("member_pass");
+    fronde_hub::private::write(&member_file, MEMBER_CANARY).unwrap();
     let config: Config = toml::from_str(&format!(
         "[server]\nlisten = \"127.0.0.1:0\"\ntoken = {{ file = {:?} }}\n\
          [data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n\
          [memory]\ngit = false\n\
          [secrets]\nmaster_key = {{ file = {:?} }}\n\
          [web]\n[users.me]\nadmin = true\npassword = {{ file = {:?} }}\n\
+         [users.marie]\npassword = {{ file = {:?} }}\n\
          [accounts.me]\nprovider = \"claude\"\nowner = \"me\"\noauth_token = {{ file = {:?} }}\n",
         token_file.display().to_string(),
         dir.path().join("data").display().to_string(),
         dir.path().join("master.key").display().to_string(),
         user_file.display().to_string(),
+        member_file.display().to_string(),
         account_file.display().to_string(),
     ))
     .unwrap();
@@ -389,17 +404,35 @@ async fn assistant_token_never_appears() {
         .await
         .unwrap();
 
+    // Each person signs in, and two attempts fail: a password typed in the name's box, a
+    // password typed wrong.
+    let sign_in = |body: String| async move {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .post(format!("http://{addr}/auth/sign-in"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    };
+    for (body, location) in [
+        (format!("name=marie&password={MEMBER_CANARY}"), "/"),
+        (
+            format!("name={NAME_CANARY}&password={MEMBER_CANARY}"),
+            "/sign-in?error=1",
+        ),
+        (
+            format!("name=marie&password={WRONG_CANARY}"),
+            "/sign-in?error=1",
+        ),
+    ] {
+        assert_eq!(sign_in(body).await.headers()["location"], location);
+    }
     // A message from the chat starts the agent, which gets its token.
-    let signed_in = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap()
-        .post(format!("http://{addr}/auth/sign-in"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!("password={USER_CANARY}"))
-        .send()
-        .await
-        .unwrap();
+    let signed_in = sign_in(format!("name=me&password={USER_CANARY}")).await;
     let cookie = signed_in.headers()["set-cookie"]
         .to_str()
         .unwrap()

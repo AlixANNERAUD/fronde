@@ -234,6 +234,15 @@ impl Saved {
 pub struct SecretStore {
     backends: Backends,
     ephemeral: Arc<EphemeralSecrets>,
+    reserved: Reserved,
+}
+
+/// Stored names and origins no card may write: the sign-in tokens of people's provider
+/// accounts, which only `fronde secret set` (and the server's own card) store.
+#[derive(Clone, Debug, Default)]
+struct Reserved {
+    names: std::collections::BTreeSet<String>,
+    origins: std::collections::BTreeSet<String>,
 }
 
 impl SecretStore {
@@ -241,7 +250,25 @@ impl SecretStore {
         Self {
             backends,
             ephemeral,
+            reserved: Reserved::default(),
         }
+    }
+
+    /// No card may keep, replace or remove a secret stored under one of `names` or for one of
+    /// `origins` (canonical, as [`Remember::origin`] is).
+    pub fn reserving(
+        mut self,
+        names: impl IntoIterator<Item = String>,
+        origins: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.reserved.names.extend(names);
+        self.reserved.origins.extend(origins);
+        self
+    }
+
+    /// Whether a card may not write the secret `name` for `origin`.
+    fn is_reserved(&self, name: &str, origin: &str) -> bool {
+        self.reserved.names.contains(name) || self.reserved.origins.contains(origin)
     }
 
     pub fn ephemeral(&self) -> &Arc<EphemeralSecrets> {
@@ -514,6 +541,14 @@ impl Requests {
         self.secrets.as_ref()
     }
 
+    /// Whether a card may not keep the secret `name` for `origin`: a person's provider sign-in
+    /// ([`SecretStore::reserving`]).
+    pub fn reserved(&self, name: &str, origin: &str) -> bool {
+        self.secrets
+            .as_ref()
+            .is_some_and(|store| store.is_reserved(name, origin))
+    }
+
     /// The origin the secret `name` is stored for, if one is.
     pub async fn stored_origin(&self, name: &str) -> anyhow::Result<Option<String>> {
         Ok(
@@ -546,6 +581,18 @@ impl Requests {
             .map_err(|error| anyhow::anyhow!("the card cannot be shown: {error}"))?;
         if matches!(ask.card, Card::Permission { .. }) && !matches!(ask.caller, Caller::Thread(_)) {
             anyhow::bail!("only a thread's agent asks for permissions");
+        }
+        if let Card::Secret {
+            remember: Some(remember),
+            ..
+        } = &ask.card
+            && self.reserved(&remember.name, &remember.origin)
+        {
+            anyhow::bail!(
+                "the card cannot be shown: {} for {} is a provider account's sign-in, which no card keeps",
+                remember.name,
+                remember.origin
+            );
         }
         if let Card::Form { fields, .. } = &ask.card
             && fields
@@ -750,6 +797,14 @@ impl Requests {
                     ..
                 },
             ) => {
+                // A person's provider sign-in is never written from a card.
+                if store.is_reserved(&remember.name, &remember.origin) {
+                    return Err(refused(format!(
+                        "« {} » est un jeton de connexion d'un compte : il ne se garde pas depuis \
+                         une carte. Garde ce secret pour cette conversation seulement.",
+                        remember.name
+                    )));
+                }
                 // Never moved to another origin behind the owner's back: a secret stored for one
                 // origin is replaced only for that origin.
                 if let Some(other) = self.stored_origin(&remember.name).await.map_err(failed)?
@@ -853,6 +908,9 @@ impl Requests {
         let Some(store) = &self.secrets else {
             anyhow::bail!("this Fronde keeps no secret");
         };
+        if store.is_reserved(name, origin) {
+            anyhow::bail!("{name} is an account's sign-in token: no card stores it");
+        }
         let _saving = self.saving.lock().await;
         match self.stored_origin(name).await? {
             Some(other) if other != origin => {
@@ -869,6 +927,9 @@ impl Requests {
     /// Removes the secret `name` stored for `origin`, if it is stored for it: what a setup cut
     /// before it was written undoes of what it kept. True when one was removed.
     pub async fn forget_secret(&self, name: &str, origin: &str) -> anyhow::Result<bool> {
+        if self.reserved(name, origin) {
+            anyhow::bail!("{name} is an account's sign-in token: no card removes it");
+        }
         let _saving = self.saving.lock().await;
         if self.stored_origin(name).await?.as_deref() != Some(origin) {
             return Ok(false);

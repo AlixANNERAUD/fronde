@@ -52,6 +52,11 @@ struct Bench {
 }
 
 async fn bench() -> Bench {
+    bench_reserving(&[], &[]).await
+}
+
+/// [`bench`], no card keeping a secret named one of `names` or for one of `origins`.
+async fn bench_reserving(names: &[&str], origins: &[&str]) -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir(&data).unwrap();
@@ -61,6 +66,10 @@ async fn bench() -> Bench {
     let store = SecretStore::new(
         Backends::file(dir.path().join("master.key")),
         ephemeral.clone(),
+    )
+    .reserving(
+        names.iter().map(|name| name.to_string()),
+        origins.iter().map(|origin| origin.to_string()),
     );
     let requests = Requests::open_with(db, Arc::new(Shown(send)), Some(store))
         .await
@@ -479,4 +488,30 @@ async fn user_secret_needs_a_store() {
         .map(|(def, _)| def.name)
         .collect();
     assert_eq!(names, ["user_ask"]);
+}
+
+/// An agent cannot offer to keep a secret under an account's stored name, nor for Claude's
+/// sign-in origin: refused before any card, so a person's provider token is never written from
+/// the chat.
+#[tokio::test]
+async fn user_secret_never_keeps_an_account_token() {
+    let mut bench = bench_reserving(&["claude_marie"], &["https://api.anthropic.com"]).await;
+    for remember in [
+        json!({"name": "claude_marie", "origin": "https://cloud.example"}),
+        json!({"name": "anthropic", "origin": "https://api.anthropic.com"}),
+        json!({"name": "anthropic", "origin": "https://API.anthropic.com:443/"}),
+    ] {
+        let out = result(bench.call(context(), with(json!({ "remember": remember })))).await;
+        let error = out["error"].as_str().unwrap();
+        assert!(error.contains("account's sign-in"), "{out}");
+        assert!(bench.shown.try_recv().is_err());
+    }
+    // Another name for another origin is still offered.
+    let call = bench.call(
+        context(),
+        with(json!({"remember": {"name": "nextcloud", "origin": "https://cloud.example"}})),
+    );
+    let (id, _, _) = bench.card().await;
+    bench.requests.cancel(id).await.unwrap();
+    output(call).await;
 }

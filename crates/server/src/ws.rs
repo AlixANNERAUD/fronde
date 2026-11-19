@@ -2,7 +2,7 @@
 //! and the page's messages passed to Fronde. Every thread a page names is checked against its
 //! user: a thread id is only a selector, never an identity.
 
-use crate::web::{Web, is_signed_in, renew};
+use crate::web::{Web, renew, signed_in_as};
 use anyhow::bail;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -30,7 +30,9 @@ pub async fn upgrade(
     if !same_origin(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !is_signed_in(&session).await {
+    // The socket is the session's user's, and nobody else's, for as long as it lives: nothing the
+    // page sends names a user.
+    let Some(user) = signed_in_as(&session, &web.users).await else {
         return upgrade.on_upgrade(|mut socket| async move {
             let close = CloseFrame {
                 code: CLOSE_SIGNED_OUT,
@@ -38,11 +40,11 @@ pub async fn upgrade(
             };
             let _ = socket.send(Message::Close(Some(close))).await;
         });
-    }
+    };
     renew(&session);
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| chat(socket, web))
+        .on_upgrade(move |socket| chat(socket, web, user))
 }
 
 /// The largest message a page may send: a message to Fronde or a card's answer is far smaller,
@@ -60,12 +62,7 @@ fn same_origin(headers: &HeaderMap) -> bool {
 }
 
 /// Streams a thread's log once the page said hello, and passes the page's messages to Fronde.
-async fn chat(mut socket: WebSocket, web: Arc<Web>) {
-    // Whoever signed in is the owner, the one user so far, and an admin.
-    let user = User {
-        name: web.user.clone(),
-        admin: web.admin,
-    };
+async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User) {
     let mut talk = Talk {
         web: &web,
         user: &user,
@@ -159,7 +156,8 @@ struct Talk<'a> {
 }
 
 /// The usage `user` is sent for the meter: their own accounts' readings and the reserve, to an
-/// admin only for now (the subscription is the owner's), and only once there is a reading.
+/// admin only for now (a member's own meter comes with usage per account), and only once there
+/// is a reading.
 pub fn usage_message(threads: &Threads, user: &User) -> Option<ServerMsg> {
     if !user.admin {
         return None;
@@ -257,7 +255,19 @@ impl Talk<'_> {
         let id = thread.unwrap_or(ThreadId::MAIN);
         let assistant = match self.assistant(id).await {
             Ok((_, assistant)) => assistant,
-            Err(error) => return refuse(socket, Some(id), None, &error).await,
+            Err(error) => {
+                refuse(socket, Some(id), None, &error).await?;
+                // The list still comes, so that the page offers the threads that are the user's:
+                // a member's `/` names the main thread, the owner's, until each person has a
+                // conversation of their own there.
+                if thread.is_some() {
+                    if self.list.is_none() {
+                        self.list = Some(self.web.threads.changes());
+                    }
+                    self.send_list(socket).await?;
+                }
+                return Ok(());
+            }
         };
         // Subscribed first, so nothing falls between the replay and the stream.
         self.live = Some(assistant.log().subscribe());

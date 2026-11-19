@@ -1,5 +1,6 @@
-//! `/sign-in`: the password form. A plain form, posted to the server, which sends back here with
-//! `?error=1` (wrong password) or `?error=2` (too many attempts).
+//! `/sign-in`: the name and password form. A plain form, posted to the server, which sends back
+//! here with `?error=1` (wrong name or password, never told apart) or `?error=2` (too many
+//! attempts).
 
 use dioxus::prelude::*;
 
@@ -15,7 +16,7 @@ fn refusal(error: &str) -> Option<&'static str> {
     match error {
         "" => None,
         "2" => Some("Trop d'essais, réessaie dans une minute."),
-        _ => Some("Mot de passe incorrect."),
+        _ => Some("Prénom ou mot de passe incorrect."),
     }
 }
 
@@ -36,6 +37,23 @@ pub fn SignInPage(error: String) -> Element {
                         }
                         div { class: "grid gap-2",
                             label {
+                                r#for: "name",
+                                class: "text-sm leading-none font-medium select-none",
+                                "Prénom"
+                            }
+                            // Not required: alone on a Fronde, its owner may leave it empty.
+                            // Names are compared exactly: no capital the phone would add.
+                            Input {
+                                id: "name",
+                                name: "name",
+                                autocomplete: "username",
+                                autocapitalize: "none",
+                                spellcheck: "false",
+                                autofocus: true,
+                            }
+                        }
+                        div { class: "grid gap-2",
+                            label {
                                 r#for: "password",
                                 class: "text-sm leading-none font-medium select-none",
                                 "Mot de passe"
@@ -45,7 +63,6 @@ pub fn SignInPage(error: String) -> Element {
                                 id: "password",
                                 name: "password",
                                 autocomplete: "current-password",
-                                autofocus: true,
                                 required: true,
                             }
                         }
@@ -71,6 +88,13 @@ mod tests {
         assert!(page.contains(r#"method="post""#), "{page}");
         assert!(page.contains(r#"action="/auth/sign-in""#), "{page}");
         assert!(page.contains(r#"name="password""#), "{page}");
+        assert!(page.contains(r#"name="name""#), "{page}");
+        assert!(page.contains("Prénom"), "{page}");
+        assert!(page.contains(r#"autocomplete="username""#), "{page}");
+        assert!(page.contains(r#"autocapitalize="none""#), "{page}");
+        // The name comes first, and takes the focus.
+        assert!(page.find(r#"name="name""#) < page.find(r#"name="password""#));
+        assert_eq!(page.matches("autofocus=true").count(), 1, "{page}");
         assert!(
             page.contains(r#"autocomplete="current-password""#),
             "{page}"
@@ -81,12 +105,12 @@ mod tests {
 
         let page = render("1");
         assert!(page.contains(r#"role="alert""#), "{page}");
-        assert!(page.contains("Mot de passe incorrect."), "{page}");
+        assert!(page.contains("Prénom ou mot de passe incorrect."), "{page}");
 
         let page = render("2");
         // The apostrophe is escaped.
         assert!(page.contains("Trop d"), "{page}");
         assert!(page.contains("essais, réessaie dans une minute."), "{page}");
-        assert!(!page.contains("Mot de passe incorrect."), "{page}");
+        assert!(!page.contains("mot de passe incorrect."), "{page}");
     }
 }

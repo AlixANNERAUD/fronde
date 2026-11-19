@@ -241,6 +241,13 @@ async fn user_secret(asking: &Asking, context: CallContext, args: SecretArgs) ->
         ..
     } = &mut card
     {
+        // A person's provider sign-in is stored by `fronde secret set` alone.
+        if requests.reserved(&remember.name, &remember.origin) {
+            return ToolOutput::error(format!(
+                "remember {:?} for {} is a provider account's sign-in, which no card keeps; ask without remember, or pick another name for another origin",
+                remember.name, remember.origin
+            ));
+        }
         match requests.stored_origin(&remember.name).await {
             // Which origin holds it is the owner's business: the asker learns only that the
             // name is taken.

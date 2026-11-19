@@ -79,8 +79,8 @@ secure_cookie = false
 
 # Who signs in, one section per person: an admin flag and a password, { file } or { env }. The
 # owner ([data] user) is an admin. Without [users], [web] password is the owner's password.
-# Signing in by name, each person to their own conversations, is planned: until then only the
-# owner signs in.
+# Each signs in to the chat with the section's name and their own password, to their own
+# conversations; an admin sees everyone's.
 [users.alix]
 admin = true
 password = { file = "/run/secrets/fronde_password" }
