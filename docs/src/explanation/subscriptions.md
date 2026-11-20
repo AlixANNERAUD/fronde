@@ -115,9 +115,10 @@ under one name shared by everyone without one.
 Readings were first kept under the provider's name, then under each account's name in the same
 place. Fronde moves such a reading to its account at the next start (the legacy form's account
 is named `claude`, as its readings were), and `fronde check` reads it where it is until then, so
-that a pause it holds is not lost at an upgrade. A reading kept under a name no account has any
-more is not given to another account: a new account's first reading comes with its next turn,
-the daily counts deciding until then.
+that a pause it holds is not lost at an upgrade; when the account already has a reading, the
+later one is kept. A reading kept there under a name no account has is removed at start, never
+given to another account: a new account's first reading comes with its next turn, the daily
+counts deciding until then.
 
 Fronde keeps a share of each window for the account's owner: past `[threads] reserve` (30 % by
 default) of an account, sub-agents on that account are neither started nor sent messages, and

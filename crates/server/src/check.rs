@@ -212,8 +212,8 @@ fn account_line(
     Ok(format!("{head}: token from {source}, read{legacy}"))
 }
 
-/// [`crate::usage_line`] of each configured account, one line each, from the readings stored
-/// in the database, opened read-only: never created, migrated or written. A data directory
+/// [`crate::usage_line`] of each configured account (there is always one, the legacy form's
+/// included), one line each, from the readings stored in the database, opened read-only: never created, migrated or written. A data directory
 /// without a database has no reading. A database that cannot be read is said once,
 /// `cannot read (…)`; a row that cannot be read is said on its account's line, and the check
 /// goes on.
@@ -251,13 +251,11 @@ async fn usage_check_lines(config: &Config) -> Vec<String> {
             ),
         });
     }
+    // Read only: a failed close loses nothing, and is no account's usage.
     if let Some(db) = db
         && let Err(error) = db.close().await
     {
-        lines.push(format!("cannot read ({error:#})"));
-    }
-    if lines.is_empty() {
-        lines.push("no account: no agent runs".to_owned());
+        tracing::debug!("cannot close the database read for the usage: {error:#}");
     }
     lines
 }

@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Datelike, Duration, Utc};
 use fronde_protocol::usage::{
-    self, Background, GUARDED, LimitStatus, ProviderUsage, Window, WindowKind, percent,
+    self, AccountUsage, Background, GUARDED, LimitStatus, Window, WindowKind, percent,
 };
 
 /// What the server last said of the subscriptions the page's user may see: their own
@@ -14,9 +14,9 @@ pub struct Usage {
     /// The share of each window kept for its account's owner, in percent.
     pub reserve: u8,
     /// The page's user's own accounts' readings, one per provider: the pill is the first's.
-    pub own: Vec<ProviderUsage>,
+    pub own: Vec<AccountUsage>,
     /// Every other account's reading, by its name: an admin's page only.
-    pub others: Vec<ProviderUsage>,
+    pub others: Vec<AccountUsage>,
 }
 
 /// A window's short name, as the chat shows it: « 5 h », « semaine ».
@@ -82,7 +82,7 @@ pub type Offset<'a> = &'a dyn Fn(DateTime<Utc>) -> i32;
 /// The meter of `reading` at `now`, under a reserve of `reserve` percent, its times in the
 /// page's time (`offset`); `None` without any window read: no pill.
 pub fn meter(
-    reading: &ProviderUsage,
+    reading: &AccountUsage,
     reserve: u8,
     now: DateTime<Utc>,
     offset: Offset<'_>,
@@ -184,7 +184,7 @@ pub fn level(window: &Window, reserve: u8) -> Level {
 
 /// What the panel says of background work.
 fn background_line(
-    reading: &ProviderUsage,
+    reading: &AccountUsage,
     reserve: u8,
     now: DateTime<Utc>,
     offset: Offset<'_>,
@@ -272,8 +272,8 @@ mod tests {
         }
     }
 
-    fn reading(windows: Vec<Window>) -> ProviderUsage {
-        ProviderUsage {
+    fn reading(windows: Vec<Window>) -> AccountUsage {
+        AccountUsage {
             account: "claude".into(),
             known_since: now() - Duration::minutes(12),
             windows,

@@ -702,14 +702,14 @@ impl Threads {
     /// The latest usage of `user`'s own subscription accounts ([`Threads::usage_is_own`]), one
     /// per configured provider read so far: what the chat's meter shows that user. Empty
     /// without a usage book or a reading, and for a user without an account.
-    pub fn usage_of(&self, user: &str) -> Vec<fronde_protocol::usage::ProviderUsage> {
+    pub fn usage_of(&self, user: &str) -> Vec<fronde_protocol::usage::AccountUsage> {
         self.usage_where(|account| self.usage_is_own(user, account))
     }
 
     /// The latest usage of every configured account but `user`'s own
     /// ([`Threads::usage_is_own`]), by account name: what an admin's meter lists besides their
     /// own. Never ask it for anyone else.
-    pub fn usage_of_others(&self, user: &str) -> Vec<fronde_protocol::usage::ProviderUsage> {
+    pub fn usage_of_others(&self, user: &str) -> Vec<fronde_protocol::usage::AccountUsage> {
         self.usage_where(|account| !self.usage_is_own(user, account))
     }
 
@@ -725,7 +725,7 @@ impl Threads {
     fn usage_where(
         &self,
         keep: impl Fn(&str) -> bool,
-    ) -> Vec<fronde_protocol::usage::ProviderUsage> {
+    ) -> Vec<fronde_protocol::usage::AccountUsage> {
         let Some(book) = &self.spec.usage else {
             return Vec::new();
         };

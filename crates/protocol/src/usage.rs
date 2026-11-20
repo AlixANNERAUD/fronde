@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 /// The latest windows read for one subscription account (one provider's, a person's).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct ProviderUsage {
+pub struct AccountUsage {
     /// The account's name (`[accounts.<name>]`, `claude` for the legacy form's): whose
     /// subscription the windows are. Read from `provider` too, as readings were first stored.
     #[serde(alias = "provider")]
@@ -20,7 +20,7 @@ pub struct ProviderUsage {
     pub windows: Vec<Window>,
 }
 
-impl ProviderUsage {
+impl AccountUsage {
     /// The windows as they stand at `now`: see [`Window::now`].
     pub fn now(&self, now: DateTime<Utc>) -> Self {
         Self {
@@ -39,8 +39,8 @@ impl ProviderUsage {
 pub const GUARDED: [WindowKind; 2] = [WindowKind::Session, WindowKind::Weekly];
 
 /// Whether background work (sub-agents started or sent a message, wake turns) may spend a
-/// provider's subscription now, under the owner's reserve: `[threads] reserve`, the share of
-/// each guarded window kept for the owner. See [`ProviderUsage::background`].
+/// subscription account now, under its owner's reserve: `[threads] reserve`, the share of
+/// each guarded window kept for the owner. See [`AccountUsage::background`].
 #[derive(Clone, PartialEq, Debug)]
 pub enum Background {
     /// Every guarded window has a fresh percentage below the line; `headroom` is the smallest
@@ -99,13 +99,13 @@ pub fn ceil_minute(at: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp(minute, 0).unwrap_or(at)
 }
 
-/// [`ProviderUsage::background`] of `usage`, [`Background::Unknown`] without a reading.
-pub fn background(usage: Option<&ProviderUsage>, reserve: u8, now: DateTime<Utc>) -> Background {
+/// [`AccountUsage::background`] of `usage`, [`Background::Unknown`] without a reading.
+pub fn background(usage: Option<&AccountUsage>, reserve: u8, now: DateTime<Utc>) -> Background {
     usage.map_or(Background::Unknown, |usage| usage.background(reserve, now))
 }
 
-impl ProviderUsage {
-    /// Whether background work may spend this provider's windows at `now`, keeping `reserve`
+impl AccountUsage {
+    /// Whether background work may spend this account's windows at `now`, keeping `reserve`
     /// percent of each guarded window ([`GUARDED`]) for the owner. Read with [`Window::now`]:
     ///
     /// - [`Background::Paused`] when a guarded window is `rejected`, its use is at the line or
@@ -400,8 +400,8 @@ mod tests {
         assert_eq!(unknown.now(at(1_000_000)), unknown);
     }
 
-    fn reading(windows: Vec<Window>) -> ProviderUsage {
-        ProviderUsage {
+    fn reading(windows: Vec<Window>) -> AccountUsage {
+        AccountUsage {
             account: "claude".into(),
             known_since: at(1_000),
             windows,
@@ -419,7 +419,7 @@ mod tests {
         }
     }
 
-    fn both(session: f64, weekly: f64) -> ProviderUsage {
+    fn both(session: f64, weekly: f64) -> AccountUsage {
         reading(vec![
             guarded(
                 WindowKind::Session,
@@ -612,8 +612,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_usage_reads_its_windows_now() {
-        let usage = ProviderUsage {
+    fn account_usage_reads_its_windows_now() {
+        let usage = AccountUsage {
             account: "claude".into(),
             known_since: at(1_000),
             windows: vec![window(Some(2_000))],
@@ -632,7 +632,7 @@ mod tests {
     /// same.
     #[test]
     fn a_reading_names_its_account() {
-        let usage = ProviderUsage {
+        let usage = AccountUsage {
             account: "marie".into(),
             known_since: at(1_000),
             windows: vec![window(Some(2_000))],
@@ -644,7 +644,7 @@ mod tests {
         let account = legacy.as_object_mut().unwrap().remove("account").unwrap();
         legacy["provider"] = account;
         assert_eq!(
-            serde_json::from_value::<ProviderUsage>(legacy).unwrap(),
+            serde_json::from_value::<AccountUsage>(legacy).unwrap(),
             usage
         );
     }

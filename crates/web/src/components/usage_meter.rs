@@ -172,7 +172,7 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use dioxus::html::{Code, Key};
     use fronde_client::Chat;
-    use fronde_protocol::usage::{LimitStatus, ProviderUsage, Window, WindowKind};
+    use fronde_protocol::usage::{AccountUsage, LimitStatus, Window, WindowKind};
 
     fn window(kind: WindowKind, used: Option<f64>, status: Option<LimitStatus>) -> Window {
         Window {
@@ -185,8 +185,8 @@ mod tests {
         }
     }
 
-    fn reading(session: Option<f64>, status: Option<LimitStatus>) -> ProviderUsage {
-        ProviderUsage {
+    fn reading(session: Option<f64>, status: Option<LimitStatus>) -> AccountUsage {
+        AccountUsage {
             account: "claude".into(),
             known_since: Utc::now() - Duration::minutes(12),
             windows: vec![
@@ -197,7 +197,7 @@ mod tests {
     }
 
     /// The usage a page gets with `reading` its user's own, under a reserve of 30 %.
-    fn own(reading: ProviderUsage) -> Usage {
+    fn own(reading: AccountUsage) -> Usage {
         Usage {
             reserve: 30,
             own: vec![reading],
@@ -211,7 +211,7 @@ mod tests {
         dioxus_ssr::render(&dom)
     }
 
-    fn render(usage: ProviderUsage) -> String {
+    fn render(usage: AccountUsage) -> String {
         render_usage(own(usage))
     }
 
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn meter_hidden_without_reading() {
-        let empty = ProviderUsage {
+        let empty = AccountUsage {
             account: "claude".into(),
             known_since: DateTime::<Utc>::MIN_UTC,
             windows: Vec::new(),

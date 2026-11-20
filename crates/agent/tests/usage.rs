@@ -10,7 +10,7 @@ use fronde_agent::log::{Event, TurnOutcome};
 use fronde_agent::provider::Provider;
 use fronde_agent::threads::Threads;
 use fronde_agent::usage::{RateLimited, UsageBook, read_usage};
-use fronde_protocol::usage::{LimitStatus, ProviderUsage, Window, WindowKind};
+use fronde_protocol::usage::{AccountUsage, LimitStatus, Window, WindowKind};
 use fronde_requests::User;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -83,7 +83,7 @@ async fn prompt(client: &AgentClient) -> anyhow::Result<TurnEnd> {
         .expect("prompt timed out")
 }
 
-fn used(usage: &ProviderUsage, kind: WindowKind) -> Option<f64> {
+fn used(usage: &AccountUsage, kind: WindowKind) -> Option<f64> {
     usage.window(&kind).and_then(|window| window.used)
 }
 
@@ -640,7 +640,7 @@ async fn usage_book_survives_a_restart_per_account() {
             .unwrap()
             .expect("stored under the account's scope");
         assert_eq!(
-            serde_json::from_slice::<fronde_protocol::usage::ProviderUsage>(&stored).unwrap(),
+            serde_json::from_slice::<fronde_protocol::usage::AccountUsage>(&stored).unwrap(),
             *reading
         );
     }
@@ -652,16 +652,16 @@ async fn usage_book_survives_a_restart_per_account() {
 
 /// A reading stored before the `account/` scope, under `provider/<name>`, is moved to its
 /// account's scope at load, so that a pause it holds survives the upgrade; the provider's other
-/// keys stay, and a reading the account already has wins.
+/// keys stay, and of two readings of one account the later is kept.
 #[tokio::test]
 async fn legacy_reading_moves_to_its_account() {
     let dir = tempfile::tempdir().unwrap();
     let db = fronde_db::open(dir.path()).await.unwrap();
-    let stored = |used: f64| {
-        let reading = fronde_protocol::usage::ProviderUsage {
+    let stored = |used: f64, known_since: DateTime<Utc>| {
+        let reading = AccountUsage {
             account: "claude".into(),
-            known_since: Utc::now(),
-            windows: vec![window(WindowKind::Session, used, hence(3), Utc::now())],
+            known_since,
+            windows: vec![window(WindowKind::Session, used, hence(3), known_since)],
         };
         // As it was written then: the account under `provider`.
         let mut json = serde_json::to_value(&reading).unwrap();
@@ -669,7 +669,8 @@ async fn legacy_reading_moves_to_its_account() {
         json["provider"] = name;
         (reading, serde_json::to_vec(&json).unwrap())
     };
-    let (legacy, bytes) = stored(0.75);
+    let now = Utc::now();
+    let (legacy, bytes) = stored(0.75, now);
     fronde_db::kv::set(&db, "provider/claude", "usage", bytes, None)
         .await
         .unwrap();
@@ -708,8 +709,8 @@ async fn legacy_reading_moves_to_its_account() {
     );
     drop(book);
 
-    // A legacy row left beside the account's own is dropped, the account's kept.
-    let (_, older) = stored(0.2);
+    // An older legacy reading left beside the account's own is dropped, the account's kept.
+    let (_, older) = stored(0.2, now - chrono::Duration::hours(1));
     fronde_db::kv::set(&db, "provider/claude", "usage", older, None)
         .await
         .unwrap();
@@ -720,5 +721,66 @@ async fn legacy_reading_moves_to_its_account() {
             .await
             .unwrap(),
         None
+    );
+    drop(book);
+
+    // A later one replaces it.
+    let (later, bytes) = stored(0.9, now + chrono::Duration::minutes(5));
+    fronde_db::kv::set(&db, "provider/claude", "usage", bytes, None)
+        .await
+        .unwrap();
+    let book = UsageBook::load(db.clone(), &["claude".to_owned()]).await;
+    assert_eq!(book.get("claude"), Some(later.clone()));
+    assert_eq!(read_usage(&db, "claude").await.unwrap(), Some(later));
+    assert_eq!(
+        fronde_db::kv::get(&db, "provider/claude", "usage")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// A legacy reading under a name no configured account has is removed at load, never given to
+/// another account; the provider's other keys stay.
+#[tokio::test]
+async fn legacy_reading_of_no_account_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let reading = AccountUsage {
+        account: "claude".into(),
+        known_since: Utc::now(),
+        windows: vec![window(WindowKind::Session, 0.9, hence(3), Utc::now())],
+    };
+    fronde_db::kv::set(
+        &db,
+        "provider/claude",
+        "usage",
+        serde_json::to_vec(&reading).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    fronde_db::kv::set(&db, "provider/claude", "models", b"[]".to_vec(), None)
+        .await
+        .unwrap();
+    let book = UsageBook::load(db.clone(), &["alix".to_owned(), "marie".to_owned()]).await;
+    assert_eq!(book.all(), []);
+    for scope in [
+        "provider/claude",
+        "account/claude",
+        "account/alix",
+        "account/marie",
+    ] {
+        assert_eq!(
+            fronde_db::kv::get(&db, scope, "usage").await.unwrap(),
+            None,
+            "{scope}"
+        );
+    }
+    assert_eq!(
+        fronde_db::kv::get(&db, "provider/claude", "models")
+            .await
+            .unwrap(),
+        Some(b"[]".to_vec())
     );
 }

@@ -1,11 +1,12 @@
 //! The latest usage reading per subscription account, kept in `fronde.db`'s `kv` table (scope
-//! `account/<name>`, key `usage`, the JSON of a [`ProviderUsage`], no expiry). Readings were
+//! `account/<name>`, key `usage`, the JSON of an [`AccountUsage`], no expiry). Readings were
 //! first stored under `provider/<name>` (the legacy account `claude`'s, then each account's
-//! by its name): [`UsageBook::load`] moves such a row to its account's scope, and
-//! [`read_usage`] reads it there until then, so that a pause is never lost at an upgrade.
+//! by its name): [`UsageBook::load`] moves such a row to its account's scope, removing one no
+//! account has, and [`read_usage`] reads it there until then, so that a pause is never lost at
+//! an upgrade.
 
 use chrono::{DateTime, Utc};
-use fronde_protocol::usage::{LimitStatus, ProviderUsage, Window, WindowKind};
+use fronde_protocol::usage::{AccountUsage, LimitStatus, Window, WindowKind};
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use std::collections::HashMap;
 use std::fmt;
@@ -25,8 +26,10 @@ fn scope(account: &str) -> String {
 /// named alike (the legacy form's owner account keeps the name `claude`, which its readings
 /// had when they were keyed by provider).
 fn legacy_scope(account: &str) -> String {
-    format!("provider/{account}")
+    format!("{LEGACY_PREFIX}{account}")
 }
+
+const LEGACY_PREFIX: &str = "provider/";
 
 /// The latest windows read for each subscription account, from every agent process, keyed by
 /// the account's id ([`Threads::account`](crate::threads::Threads::account)). A window replaces
@@ -35,14 +38,14 @@ fn legacy_scope(account: &str) -> String {
 /// the database by a task of the book's own, so that a slow write never holds an agent's
 /// messages; a failed write is logged, and the reading stays in memory.
 pub struct UsageBook {
-    readings: Mutex<HashMap<String, ProviderUsage>>,
+    readings: Mutex<HashMap<String, AccountUsage>>,
     changes: watch::Sender<u64>,
     /// To the task that writes the readings; `None` for a book kept in memory only.
     saves: Option<mpsc::UnboundedSender<Save>>,
 }
 
 enum Save {
-    Usage(ProviderUsage),
+    Usage(AccountUsage),
     /// Answered once every reading sent before it is written.
     Flush(oneshot::Sender<()>),
 }
@@ -62,8 +65,12 @@ impl UsageBook {
     /// left out: the book then starts without it.
     ///
     /// A reading stored under the legacy scope is first moved to its account's, unless that
-    /// one already has a reading; a move that fails is logged, and the legacy row still read.
+    /// one already has a later reading; a move that fails is logged, and the legacy row still
+    /// read. A legacy reading of a name that is no account is removed.
     pub async fn load(db: DatabaseConnection, accounts: &[String]) -> Arc<Self> {
+        if let Err(error) = drop_orphans(&db, accounts).await {
+            tracing::warn!("cannot remove the stored usage of no account: {error:#}");
+        }
         let mut readings = HashMap::new();
         for account in accounts.iter().filter(|account| !account.is_empty()) {
             if let Err(error) = move_legacy(&db, account).await {
@@ -125,7 +132,7 @@ impl UsageBook {
             let mut latest: Option<DateTime<Utc>> = None;
             let usage = readings
                 .entry(account.to_owned())
-                .or_insert_with(|| ProviderUsage {
+                .or_insert_with(|| AccountUsage {
                     account: account.to_owned(),
                     known_since: DateTime::<Utc>::MIN_UTC,
                     windows: Vec::new(),
@@ -171,10 +178,10 @@ impl UsageBook {
         true
     }
 
-    /// The latest windows of `account`, as read (see [`ProviderUsage::now`] for how they stand
+    /// The latest windows of `account`, as read (see [`AccountUsage::now`] for how they stand
     /// now), and since when they are known; `None` before its first reading, and for an empty
     /// name.
-    pub fn get(&self, account: &str) -> Option<ProviderUsage> {
+    pub fn get(&self, account: &str) -> Option<AccountUsage> {
         if account.is_empty() {
             return None;
         }
@@ -182,7 +189,7 @@ impl UsageBook {
     }
 
     /// Every account's latest windows, by account name.
-    pub fn all(&self) -> Vec<ProviderUsage> {
+    pub fn all(&self) -> Vec<AccountUsage> {
         let mut all: Vec<_> = lock(&self.readings).values().cloned().collect();
         all.sort_by(|a, b| a.account.cmp(&b.account));
         all
@@ -281,7 +288,7 @@ fn cap_others(windows: &mut Vec<Window>) -> bool {
 pub async fn read_usage<C: ConnectionTrait>(
     db: &C,
     account: &str,
-) -> anyhow::Result<Option<ProviderUsage>> {
+) -> anyhow::Result<Option<AccountUsage>> {
     if account.is_empty() {
         return Ok(None);
     }
@@ -292,7 +299,7 @@ pub async fn read_usage<C: ConnectionTrait>(
             None => return Ok(None),
         },
     };
-    let usage = serde_json::from_slice::<ProviderUsage>(&value)
+    let usage = serde_json::from_slice::<AccountUsage>(&value)
         .map_err(|error| anyhow::anyhow!("the stored usage does not read: {error}"))?;
     if usage.account != account {
         anyhow::bail!("the stored usage names another account");
@@ -301,7 +308,8 @@ pub async fn read_usage<C: ConnectionTrait>(
 }
 
 /// Moves `account`'s reading from the legacy scope to its own, in one transaction: copied when
-/// its own has none, then removed from the legacy scope (the provider's other keys, its models,
+/// its own has none or an older one (by `known_since`; a row that does not read is older than
+/// one that does), then removed from the legacy scope (the provider's other keys, its models,
 /// stay).
 async fn move_legacy(db: &DatabaseConnection, account: &str) -> anyhow::Result<()> {
     let legacy = legacy_scope(account);
@@ -309,12 +317,19 @@ async fn move_legacy(db: &DatabaseConnection, account: &str) -> anyhow::Result<(
         return Ok(());
     }
     let transaction = fronde_db::begin_write(db).await?;
-    if let Some(value) = fronde_db::kv::get(&transaction, &legacy, KEY).await? {
-        if fronde_db::kv::get(&transaction, &scope(account), KEY)
-            .await?
-            .is_none()
-        {
-            fronde_db::kv::set(&transaction, &scope(account), KEY, value, None).await?;
+    if let Some(old) = fronde_db::kv::get(&transaction, &legacy, KEY).await? {
+        let current = fronde_db::kv::get(&transaction, &scope(account), KEY).await?;
+        let since = |value: &[u8]| {
+            serde_json::from_slice::<AccountUsage>(value)
+                .ok()
+                .map(|usage| usage.known_since)
+        };
+        let newer = match &current {
+            None => true,
+            Some(current) => since(&old) > since(current),
+        };
+        if newer {
+            fronde_db::kv::set(&transaction, &scope(account), KEY, old, None).await?;
         }
         fronde_db::kv::delete(&transaction, &legacy, KEY).await?;
     }
@@ -322,11 +337,24 @@ async fn move_legacy(db: &DatabaseConnection, account: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// Removes every reading left under the legacy scope by a name that is none of `accounts`: it
+/// is no account's, and no account ever reads it (the provider's other keys stay).
+async fn drop_orphans(db: &DatabaseConnection, accounts: &[String]) -> anyhow::Result<()> {
+    for scope in fronde_db::kv::scopes_with(db, LEGACY_PREFIX, KEY).await? {
+        let name = scope.strip_prefix(LEGACY_PREFIX).unwrap_or_default();
+        if !accounts.iter().any(|account| account == name) {
+            fronde_db::kv::delete(db, &scope, KEY).await?;
+            tracing::info!("dropped the usage reading stored under {scope}: no account has it");
+        }
+    }
+    Ok(())
+}
+
 /// Writes the readings sent, the latest of each account when several wait, until the book is
 /// dropped.
 async fn save_loop(db: DatabaseConnection, mut saves: mpsc::UnboundedReceiver<Save>) {
     while let Some(first) = saves.recv().await {
-        let mut latest: HashMap<String, ProviderUsage> = HashMap::new();
+        let mut latest: HashMap<String, AccountUsage> = HashMap::new();
         let mut flushes = Vec::new();
         let mut take = |save| match save {
             Save::Usage(usage) => {
@@ -349,7 +377,7 @@ async fn save_loop(db: DatabaseConnection, mut saves: mpsc::UnboundedReceiver<Sa
     }
 }
 
-async fn save(db: &DatabaseConnection, usage: &ProviderUsage) -> anyhow::Result<()> {
+async fn save(db: &DatabaseConnection, usage: &AccountUsage) -> anyhow::Result<()> {
     let value = serde_json::to_vec(usage)?;
     fronde_db::kv::set(db, &scope(&usage.account), KEY, value, None).await?;
     Ok(())

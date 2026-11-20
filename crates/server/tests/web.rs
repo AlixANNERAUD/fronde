@@ -2690,11 +2690,11 @@ async fn usage_pushed_on_change() {
 /// Stores a reading of `account` (its 5-hour window at `session`) in the database of `data`,
 /// as the server keeps it, before the server starts.
 async fn store_reading(data: &Path, account: &str, session: f64) {
-    use fronde_protocol::usage::{LimitStatus, ProviderUsage, Window, WindowKind};
+    use fronde_protocol::usage::{AccountUsage, LimitStatus, Window, WindowKind};
     fronde_hub::private::create_dir_all(data).unwrap();
     let db = fronde_db::open(data).await.unwrap();
     let now = chrono::Utc::now();
-    let usage = ProviderUsage {
+    let usage = AccountUsage {
         account: account.into(),
         known_since: now,
         windows: vec![Window {
@@ -2727,7 +2727,7 @@ async fn until_quiet(socket: &mut Socket) -> Vec<ServerMsg> {
 
 /// The usage messages among `messages`: the accounts of each one's own readings and others'.
 fn usages(messages: &[ServerMsg]) -> Vec<(Vec<String>, Vec<String>)> {
-    let names = |usage: &[fronde_protocol::usage::ProviderUsage]| {
+    let names = |usage: &[fronde_protocol::usage::AccountUsage]| {
         usage.iter().map(|usage| usage.account.clone()).collect()
     };
     messages
@@ -2806,6 +2806,53 @@ async fn family_member_gets_only_her_own_usage() {
     })
     .await
     .expect("the reading was never kept");
+}
+
+/// Another account's reading changing sends a member's page nothing: her meter's usage is sent
+/// again only when what she may see changed.
+#[tokio::test]
+async fn another_accounts_reading_sends_a_member_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector_with(FakeScript {
+        updates: vec![
+            text_chunk("Bonjour"),
+            fronde_agent::fake::usage_update(rate_limit(0.42)),
+        ],
+        ..FakeScript::default()
+    });
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let mut marie = open_chat(addr, &cookie).await;
+    let theirs = create(&mut marie, "client-1", "Salut").await;
+    hello_thread(&mut marie, theirs, 0, None).await;
+    // Her own turn, and her own reading, then quiet.
+    let mut seen = Vec::new();
+    while !usages(&seen).iter().any(|(own, _)| own == &["marie"]) {
+        seen.push(next_message(&mut marie).await);
+    }
+    until_quiet(&mut marie).await;
+
+    // The owner's agent reads his account: his page gets it.
+    let alix_cookie = sign_in_as(addr, "Alix", PASSWORD).await;
+    let mut alix = open_chat(addr, &alix_cookie).await;
+    hello(&mut alix, 0, None).await;
+    say(
+        &mut alix,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    loop {
+        if let ServerMsg::Usage { usage, .. } = next_message(&mut alix).await
+            && usage.iter().any(|usage| usage.account == "alix")
+        {
+            break;
+        }
+    }
+    let after = until_quiet(&mut marie).await;
+    assert_eq!(after, [], "marie got something: {after:?}");
 }
 
 /// An admin's page gets every account's usage: the others' at once after its hello, by name,

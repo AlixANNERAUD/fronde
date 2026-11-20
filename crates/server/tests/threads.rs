@@ -3293,6 +3293,59 @@ async fn reserve_is_per_account() {
     bench.gate.notify_waiters();
 }
 
+/// A member's sub-agent result is held by her own account's reserve line, whatever the
+/// owner's account reads: it waits for her next message, and wakes nothing.
+#[tokio::test]
+async fn member_wake_is_held_by_her_own_reserve() {
+    let bench = held_parent(FakeScript::default()).await;
+    let hers = bench.new_thread_for("marie").await;
+    let client = bench
+        .client(&bench.start(hers).await, "claude-code", &[])
+        .await;
+    let child = start_child(&client, TASK).await;
+    let assistant = bench.assistant(hers).await;
+    // The sub-agent ends during her held turn: its result waits for that turn's end.
+    timeout(WAIT, async {
+        while !events_of(&assistant)
+            .iter()
+            .any(|event| matches!(event, Event::ChildEnded { thread, .. } if *thread == child))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent never ended");
+    let resets_at = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+    bench.usage.record("claude", reading(0.1, 0.1, resets_at));
+    bench.usage.record("marie", reading(0.8, 0.1, resets_at));
+    bench.gate.notify_waiters();
+    let held = |events: &[Event]| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                Event::WakesHeld {
+                    reason: fronde_protocol::HoldReason::Reserve { .. },
+                    ..
+                }
+            )
+        })
+    };
+    timeout(WAIT, async {
+        while !held(&events_of(&assistant)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never held: {:?}", events_of(&assistant)));
+    assert!(
+        !events_of(&assistant)
+            .iter()
+            .any(|event| matches!(event, Event::Woken { .. })),
+        "{:?}",
+        events_of(&assistant)
+    );
+}
+
 /// The daily counts that stand in for a reading are each account's: the sub-agents and their
 /// turns on the owner's account never use up a member's, nor do threads without an account.
 #[tokio::test]
@@ -3306,15 +3359,11 @@ async fn daily_counts_are_per_account() {
         },
     )
     .await;
-    // Two sub-agents on the owner's account today, and two of a person with no account.
+    // One sub-agent on the owner's account today, and two of a person with no account: the
+    // owner's count is 1, Paul's sub-agents counting on no one's.
     let other = bench.new_thread().await;
     let pauls = bench.new_thread_for("paul").await;
-    for (owner, parent) in [
-        ("alix", other),
-        ("alix", other),
-        ("paul", pauls),
-        ("paul", pauls),
-    ] {
+    for (owner, parent) in [("alix", other), ("paul", pauls), ("paul", pauls)] {
         bench
             .threads
             .create(owner, StartedBy::Thread(parent), Some(parent), "Hier")
@@ -3324,7 +3373,14 @@ async fn daily_counts_are_per_account() {
     let main = bench
         .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
         .await;
-    let refused = call(&main, "threads_start", json!({"arguments": {"task": TASK}})).await;
+    start_child(&main, TASK).await;
+    // Now two on his account: the next is refused.
+    let refused = call(
+        &main,
+        "threads_start",
+        json!({"arguments": {"task": "Une de trop."}}),
+    )
+    .await;
     assert_eq!(
         refused,
         json!({"error": Delegation::TooManyToday { limit: 2 }.to_string()})

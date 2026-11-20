@@ -33,7 +33,7 @@ use fronde_hub::Hub;
 use fronde_hub::config::{Config, SourceConfig};
 use fronde_hub::mcp::{HubServer, McpCaller};
 use fronde_hub::source::ToolSource;
-use fronde_protocol::usage::ProviderUsage;
+use fronde_protocol::usage::AccountUsage;
 use fronde_requests::{Requests, SecretStore};
 use fronde_wasm::{Checks, ComponentHost, ComponentSource, PythonSource};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -612,7 +612,7 @@ pub fn children_line(config: &Config) -> String {
 /// work allowed below 70 %`, or `marie: no reading yet; background work bounded by the daily
 /// counts`. `readings`: each account's name and reading, if any, one part each; times in `tz`.
 pub fn usage_line(
-    readings: &[(&str, Option<ProviderUsage>)],
+    readings: &[(&str, Option<AccountUsage>)],
     reserve: u8,
     now: chrono::DateTime<chrono::Utc>,
     tz: chrono_tz::Tz,
@@ -631,10 +631,10 @@ pub fn usage_line(
     let limit = format!("{}%", line(reserve));
     let parts: Vec<String> = readings
         .iter()
-        .map(|(provider, reading)| {
+        .map(|(account, reading)| {
             let Some(reading) = reading.as_ref().map(|reading| reading.now(now)) else {
                 return format!(
-                    "{provider}: no reading yet; background work bounded by the daily counts"
+                    "{account}: no reading yet; background work bounded by the daily counts"
                 );
             };
             let mut windows: Vec<_> = reading.windows.iter().collect();
@@ -695,7 +695,7 @@ pub fn usage_line(
                     "no complete reading; background work bounded by the daily counts".to_owned()
                 }
             };
-            format!("{provider}: {}, {age}; {background}", windows.join(", "))
+            format!("{account}: {}, {age}; {background}", windows.join(", "))
         })
         .collect();
     parts.join("; ")

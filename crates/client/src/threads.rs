@@ -549,7 +549,7 @@ mod tests {
         let mut threads = Threads::default();
         assert!(threads.usage().is_none());
         let at = "2026-11-17T12:00:00Z".parse().unwrap();
-        let reading = fronde_protocol::usage::ProviderUsage {
+        let reading = fronde_protocol::usage::AccountUsage {
             account: "claude".into(),
             known_since: at,
             windows: vec![Window {
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(usage.reserve, 30);
         assert!(usage.others.is_empty());
         // An admin's page also gets every other account's, by name.
-        let hers = fronde_protocol::usage::ProviderUsage {
+        let hers = fronde_protocol::usage::AccountUsage {
             account: "marie".into(),
             ..reading.clone()
         };

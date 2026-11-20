@@ -64,6 +64,22 @@ pub async fn delete<C: ConnectionTrait>(db: &C, scope: &str, key: &str) -> Resul
     Ok(result.rows_affected > 0)
 }
 
+/// Every scope starting with `prefix` that holds a value under `key`, expired or not.
+pub async fn scopes_with<C: ConnectionTrait>(
+    db: &C,
+    prefix: &str,
+    key: &str,
+) -> Result<Vec<String>, DbErr> {
+    Ok(kv::Entity::find()
+        .filter(kv::Column::Scope.starts_with(prefix))
+        .filter(kv::Column::Key.eq(key))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.scope)
+        .collect())
+}
+
 /// Remove every expired row; returns how many.
 pub async fn purge_expired<C: ConnectionTrait>(db: &C) -> Result<u64, DbErr> {
     let result = kv::Entity::delete_many()

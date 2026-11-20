@@ -1118,7 +1118,7 @@ async fn store_reading_in(
 ) {
     fronde_hub::private::create_dir_all(data).unwrap();
     let db = fronde_db::open(data).await.unwrap();
-    let usage = fronde_protocol::usage::ProviderUsage {
+    let usage = fronde_protocol::usage::AccountUsage {
         account: account.into(),
         known_since: chrono::Utc::now() - chrono::TimeDelta::minutes(12),
         windows,

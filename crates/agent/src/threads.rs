@@ -397,7 +397,11 @@ fn bound_spec(
         (false, Some(prompt)) => prompt(owner),
         (false, None) => base.system_prompt.clone(),
     };
-    let (oauth_token, account) = match (users.get(owner), accounts.of(owner, provider)) {
+    // An empty name is no account, as for `Threads::account`.
+    let binding = accounts
+        .of(owner, provider)
+        .filter(|binding| !binding.account.is_empty());
+    let (oauth_token, account) = match (users.get(owner), binding) {
         (None, _) => {
             let owner = owner.to_owned();
             (

@@ -406,11 +406,11 @@ pub enum ServerMsg {
     /// and for an admin every other account's too, in `others`, each by its name.
     Usage {
         reserve: u8,
-        usage: Vec<usage::ProviderUsage>,
+        usage: Vec<usage::AccountUsage>,
         /// Every other configured account's reading, for an admin only: empty for anyone
         /// else.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        others: Vec<usage::ProviderUsage>,
+        others: Vec<usage::AccountUsage>,
     },
 }
 
