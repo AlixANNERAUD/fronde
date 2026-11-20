@@ -710,7 +710,13 @@ async fn secure_cookie_marks_the_session_cookie_secure() {
     config.web.as_mut().unwrap().secure_cookie = true;
     let (connector, _) = fake_connector();
     let addr = start_with(config, connector, &site(dir.path())).await;
-    let response = post_password(addr, PASSWORD).await;
+    // Behind https, as `secure_cookie` says: the page's origin is https.
+    let response = post_sign_in_from(
+        addr,
+        Some(&format!("https://{addr}")),
+        form_body(&[("password", PASSWORD)]),
+    )
+    .await;
     let set_cookie = response.headers()[SET_COOKIE].to_str().unwrap();
     assert!(set_cookie.contains("Secure"), "{set_cookie}");
 }
@@ -3854,4 +3860,67 @@ fn check_warns_about_a_short_password() {
         !stdout.contains("short\n") && !stdout.contains("\"short\""),
         "{stdout}"
     );
+}
+
+/// With `secure_cookie`, Fronde is served over https: a form or a socket from an http page of
+/// the same host is another origin, and refused.
+#[tokio::test]
+async fn behind_https_only_https_pages_are_same_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), true);
+    config.web.as_mut().unwrap().secure_cookie = true;
+    let (connector, _) = fake_connector();
+    let addr = start_with(config, connector, &site(dir.path())).await;
+    let body = form_body(&[("password", PASSWORD)]);
+    let plain = post_sign_in_from(addr, Some(&format!("http://{addr}")), body.clone()).await;
+    assert_eq!(plain.status(), 403);
+    assert!(plain.headers().get(SET_COOKIE).is_none());
+    let secure = post_sign_in_from(addr, Some(&format!("https://{addr}")), body).await;
+    assert_eq!(secure.headers()[LOCATION], "/");
+    let cookie = secure.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let refused = connect(addr, Some(&cookie), Some(&format!("http://{addr}")))
+        .await
+        .unwrap_err();
+    assert_eq!(status_of(refused), 403);
+    connect(addr, Some(&cookie), Some(&format!("https://{addr}")))
+        .await
+        .unwrap();
+}
+
+/// Thousands of made-up names posted at once, as an outsider would to keep everyone out, never
+/// keep a configured person out: their right password still opens, and opens again.
+#[tokio::test]
+async fn a_flood_of_made_up_names_never_keeps_a_person_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let client = client();
+    let origin = format!("http://{addr}");
+    let flood = futures::stream::iter(0..4200)
+        .map(|n| {
+            let request = client
+                .post(format!("http://{addr}/auth/sign-in"))
+                .header(ORIGIN, &origin)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(form_body(&[
+                    ("name", &format!("made-up-{n}")),
+                    ("password", "x"),
+                ]))
+                .send();
+            async move { request.await.unwrap().status() }
+        })
+        .buffer_unordered(512)
+        .collect::<Vec<_>>();
+    let statuses = timeout(Duration::from_secs(60), flood).await.unwrap();
+    assert!(statuses.iter().all(|status| *status == 303));
+    for _ in 0..2 {
+        sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+        sign_in_as(addr, "Alix", PASSWORD).await;
+    }
 }

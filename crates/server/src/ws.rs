@@ -27,7 +27,7 @@ pub async fn upgrade(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     // Browsers do not apply the same-origin policy to WebSockets: the page's origin must match.
-    if !same_origin(&headers) {
+    if !same_origin(&headers, web.secure_cookie) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // The socket is the session's user's, and nobody else's, for as long as it lives: nothing the

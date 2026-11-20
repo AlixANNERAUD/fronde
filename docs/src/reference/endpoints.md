@@ -19,8 +19,8 @@ another site cannot know.
 | `GET /threads` | The thread list, full screen (on a wide screen it also sits beside the chat). Without a session, a redirect to `/sign-in`. |
 | `GET /new` | An empty chat whose first message starts a thread. Without a session, a redirect to `/sign-in`. |
 | `GET /sign-in` | The sign-in page. |
-| `POST /auth/sign-in` | Form fields `name` and `password`. The person named `name` (spaces around it ignored, compared exactly) and their own password: a new session for them and a redirect to `/`. With a single person configured (the legacy form, or `[users]` listing one), `name` may be empty or left out. Anything else, a name that is no one's included: a redirect to `/sign-in?error=1`, after one second, the same answer either way. Only from Fronde's own pages: an `Origin` header naming another host than `Host`, or none, gets `403` before anything is checked or counted. |
-| `POST /auth/sign-out` | Ends the session, then redirects to `/sign-in`. `403`, the session kept, unless `Origin` names the same host as `Host`. |
+| `POST /auth/sign-in` | Form fields `name` and `password`. The person named `name` (spaces around it ignored, compared exactly) and their own password: a new session for them and a redirect to `/`. With a single person configured (the legacy form, or `[users]` listing one), `name` may be empty or left out. Anything else, a name that is no one's included: a redirect to `/sign-in?error=1`, after one second, the same answer either way. Only from Fronde's own pages: an `Origin` header naming another host than `Host` (or not https while `secure_cookie = true`), or none, gets `403` before anything is checked or counted. |
+| `POST /auth/sign-out` | Ends the session, then redirects to `/sign-in`. `403`, the session kept, unless `Origin` names the same host as `Host` (over https while `secure_cookie = true`). |
 | `GET /ws` | The chat's WebSocket, described below. |
 | `GET /assets/…` | The interface's files, cached for a year: their names change with their content. |
 | Other paths | Files of the built interface, else `404`. |
@@ -36,11 +36,10 @@ that name is refused for 60 seconds, for every client at once, with a redirect t
 `/sign-in?error=2`; the other names still sign in. A name's mistakes are forgotten 15 minutes
 after its last one, and a right password starts its count again. A name that is no one's is
 counted the same way, so neither the answer, its delay nor the lockout tells whether a name is
-someone's. Names are counted by their HMAC-SHA256 under a key made at each start, never as typed,
-for at most 4096 names at once. A name is never forgotten before its 15 minutes to make room:
-while 4096 names have recent mistakes, a name not among them is answered `/sign-in?error=2`,
-its password right or not, until some are forgotten. Typing made-up names can thus keep new
-names out for a while, never let anyone guess more.
+someone's. Names are counted by their HMAC-SHA256 under a key made at each start, never as typed.
+The configured people are counted apart, one entry each, never forgotten to make room: no flood
+of made-up names keeps a person out or resets their count. Names that are no one's are counted
+for at most 4096 at once; past that, those whose last mistake is the oldest are forgotten.
 
 ### Sessions
 
@@ -70,7 +69,8 @@ The pages, assets and forms carry:
 
 ### The chat WebSocket
 
-`GET /ws` upgrades only when the `Origin` header names the same host as `Host`, else `403`.
+`GET /ws` upgrades only when the `Origin` header names the same host as `Host`, over https while
+`secure_cookie = true`, else `403`.
 Without a session, it upgrades and closes at once with code `4401`, which the page reads as
 "sign in again": a refused upgrade would look like a network failure.
 

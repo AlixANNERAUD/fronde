@@ -140,9 +140,9 @@ values. They print as redacted with
 `Debug` and their memory is zeroed when they are dropped. The plain value is read only at a few
 places in the code, each listed in a test (`crates/server/tests/secrets.rs`): the checks of the
 token's length and of the password, the constant-time compare of `/mcp` tokens (on SHA-256
-digests, so the length does not leak either), the sign-in passwords' digests and session
-bindings, made once at start (the chat's passwords are then dropped: only their digests are
-kept), the derivation of the session binding key from `server.token`, the component gate, the
+digests, so the length does not leak either), the sign-in passwords' session bindings, made
+once at start (the chat's passwords are then dropped: only their bindings are kept), the
+derivation of the session binding key from `server.token`, the component gate, the
 ACP header and the upstream MCP client.
 
 A component's `Authorization` header is built by the gate for each request, marked sensitive (its
@@ -314,16 +314,21 @@ encrypted: see above, and below.
   no one's gets the same answer after the same second, its typed password compared with a random
   stand-in made at each start, and is counted and locked out like anyone's, so neither the
   answer, its timing nor the lockout tells which names exist. Each password is read once at
-  start and kept as its SHA-256 digest only; a typed one is compared digest to digest in
-  constant time, so neither its content nor its length leaks through timing.
+  start and kept only as its session binding (an HMAC, never a plain digest); a typed one is
+  bound the same way and compared in constant time, so neither its content nor its length leaks
+  through timing.
   The typed name is never logged (a password may be typed there by mistake) and is wiped with the
   password; the throttle keeps names by their HMAC-SHA256 under a key made at each start only.
-  The throttle remembers at most 4096 names and forgets none before its 15 minutes: typing
-  made-up names cannot push a name's mistakes out to start its count again. Once it is full, a
-  name not in it is refused whatever its password, so that a full table never answers a guess
-  without counting it; a flood of made-up names can keep new sign-ins out for 15 minutes, never
-  let a guess through. The forms take posts from Fronde's own pages only (`Origin`): another site
-  can neither sign your browser in as someone else, nor lock your name out from its visitors'
+  The throttle counts the configured people apart, one entry each at most, never pushed out:
+  no flood of made-up names resets a person's count or lifts their lockout, and a person's right
+  password always signs them in, but during that person's own lockout. Names that are no one's
+  are counted in a table of at most 4096, which forgets its oldest names to take new ones:
+  losing such a count lets no guess through, since no password opens those names. This leaks a
+  little: someone who makes mistakes under a name, floods the table with over 4096 made-up names
+  and sees whether the name still locks out learns whether it is someone's. It takes thousands
+  of requests per name tried, and tells only whether a name exists. The forms take posts from
+  Fronde's own pages only (`Origin`, over https when `secure_cookie` is on): another site can
+  neither sign your browser in as someone else, nor lock your name out from its visitors'
   browsers, nor sign you out. Signing in issues a new session id, so an id planted before sign-in
   is worthless after it.
 
@@ -336,7 +341,11 @@ HMAC-SHA256 under a key derived from `server.token`: a session is someone's only
 binding is the one their current password makes. Changing a person's password is thus how the
 owner signs them out of every browser, and changing `server.token` signs everyone out. The key
 lives where `server.token` does, outside `fronde.db`, so a copy of the database gives no way to
-test guesses of a password offline. A session whose person is no longer configured, or whose
+test guesses of a password offline. Someone who holds `server.token` and can read `fronde.db`
+could: treat `server.token` as an owner's credential, which it already is (it opens `/mcp` as
+the owner). The binding is per person, not per session: every session of a person carries the
+same one. Someone who can write `fronde.db` can therefore make a session for anyone whose binding
+they read there, but writing Fronde's database already gives them everything. A session whose person is no longer configured, or whose
 binding no longer matches, is refused at its next request and deleted at the next start, so a
 person later configured under that name with a password of their own (or the new
 `[data] user`, should it change) never inherits it; sessions from before names were signed
@@ -348,8 +357,10 @@ stores a session: a cookie a client made up is never saved.
 
 Pages cannot be framed by another site (`frame-ancestors 'none'`). Browsers do not apply the
 same-origin policy to WebSockets, so `/ws` checks that the page's `Origin` matches the `Host` it
-was sent to: another site cannot open your chat with your cookie. This is why a reverse proxy must
-forward `Host`.
+was sent to: another site cannot open your chat with your cookie. The sign-in and sign-out forms
+check it too, and with `secure_cookie` the `Origin` must also be https, so a page served over
+plain http under the same name is another site. This is why a reverse proxy must forward `Host`
+as the browser sent it, port included.
 
 ## The agent
 
