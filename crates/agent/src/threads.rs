@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use fronde_db::DatabaseConnection;
 use fronde_entity::{stream_entries, streams, threads};
-use fronde_protocol::{Card, Outcome, RequestId, ThreadSummary};
+use fronde_protocol::{Card, Outcome, RequestId, ThreadStatus, ThreadSummary};
 use fronde_requests::{Ask, Caller, Journal, LateAnswer, Requests, User, Users, Waiter};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -114,6 +114,9 @@ pub struct ThreadRow {
     pub updated_at: DateTime<Utc>,
     /// When it was archived: an archived thread refuses messages.
     pub archived_at: Option<DateTime<Utc>>,
+    /// The account its owner picked for it, checked again at each start; `None` runs it on its
+    /// owner's default for its provider, looked up at each start ([`Accounts::for_thread`]).
+    pub account: Option<String>,
 }
 
 impl ThreadRow {
@@ -143,6 +146,7 @@ impl ThreadRow {
             created_at: row.created_at,
             updated_at: row.updated_at,
             archived_at: row.archived_at,
+            account: row.account,
         })
     }
 }
@@ -365,7 +369,6 @@ struct Tail {
 struct Bound<'a> {
     id: ThreadId,
     owner: &'a str,
-    provider: &'a str,
     sub_agent: bool,
     /// Its own directories; `None` keeps the base's, the main thread's.
     dirs: Option<ThreadDirs>,
@@ -373,22 +376,13 @@ struct Bound<'a> {
     owners_grants: bool,
 }
 
-/// `base` bound for one thread: its directories, its system prompt (a sub-agent's own, else
-/// `prompt` for its owner, else the base's) and its owner's account on its provider. Only that
-/// account's token signs it in. An owner who is not a user, or has no account there, gets a
-/// sign-in that fails before any process starts ([`NoOwner`], [`crate::acp::NoAccount`]):
-/// nothing falls back to anyone else's account.
-fn bound_spec(
-    base: &AgentSpec,
-    users: &Users,
-    accounts: &Accounts,
-    prompt: Option<&SystemPrompt>,
-    bound: Bound<'_>,
-) -> AgentSpec {
+/// `base` bound for one thread: its directories and its system prompt (a sub-agent's own, else
+/// `prompt` for its owner, else the base's). It holds no token and no account: its [`Signer`]
+/// resolves them at each start.
+fn bound_spec(base: &AgentSpec, prompt: Option<&SystemPrompt>, bound: Bound<'_>) -> AgentSpec {
     let Bound {
         id,
         owner,
-        provider,
         sub_agent,
         dirs,
         owners_grants,
@@ -397,36 +391,6 @@ fn bound_spec(
         (true, _) => children::SYSTEM_PROMPT.to_owned(),
         (false, Some(prompt)) => prompt(owner),
         (false, None) => base.system_prompt.clone(),
-    };
-    // An empty name is no account, as for `Threads::account`.
-    let binding = accounts
-        .of(owner, provider)
-        .filter(|binding| !binding.account.is_empty());
-    let (oauth_token, account) = match (users.get(owner), binding) {
-        (None, _) => {
-            let owner = owner.to_owned();
-            (
-                Some(crate::acp::oauth_token(move || {
-                    let error = NoOwner(owner.clone());
-                    async move { Err(error.into()) }
-                })),
-                None,
-            )
-        }
-        (Some(_), Some(binding)) => (binding.token.clone(), Some(binding.account.clone())),
-        (Some(_), None) => {
-            let error = crate::acp::NoAccount {
-                owner: owner.to_owned(),
-                provider: provider.to_owned(),
-            };
-            (
-                Some(crate::acp::oauth_token(move || {
-                    let error = error.clone();
-                    async move { Err(error.into()) }
-                })),
-                None,
-            )
-        }
     };
     let (cwd, home) = match dirs {
         Some(ThreadDirs { work, home }) => (work, home),
@@ -437,10 +401,59 @@ fn bound_spec(
         cwd,
         home,
         system_prompt,
-        oauth_token,
-        account,
+        oauth_token: None,
+        account: None,
         owners_grants,
         ..base.clone()
+    }
+}
+
+/// How one thread's agent signs in: the account [`Accounts::for_thread`] gives for its owner,
+/// its provider and its pick, resolved again at each start, before any hub token or process.
+/// An owner who is no longer a user, a pick the owner may no longer use and an owner without a
+/// default each fail the start ([`NoOwner`], [`crate::acp::AccountNotAllowed`],
+/// [`crate::acp::NoAccount`]): nothing falls back to another account.
+pub(crate) struct Signer {
+    accounts: Arc<Accounts>,
+    owner: String,
+    /// Whether `owner` is a configured user.
+    configured: bool,
+    provider: String,
+    /// The thread's pick, as its row holds it; [`Threads::set_account`] changes both.
+    chosen: Mutex<Option<String>>,
+}
+
+impl Signer {
+    /// The account the thread's agent signs in with now, or why none.
+    pub(crate) fn binding(&self) -> anyhow::Result<Binding> {
+        if !self.configured {
+            return Err(NoOwner(self.owner.clone()).into());
+        }
+        let chosen = lock(&self.chosen).clone();
+        match self
+            .accounts
+            .for_thread(&self.owner, &self.provider, chosen.as_deref())
+        {
+            Ok(binding) => Ok(binding.clone()),
+            Err(Unbound::NoAccount) => Err(crate::acp::NoAccount {
+                owner: self.owner.clone(),
+                provider: self.provider.clone(),
+            }
+            .into()),
+            Err(Unbound::NotAllowed { account }) => {
+                Err(crate::acp::AccountNotAllowed { account }.into())
+            }
+        }
+    }
+
+    /// The account's name, when the thread has one now.
+    pub(crate) fn account(&self) -> Option<String> {
+        self.binding().ok().map(|binding| binding.account)
+    }
+
+    /// The thread's pick changed to `chosen`.
+    pub(crate) fn set(&self, chosen: Option<String>) {
+        *lock(&self.chosen) = chosen;
     }
 }
 
@@ -463,7 +476,7 @@ impl std::error::Error for NoOwner {}
 
 /// Why a page's thread was refused. An unknown thread and one the user may not see are the
 /// same refusal, so that a page learns nothing of other users' threads.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// No such thread, or not the user's.
     NotFound,
@@ -475,6 +488,18 @@ pub enum Refusal {
     Taken,
     /// The thread's owner is no longer a configured user: read-only.
     NoOwner,
+    /// A sub-agent runs on its conversation's account: only a root thread is switched.
+    SubAgent,
+    /// Only the thread's owner picks its account, an admin included.
+    NotOwner,
+    /// The account named is not one the thread's owner may use on its provider, or there is no
+    /// such account: told alike.
+    AccountNotAllowed,
+    /// A turn runs or waits for an agent in the thread or under it: no switch until it ends.
+    Busy,
+    /// The thread's pick is an account its owner may no longer use: nothing runs until another
+    /// is picked.
+    Unusable { account: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -486,6 +511,23 @@ impl std::fmt::Display for Refusal {
             Self::Taken => "Cet identifiant de conversation est déjà pris.",
             Self::NoOwner => {
                 "Cette conversation appartient à une personne qui n'a plus de compte : elle est en lecture seule."
+            }
+            Self::SubAgent => "Un sous-agent suit l'abonnement de sa conversation.",
+            Self::NotOwner => {
+                "Seule la personne à qui est la conversation choisit son abonnement."
+            }
+            Self::AccountNotAllowed => "Cet abonnement n'est pas l'un des tiens.",
+            Self::Busy => {
+                "Une réponse est en cours dans cette conversation ou un de ses sous-agents : \
+                 attends qu'elle finisse pour changer d'abonnement."
+            }
+            Self::Unusable { account } => {
+                return f.write_str(
+                    &crate::acp::AccountNotAllowed {
+                        account: account.clone(),
+                    }
+                    .notice(),
+                );
             }
         })
     }
@@ -509,55 +551,140 @@ pub struct Holder {
 /// told whose assistant it is.
 pub type SystemPrompt = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-/// The account a person's agents of one provider sign in with: its name, which its usage is kept
-/// under, and its token, read again at each start (`None` only for the legacy form's owner
-/// account without a token: the agent starts unsigned).
+/// A subscription account, as the threads use it: its name, which its usage is kept under,
+/// its provider, its subscriber (`owner`), the other people who may run threads on it, and its
+/// token, read again at each start (`None` only for the legacy form's owner account without a
+/// token: the agent starts unsigned).
 #[derive(Clone)]
 pub struct Binding {
     pub account: String,
+    pub provider: String,
+    /// The subscriber: whose subscription it is.
+    pub owner: String,
+    /// The other people who may use it.
+    pub users: Vec<String>,
     pub token: Option<OauthToken>,
+}
+
+impl Binding {
+    /// Whether `user` may run threads on it: its subscriber, or one of its `users`.
+    pub fn usable_by(&self, user: &str) -> bool {
+        self.owner == user || self.users.iter().any(|name| name == user)
+    }
 }
 
 impl std::fmt::Debug for Binding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Binding")
             .field("account", &self.account)
+            .field("provider", &self.provider)
+            .field("owner", &self.owner)
+            .field("users", &self.users)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
 
-/// Each person's account per provider: the one lookup from a thread to the token its agent
-/// signs in with. Built once from the configuration; a person without an account for a
-/// provider has none, and nothing falls back to another's.
+/// Why a thread has no account to run on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unbound {
+    /// No pick, and its owner has no default on its provider.
+    NoAccount,
+    /// Its pick is not an account its owner may use on its provider (any more): refused, never
+    /// replaced by the default.
+    NotAllowed { account: String },
+}
+
+/// The configured accounts by name, and each person's default per provider: the one lookup
+/// from a thread to the account its agent signs in with ([`Accounts::for_thread`]). Built once
+/// from the configuration; nothing falls back to an account its owner may not use.
 #[derive(Clone, Debug, Default)]
 pub struct Accounts {
-    by_owner: HashMap<(String, String), Binding>,
+    by_name: std::collections::BTreeMap<String, Binding>,
+    /// `(user, provider)` to the account `default_for` names for them.
+    defaults: HashMap<(String, String), String>,
 }
 
 impl Accounts {
-    /// `owner`'s account on `provider` is `binding`.
-    pub fn insert(&mut self, owner: &str, provider: &str, binding: Binding) {
-        self.by_owner
-            .insert((owner.to_owned(), provider.to_owned()), binding);
+    /// Adds `binding`. An empty name is no account, never one that every account-less thread
+    /// shares: it is left out.
+    pub fn insert(&mut self, binding: Binding) {
+        if binding.account.is_empty() {
+            return;
+        }
+        self.by_name.insert(binding.account.clone(), binding);
     }
 
-    /// `owner`'s account on `provider`, if they have one.
-    pub fn of(&self, owner: &str, provider: &str) -> Option<&Binding> {
-        self.by_owner.get(&(owner.to_owned(), provider.to_owned()))
+    /// `user`'s default on `provider` is `account` (its `default_for` names them).
+    pub fn set_default(&mut self, user: &str, provider: &str, account: &str) {
+        self.defaults
+            .insert((user.to_owned(), provider.to_owned()), account.to_owned());
+    }
+
+    /// The account named `account`.
+    pub fn get(&self, account: &str) -> Option<&Binding> {
+        self.by_name.get(account)
+    }
+
+    /// Whether `user` may run threads on `account`.
+    pub fn may_use(&self, user: &str, account: &str) -> bool {
+        self.get(account)
+            .is_some_and(|binding| binding.usable_by(user))
+    }
+
+    /// The accounts of `provider` that `user` may use, by name.
+    pub fn usable_by(&self, user: &str, provider: &str) -> Vec<&Binding> {
+        self.by_name
+            .values()
+            .filter(|binding| binding.provider == provider && binding.usable_by(user))
+            .collect()
+    }
+
+    /// `user`'s default account on `provider`: the one named for them, else the only one they
+    /// may use there, else none.
+    pub fn default_of(&self, user: &str, provider: &str) -> Option<&Binding> {
+        if let Some(named) = self
+            .defaults
+            .get(&(user.to_owned(), provider.to_owned()))
+            .and_then(|account| self.get(account))
+            .filter(|binding| binding.provider == provider && binding.usable_by(user))
+        {
+            return Some(named);
+        }
+        match self.usable_by(user, provider)[..] {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Whose subscription `account` is.
+    pub fn subscriber(&self, account: &str) -> Option<&str> {
+        self.get(account).map(|binding| binding.owner.as_str())
+    }
+
+    /// The account a thread of `owner` on `provider` runs on: `chosen`, its pick, when `owner`
+    /// may use it on that provider, else [`Unbound::NotAllowed`]; without a pick, `owner`'s
+    /// default, else [`Unbound::NoAccount`]. Nothing falls back.
+    pub fn for_thread(
+        &self,
+        owner: &str,
+        provider: &str,
+        chosen: Option<&str>,
+    ) -> Result<&Binding, Unbound> {
+        match chosen {
+            Some(account) => self
+                .get(account)
+                .filter(|binding| binding.provider == provider && binding.usable_by(owner))
+                .ok_or_else(|| Unbound::NotAllowed {
+                    account: account.to_owned(),
+                }),
+            None => self.default_of(owner, provider).ok_or(Unbound::NoAccount),
+        }
     }
 
     /// Every account's name.
     pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .by_owner
-            .values()
-            .map(|binding| binding.account.clone())
-            .filter(|account| !account.is_empty())
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+        self.by_name.keys().cloned().collect()
     }
 }
 
@@ -595,8 +722,8 @@ pub struct Threads {
     prompt: Option<SystemPrompt>,
     /// The owner of each thread opened so far, as [`Threads::user_of`] read it at its opening.
     owners: Mutex<HashMap<ThreadId, User>>,
-    /// Each person's account per provider.
-    accounts: Accounts,
+    /// The accounts, and each person's default per provider.
+    accounts: Arc<Accounts>,
     /// `[data] user`: the main thread is theirs, their threads have the pool's last slot, and
     /// only their agents get the owner's grants (`[agent] read`).
     owner: String,
@@ -649,14 +776,13 @@ impl Threads {
         // One person, whose account is the spec's own, if it names one.
         let mut accounts = Accounts::default();
         if let Some(account) = spec.account.clone() {
-            accounts.insert(
-                &owner.name,
-                spec.provider.id,
-                Binding {
-                    account,
-                    token: spec.oauth_token.clone(),
-                },
-            );
+            accounts.insert(Binding {
+                account,
+                provider: spec.provider.id.to_owned(),
+                owner: owner.name.clone(),
+                users: Vec::new(),
+                token: spec.oauth_token.clone(),
+            });
         }
         let people = People {
             owner: owner.name.clone(),
@@ -668,9 +794,9 @@ impl Threads {
     }
 
     /// [`Threads::open_with`] for `people`: each thread acts for its row's owner, its root
-    /// threads told so by `people.prompt` when given, and its agent signs in with that owner's
-    /// account for the thread's provider, looked up at each start: never another's. A thread
-    /// whose owner has no account starts no agent; one whose owner is not a user opens
+    /// threads told so by `people.prompt` when given, and its agent signs in with the account
+    /// [`Accounts::for_thread`] gives for its row, looked up at each start: never one its owner
+    /// may not use. A thread without one starts no agent; one whose owner is not a user opens
     /// read-only. `spec`'s own token is not used.
     pub async fn open_for(
         db: DatabaseConnection,
@@ -687,6 +813,7 @@ impl Threads {
             accounts,
         } = people;
         let owner = owner.as_str();
+        let accounts = Arc::new(accounts);
         legacy::import(&db, data_dir, TOPIC, LEGACY_SESSION).await?;
         let cancelled = ensure_main(&db, data_dir, owner, spec.provider.id)
             .await
@@ -705,18 +832,26 @@ impl Threads {
         // The main thread is the owner's.
         let main_spec = bound_spec(
             &spec,
-            &users,
-            &accounts,
             prompt.as_ref(),
             Bound {
                 id: ThreadId::MAIN,
                 owner,
-                provider: spec.provider.id,
                 sub_agent: false,
                 dirs: None,
                 owners_grants: true,
             },
         );
+        let main_row = threads::Entity::find_by_id(ThreadId::MAIN.0)
+            .one(&db)
+            .await?
+            .context("the main thread was just made")?;
+        let main_signer = Signer {
+            accounts: accounts.clone(),
+            owner: owner.to_owned(),
+            configured: users.get(owner).is_some(),
+            provider: main_row.provider,
+            chosen: Mutex::new(main_row.account),
+        };
         let tokens = Tokens::new();
         let pool = Pool::new(budget);
         let changes = Changes::new();
@@ -736,6 +871,7 @@ impl Threads {
             ThreadId::MAIN,
             TOPIC.into(),
             main_spec,
+            main_signer,
             shared,
             false,
             true,
@@ -915,10 +1051,18 @@ impl Threads {
             _ => None,
         };
         let turn_timeout = row.parent.map(|_| self.limits().child_turn_timeout);
+        let signer = Signer {
+            accounts: self.accounts.clone(),
+            owner: row.owner.clone(),
+            configured: self.configured(&row),
+            provider: row.provider.clone(),
+            chosen: Mutex::new(row.account.clone()),
+        };
         let (assistant, interrupted) = Assistant::open(
             id,
             row.topic.clone(),
             self.spec_for(&row),
+            signer,
             shared,
             row.archived_at.is_some(),
             // Only the owner's own threads have the pool's last slot.
@@ -937,16 +1081,37 @@ impl Threads {
         Ok(Some((assistant, interrupted.filter(|_| parent.is_some()))))
     }
 
-    /// The subscription account the threads `owner` owns spend on `provider`: the key of their
-    /// usage readings, of the reserve kept for them and of the daily counts that stand in for
-    /// it, and the account their agents sign in with. The one lookup from a thread to its
-    /// account; `None` when `owner` has none on `provider`, and then nothing runs on any.
-    pub fn account(&self, owner: &str, provider: &str) -> Option<String> {
+    /// The subscription account thread `row` spends: the key of its usage readings, of the
+    /// reserve and of the daily counts that stand in for it, and the account its agent signs in
+    /// with. `None` when it has none now ([`Threads::resolve`]), and then nothing runs on any.
+    pub fn account(&self, row: &ThreadRow) -> Option<String> {
+        self.resolve(row).ok()
+    }
+
+    /// The account thread `row` runs on now, or why none: [`Accounts::for_thread`] for its
+    /// owner, provider and pick. An owner no longer configured has none.
+    pub fn resolve(&self, row: &ThreadRow) -> Result<String, Unbound> {
+        self.resolve_on(&row.owner, &row.provider, row.account.as_deref())
+    }
+
+    /// [`Threads::resolve`] for a thread of `owner` on `provider` picked onto `chosen`.
+    pub fn resolve_on(
+        &self,
+        owner: &str,
+        provider: &str,
+        chosen: Option<&str>,
+    ) -> Result<String, Unbound> {
+        if self.users.get(owner).is_none() {
+            return Err(Unbound::NoAccount);
+        }
         self.accounts
-            .of(owner, provider)
+            .for_thread(owner, provider, chosen)
             .map(|binding| binding.account.clone())
-            // An empty name is no account: never one that every account-less thread shares.
-            .filter(|account| !account.is_empty())
+    }
+
+    /// The accounts, and each person's default.
+    pub fn accounts(&self) -> &Accounts {
+        &self.accounts
     }
 
     /// Every configured account's name.
@@ -955,19 +1120,16 @@ impl Threads {
     }
 
     /// How thread `row`'s agent starts: the base spec, with the thread's own directories (the
-    /// base's for the main thread) and scope name, a sub-agent's own system prompt or its
-    /// owner's, and its owner's account for its provider: see [`bound_spec`].
+    /// base's for the main thread) and scope name, and a sub-agent's own system prompt or its
+    /// owner's: see [`bound_spec`]. Its account is its [`Signer`]'s.
     fn spec_for(&self, row: &ThreadRow) -> AgentSpec {
         let dirs = (row.id != ThreadId::MAIN).then(|| thread_dirs(&self.data_dir, row.id));
         bound_spec(
             &self.spec,
-            &self.users,
-            &self.accounts,
             self.prompt.as_ref(),
             Bound {
                 id: row.id,
                 owner: &row.owner,
-                provider: &row.provider,
                 sub_agent: row.parent.is_some(),
                 dirs,
                 owners_grants: row.owner == self.owner,
@@ -1154,7 +1316,8 @@ impl Threads {
         title: &str,
         client_request_id: Option<&str>,
     ) -> anyhow::Result<ThreadRow> {
-        let depth = match parent {
+        let provider = self.spec.provider.id;
+        let (depth, account) = match parent {
             Some(parent) => {
                 let row = threads::Entity::find_by_id(parent.0)
                     .one(transaction)
@@ -1167,9 +1330,12 @@ impl Threads {
                         row.owner
                     );
                 }
-                row.depth + 1
+                // And it runs on its parent's account, read in this transaction: a whole tree
+                // runs on its root's. On another provider, its owner's default there.
+                let account = row.account.filter(|_| row.provider == provider);
+                (row.depth + 1, account)
             }
-            None => 0,
+            None => (0, None),
         };
         // The topic names the id, and must exist as a stream before the row. Threads are never
         // deleted and the write lock is held, so the next id is the greatest one plus one.
@@ -1195,13 +1361,14 @@ impl Threads {
             depth: Set(depth),
             owner: Set(owner.into()),
             started_by: Set(started_by.stored()),
-            provider: Set(self.spec.provider.id.into()),
+            provider: Set(provider.into()),
             model: Set(None),
             session_id: Set(None),
             client_request_id: Set(client_request_id.map(str::to_owned)),
             created_at: Set(now),
             updated_at: Set(now),
             archived_at: Set(None),
+            account: Set(account),
         };
         let row = threads::Entity::insert(row)
             .exec_with_returning(transaction)
@@ -1219,6 +1386,81 @@ impl Threads {
             Expr::value(model.map(str::to_owned)),
         )
         .await
+    }
+
+    /// Puts root thread `id` and every thread of its owner's under it on `account`, one its
+    /// owner may use on its provider, or back on the owner's default with `None`: in one
+    /// transaction, under the lock sub-agents start under, so that a sub-agent made meanwhile
+    /// copies the new pick. Only the thread's owner switches (`by`); a sub-agent follows its
+    /// conversation; refused while a turn runs or waits for an agent anywhere in the tree. The
+    /// tree's idle agents stop: the next message starts on the new account, resuming the same
+    /// session in the same home. Each refusal is a [`Refusal`]: [`Refusal::NotFound`] for a
+    /// thread `by` may not see.
+    pub async fn set_account(
+        &self,
+        id: ThreadId,
+        account: Option<&str>,
+        by: &User,
+    ) -> anyhow::Result<()> {
+        let starting = self.children.starting.lock().await;
+        let Some(row) = self.get(id).await?.filter(|row| row.visible_to(by)) else {
+            bail!(Refusal::NotFound);
+        };
+        if row.parent.is_some() {
+            bail!(Refusal::SubAgent);
+        }
+        if row.owner != by.name {
+            bail!(Refusal::NotOwner);
+        }
+        if row.archived_at.is_some() {
+            bail!(Refusal::Archived);
+        }
+        // An unknown name and one the owner may not use are told alike.
+        if let Some(account) = account
+            && self
+                .accounts
+                .for_thread(&row.owner, &row.provider, Some(account))
+                .is_err()
+        {
+            bail!(Refusal::AccountNotAllowed);
+        }
+        let mut tree = vec![row.id];
+        tree.extend(self.own_descendants(id).await?.iter().map(|row| row.id));
+        let open: Vec<Arc<Assistant>> = {
+            let open = self.open.lock().await;
+            tree.iter().filter_map(|id| open.get(id).cloned()).collect()
+        };
+        if open.iter().any(|assistant| {
+            matches!(
+                assistant.status(),
+                ThreadStatus::Running | ThreadStatus::Queued
+            )
+        }) {
+            bail!(Refusal::Busy);
+        }
+        let transaction = fronde_db::begin_write(&self.db).await?;
+        threads::Entity::update_many()
+            .col_expr(
+                threads::Column::Account,
+                Expr::value(account.map(str::to_owned)),
+            )
+            .col_expr(threads::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(threads::Column::Id.is_in(tree.iter().map(|id| id.0)))
+            .exec(&transaction)
+            .await?;
+        transaction.commit().await?;
+        for assistant in &open {
+            assistant.set_account(account.map(str::to_owned));
+            assistant.stop_agent().await;
+        }
+        drop(starting);
+        tracing::info!(
+            "thread {id} and the {} thread(s) under it now run on {}",
+            tree.len() - 1,
+            account.unwrap_or("their owner's default account")
+        );
+        self.changes.notify();
+        Ok(())
     }
 
     /// The models the agent of `provider` offered when it last started, for choosing one; empty
@@ -1526,8 +1768,9 @@ pub const REMOVED: &str = "removed:";
 /// with every thread under it, to `to`, in one transaction, their cards for `from` with them:
 /// the way back from [`REMOVED`], or to hand a person's conversations to another. The caller
 /// checks that `to` is a configured user and that Fronde is not running on `data_dir`. Given
-/// to anyone but the person `from` named, each thread's agent session is forgotten and its home
-/// moved aside, as when the main thread changes owner. The number of threads given.
+/// to anyone but the person `from` named, each thread's agent session and account pick are
+/// forgotten and its home moved aside, as when the main thread changes owner. The number of
+/// threads given.
 pub async fn reassign(
     db: &DatabaseConnection,
     data_dir: &Path,
@@ -1604,10 +1847,15 @@ pub async fn reassign(
         .filter(threads::Column::Id.is_in(kept.iter().map(|(id, ..)| *id)))
         .exec(&transaction)
         .await?;
+    // A pick was the earlier person's: given away, a thread runs on its new owner's default.
     threads::Entity::update_many()
         .col_expr(threads::Column::Owner, Expr::value(to.to_owned()))
         .col_expr(
             threads::Column::SessionId,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            threads::Column::Account,
             Expr::value(Option::<String>::None),
         )
         .col_expr(threads::Column::UpdatedAt, Expr::value(now))
@@ -1681,9 +1929,10 @@ async fn bury_removed(db: &DatabaseConnection, users: &Users) -> anyhow::Result<
 /// Makes the main thread's stream and row when missing, and moves the agent's session id from
 /// the key-value table to the row, in one transaction: the row is then the only place it is
 /// kept. The main thread is `owner`'s, `[data] user`, and so is every thread under it, at every
-/// start: a row of that tree made for anyone else is given to `owner`, its agent session
-/// forgotten and its home moved aside ([`move_dirs_aside`]), so that the new owner's agent
-/// never resumes the earlier owner's conversation nor reads their agent's files.
+/// start: a row of that tree made for anyone else is given to `owner`, its agent session and
+/// account pick forgotten and its home moved aside ([`move_dirs_aside`]), so that the new
+/// owner's agent never resumes the earlier owner's conversation nor reads their agent's files,
+/// and runs on the new owner's default.
 async fn ensure_main(
     db: &DatabaseConnection,
     data_dir: &Path,
@@ -1720,6 +1969,7 @@ async fn ensure_main(
             created_at: Set(now),
             updated_at: Set(now),
             archived_at: Set(None),
+            account: Set(None),
         })
         .exec(&transaction)
         .await?;
@@ -1771,10 +2021,15 @@ async fn ensure_main(
                  thread and everything under it are; its agent starts a new conversation"
             );
         }
+        // A pick was the earlier owner's: the new owner's threads run on their default.
         threads::Entity::update_many()
             .col_expr(threads::Column::Owner, Expr::value(owner.to_owned()))
             .col_expr(
                 threads::Column::SessionId,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                threads::Column::Account,
                 Expr::value(Option::<String>::None),
             )
             .col_expr(threads::Column::UpdatedAt, Expr::value(now))

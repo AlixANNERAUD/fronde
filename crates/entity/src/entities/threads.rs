@@ -36,6 +36,8 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub archived_at: Option<DateTimeUtc>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub account: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

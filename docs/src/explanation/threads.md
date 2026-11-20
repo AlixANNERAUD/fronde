@@ -226,14 +226,19 @@ The other limits (depth, at once, kept, time per turn, wakes without you) always
 bound concurrency, clutter, loops and time, not the quota. `threads_list` tells an agent whether
 background work may run before it tries.
 
-Readings, the reserve and the daily counts belong to a subscription account: the account of the
-thread's owner on its provider (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)).
-A sub-agent runs on its root thread's owner's account, never on another person's: its readings
-and its counts are that account's, and a person's background work stops at their own account's
-line, never at another's. A thread whose owner has no account starts no sub-agent, and its
-threads count on no one's account. `threads_list` names the caller's own account beside each
-provider's `background`. The meter shows each person their own account's usage, and an admin
-every account's.
+Readings, the reserve and the daily counts belong to a subscription account: the one the thread
+runs on, its owner's pick for it or else their default on its provider (see
+[`[accounts.<name>]`](../reference/configuration.md#accountsname)). A sub-agent runs on its root
+thread's account: it copies its parent's pick when it is made, and when the owner switches a
+conversation to another account (only its owner may, never while a turn runs or waits in it or
+under it) the switch moves the whole tree at once, stopping its idle agents, which resume the same
+sessions in the same homes on the new account at the next message. Its readings and its counts are
+that account's, whoever's thread it is, and background work on an account stops at that account's
+line, never at another's. A thread without an account (its owner has none, or may no longer use
+the one picked) starts no sub-agent, and its threads count on no one's account. `threads_list`
+names the account a sub-agent of the caller would run on beside each provider's `background`
+(`no account`, or `account not allowed` for a pick its owner may no longer use). The meter shows
+each person their default account's usage, and an admin every account's.
 
 ## Stopping
 

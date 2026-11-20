@@ -28,7 +28,8 @@ Earlier versions kept the memory's search index in `index.sqlite`: Fronde delete
 
 Each conversation is a thread: a row of the `threads` table (its title, who started it, its
 parent if another thread started it, the id of its agent session, resumed after a restart when
-the agent allows it, and when it was archived) and a stream of numbered entries, with the log id
+the agent allows it, the subscription account its owner picked for it, empty for their default,
+and when it was archived) and a stream of numbered entries, with the log id
 pages use to notice a new conversation. The chat is thread 1, over the stream `conversation`.
 Earlier versions kept the agent's session id apart, in a key-value row: the first start of this
 version moves it to thread 1's row. Each thread's agent works in a directory of its own and has

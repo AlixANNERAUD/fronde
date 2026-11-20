@@ -9,7 +9,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fronde_agent::assistant::Assistant;
-use fronde_agent::threads::{Refusal, ThreadRow, Threads};
+use fronde_agent::threads::{Refusal, ThreadRow, Threads, Unbound};
 use fronde_protocol::{
     CLOSE_SIGNED_OUT, ClientMsg, Entry, MAX_CLIENT_ID, ServerMsg, ThreadId, ThreadSummary,
     check_title,
@@ -436,6 +436,10 @@ impl Talk<'_> {
         }
         if !self.web.threads.configured(&row) {
             bail!(Refusal::NoOwner);
+        }
+        // A pick its owner may no longer use runs nothing: said now, the draft kept.
+        if let Err(Unbound::NotAllowed { account }) = self.web.threads.resolve(&row) {
+            bail!(Refusal::Unusable { account });
         }
         Ok(assistant)
     }

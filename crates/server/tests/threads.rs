@@ -59,6 +59,8 @@ struct Bench {
     specs: Arc<Mutex<Vec<AgentSpec>>>,
     /// Each agent start's thread, account and the token its sign-in read, in order.
     sign_ins: SignIns,
+    /// Every token value an account's reader gave, in order, whoever read it.
+    reads: Arc<Mutex<Vec<String>>>,
     /// Releases the turns the fake agents hold open.
     gate: Arc<Notify>,
     /// The data directory.
@@ -105,9 +107,19 @@ const ALIX_TOKEN: &str = "token-of-alix";
 const MARIE_TOKEN: &str = "token-of-marie";
 const LEA_TOKEN: &str = "token-of-lea";
 
-/// A sign-in that reads `value`, as an account's token reads.
-fn token_reading(value: &'static str) -> fronde_agent::acp::OauthToken {
-    fronde_agent::acp::oauth_token(move || async move { Ok(SecretString::from(value)) })
+/// The shared account's made-up token.
+const FAMILLE_TOKEN: &str = "token-of-famille";
+
+/// A sign-in that reads `value`, as an account's token reads, each read kept in `reads`.
+fn counted_reading(
+    reads: &Arc<Mutex<Vec<String>>>,
+    value: &'static str,
+) -> fronde_agent::acp::OauthToken {
+    let reads = reads.clone();
+    fronde_agent::acp::oauth_token(move || {
+        reads.lock().unwrap().push(value.to_owned());
+        async move { Ok(SecretString::from(value)) }
+    })
 }
 
 /// The system prompt of a thread a user started, as the bench's threads give it.
@@ -122,6 +134,18 @@ async fn bench(script: FakeScript) -> Bench {
 /// [`bench`], sub-agents playing `child` when given, at most `budget.max_running` agents at
 /// once.
 async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budget) -> Bench {
+    bench_on(script, child, budget, None).await
+}
+
+/// [`bench_with`], with the shared account `famille` when given: the owner's subscription,
+/// which the people it lists may also use. Alix's default stays `claude` and Marie's `marie`;
+/// Paul's is `famille` when it lists him, the only one he may use.
+async fn bench_on(
+    script: FakeScript,
+    child: Option<FakeScript>,
+    budget: Budget,
+    famille: Option<&[&str]>,
+) -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let config: fronde_hub::config::Config = toml::from_str(&format!(
@@ -189,20 +213,33 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
     // The owner, an admin, and two family members, one of whom has no account. The owner's
     // account keeps the legacy name, which the usage readings stored before accounts have.
     let prompt: fronde_agent::threads::SystemPrompt = Arc::new(prompt_for);
+    let reads: Arc<Mutex<Vec<String>>> = Arc::default();
     let mut accounts = fronde_agent::threads::Accounts::default();
     for (owner, account, token) in [
         ("alix", "claude", ALIX_TOKEN),
         ("marie", "marie", MARIE_TOKEN),
         ("lea", "lea", LEA_TOKEN),
     ] {
-        accounts.insert(
-            owner,
-            "claude",
-            fronde_agent::threads::Binding {
-                account: account.into(),
-                token: Some(token_reading(token)),
-            },
-        );
+        accounts.insert(fronde_agent::threads::Binding {
+            account: account.into(),
+            provider: "claude".into(),
+            owner: owner.into(),
+            users: Vec::new(),
+            token: Some(counted_reading(&reads, token)),
+        });
+    }
+    if let Some(users) = famille {
+        accounts.insert(fronde_agent::threads::Binding {
+            account: "famille".into(),
+            provider: "claude".into(),
+            owner: "alix".into(),
+            users: users.iter().map(|user| (*user).to_owned()).collect(),
+            token: Some(counted_reading(&reads, FAMILLE_TOKEN)),
+        });
+        accounts.set_default("alix", "claude", "claude");
+        if users.contains(&"marie") {
+            accounts.set_default("marie", "claude", "marie");
+        }
     }
     let people = fronde_agent::threads::People {
         users: [alix(), marie(), paul(), lea()].into_iter().collect(),
@@ -320,6 +357,7 @@ async fn bench_with(script: FakeScript, child: Option<FakeScript>, budget: Budge
         fakes,
         specs,
         sign_ins,
+        reads,
         gate: Arc::new(Notify::new()),
         data,
         usage,
@@ -3897,7 +3935,8 @@ async fn a_removed_owners_thread_never_signs_in() {
     bench.assistant(theirs).await.send("Salut".into()).await;
     failed_with(&bench, theirs, fronde_agent::assistant::NO_OWNER).await;
     assert!(bench.tokens_of(theirs).is_empty(), "an agent started");
-    assert_eq!(bench.threads.account("zoe", "claude"), None);
+    let row = bench.threads.get(theirs).await.unwrap().unwrap();
+    assert_eq!(bench.threads.account(&row), None);
 }
 
 /// A person with no account on the thread's provider gets no agent: the connector is never
@@ -3928,7 +3967,8 @@ async fn no_account_starts_no_agent() {
             .any(|spec| spec.thread == his),
         "the connector was called"
     );
-    assert_eq!(bench.threads.account("paul", "claude"), None);
+    let row = bench.threads.get(his).await.unwrap().unwrap();
+    assert_eq!(bench.threads.account(&row), None);
     // Again at the next message: still nothing, and still nobody else's.
     bench.assistant(his).await.send("Encore".into()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4266,5 +4306,658 @@ async fn threads_tools_never_cross_owners() {
         .await;
         assert!(read.get("result").is_some(), "{read}");
     }
+    bench.gate.notify_waiters();
+}
+
+/// What a person's pick that is no longer allowed says, for the shared account.
+const FAMILLE_GONE: &str = "Tu n'as plus accès à l'abonnement « famille » : choisis-en un autre dans le menu de la conversation.";
+
+/// [`held_bench`], with the shared account `famille` used by `users` besides Alix.
+async fn shared_bench(users: &[&str], budget: Budget) -> Bench {
+    let gate = Arc::new(Notify::new());
+    let mut bench = bench_on(held(&gate), None, budget, Some(users)).await;
+    bench.gate = gate;
+    bench
+}
+
+/// Sets thread `id`'s stored account in the bench's database, behind the threads' back: a pick
+/// made in an earlier run, under a configuration that allowed it.
+async fn pick(bench: &Bench, id: ThreadId, account: &str) {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+    let db = fronde_db::open(&bench.data).await.unwrap();
+    fronde_entity::threads::Entity::update_many()
+        .col_expr(
+            fronde_entity::threads::Column::Account,
+            Expr::value(account.to_owned()),
+        )
+        .filter(fronde_entity::threads::Column::Id.eq(id.0))
+        .exec(&db)
+        .await
+        .unwrap();
+}
+
+/// The accounts and tokens thread `id`'s agent starts signed in with, in order.
+fn sign_ins_of(bench: &Bench, id: ThreadId) -> Vec<(String, Option<String>)> {
+    bench
+        .sign_ins
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(thread, ..)| *thread == id)
+        .map(|(_, account, token)| (account.clone(), token.clone()))
+        .collect()
+}
+
+fn on(account: &str, token: &str) -> (String, Option<String>) {
+    (account.to_owned(), Some(token.to_owned()))
+}
+
+/// The refusal `error` is, if it is one of the threads'.
+fn refusal(error: &anyhow::Error) -> Option<&fronde_agent::threads::Refusal> {
+    error.downcast_ref::<fronde_agent::threads::Refusal>()
+}
+
+/// A thread that never picked an account, a row from before picks among them, runs on its
+/// owner's default, looked up at each start: Alix's on `claude` though she may use `famille`
+/// too, Marie's on hers.
+#[tokio::test]
+async fn null_account_is_the_owner_default() {
+    let bench = shared_bench(&["marie"], many()).await;
+    let his = bench.new_thread().await;
+    let hers = bench.new_thread_for("marie").await;
+    for id in [his, hers] {
+        assert_eq!(bench.threads.get(id).await.unwrap().unwrap().account, None);
+    }
+    bench.start(his).await;
+    bench.start(hers).await;
+    assert_eq!(sign_ins_of(&bench, his), [on("claude", ALIX_TOKEN)]);
+    assert_eq!(sign_ins_of(&bench, hers), [on("marie", MARIE_TOKEN)]);
+    bench.gate.notify_waiters();
+}
+
+/// A thread its owner put on a shared account signs in with that account's token, and its
+/// row keeps the pick.
+#[tokio::test]
+async fn picked_account_signs_in() {
+    let bench = shared_bench(&["marie"], many()).await;
+    let hers = bench.new_thread_for("marie").await;
+    bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap();
+    assert_eq!(
+        bench.threads.get(hers).await.unwrap().unwrap().account,
+        Some("famille".into())
+    );
+    bench.start(hers).await;
+    assert_eq!(sign_ins_of(&bench, hers), [on("famille", FAMILLE_TOKEN)]);
+    assert!(
+        !bench
+            .reads
+            .lock()
+            .unwrap()
+            .contains(&MARIE_TOKEN.to_owned())
+    );
+    bench.gate.notify_waiters();
+}
+
+/// A whole tree runs on its root's account: a sub-agent and its own sub-agent of a thread on
+/// `famille` copy the pick, and each of their starts reads `famille`'s token.
+#[tokio::test]
+async fn child_runs_on_its_root_account() {
+    let bench = shared_bench(
+        &["marie"],
+        Budget {
+            max_running: 8,
+            limits: Limits {
+                max_depth: 2,
+                ..Limits::default()
+            },
+            ..Budget::default()
+        },
+    )
+    .await;
+    let hers = bench.new_thread_for("marie").await;
+    bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap();
+    let client = bench
+        .client(&bench.start(hers).await, "claude-code", &[])
+        .await;
+    let child = start_child(&client, TASK).await;
+    let child_client = bench
+        .client(&token_of(&bench, child).await, "claude-code", &[])
+        .await;
+    let grandchild = start_child(&child_client, TASK).await;
+    token_of(&bench, grandchild).await;
+    for id in [hers, child, grandchild] {
+        let row = bench.threads.get(id).await.unwrap().unwrap();
+        assert_eq!(row.account.as_deref(), Some("famille"), "thread {id}");
+        assert_eq!(bench.threads.account(&row).as_deref(), Some("famille"));
+        assert_eq!(
+            sign_ins_of(&bench, id),
+            [on("famille", FAMILLE_TOKEN)],
+            "thread {id}"
+        );
+    }
+    assert!(
+        !bench
+            .reads
+            .lock()
+            .unwrap()
+            .contains(&MARIE_TOKEN.to_owned())
+    );
+    bench.gate.notify_waiters();
+}
+
+/// A pick its owner may no longer use refuses the start, and nothing falls back to her
+/// default: the connector is never called, no token is read, not even hers, no hub token is
+/// made, the notice says what to do, and the row keeps its pick.
+#[tokio::test]
+async fn unusable_pick_refuses_the_start() {
+    // `famille` no longer lists Marie.
+    let bench = shared_bench(&["paul"], many()).await;
+    let hers = bench.new_thread_for("marie").await;
+    pick(&bench, hers, "famille").await;
+    bench.assistant(hers).await.send("Salut".into()).await;
+    failed_with(&bench, hers, FAMILLE_GONE).await;
+    assert!(bench.tokens_of(hers).is_empty(), "an agent started");
+    assert!(bench.threads.tokens().is_empty(), "a hub token stays live");
+    assert!(
+        !bench
+            .specs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|spec| spec.thread == hers),
+        "the connector was called"
+    );
+    assert!(bench.reads.lock().unwrap().is_empty(), "a token was read");
+    let row = bench.threads.get(hers).await.unwrap().unwrap();
+    assert_eq!(row.account.as_deref(), Some("famille"));
+    assert_eq!(bench.threads.account(&row), None);
+    // Her sub-agents would run on it too: none starts.
+    let refused = bench
+        .threads
+        .start_child(
+            hers,
+            None,
+            fronde_agent::threads::ChildTask {
+                task: TASK.into(),
+                title: None,
+                provider: None,
+                model: None,
+                client_request_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.downcast_ref::<fronde_agent::threads::Delegation>(),
+            Some(fronde_agent::threads::Delegation::AccountNotAllowed { .. })
+        ),
+        "{refused:#}"
+    );
+}
+
+/// A sub-agent's result that would wake a thread whose pick is no longer allowed is held for
+/// the next message, its prompt never going out, as when any start of a wake fails.
+#[tokio::test]
+async fn wake_on_unusable_pick_is_held() {
+    let bench = bench_on(FakeScript::default(), None, many(), Some(&["paul"])).await;
+    let hers = bench.new_thread_for("marie").await;
+    let child = bench
+        .threads
+        .create("marie", StartedBy::Thread(hers), Some(hers), "Mesurer")
+        .await
+        .unwrap()
+        .id;
+    // Picked after the sub-agent was made: it runs on her default, its parent on `famille`.
+    pick(&bench, hers, "famille").await;
+    bench.assistant(child).await.send(TASK.into()).await;
+    let assistant = bench.assistant(hers).await;
+    timeout(WAIT, async {
+        loop {
+            let held = events_of(&assistant)
+                .iter()
+                .any(|event| matches!(event, Event::WakesHeld { count: 1, .. }));
+            if held {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never held: {:?}", events_of(&assistant)));
+    assert!(
+        events_of(&assistant)
+            .iter()
+            .any(|event| matches!(event, Event::Notice { text } if text == FAMILLE_GONE)),
+        "{:?}",
+        events_of(&assistant)
+    );
+    assert!(
+        !events_of(&assistant)
+            .iter()
+            .any(|event| matches!(event, Event::Woken { .. })),
+        "{:?}",
+        events_of(&assistant)
+    );
+    assert!(bench.tokens_of(hers).is_empty(), "her agent started");
+    assert_eq!(sign_ins_of(&bench, child), [on("marie", MARIE_TOKEN)]);
+}
+
+/// A switch moves the root and every thread under it at once, and back to the default.
+#[tokio::test]
+async fn switch_moves_the_tree() {
+    let bench = shared_bench(&["marie"], many()).await;
+    let hers = bench.new_thread_for("marie").await;
+    let child = bench
+        .threads
+        .create("marie", StartedBy::Thread(hers), Some(hers), "Mesurer")
+        .await
+        .unwrap()
+        .id;
+    let grandchild = bench
+        .threads
+        .create("marie", StartedBy::Thread(child), Some(child), "Compter")
+        .await
+        .unwrap()
+        .id;
+    let other = bench.new_thread_for("marie").await;
+    let accounts = || async {
+        let mut found = Vec::new();
+        for id in [hers, child, grandchild, other] {
+            found.push(bench.threads.get(id).await.unwrap().unwrap().account);
+        }
+        found
+    };
+    bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap();
+    let famille = Some("famille".to_owned());
+    assert_eq!(
+        accounts().await,
+        [famille.clone(), famille.clone(), famille, None]
+    );
+    // A sub-agent made after the switch copies it.
+    let late = bench
+        .threads
+        .create("marie", StartedBy::Thread(hers), Some(hers), "Plus tard")
+        .await
+        .unwrap()
+        .id;
+    assert_eq!(
+        bench.threads.get(late).await.unwrap().unwrap().account,
+        Some("famille".into())
+    );
+    bench
+        .threads
+        .set_account(hers, None, &marie())
+        .await
+        .unwrap();
+    assert_eq!(accounts().await, [None, None, None, None]);
+    assert_eq!(
+        bench.threads.get(late).await.unwrap().unwrap().account,
+        None
+    );
+}
+
+/// No switch while a turn runs in the tree, the root's or a sub-agent's waiting for an agent:
+/// the turn keeps the account it started on, and nothing changes.
+#[tokio::test]
+async fn switch_refused_while_a_turn_runs() {
+    let bench = shared_bench(
+        &["marie"],
+        Budget {
+            max_running: 1,
+            ..Budget::default()
+        },
+    )
+    .await;
+    let hers = bench.new_thread_for("marie").await;
+    let child = bench
+        .threads
+        .create("marie", StartedBy::Thread(hers), Some(hers), "Mesurer")
+        .await
+        .unwrap()
+        .id;
+    bench.start(hers).await;
+    let refused = bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&refused),
+        Some(&fronde_agent::threads::Refusal::Busy)
+    );
+    bench.gate.notify_waiters();
+    until_idle(&*bench.assistant(hers).await).await;
+    // Alix's thread holds the only agent: the sub-agent's turn waits for it.
+    bench.start(bench.new_thread().await).await;
+    let assistant = bench.assistant(child).await;
+    assistant.send(TASK.into()).await;
+    timeout(WAIT, async {
+        while assistant.status() != fronde_protocol::ThreadStatus::Queued {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent's turn never queued");
+    let refused = bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&refused),
+        Some(&fronde_agent::threads::Refusal::Busy)
+    );
+    for id in [hers, child] {
+        assert_eq!(bench.threads.get(id).await.unwrap().unwrap().account, None);
+    }
+    bench.gate.notify_waiters();
+}
+
+/// A switch stops the tree's idle agents; the next message starts on the new account, resuming
+/// the same session in the same home.
+#[tokio::test]
+async fn switch_stops_idle_agents_and_resumes_the_session() {
+    let bench = bench_on(
+        FakeScript {
+            resume: true,
+            ..FakeScript::default()
+        },
+        None,
+        many(),
+        Some(&["marie"]),
+    )
+    .await;
+    let hers = bench.new_thread_for("marie").await;
+    let first = bench.start(hers).await;
+    let assistant = bench.assistant(hers).await;
+    until_idle(&assistant).await;
+    assert!(assistant.agent_running());
+    bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap();
+    assert!(!assistant.agent_running(), "the agent kept running");
+    assert_eq!(bench.status(&first).await, 401);
+    bench.start(hers).await;
+    until_idle(&assistant).await;
+    assert_eq!(
+        sign_ins_of(&bench, hers),
+        [on("marie", MARIE_TOKEN), on("famille", FAMILLE_TOKEN)]
+    );
+    let specs: Vec<AgentSpec> = bench
+        .specs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|spec| spec.thread == hers)
+        .cloned()
+        .collect();
+    assert_eq!(specs.len(), 2);
+    assert_eq!(specs[0].home, specs[1].home);
+    assert_eq!(specs[0].cwd, specs[1].cwd);
+    let fakes = bench.fakes.lock().unwrap().clone();
+    let resumed = &fakes.last().unwrap().record().resumes;
+    assert_eq!(
+        &*resumed[0].session_id.0,
+        fronde_agent::fake::FAKE_SESSION_ID
+    );
+}
+
+/// A switch names an account the thread's owner may use on its provider: one she may not use
+/// and one that does not exist are refused alike, and the row stays as it was.
+#[tokio::test]
+async fn switch_only_to_an_account_the_owner_may_use() {
+    let bench = shared_bench(&["paul"], many()).await;
+    let hers = bench.new_thread_for("marie").await;
+    let refusals: Vec<_> = {
+        let mut found = Vec::new();
+        for account in ["famille", "claude", "lea", "nope", ""] {
+            let error = bench
+                .threads
+                .set_account(hers, Some(account), &marie())
+                .await
+                .unwrap_err();
+            found.push(refusal(&error).cloned());
+        }
+        found
+    };
+    for found in &refusals {
+        assert_eq!(
+            found.as_ref(),
+            Some(&fronde_agent::threads::Refusal::AccountNotAllowed)
+        );
+    }
+    assert_eq!(
+        fronde_agent::threads::Refusal::AccountNotAllowed.to_string(),
+        refusals[3].as_ref().unwrap().to_string()
+    );
+    assert_eq!(
+        bench.threads.get(hers).await.unwrap().unwrap().account,
+        None
+    );
+    // Her own one is fine, and so is Paul's shared one for him.
+    bench
+        .threads
+        .set_account(hers, Some("marie"), &marie())
+        .await
+        .unwrap();
+    let his = bench.new_thread_for("paul").await;
+    bench
+        .threads
+        .set_account(his, Some("famille"), &paul())
+        .await
+        .unwrap();
+}
+
+/// Only the person a thread is for picks its account: an admin is refused on a member's
+/// thread, and another member does not even find it.
+#[tokio::test]
+async fn only_the_owner_switches() {
+    let bench = shared_bench(&["marie", "paul"], many()).await;
+    let hers = bench.new_thread_for("marie").await;
+    let error = bench
+        .threads
+        .set_account(hers, Some("famille"), &alix())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&error),
+        Some(&fronde_agent::threads::Refusal::NotOwner)
+    );
+    let error = bench
+        .threads
+        .set_account(hers, Some("famille"), &paul())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&error),
+        Some(&fronde_agent::threads::Refusal::NotFound)
+    );
+    assert_eq!(
+        bench.threads.get(hers).await.unwrap().unwrap().account,
+        None
+    );
+}
+
+/// A sub-agent follows its conversation's account: it is never switched on its own.
+#[tokio::test]
+async fn sub_agent_cannot_switch() {
+    let bench = shared_bench(&["marie"], many()).await;
+    let hers = bench.new_thread_for("marie").await;
+    let child = bench
+        .threads
+        .create("marie", StartedBy::Thread(hers), Some(hers), "Mesurer")
+        .await
+        .unwrap()
+        .id;
+    let error = bench
+        .threads
+        .set_account(child, Some("famille"), &marie())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&error),
+        Some(&fronde_agent::threads::Refusal::SubAgent)
+    );
+    assert_eq!(
+        bench.threads.get(child).await.unwrap().unwrap().account,
+        None
+    );
+}
+
+/// Two people on one account share its token and nothing else: each agent has its own home and
+/// working directory, its thread's.
+#[tokio::test]
+async fn shared_account_threads_keep_their_own_home() {
+    let bench = shared_bench(&["marie"], many()).await;
+    let his = bench.new_thread().await;
+    let hers = bench.new_thread_for("marie").await;
+    for (id, user) in [(his, alix()), (hers, marie())] {
+        bench
+            .threads
+            .set_account(id, Some("famille"), &user)
+            .await
+            .unwrap();
+        bench.start(id).await;
+        assert_eq!(sign_ins_of(&bench, id), [on("famille", FAMILLE_TOKEN)]);
+    }
+    let specs = bench.specs.lock().unwrap().clone();
+    let spec_of = |id: ThreadId| specs.iter().find(|spec| spec.thread == id).unwrap();
+    let (his_spec, her_spec) = (spec_of(his), spec_of(hers));
+    assert_ne!(his_spec.home, her_spec.home);
+    assert_ne!(his_spec.cwd, her_spec.cwd);
+    for (id, spec) in [(his, his_spec), (hers, her_spec)] {
+        let dirs = thread_dirs(&bench.data, id);
+        assert_eq!(spec.home, dirs.home);
+        assert_eq!(spec.cwd, dirs.work);
+    }
+    bench.gate.notify_waiters();
+}
+
+/// Sharing an account shares no thread: Marie and Paul both on `famille` see none of each
+/// other's, in the page or through their agents' tools.
+#[tokio::test]
+async fn member_sees_no_thread_through_a_shared_account() {
+    let bench = shared_bench(&["marie", "paul"], many()).await;
+    let hers = bench.new_thread_for("marie").await;
+    let his = bench.new_thread_for("paul").await;
+    bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap();
+    let her_client = bench
+        .client(&bench.start(hers).await, "claude-code", &[])
+        .await;
+    let his_client = bench
+        .client(&bench.start(his).await, "claude-code", &[])
+        .await;
+    assert_eq!(sign_ins_of(&bench, his), [on("famille", FAMILLE_TOKEN)]);
+    for (user, own, other, client) in [
+        (marie(), hers, his, &her_client),
+        (paul(), his, hers, &his_client),
+    ] {
+        let shown: Vec<ThreadId> = bench
+            .threads
+            .summaries(&user)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect();
+        assert!(shown.contains(&own) && !shown.contains(&other), "{shown:?}");
+        let error = bench.threads.visible(other, &user).await.unwrap_err();
+        assert_eq!(
+            refusal(&error),
+            Some(&fronde_agent::threads::Refusal::NotFound)
+        );
+        assert!(listed(client).await.is_empty());
+        let read = call(
+            client,
+            "threads_read",
+            json!({"arguments": {"thread": other.0}}),
+        )
+        .await;
+        assert_eq!(read, no_such_thread());
+    }
+    bench.gate.notify_waiters();
+}
+
+/// The daily counts of sub-agents go to the account each runs on: those of a thread on
+/// `famille` count on `famille`, whoever's thread it is, and never on the owner's own.
+#[tokio::test]
+async fn daily_counts_follow_the_row_account() {
+    let bench = shared_bench(
+        &["marie"],
+        Budget {
+            max_running: 8,
+            limits: Limits {
+                children_per_day: 1,
+                ..Limits::default()
+            },
+            ..Budget::default()
+        },
+    )
+    .await;
+    // Alix's thread on `famille` starts the day's one sub-agent there.
+    let his = bench.new_thread().await;
+    bench
+        .threads
+        .set_account(his, Some("famille"), &alix())
+        .await
+        .unwrap();
+    let client = bench
+        .client(&bench.start(his).await, "claude-code", &[])
+        .await;
+    let child = start_child(&client, TASK).await;
+    token_of(&bench, child).await;
+    assert_eq!(sign_ins_of(&bench, child), [on("famille", FAMILLE_TOKEN)]);
+    // Her own `claude` has its own count.
+    let main = bench
+        .client(&bench.start(ThreadId::MAIN).await, "claude-code", &[])
+        .await;
+    start_child(&main, TASK).await;
+    // Marie's thread on `famille` finds the day's count spent.
+    let hers = bench.new_thread_for("marie").await;
+    bench
+        .threads
+        .set_account(hers, Some("famille"), &marie())
+        .await
+        .unwrap();
+    let her_client = bench
+        .client(&bench.start(hers).await, "claude-code", &[])
+        .await;
+    let refused = call(
+        &her_client,
+        "threads_start",
+        json!({"arguments": {"task": TASK}}),
+    )
+    .await;
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("children_per_day")),
+        "{refused}"
+    );
+    // On her own account she still may.
+    let mine = bench.new_thread_for("marie").await;
+    let mine_client = bench
+        .client(&bench.start(mine).await, "claude-code", &[])
+        .await;
+    start_child(&mine_client, TASK).await;
     bench.gate.notify_waiters();
 }

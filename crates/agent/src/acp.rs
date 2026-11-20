@@ -105,6 +105,38 @@ impl fmt::Display for NoAccount {
 
 impl std::error::Error for NoAccount {}
 
+/// The thread's pick is an account its owner may no longer use (removed from its `users`, the
+/// account removed, or on another provider): no agent starts, and nothing falls back to the
+/// owner's default, which may be a subscription kept for other work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountNotAllowed {
+    pub account: String,
+}
+
+impl AccountNotAllowed {
+    /// What its owner is told, in the thread and when a message is refused.
+    pub fn notice(&self) -> String {
+        format!(
+            "Tu n'as plus accès à l'abonnement « {} » : choisis-en un autre dans le menu de la \
+             conversation.",
+            self.account
+        )
+    }
+}
+
+impl fmt::Display for AccountNotAllowed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "this thread is set to the account {}, which its owner may no longer use: no agent \
+             starts until another is picked",
+            self.account
+        )
+    }
+}
+
+impl std::error::Error for AccountNotAllowed {}
+
 /// How to start the agent and what its session gets.
 #[derive(Clone)]
 pub struct AgentSpec {

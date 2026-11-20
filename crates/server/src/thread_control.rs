@@ -3,7 +3,9 @@
 
 use async_trait::async_trait;
 use fronde_agent::assistant::{AdminFromMember, AdminFromSubAgent, LastingInWake, SecretInWake};
-use fronde_agent::threads::{Background, ChildEnd, ChildTask, Delegation, ThreadId, Threads};
+use fronde_agent::threads::{
+    Background, ChildEnd, ChildTask, Delegation, ThreadId, Threads, Unbound,
+};
 use fronde_hub::threads::{
     Child, NewChild, ProviderModels, ReadThread, Started, ThreadControl, ThreadError, Waited,
 };
@@ -64,13 +66,17 @@ impl ThreadControl for ThreadBridge {
         };
         let mut providers = Vec::new();
         for id in self.0.providers() {
-            // The account a sub-agent of the caller would spend on this provider: none, and
-            // no sub-agent runs there.
-            let account = self.0.account(&caller.owner, id);
-            let background = match &account {
-                Some(account) => background_text(&self.0.background(account)),
-                None => "no account".to_owned(),
+            // The account a sub-agent of the caller would spend on this provider: the caller's
+            // own on its provider, its owner's default on another. None, and no sub-agent runs
+            // there.
+            let chosen = caller.account.as_deref().filter(|_| caller.provider == id);
+            let resolved = self.0.resolve_on(&caller.owner, id, chosen);
+            let background = match &resolved {
+                Ok(account) => background_text(&self.0.background(account)),
+                Err(Unbound::NoAccount) => "no account".to_owned(),
+                Err(Unbound::NotAllowed { .. }) => "account not allowed".to_owned(),
             };
+            let account = resolved.ok();
             let models = self.0.models(id).await.map_err(hub_error)?;
             providers.push(ProviderModels {
                 id: id.to_owned(),

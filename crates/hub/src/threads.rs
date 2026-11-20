@@ -120,8 +120,9 @@ pub struct ProviderModels {
     /// `(id, name)`.
     pub models: Vec<(String, String)>,
     /// Whether sub-agents may run on it now, under the reserve of the caller's own account:
-    /// `allowed`, `paused until <time>`, `unknown` (no usage reading: the daily counts decide)
-    /// or `no account`.
+    /// `allowed`, `paused until <time>`, `unknown` (no usage reading: the daily counts decide),
+    /// `no account`, or `account not allowed` (the conversation's pick is an account its owner
+    /// may no longer use).
     pub background: String,
     /// The caller's own account on it, whose reserve `background` reads, if they have one.
     pub account: Option<String>,

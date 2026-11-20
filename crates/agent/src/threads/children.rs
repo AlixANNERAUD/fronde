@@ -24,7 +24,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::{StartedBy, ThreadId, ThreadRow, Threads, lock};
+use super::{StartedBy, ThreadId, ThreadRow, Threads, Unbound, lock};
 use crate::assistant::{Assistant, Refused};
 use crate::log::{Entry, Event, TurnOutcome};
 
@@ -521,6 +521,9 @@ pub enum Delegation {
     TurnOver,
     /// The thread's owner has no account on the provider: no sub-agent runs for them.
     NoAccount { owner: String, provider: String },
+    /// The thread's conversation is set to an account its owner may no longer use: nothing
+    /// runs in it until another is picked.
+    AccountNotAllowed { account: String },
     /// The thread's owner is no longer a user: it is read-only.
     NoOwner,
     /// The owner's reserve of a subscription window is reached (`[threads] reserve`): `window`,
@@ -608,6 +611,12 @@ impl std::fmt::Display for Delegation {
                 f,
                 "{owner} has no {provider} account, so no sub-agent runs for this conversation; \
                  do the task yourself"
+            ),
+            Self::AccountNotAllowed { account } => write!(
+                f,
+                "this conversation is set to the subscription {account}, which its owner may no \
+                 longer use, so no sub-agent runs for it; do the task yourself, and tell the \
+                 user to pick another subscription in the conversation's menu"
             ),
             Self::Reserve {
                 window,
@@ -713,12 +722,13 @@ impl Threads {
         self.usage_where(|account| !self.usage_is_own(user, account))
     }
 
-    /// Whether `account` is one of `user`'s own, whose usage their meter's pill shows: the one
-    /// predicate [`Threads::usage_of`] and [`Threads::usage_of_others`] split the accounts by.
+    /// Whether `account` is one of `user`'s own, whose usage their meter's pill shows: their
+    /// default on a configured provider. The one predicate [`Threads::usage_of`] and
+    /// [`Threads::usage_of_others`] split the accounts by.
     fn usage_is_own(&self, user: &str, account: &str) -> bool {
         self.providers()
             .into_iter()
-            .any(|provider| self.account(user, provider).as_deref() == Some(account))
+            .any(|provider| self.resolve_on(user, provider, None).as_deref() == Ok(account))
     }
 
     /// The latest reading of each configured account `keep` keeps, by account name.
@@ -741,12 +751,22 @@ impl Threads {
         self.spec.usage.as_ref().map(|book| book.changes())
     }
 
-    /// `owner`'s account on `provider`, or [`Delegation::NoAccount`].
-    fn account_or_refuse(&self, owner: &str, provider: &str) -> Result<String, Delegation> {
-        self.account(owner, provider)
-            .ok_or_else(|| Delegation::NoAccount {
-                owner: owner.to_owned(),
-                provider: provider.to_owned(),
+    /// The account a thread of `owner` on `provider` picked onto `chosen` runs on
+    /// ([`Threads::resolve_on`]), or [`Delegation::NoAccount`] or
+    /// [`Delegation::AccountNotAllowed`].
+    fn account_or_refuse(
+        &self,
+        owner: &str,
+        provider: &str,
+        chosen: Option<&str>,
+    ) -> Result<String, Delegation> {
+        self.resolve_on(owner, provider, chosen)
+            .map_err(|unbound| match unbound {
+                Unbound::NoAccount => Delegation::NoAccount {
+                    owner: owner.to_owned(),
+                    provider: provider.to_owned(),
+                },
+                Unbound::NotAllowed { account } => Delegation::AccountNotAllowed { account },
             })
     }
 
@@ -833,10 +853,11 @@ impl Threads {
         account: &str,
         since: chrono::DateTime<Utc>,
     ) -> anyhow::Result<u64> {
-        let started: Vec<(String, String)> = threads::Entity::find()
+        let started: Vec<(String, String, Option<String>)> = threads::Entity::find()
             .select_only()
             .column(threads::Column::Owner)
             .column(threads::Column::Provider)
+            .column(threads::Column::Account)
             .filter(threads::Column::StartedBy.starts_with("thread:"))
             .filter(threads::Column::CreatedAt.gt(since))
             .into_tuple()
@@ -844,7 +865,11 @@ impl Threads {
             .await?;
         let on_account = started
             .iter()
-            .filter(|(owner, provider)| self.account(owner, provider).as_deref() == Some(account))
+            .filter(|(owner, provider, chosen)| {
+                self.resolve_on(owner, provider, chosen.as_deref())
+                    .as_deref()
+                    == Ok(account)
+            })
             .count();
         Ok(u64::try_from(on_account).unwrap_or(u64::MAX))
     }
@@ -876,12 +901,18 @@ impl Threads {
             .column(threads::Column::Topic)
             .column(threads::Column::Owner)
             .column(threads::Column::Provider)
+            .column(threads::Column::Account)
             .filter(threads::Column::Topic.is_in(by_topic.iter().map(|(topic, _)| topic.clone())))
-            .into_tuple::<(String, String, String)>()
+            .into_tuple::<(String, String, String, Option<String>)>()
             .all(&self.db)
             .await?
             .into_iter()
-            .map(|(topic, owner, provider)| (topic, self.account(&owner, &provider)))
+            .map(|(topic, owner, provider, chosen)| {
+                (
+                    topic,
+                    self.resolve_on(&owner, &provider, chosen.as_deref()).ok(),
+                )
+            })
             .collect();
         Ok(by_topic
             .into_iter()
@@ -1049,9 +1080,13 @@ impl Threads {
         let origin = self.opened(parent).await?.origin_of(turn).await?;
         // Under the start lock: two starts never both pass. The owner's reserve first, from
         // Fronde's own book: nothing the agent says changes it.
-        // The sub-agent spends the account of its parent's owner on its provider, and runs on
-        // nothing when that owner has none.
-        let account = self.account_or_refuse(&parent_row.owner, &provider)?;
+        // The sub-agent spends the account it will run on: its parent's, which it copies, on
+        // the parent's provider; its owner's default on another. Nothing when that is none.
+        let chosen = parent_row
+            .account
+            .as_deref()
+            .filter(|_| provider == parent_row.provider);
+        let account = self.account_or_refuse(&parent_row.owner, &provider, chosen)?;
         let counts = self.check_reserve(&account)?;
         let limits = self.limits();
         let kept = self.kept_children(parent).await?;
@@ -1200,7 +1235,7 @@ impl Threads {
         // sub-agent itself is idle, or the send is refused below as busy.
         let _starting = self.children.starting.lock().await;
         self.check_delegate(caller).await?;
-        let account = self.account_or_refuse(&row.owner, &row.provider)?;
+        let account = self.account_or_refuse(&row.owner, &row.provider, row.account.as_deref())?;
         let counts = self.check_reserve(&account)?;
         let kept = self.kept_children(caller).await?;
         let limit = self.limits().children_running;
@@ -1260,7 +1295,7 @@ impl Threads {
 
     /// Every descendant of `id` that is `id`'s owner's, archived ones included: what an agent
     /// of `id` may list or stop.
-    async fn own_descendants(&self, id: ThreadId) -> anyhow::Result<Vec<ThreadRow>> {
+    pub(super) async fn own_descendants(&self, id: ThreadId) -> anyhow::Result<Vec<ThreadRow>> {
         let Some(row) = self.get(id).await? else {
             return Ok(Vec::new());
         };

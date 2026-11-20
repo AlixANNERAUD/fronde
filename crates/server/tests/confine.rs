@@ -1858,16 +1858,15 @@ async fn each_agent_environment_holds_its_owners_token_only() {
     );
     let mut accounts = Accounts::default();
     for (owner, token) in [("alix", ALIX), ("marie", MARIE)] {
-        accounts.insert(
-            owner,
-            "claude",
-            Binding {
-                account: owner.into(),
-                token: Some(fronde_agent::acp::oauth_token(move || async move {
-                    Ok(SecretString::from(token))
-                })),
-            },
-        );
+        accounts.insert(Binding {
+            account: owner.into(),
+            provider: "claude".into(),
+            owner: owner.into(),
+            users: Vec::new(),
+            token: Some(fronde_agent::acp::oauth_token(move || async move {
+                Ok(SecretString::from(token))
+            })),
+        });
     }
     let people = People {
         users: [
@@ -1936,4 +1935,165 @@ async fn each_agent_environment_holds_its_owners_token_only() {
         assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], MARIE, "thread {id}");
         assert!(!text.contains(ALIX), "thread {id}:\n{text}");
     }
+}
+
+/// Two people on one shared account, through the real helper and its sandbox: both agents get
+/// that account's token, and nothing else of each other's. Marie's agent has its own `HOME`,
+/// and reading Alix's agent's transcript or credentials file in Alix's thread's home is refused
+/// (`EACCES`); Fronde writes no credentials file in any home.
+#[tokio::test]
+async fn shared_account_agents_cannot_read_each_others_home() {
+    use fronde_agent::threads::{Accounts, Binding, Budget, People, StartedBy, Threads};
+    use fronde_requests::User;
+    const FAMILLE: &str = "token-of-famille";
+    let exe = std::env::current_exe().unwrap();
+    let exe_dir = exe.parent().unwrap().display().to_string();
+    let setup = setup(&format!("read = [{exe_dir:?}]"));
+    if !landlock() {
+        return;
+    }
+    // Thread 2 is Alix's, thread 3 Marie's.
+    let alix_home = thread_dirs(&setup.data, ThreadId(2)).home;
+    let planted = [
+        alix_home.join(".claude/projects/t.jsonl"),
+        alix_home.join(".claude/.credentials.json"),
+    ];
+    let script = format!(
+        r#"env > "$PWD/env.txt"; for f in {:?} {:?}; do LC_ALL=C cat "$f" >> "$PWD/read.txt" 2>&1; done; "$0" --exact acp_child --nocapture | grep --line-buffered '^{{'"#,
+        planted[0].display().to_string(),
+        planted[1].display().to_string(),
+    );
+    let spec = setup.spec(
+        &["/bin/sh", "-c", &script, exe.to_str().unwrap()],
+        &[("FRONDE_ACP_CHILD", "1")],
+    );
+    let reading = |value: &'static str| {
+        Some(fronde_agent::acp::oauth_token(move || async move {
+            Ok(SecretString::from(value))
+        }))
+    };
+    let mut accounts = Accounts::default();
+    accounts.insert(Binding {
+        account: "claude".into(),
+        provider: "claude".into(),
+        owner: "alix".into(),
+        users: Vec::new(),
+        token: reading("token-of-alix"),
+    });
+    accounts.insert(Binding {
+        account: "famille".into(),
+        provider: "claude".into(),
+        owner: "alix".into(),
+        users: vec!["marie".into()],
+        token: reading(FAMILLE),
+    });
+    accounts.set_default("alix", "claude", "claude");
+    let (alix, marie) = (
+        User {
+            name: "alix".into(),
+            admin: true,
+        },
+        User {
+            name: "marie".into(),
+            admin: false,
+        },
+    );
+    let people = People {
+        users: [alix.clone(), marie].into_iter().collect(),
+        owner: "alix".into(),
+        prompt: None,
+        accounts,
+    };
+    let db = fronde_db::open(&setup.data).await.unwrap();
+    let threads = Threads::open_for(
+        db,
+        &setup.data,
+        spec,
+        fronde_agent::assistant::confined_connector(setup.confine.clone()),
+        people,
+        Budget::default(),
+    )
+    .await
+    .unwrap();
+    let his = threads
+        .create("alix", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    assert_eq!(his, ThreadId(2));
+    threads
+        .set_account(his, Some("famille"), &alix)
+        .await
+        .unwrap();
+    let assistant = threads.assistant(his).await.unwrap().unwrap();
+    assistant.send("Bonjour".into()).await;
+    turns_ended(&assistant).await;
+    // What Alix's agent left in its home: its transcript and a sign-in of its own.
+    for file in &planted {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "secret of alix").unwrap();
+    }
+    let hers = threads
+        .create("marie", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    assert_eq!(hers, ThreadId(3));
+    let assistant = threads.assistant(hers).await.unwrap().unwrap();
+    assistant.send("Bonjour".into()).await;
+    // Her agent cannot run the fake adapter (`[agent] read`, which lets it reach this test's
+    // binary, is the owner's alone): its turn fails once the script has run.
+    turns_ended(&assistant).await;
+
+    let env_of = |id: ThreadId| {
+        let file = thread_dirs(&setup.data, id).work.join("env.txt");
+        variables(&std::fs::read_to_string(&file).unwrap())
+    };
+    let (his_env, her_env) = (env_of(his), env_of(hers));
+    assert_eq!(his_env["CLAUDE_CODE_OAUTH_TOKEN"], FAMILLE);
+    assert_eq!(her_env["CLAUDE_CODE_OAUTH_TOKEN"], FAMILLE);
+    let her_home = thread_dirs(&setup.data, hers).home;
+    assert_eq!(her_env["HOME"], her_home.display().to_string());
+    assert_eq!(his_env["HOME"], alix_home.display().to_string());
+    let read =
+        std::fs::read_to_string(thread_dirs(&setup.data, hers).work.join("read.txt")).unwrap();
+    assert!(!read.contains("secret of alix"), "{read}");
+    assert_eq!(read.matches("Permission denied").count(), 2, "{read}");
+    // The token went in by environment only: no home holds a credentials file Fronde wrote.
+    let mut credentials = Vec::new();
+    let mut dirs = vec![setup.data.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(path);
+            } else if entry.file_name() == ".credentials.json" {
+                credentials.push(path);
+            }
+        }
+    }
+    assert_eq!(credentials, [planted[1].clone()]);
+}
+
+/// Waits until thread `assistant`'s log holds an ended turn, however it ended.
+async fn turns_ended(assistant: &fronde_agent::assistant::Assistant) {
+    use fronde_agent::log::Event;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !assistant
+            .log()
+            .since(0)
+            .iter()
+            .any(|entry| matches!(entry.event, Event::TurnEnded { .. }))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "thread {}: {:?}",
+            assistant.thread(),
+            assistant.log().since(0)
+        )
+    });
 }

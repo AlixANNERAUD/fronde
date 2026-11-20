@@ -4176,3 +4176,70 @@ async fn owner_slash_is_thread_one() {
     assert!(newest > 0);
     assert_eq!(ids(&threads), [ThreadId::MAIN]);
 }
+
+/// A thread picked onto an account its owner may no longer use refuses a message from the
+/// page, saying how to fix it, before any agent starts; the row keeps its pick.
+#[tokio::test]
+async fn unusable_pick_refuses_a_send() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    two_people(path);
+    fronde_hub::private::write(path.join("famille.token"), "token-of-famille").unwrap();
+    // `famille` is Alix's alone: Marie may not use it.
+    let config = fronde_hub::config::load_str(
+        "[server]\nlisten = \"127.0.0.1:0\"\ntoken = { file = \"token\" }\n\
+         [data]\ndir = \"data\"\ntimezone = \"Europe/Paris\"\nuser = \"Alix\"\n\
+         [memory]\ngit = false\n\
+         [secrets]\nbackend = \"file\"\nmaster_key = { file = \"master.key\" }\n\
+         [web]\n\
+         [users.Alix]\nadmin = true\npassword = { file = \"password\" }\n\
+         [users.marie]\npassword = { file = \"marie.password\" }\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"Alix\"\ndefault_for = [\"Alix\"]\n\
+         oauth_token = { file = \"alix.token\" }\n\
+         [accounts.famille]\nprovider = \"claude\"\nowner = \"Alix\"\n\
+         oauth_token = { file = \"famille.token\" }\n\
+         [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+         oauth_token = { file = \"marie.token\" }\n",
+        path,
+    )
+    .unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(config, connector, &site(path)).await;
+    let cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    let hers = create(&mut socket, "client-1", "Salut").await;
+    hello_thread(&mut socket, hers, 0, None).await;
+    until_turn_ended(&mut socket).await;
+    // Picked in an earlier run, when `famille` still listed her.
+    let db = database(path).await;
+    fronde_entity::threads::Entity::update_many()
+        .col_expr(
+            fronde_entity::threads::Column::Account,
+            Expr::value("famille".to_owned()),
+        )
+        .filter(fronde_entity::threads::Column::Id.eq(hers.0))
+        .exec(&db)
+        .await
+        .unwrap();
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Encore".into(),
+            thread: Some(hers),
+        },
+    )
+    .await;
+    let (thread, _, reason) = next_thread_refusal(&mut socket).await;
+    assert_eq!(thread, Some(hers));
+    assert_eq!(
+        reason,
+        "Tu n'as plus accès à l'abonnement « famille » : choisis-en un autre dans le menu de la conversation."
+    );
+    let row = fronde_entity::threads::Entity::find_by_id(hers.0)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.account.as_deref(), Some("famille"));
+}

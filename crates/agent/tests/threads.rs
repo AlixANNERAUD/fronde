@@ -3906,16 +3906,15 @@ async fn remapped_owner_applies_at_the_next_start() {
     });
     let people = |account: &str, token: &'static str| {
         let mut accounts = Accounts::default();
-        accounts.insert(
-            "marie",
-            "claude",
-            Binding {
-                account: account.into(),
-                token: Some(fronde_agent::acp::oauth_token(move || async move {
-                    Ok(secrecy::SecretString::from(token))
-                })),
-            },
-        );
+        accounts.insert(Binding {
+            account: account.into(),
+            provider: "claude".into(),
+            owner: "marie".into(),
+            users: Vec::new(),
+            token: Some(fronde_agent::acp::oauth_token(move || async move {
+                Ok(secrecy::SecretString::from(token))
+            })),
+        });
         People {
             users: [
                 alix(),
@@ -4195,14 +4194,13 @@ async fn a_result_never_wakes_another_persons_thread() {
     let db = fronde_db::open(dir.path()).await.unwrap();
     let mut accounts = Accounts::default();
     for name in ["alix", "marie"] {
-        accounts.insert(
-            name,
-            "claude",
-            Binding {
-                account: name.into(),
-                token: None,
-            },
-        );
+        accounts.insert(Binding {
+            account: name.into(),
+            provider: "claude".into(),
+            owner: name.into(),
+            users: Vec::new(),
+            token: None,
+        });
     }
     let people = People {
         users: [
@@ -4339,20 +4337,19 @@ async fn the_token_is_read_again_at_each_start() {
         }
     });
     let mut accounts = Accounts::default();
-    accounts.insert(
-        "marie",
-        "claude",
-        Binding {
-            account: "marie".into(),
-            token: Some(fronde_agent::acp::oauth_token({
-                let current = current.clone();
-                move || {
-                    let value = *current.lock().unwrap();
-                    async move { Ok(secrecy::SecretString::from(value)) }
-                }
-            })),
-        },
-    );
+    accounts.insert(Binding {
+        account: "marie".into(),
+        provider: "claude".into(),
+        owner: "marie".into(),
+        users: Vec::new(),
+        token: Some(fronde_agent::acp::oauth_token({
+            let current = current.clone();
+            move || {
+                let value = *current.lock().unwrap();
+                async move { Ok(secrecy::SecretString::from(value)) }
+            }
+        })),
+    });
     let people = People {
         users: [
             alix(),
@@ -4503,14 +4500,13 @@ async fn an_archive_never_reaches_another_persons_thread() {
     let db = fronde_db::open(dir.path()).await.unwrap();
     let mut accounts = Accounts::default();
     for name in ["alix", "marie"] {
-        accounts.insert(
-            name,
-            "claude",
-            Binding {
-                account: name.into(),
-                token: None,
-            },
-        );
+        accounts.insert(Binding {
+            account: name.into(),
+            provider: "claude".into(),
+            owner: name.into(),
+            users: Vec::new(),
+            token: None,
+        });
     }
     let people = People {
         users: [
@@ -4668,4 +4664,156 @@ async fn home_cannot_be_archived() {
     );
     // Asked for again, the home is the same thread.
     assert_eq!(threads.home(&marie).await.unwrap(), home);
+}
+
+/// An account of `provider` that `owner` subscribes to, `users` may use too, without a token.
+fn binding(account: &str, provider: &str, owner: &str, users: &[&str]) -> Binding {
+    Binding {
+        account: account.into(),
+        provider: provider.into(),
+        owner: owner.into(),
+        users: users.iter().map(|user| (*user).to_owned()).collect(),
+        token: None,
+    }
+}
+
+/// The one lookup from a thread to its account: its pick when its owner may use it, else a
+/// refusal that never falls back; without a pick, its owner's default, named or the only one
+/// they may use; else no account.
+#[test]
+fn for_thread_follows_the_pick_else_the_default() {
+    use fronde_agent::threads::Unbound;
+    let mut accounts = Accounts::default();
+    accounts.insert(binding("alix", "claude", "alix", &[]));
+    accounts.insert(binding("famille", "claude", "alix", &["marie", "paul"]));
+    accounts.insert(binding("marie", "claude", "marie", &[]));
+    accounts.insert(binding("ailleurs", "other", "marie", &[]));
+    accounts.set_default("alix", "claude", "alix");
+    accounts.set_default("marie", "claude", "marie");
+    let account = |owner: &str, provider: &str, chosen: Option<&str>| {
+        accounts
+            .for_thread(owner, provider, chosen)
+            .map(|binding| binding.account.clone())
+    };
+    // Defaults: named, else the only usable one, else none.
+    assert_eq!(account("alix", "claude", None), Ok("alix".into()));
+    assert_eq!(account("marie", "claude", None), Ok("marie".into()));
+    assert_eq!(account("paul", "claude", None), Ok("famille".into()));
+    assert_eq!(account("lea", "claude", None), Err(Unbound::NoAccount));
+    // A pick its owner may use.
+    assert_eq!(
+        account("marie", "claude", Some("famille")),
+        Ok("famille".into())
+    );
+    assert_eq!(
+        account("alix", "claude", Some("famille")),
+        Ok("famille".into())
+    );
+    // A pick she may not use, one that does not exist, one of another provider: refused,
+    // never her default instead.
+    for (owner, chosen) in [
+        ("paul", "marie"),
+        ("marie", "alix"),
+        ("marie", "nope"),
+        ("marie", "ailleurs"),
+        ("lea", "famille"),
+    ] {
+        assert_eq!(
+            account(owner, "claude", Some(chosen)),
+            Err(Unbound::NotAllowed {
+                account: chosen.into()
+            }),
+            "{owner} on {chosen}"
+        );
+    }
+    assert!(accounts.may_use("paul", "famille"));
+    assert!(!accounts.may_use("paul", "alix"));
+    assert_eq!(accounts.subscriber("famille"), Some("alix"));
+    let usable: Vec<&str> = accounts
+        .usable_by("marie", "claude")
+        .into_iter()
+        .map(|binding| binding.account.as_str())
+        .collect();
+    assert_eq!(usable, ["famille", "marie"]);
+    assert_eq!(accounts.names(), ["ailleurs", "alix", "famille", "marie"]);
+}
+
+/// Sets thread `id`'s stored account in the database of `dir`.
+async fn set_pick(dir: &Path, id: ThreadId, account: &str) {
+    use sea_orm::{ColumnTrait, QueryFilter, sea_query::Expr};
+    let db = fronde_db::open(dir).await.unwrap();
+    fronde_entity::threads::Entity::update_many()
+        .col_expr(
+            fronde_entity::threads::Column::Account,
+            Expr::value(account.to_owned()),
+        )
+        .filter(fronde_entity::threads::Column::Id.eq(id.0))
+        .exec(&db)
+        .await
+        .unwrap();
+}
+
+/// A pick is its person's: a thread given to someone else forgets it, back on its new owner's
+/// default, whether `ensure_main` gives thread 1's tree to `[data] user` or `reassign` gives a
+/// person's conversations away. Given back to the same person, it keeps it.
+#[tokio::test]
+async fn a_thread_given_away_forgets_its_pick() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["me", "paul"], "me").await;
+    let child = threads
+        .create(
+            "me",
+            StartedBy::Thread(ThreadId::MAIN),
+            Some(ThreadId::MAIN),
+            "Mesurer",
+        )
+        .await
+        .unwrap()
+        .id;
+    let his = threads
+        .create("paul", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    let under = threads
+        .create("paul", StartedBy::Thread(his), Some(his), "Compter")
+        .await
+        .unwrap()
+        .id;
+    drop(threads);
+    for id in [ThreadId::MAIN, child, his, under] {
+        set_pick(dir.path(), id, "famille").await;
+    }
+    let account = |id: ThreadId| {
+        let dir = dir.path().to_path_buf();
+        async move {
+            let db = fronde_db::open(&dir).await.unwrap();
+            fronde_entity::threads::Entity::find_by_id(id.0)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .account
+        }
+    };
+    // The main tree goes to the new `[data] user`, Paul leaves.
+    drop(open_people(dir.path(), &["alix"], "alix").await);
+    for id in [ThreadId::MAIN, child] {
+        assert_eq!(account(id).await, None, "thread {id}");
+    }
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    // Back to Paul himself: his picks stay.
+    fronde_agent::threads::reassign(&db, dir.path(), "removed:paul", "paul")
+        .await
+        .unwrap();
+    for id in [his, under] {
+        assert_eq!(account(id).await.as_deref(), Some("famille"), "thread {id}");
+    }
+    // To Marie: hers to pick.
+    fronde_agent::threads::reassign(&db, dir.path(), "paul", "marie")
+        .await
+        .unwrap();
+    for id in [his, under] {
+        assert_eq!(account(id).await, None, "thread {id}");
+    }
 }

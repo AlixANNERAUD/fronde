@@ -347,19 +347,21 @@ reserve` applies on it. Every agent Fronde starts for a thread of theirs (their 
 sub-agents, the turns a sub-agent's result wakes) signs in with an account's token, read again at
 each start, and with no one else's. A person without an account on a provider gets no agent
 there: the thread says « Aucun abonnement Claude n'est relié à ton compte : demande à
-l'administrateur. », and nothing falls back to the owner's account. Which account is a person's
-is read from the file at start, never stored with the threads: a change applies at each agent's
-next start after a restart.
+l'administrateur. », and nothing falls back to the owner's account. Who may use which account is
+read from the file at start: a change applies at each agent's next start after a restart.
 
 One account may be used by several people, and one person may use several accounts of one
 provider (their own Claude and a family one): a person **may use** an account they own or that
 lists them in `users`. Their **default account** on a provider is the one whose `default_for`
-names them, or else the only account of that provider they may use. Running each person's threads
-on their default account, which may be someone else's, and choosing another one per conversation
-are **planned**: until then `users` and `default_for` are read, checked and listed by
-`fronde check`, and each person's threads run on an account they own, their default when they own
-it. Sharing an account shares its usage windows, its reserve and its daily counts, never a
-conversation, a home, a session or a credential (see
+names them, or else the only account of that provider they may use. Each thread runs on one
+account its owner may use: the one its owner picked for it, kept with the thread, else their
+default, looked up at each start, so that a default changed in the file applies at the next
+start. A sub-agent runs on its conversation's account. A pick the owner may no longer use (they
+left the account's `users`, or the account is gone) refuses the thread's messages with « Tu n'as
+plus accès à l'abonnement « famille » : choisis-en un autre dans le menu de la conversation. »,
+and never falls back to the default; restoring the file restores the thread. Picking an account
+from the page is **planned**. Sharing an account shares its usage windows, its reserve and its
+daily counts, never a conversation, a home, a session or a credential (see
 [One subscription, several people](../explanation/subscriptions.md#one-subscription-several-people)).
 
 | Key | Type | Default | Meaning |

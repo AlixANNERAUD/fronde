@@ -17,6 +17,7 @@ mod m20261117_000006_requests;
 mod m20261117_000007_requests_retry_index;
 mod m20261117_000008_threads;
 mod m20261117_000009_stream_entries_at;
+mod m20261120_000010_threads_account;
 
 /// Every migration of Fronde, in the order they apply.
 pub struct Migrator;
@@ -34,6 +35,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261117_000007_requests_retry_index::Migration),
             Box::new(m20261117_000008_threads::Migration),
             Box::new(m20261117_000009_stream_entries_at::Migration),
+            Box::new(m20261120_000010_threads_account::Migration),
         ]
     }
 }

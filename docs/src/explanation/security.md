@@ -488,20 +488,27 @@ thread's first message, with its own directories, its own sandbox and its own hu
   writes to their own threads only, answers their own cards only, and gets the usage readings of
   their own account only, never anyone else's; an admin's page sees every thread and every
   account's readings.
-- **Which token reaches which agent.** A thread's account is its owner's account for the
-  thread's provider, looked up at each start and by nothing else: no argument, agent, card or
-  page chooses it, and the thread's row does not store it. A sub-agent's row carries its parent's
-  owner, so it runs on its root thread's account; a wake turn runs in its parent's own thread,
-  on the parent's. The token is read before anything starts: when the owner has no account on
-  the provider (or its stored token is not stored yet, or the owner is no longer a user), no hub
-  token is made, no process starts, the thread says why and the turn fails; nothing falls back to
-  another person's account, the owner's included. Only the legacy form's account, the owner's,
+- **Which token reaches which agent.** A thread runs on one account its owner may use (they
+  subscribe to it, or its `users` list them): the one its owner picked for it, stored in its row,
+  else their default for the thread's provider, looked up at each start. Nothing else chooses it:
+  no tool argument (`threads_start` takes no account), agent, header, card or `_meta`, and only the
+  thread's owner may change a pick, an admin included, never while a turn runs in its tree. A
+  sub-agent copies its parent's pick when it is made and a switch moves the whole tree, so a tree
+  runs on its root thread's account; a wake turn runs in its parent's own thread, on the
+  parent's. The account is resolved again at each start, before anything starts: when the owner
+  has no account on the provider, may no longer use the one picked, or is no longer a user (or the
+  account's stored token is not stored yet), no hub token is made, no process starts, the thread
+  says why and the turn fails; nothing falls back to another account, the owner's default
+  included. Only the legacy form's account, the owner's,
   may lack a token, and its agent then starts unsigned as before. The agent never inherits a
   sign-in variable from Fronde's environment (see [The agent's environment](#the-agents-environment)):
   the account's token is the only `CLAUDE_CODE_OAUTH_TOKEN` it gets. Usage readings, the reserve
   and the daily counts of sub-agents are kept per account; a reading from an agent without an
-  account is kept nowhere. The meter shows each person their own account's usage only, and an
-  admin every account's.
+  account is kept nowhere. The meter shows each person their default account's usage only, and an
+  admin every account's. People who share an account share its token and nothing else: each
+  thread keeps its own home and working directory, which its sandbox alone writes, so no
+  transcript, `~/.claude` state, session or credential goes from one person's agent to another's;
+  the token reaches the agent through its environment only, and Fronde writes no credential file.
 - **What anyone else's agent reaches.** Until each person has a memory and spaces of their own,
   memory, the calendar, every component's and upstream server's tools, and setting up an
   integration are the owner's, `[data] user`'s, not every admin's. The agent of anyone else's

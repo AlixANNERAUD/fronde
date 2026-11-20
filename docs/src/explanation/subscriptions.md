@@ -107,7 +107,7 @@ window no longer lists them.
 ### One subscription per person
 
 Readings belong to a subscription account, the one the agent that sent them signs in with: its
-thread's owner's (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)), kept
+thread's (see [`[accounts.<name>]`](../reference/configuration.md#accountsname)), kept
 under that account's name. A reading from an agent without an account (its owner has none, or
 is no longer a user, so it never starts) is kept nowhere: never under another account, never
 under one name shared by everyone without one.
@@ -140,9 +140,12 @@ An account may list other people in `users`, and a person may use several accoun
 provider: their own Claude and a family one, say (see
 [`[accounts.<name>]`](../reference/configuration.md#accountsname)). Each person has one default
 account per provider, named by `default_for` when they may use more than one, so that who pays
-for a conversation is always written in the file, never guessed. Running a person's threads on an
-account someone else owns, and picking another account for one conversation, are **planned**:
-for now each person's threads run on an account they own.
+for a conversation is always written in the file, never guessed. A conversation runs on its
+owner's default, which may be an account someone else subscribes to, unless its owner picked
+another one they may use for it; its sub-agents run on the same. Picking an account from the page
+is **planned**. A pick is never replaced behind its owner's back: when they may no longer use it,
+the conversation refuses messages until they pick another, rather than run on their default, which
+may be a subscription kept for other work.
 
 What the people of one account share is what the subscription itself counts:
 

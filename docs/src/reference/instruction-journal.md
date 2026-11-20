@@ -241,6 +241,20 @@ the history gives no reason, the entry says so.
   message: keep a share of the subscription for the owner. Expected: the agent checks before
   starting, and explains a refusal. Observed: not recorded. Scope: general (only Claude Code has
   read it). Evaluation: threads tests.
+- 2026-11-20, commit `feat(agent): run each thread on an account its owner may use`. Surface:
+  `children.rs` `Delegation::AccountNotAllowed`; the `background` value `account not allowed` of
+  `threads_list`'s providers (`crates/server/src/thread_control.rs`, documented on
+  `ProviderModels::background` in `crates/hub/src/threads.rs`). Change: a `threads_start` or
+  `threads_send` in a conversation set to an account its owner may no longer use is refused with
+  "this conversation is set to the subscription <account>, which its owner may no longer use, so
+  no sub-agent runs for it; do the task yourself, and tell the user to pick another subscription in
+  the conversation's menu", and `threads_list` says `account not allowed` instead of `allowed` or
+  `paused`. The French notice « Tu n'as plus accès à l'abonnement … » is shown to people only.
+  Rationale: a pick is refused rather than replaced by the owner's default, so the agent must
+  neither retry nor expect another account to take over. Expected: the agent does the task itself
+  and tells the user how to fix the conversation. Observed: to observe. Scope: general (only Claude
+  Code has read it). Evaluation: `unusable_pick_refuses_the_start` checks the refusal is
+  `AccountNotAllowed`; none for the wording's effect.
 
 ## Agent's identity and tone
 
@@ -265,7 +279,7 @@ the history gives no reason, the entry says so.
 | `search_tools`, `use_tool` | `crates/hub/src/tools.rs` `meta_tools` | 2026-11-16 |
 | Unknown tool answer | `crates/hub/src/tools.rs` `unknown_tool` | 2026-11-18 |
 | `memory_add`, `memory_replace`, `memory_search` | `crates/hub/src/memory/tools.rs` | 2026-11-16 |
-| `threads_*` descriptions, refusals and hints | `crates/hub/src/threads.rs`, `crates/agent/src/threads/children.rs` | 2026-11-17 |
+| `threads_*` descriptions, refusals and hints | `crates/hub/src/threads.rs`, `crates/agent/src/threads/children.rs` | 2026-11-20 |
 | `user_ask` | `crates/hub/src/user.rs` `DESCRIPTION` | 2026-11-17 |
 | `user_secret` | `crates/hub/src/user.rs` `SECRET_DESCRIPTION` | 2026-11-17 |
 | `integrations_request_setup` | `crates/hub/src/integrations.rs` `DESCRIPTION` | 2026-11-17 |

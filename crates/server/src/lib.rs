@@ -1208,39 +1208,37 @@ pub async fn start_with(
     // The chat's assistant and its requests come first: the hub's tools ask through them.
     let chat = match password {
         Some((password, secure_cookie)) => {
-            // Each person's account per provider, its token read at each start of an agent of
-            // theirs. The configuration is read once per run: a reload would have to stop the
-            // agents of every person whose account changed.
+            // Every account, who may use it and each person's default per provider, its token
+            // read at each start of an agent on it. The configuration is read once per run: a
+            // reload would have to stop the agents of every thread whose account changed.
             let mut bindings = fronde_agent::threads::Accounts::default();
-            for account in config.accounts() {
-                // Each person's threads still run on an account they own: of two they own on
-                // one provider, their default when it is one of them, else the first.
-                let default = config
-                    .default_account(&account.owner, &account.provider)
-                    .map(|default| default.name);
-                if bindings.of(&account.owner, &account.provider).is_some()
-                    && default.as_deref() != Some(account.name.as_str())
-                {
-                    continue;
-                }
-                let token = account.token.map(|token| {
+            let configured = config.accounts();
+            for account in &configured {
+                let token = account.token.clone().map(|token| {
                     account_token(account.name.clone(), token, db.clone(), backends.clone())
                 });
-                bindings.insert(
-                    &account.owner,
-                    &account.provider,
-                    fronde_agent::threads::Binding {
-                        account: account.name,
-                        token,
-                    },
-                );
+                bindings.insert(fronde_agent::threads::Binding {
+                    account: account.name.clone(),
+                    provider: account.provider.clone(),
+                    owner: account.owner.clone(),
+                    users: account.users.clone(),
+                    token,
+                });
             }
-            // Every account's, bound or not: a reading is never dropped for want of a binding.
-            let accounts: Vec<String> = config
-                .accounts()
-                .into_iter()
-                .map(|account| account.name)
+            let providers: std::collections::BTreeSet<&str> = configured
+                .iter()
+                .map(|account| account.provider.as_str())
                 .collect();
+            for user in config.users().iter() {
+                for provider in &providers {
+                    if let Some(default) = config.default_account(&user.name, provider) {
+                        bindings.set_default(&user.name, provider, &default.name);
+                    }
+                }
+            }
+            // Every account's: a reading is never dropped for want of a binding.
+            let accounts: Vec<String> =
+                configured.into_iter().map(|account| account.name).collect();
             let main = thread_dirs(&data_dir, ThreadId::MAIN);
             for dir in [&main.work, &main.home] {
                 fronde_hub::private::create_dir_all(dir).with_context(|| {

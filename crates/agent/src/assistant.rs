@@ -10,7 +10,8 @@ use crate::log::{ConversationLog, Event, ToolState, TurnOutcome};
 use crate::permission;
 use crate::threads::wakes::{self, Opened, Queue, Wake};
 use crate::threads::{
-    self, Changes, Delegation, Handoff, Limits, Pause, Pool, Registry, Slot, ThreadId, TurnResult,
+    self, Changes, Delegation, Handoff, Limits, Pause, Pool, Registry, Signer, Slot, ThreadId,
+    TurnResult,
 };
 use crate::tokens::{TokenLease, Tokens};
 use agent_client_protocol::v1::schema::CreateElicitationResponse;
@@ -120,7 +121,11 @@ pub struct Assistant {
     /// The thread's stream.
     topic: String,
     /// How this thread's agent starts: its directories and its scope's name are the thread's.
+    /// It holds no token and no account: [`Assistant::signer`] gives them at each start.
     spec: AgentSpec,
+    /// The account its agent signs in with, resolved at each start from the thread's owner,
+    /// provider and pick.
+    signer: Signer,
     connector: Connector,
     /// Where each start of the agent gets its own hub token.
     tokens: Tokens,
@@ -291,6 +296,7 @@ impl Assistant {
         thread: ThreadId,
         topic: String,
         spec: AgentSpec,
+        signer: Signer,
         shared: Shared,
         archived: bool,
         owners: bool,
@@ -312,6 +318,7 @@ impl Assistant {
             thread,
             topic,
             spec,
+            signer,
             connector,
             tokens,
             pool,
@@ -881,10 +888,9 @@ impl Assistant {
     /// may run or no reading decides (then only the wake budget holds results).
     fn reserve_hold(&self) -> Option<HoldReason> {
         let book = self.spec.usage.as_ref()?;
-        // The account its agent signs in with: the thread's (`AgentSpec::account`). A thread
-        // without one holds nothing here: its agent cannot start, and its turn fails before
-        // spending any account.
-        let usage = book.get(self.spec.account.as_deref()?);
+        // The account its agent signs in with, the thread's. A thread without one holds nothing
+        // here: its agent cannot start, and its turn fails before spending any account.
+        let usage = book.get(&self.signer.account()?);
         match fronde_protocol::usage::background(usage.as_ref(), self.limits.reserve, Utc::now()) {
             Background::Paused(pause) => Some(HoldReason::Reserve {
                 used: pause.used_percent(),
@@ -1597,6 +1603,10 @@ impl Assistant {
     /// Starts the agent in `slot` and resumes the saved session, or opens a new one. Each start
     /// of the agent gets a new hub token, which the session holds with the slot.
     async fn connect(self: &Arc<Self>, slot: Slot) -> anyhow::Result<Session> {
+        // The thread's account, resolved now and before anything starts: without one (no
+        // account, a pick its owner may no longer use, an owner no longer configured), no hub
+        // token is made and no process starts.
+        let binding = self.signer.binding()?;
         // The main thread's directories are the data directory's `agent` and `home`, which the
         // server makes; another thread's are made when its agent first starts.
         if self.thread != ThreadId::MAIN {
@@ -1606,11 +1616,11 @@ impl Assistant {
                 })?;
             }
         }
-        // The owner's account's token, read at each start and before anything starts: without
-        // one (no account, not connected, an owner no longer configured), no hub token is
-        // made and no process starts.
+        // Its token, read at each start and before anything starts: one not connected yet
+        // starts nothing either.
         let mut spec = self.spec.clone();
-        if let Some(read) = &self.spec.oauth_token {
+        spec.account = Some(binding.account);
+        if let Some(read) = &binding.token {
             let token = read().await?;
             spec.oauth_token = Some(crate::acp::oauth_token(move || {
                 let token = token.clone();
@@ -1660,6 +1670,12 @@ impl Assistant {
         *self.session_slot() = Some(session.clone());
         tokio::spawn(recorder);
         Ok(session)
+    }
+
+    /// The thread was switched to `account` (`None`: its owner's default), which its next start
+    /// signs in with ([`Threads::set_account`](crate::threads::Threads::set_account)).
+    pub(crate) fn set_account(&self, account: Option<String>) {
+        self.signer.set(account);
     }
 
     /// Stops the thread's agent process when no turn runs, revoking its hub token and freeing
@@ -2029,6 +2045,12 @@ fn notice_for(error: &anyhow::Error) -> String {
         .any(|cause| cause.is::<crate::threads::NoOwner>())
     {
         return NO_OWNER.into();
+    }
+    if let Some(gone) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::acp::AccountNotAllowed>())
+    {
+        return gone.notice();
     }
     // A limit says when turns run again.
     if let Some(limited) = error.downcast_ref::<crate::usage::RateLimited>() {
