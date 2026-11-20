@@ -4817,3 +4817,36 @@ async fn a_thread_given_away_forgets_its_pick() {
         assert_eq!(account(id).await, None, "thread {id}");
     }
 }
+
+/// A person removed from the configuration leaves her home buried with her other threads: a new
+/// person configured later under the same name gets a home of her own, never the buried one.
+#[tokio::test]
+async fn a_new_person_of_a_removed_name_gets_a_fresh_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["alix", "marie"], "alix").await;
+    let buried = threads.home(&threads.user_of("marie")).await.unwrap();
+    drop(threads);
+
+    let threads = open_people(dir.path(), &["alix"], "alix").await;
+    assert_eq!(
+        threads.get(buried).await.unwrap().unwrap().owner,
+        "removed:marie"
+    );
+    drop(threads);
+
+    let threads = open_people(dir.path(), &["alix", "marie"], "alix").await;
+    let marie = threads.user_of("marie");
+    let home = threads.home(&marie).await.unwrap();
+    assert!(home != buried && home != ThreadId::MAIN);
+    assert_eq!(threads.get(home).await.unwrap().unwrap().owner, "marie");
+    assert_eq!(
+        threads
+            .visible(buried, &marie)
+            .await
+            .unwrap_err()
+            .downcast::<Refusal>()
+            .unwrap(),
+        Refusal::NotFound
+    );
+    assert_eq!(threads.home(&marie).await.unwrap(), home);
+}

@@ -79,12 +79,14 @@ Messages are JSON objects tagged by `type`. A page's message is at most 64 KiB; 
 closes the socket.
 
 A socket streams one **thread** at a time, the one its last `hello` named. Every `thread` field
-is optional where shown so: without it, a message is for the user's **home conversation**, the
-page's `/`. The owner's (`[data] user`) is the main thread, thread 1, so a page that knows nothing
-of threads talks to the main thread as before, and never gets a thread message. Anyone else's is
-a thread of their own, made the first time it is needed (a `hello`, `send` or `cancel` without a
-thread, or any `hello` that is not refused), once even when two pages ask at once, and never
-archived. A thread id is only a selector: each one is checked against the signed-in user, and a
+is optional where shown so: a `hello` without one is for the user's **home conversation**, the
+page's `/`, and a `send` or `cancel` without one for the thread the socket streams, or the home
+when it streams none yet (a page from before homes names thread 1 in its `hello` at `/` and no
+thread in what it sends). The owner's home (`[data] user`) is the main thread, thread 1, so a
+page that knows nothing of threads talks to the main thread as before, and never gets a thread
+message. Anyone else's is a thread of their own, made the first time it is needed (a `hello`,
+`send` or `cancel` that goes to it, or any `hello` that is not refused), once even when two pages
+ask at once, and never archived. A thread id is only a selector: each one is checked against the signed-in user, and a
 thread that does not exist is refused exactly like one the user may not see. An admin sees every
 thread; a member sees only the threads that are hers, and the main thread is the owner's. A
 `hello` that names a thread the user may not see is refused with `thread_refused`, and the socket
@@ -107,12 +109,12 @@ From the server:
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
-| `hello` | `log_id`, `last_seq`, `user`, optional `admin`, optional `thread`, optional `home` | The answer to the page's `hello`, before any entry. `user` is whom the page is signed in as, from the session, and `admin` whether they are one: a closed card names who answered only when it was someone else. `thread` repeats the thread the page named; the entries that follow are its, the home's when it named none. `home` is the user's home conversation, the page's `/`; absent, it is the main thread (thread 1), the owner's. |
+| `hello` | `log_id`, `last_seq`, `user`, optional `admin`, optional `thread`, optional `home` | The answer to the page's `hello`, before any entry. `user` is whom the page is signed in as, from the session, and `admin` whether they are one: a closed card names who answered only when it was someone else. `thread` repeats the thread the page named; the entries that follow are its, the home's when it named none. `home` is the user's home conversation, the page's `/`; absent, it is the main thread (thread 1), the owner's. It is also absent when a `hello` naming a thread could not make the home just then: the thread streams all the same, and the next `hello` tries again. |
 | `entry` | `seq`, `at`, `event` | One numbered, timestamped event of the thread streamed: a user message (`user`: `text`, optional `by` naming who wrote it when it was not the page's user, such as a parent thread for a sub-agent's task), an assistant text chunk, a tool call, a permission request or answer from before permissions were cards (kept so old logs replay), a request to the user (`request`: `id`, `card` of kind `permission`, `form` or `secret`, optional `from`) or its end (`request_closed`: `id`, `outcome`, optional `by`; a card the thread's agent asked closes before its turn's end), the end of a turn, or a notice (among them « En attente : d'autres conversations utilisent l'agent. » when a message waits for an agent, « Ta réponse partira à l'agent à la fin du tour en cours. » when a late answer waits for the running turn, and « Conversation archivée : ta réponse arrivée après coup ne partira pas à l'agent. » when an archive drops one). A late answer shows as a `user` entry without `by`: « Réponse à ta question « … » : … » or « Secret enregistré : … ». |
 | `refused` | `id`, `reason` | The page's answer to the request `id` was refused, and the request did not change: it is not this user's, it is closed already, or the answer does not fit the card (`reason` says what to fix, in French). Sent to that page only; never logged. |
 | `threads` | `threads` | The threads the user may see, archived ones included, oldest first, each `{ id, title, parent?, status, open_requests, updated_at, archived? }`. Sent after a `hello` that named a thread or set `list`, then whenever the list changes: a thread made, renamed or archived, a turn started, queued or ended, a card opened or closed. `status` is `idle` (no turn yet), `queued` (waiting for an agent), `running`, or how the last turn ended: `done`, `failed` or `cancelled`. `open_requests` counts the cards waiting for an answer: the « attend ta réponse » badge, the tray's other threads and, with the open cards of the thread shown, the tab's title « (N) Fronde ». `updated_at` is the thread's newest entry or last change. |
 | `created` | `client_id`, `thread` | The thread a `create` made; the page says `hello` to it to stream it. |
-| `thread_refused` | optional `thread`, optional `client_id`, `reason` | A thread message was refused, for this page only: « Conversation introuvable. » for a thread that does not exist or is not the user's, the thread is archived, a home conversation cannot be archived (« La conversation principale ne s'archive pas. »), or the title or `client_id` is not valid (`reason` is French). |
+| `thread_refused` | optional `thread`, optional `client_id`, `reason` | A thread message was refused, for this page only, naming the thread as the message did (none for one that named none): « Conversation introuvable. » for a thread that does not exist or is not the user's, the thread is archived, a home conversation cannot be archived (« La conversation principale ne s'archive pas. »), or the title or `client_id` is not valid (`reason` is French). |
 | `usage` | `reserve`, `usage`, `others`? | How much of the subscription accounts the user may see is used, for the meter: `usage` holds the user's own accounts' readings, one per account read so far, each `{ account, known_since, windows }` (`account` the account's name), a window `{ kind, used?, status?, resets_at?, as_of }` (`kind` `session`, `weekly`, `weekly_model:<m>`, `extra` or `other:<id>`; `used` a fraction from 0 to 1; `status` `allowed`, `warning` or `rejected`); `reserve` is `[threads] reserve` in percent; `others`, for an admin only, every other configured account's reading, by name, absent when there is none. Sent after each `hello`, once the log is replayed, and when a reading the user may see changes; only once there is one. |
 
 When the socket drops, the page reconnects after 1 second, doubling the wait up to 30 seconds,

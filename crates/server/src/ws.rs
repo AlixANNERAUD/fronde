@@ -192,8 +192,9 @@ impl Talk<'_> {
                 thread,
                 list,
             } => self.hello(socket, last_seq, log_id, thread, list).await,
+            // A refusal names the thread as the page did: none, for a page that named none.
             ClientMsg::Send { text, thread } => {
-                let id = match self.thread_or_home(thread).await {
+                let id = match self.addressed(thread).await {
                     Ok(id) => id,
                     Err(error) => return refuse(socket, thread, None, &error).await,
                 };
@@ -202,11 +203,11 @@ impl Talk<'_> {
                         assistant.send(text).await;
                         Ok(())
                     }
-                    Err(error) => refuse(socket, Some(id), None, &error).await,
+                    Err(error) => refuse(socket, thread, None, &error).await,
                 }
             }
             ClientMsg::Cancel { thread } => {
-                let id = match self.thread_or_home(thread).await {
+                let id = match self.addressed(thread).await {
                     Ok(id) => id,
                     Err(error) => return refuse(socket, thread, None, &error).await,
                 };
@@ -215,7 +216,7 @@ impl Talk<'_> {
                         assistant.cancel().await;
                         Ok(())
                     }
-                    Err(error) => refuse(socket, Some(id), None, &error).await,
+                    Err(error) => refuse(socket, thread, None, &error).await,
                 }
             }
             ClientMsg::Answer { id, response } => {
@@ -270,23 +271,19 @@ impl Talk<'_> {
         list: bool,
     ) -> Result<(), ()> {
         let list = list || thread.is_some();
-        let mut named = thread;
         let opened = async {
             let id = self.thread_or_home(thread).await?;
-            named = Some(id);
             let (_, assistant) = self.assistant(id).await?;
-            // Made now if it was not yet: the hello tells the page which it is.
-            let home = self.thread_or_home(None).await?;
-            anyhow::Ok((assistant, home))
+            anyhow::Ok(assistant)
         };
-        let (assistant, home) = match opened.await {
+        let assistant = match opened.await {
             Ok(opened) => opened,
             Err(error) => {
                 // The page now shows the thread it named: the one streamed until now must not
                 // reach it any more.
                 self.current = None;
                 self.live = None;
-                refuse(socket, named, None, &error).await?;
+                refuse(socket, thread, None, &error).await?;
                 // The list still comes, so that the page offers the threads that are the user's,
                 // and so does the meter.
                 if list {
@@ -296,6 +293,15 @@ impl Talk<'_> {
                     self.send_list(socket).await?;
                 }
                 return self.start_usage(socket).await;
+            }
+        };
+        // Made now if it was not yet: the hello tells the page which it is. Its failure costs the
+        // page only that, not the thread it named.
+        let home = match self.thread_or_home(None).await {
+            Ok(home) => Some(home),
+            Err(error) => {
+                tracing::error!("cannot make a home conversation: {error:#}");
+                None
             }
         };
         // Subscribed first, so nothing falls between the replay and the stream.
@@ -317,7 +323,7 @@ impl Talk<'_> {
             admin: self.user.admin,
             thread,
             // Absent for the owner, as before homes: thread 1.
-            home: (home != ThreadId::MAIN).then_some(home),
+            home: home.filter(|home| *home != ThreadId::MAIN),
         };
         self.current = Some(assistant);
         send(socket, &hello).await?;
@@ -354,6 +360,16 @@ impl Talk<'_> {
         let home = self.web.threads.home(self.user).await?;
         self.home = Some(home);
         Ok(home)
+    }
+
+    /// The thread a `send` or `cancel` is for: the one it names; else the one this socket
+    /// streams, which a page of before homes named in its hello only (thread 1, at `/`); else
+    /// the user's home.
+    async fn addressed(&mut self, thread: Option<ThreadId>) -> anyhow::Result<ThreadId> {
+        match (thread, &self.current) {
+            (None, Some(streamed)) => Ok(streamed.thread()),
+            _ => self.thread_or_home(thread).await,
+        }
     }
 
     /// Sends the meter's usage, if the page's user gets one and it changed since last sent.

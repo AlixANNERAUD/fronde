@@ -123,7 +123,7 @@ fn Screen(view: View) -> Element {
 /// Shows thread `id`: unless the page already does, its hello, which asks only for what its chat
 /// does not have yet.
 pub fn show(mut threads: Signal<Threads>, id: ThreadId, on_send: impl Fn(Outgoing)) {
-    if threads.peek().current() == id {
+    if threads.peek().current() == Some(id) {
         return;
     }
     let hello = threads.write().open(id);
@@ -162,21 +162,20 @@ pub fn Workspace(
     let rows = model.rows();
     let archived = model.archived_rows();
     let refusal = model.refusal().map(|refusal| refusal.reason.clone());
-    let shown = model.current();
-    // `/` is the home, whichever thread the server says it is: thread 1 until it says.
+    // `/` is the home, whichever thread the server says it is: a chat naming no thread until it
+    // says.
     let at_home = view == View::Home || (model.home_known() && view == View::Thread(model.home()));
     let view = match view {
-        View::Home => View::Thread(model.home()),
+        View::Home if model.home_known() => View::Thread(model.home()),
         view => view,
     };
     let current = match view {
         View::Thread(id) => Some(id),
         View::Home | View::List | View::New => None,
     };
-    let back = if model.shows_home() {
-        Place::Home
-    } else {
-        Place::Thread(shown)
+    let back = match model.current() {
+        Some(id) if !model.shows_home() => Place::Thread(id),
+        _ => Place::Home,
     };
     let sidebar = rows.len() + archived.len() > 1;
     // The shown thread's open cards from its chat, the others' from the list.
@@ -242,7 +241,14 @@ pub fn Workspace(
                     },
                     model.summary(id).cloned(),
                 ),
-                View::Home | View::List | View::New => (
+                // The home before the server named it: its own chat, never thread 1's.
+                View::Home => (
+                    "home".to_owned(),
+                    model.home_chat().cloned().unwrap_or_default(),
+                    Target::Home(model.home()),
+                    None,
+                ),
+                View::List | View::New => (
                     "new".to_owned(),
                     Chat::default(),
                     Target::New(threads),

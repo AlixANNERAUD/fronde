@@ -233,8 +233,10 @@ pub const CLOSE_SIGNED_OUT: u16 = 4401;
 /// `thread` fields are optional: none means the page's user's home conversation (the main thread,
 /// thread 1, for the owner; a thread of their own for anyone else: see [`ServerMsg::Hello`]'s
 /// `home`), so that a page that knows nothing of threads talks to the main thread as before, and
-/// a page that does not know its user's home yet reaches it. Every thread id is checked against
-/// the page's user:
+/// a page that does not know its user's home yet reaches it. A `Send` or `Cancel` without one
+/// goes to the thread the socket streams, and to the home only when it streams none: a page from
+/// before homes names thread 1 in its hello at `/`, never in what it sends. Every thread id is
+/// checked against the page's user:
 /// an unknown thread and one the user may not see are refused alike ([`ServerMsg::ThreadRefused`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]

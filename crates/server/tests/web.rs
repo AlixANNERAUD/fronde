@@ -2644,6 +2644,161 @@ async fn old_page_still_talks_to_the_main_thread() {
         .unwrap();
 }
 
+/// A page of before homes names thread 1 in its hello at `/`, but no thread in what it sends: a
+/// `send` or `cancel` without a thread goes to the thread its socket streams, so that an admin's
+/// old tab never writes into her own home in its place, and only a socket that streams none yet
+/// writes to its user's home. A refusal of a message that named no thread names none either.
+#[tokio::test]
+async fn a_message_without_a_thread_stays_on_the_thread_streamed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let mut page = open_chat(addr, &cookie).await;
+    let garage = create(&mut page, "garage", "Range le garage").await;
+    hello_thread(&mut page, garage, 0, None).await;
+    until_turn_ended(&mut page).await;
+    say(
+        &mut page,
+        ClientMsg::Send {
+            text: "Et la cave".into(),
+            thread: None,
+        },
+    )
+    .await;
+    let events = events_of(until_turn_ended(&mut page).await);
+    assert_eq!(
+        events[0],
+        Event::User {
+            text: "Et la cave".into(),
+            by: None,
+        }
+    );
+    say(&mut page, ClientMsg::Cancel { thread: None }).await;
+    let quiet = until_quiet(&mut page).await;
+    assert!(
+        !quiet
+            .iter()
+            .any(|m| matches!(m, ServerMsg::ThreadRefused { .. })),
+        "{quiet:?}"
+    );
+    say(
+        &mut page,
+        ClientMsg::Archive {
+            thread: garage,
+            archived: true,
+        },
+    )
+    .await;
+    list_until(&mut page, |threads| {
+        listed(threads, garage).is_some_and(|thread| thread.archived)
+    })
+    .await;
+    say(
+        &mut page,
+        ClientMsg::Send {
+            text: "Encore".into(),
+            thread: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        next_thread_refusal(&mut page).await,
+        (None, None, ARCHIVED_REFUSAL.into())
+    );
+
+    // A socket that streams nothing yet: her home, which got nothing of the above.
+    let mut fresh = open_chat(addr, &cookie).await;
+    say(
+        &mut fresh,
+        ClientMsg::Send {
+            text: "À la maison".into(),
+            thread: None,
+        },
+    )
+    .await;
+    say(&mut fresh, home_hello()).await;
+    let home = loop {
+        if let ServerMsg::Hello { home, .. } = next_message(&mut fresh).await {
+            break home.expect("her hello names her home");
+        }
+    };
+    assert_ne!(home, garage);
+    let events = events_of(until_turn_ended(&mut fresh).await);
+    assert_eq!(
+        events[0],
+        Event::User {
+            text: "À la maison".into(),
+            by: None,
+        }
+    );
+}
+
+/// A home that cannot be made costs a hello naming a thread the user may see only its `home`:
+/// the thread streams all the same. A hello naming no thread, which is for the home, is refused,
+/// naming no thread.
+#[tokio::test]
+async fn a_home_that_cannot_be_made_spares_a_hello_naming_a_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    // Every home made from now on fails, as on a full disk.
+    let db = database(dir.path()).await;
+    sqlx::query(
+        "CREATE TRIGGER no_home BEFORE INSERT ON kv WHEN NEW.key = 'home' \
+         BEGIN SELECT RAISE(ABORT, 'no room for a home'); END",
+    )
+    .execute(db.get_sqlite_connection_pool())
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    let cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let mut page = open_chat(addr, &cookie).await;
+    let garage = create(&mut page, "garage", "Range le garage").await;
+    say(
+        &mut page,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: Some(garage),
+            list: false,
+        },
+    )
+    .await;
+    let (thread, home) = loop {
+        match next_message(&mut page).await {
+            ServerMsg::Hello { thread, home, .. } => break (thread, home),
+            refused @ ServerMsg::ThreadRefused { .. } => panic!("refused: {refused:?}"),
+            _ => {}
+        }
+    };
+    assert_eq!((thread, home), (Some(garage), None));
+    let events = events_of(until_turn_ended(&mut page).await);
+    assert_eq!(
+        events[0],
+        Event::User {
+            text: "Range le garage".into(),
+            by: None,
+        }
+    );
+    say(&mut page, home_hello()).await;
+    let refused = loop {
+        match next_message(&mut page).await {
+            refused @ ServerMsg::ThreadRefused { .. } => break refused,
+            hello @ ServerMsg::Hello { .. } => panic!("not refused: {hello:?}"),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        refused,
+        ServerMsg::ThreadRefused {
+            thread: None,
+            client_id: None,
+            reason: "Impossible pour le moment ; réessaie plus tard.".into(),
+        }
+    );
+}
+
 /// A Claude `rate_limit_info` with both windows: the 5-hour one at `session`, resetting in two
 /// hours, and the weekly one at 18 %.
 fn rate_limit(session: f64) -> serde_json::Value {
@@ -4178,7 +4333,8 @@ async fn owner_slash_is_thread_one() {
 }
 
 /// A thread picked onto an account its owner may no longer use refuses a message from the
-/// page, saying how to fix it, before any agent starts; the row keeps its pick.
+/// page, saying how to fix it, before any agent starts, whether the message names it or comes
+/// without a thread to the socket streaming it; the row keeps its pick.
 #[tokio::test]
 async fn unusable_pick_refuses_a_send() {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
@@ -4230,11 +4386,22 @@ async fn unusable_pick_refuses_a_send() {
         },
     )
     .await;
+    let unusable = "Tu n'as plus accès à l'abonnement « famille » : choisis-en un autre dans le menu de la conversation.";
     let (thread, _, reason) = next_thread_refusal(&mut socket).await;
     assert_eq!(thread, Some(hers));
+    assert_eq!(reason, unusable);
+    // Sent without a thread, as an old page does, it goes to the thread streamed: refused alike.
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Encore".into(),
+            thread: None,
+        },
+    )
+    .await;
     assert_eq!(
-        reason,
-        "Tu n'as plus accès à l'abonnement « famille » : choisis-en un autre dans le menu de la conversation."
+        next_thread_refusal(&mut socket).await,
+        (None, None, unusable.into())
     );
     let row = fronde_entity::threads::Entity::find_by_id(hers.0)
         .one(&db)
