@@ -93,11 +93,11 @@ webpki-roots = "1"
 zeroize = "1"
 web-sys = "0.3"
 # Only what a host of tool components uses: no GC, threads, cache or debugging support.
-wasmtime = { version = "50.0.1", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"] }
+wasmtime = { version = "50.0.3", default-features = false, features = ["anyhow", "async", "component-model", "cranelift", "parallel-compilation", "runtime", "std", "wat"] }
 # p1 runs CPython for WASI (crates/wasm/src/python.rs), a wasm32-wasip1 core module.
-wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p1", "p2"] }
+wasmtime-wasi = { version = "50.0.3", default-features = false, features = ["p1", "p2"] }
 # Without its default sender: the gate sends requests itself (crates/wasm/src/dial.rs).
-wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "50.0.3", default-features = false, features = ["p2"] }
 url = { version = "2", features = ["serde"] }
 
 [workspace.lints.rust]
