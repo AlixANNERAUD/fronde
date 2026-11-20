@@ -256,6 +256,9 @@ impl SecretStore {
 
     /// No card may keep, replace or remove a secret stored under one of `names` or for one of
     /// `origins` (canonical, as [`Remember::origin`] is).
+    ///
+    /// The connect card (planned) writes an account's token on purpose: it will need a path of
+    /// its own past these reservations, never a lifted reservation.
     pub fn reserving(
         mut self,
         names: impl IntoIterator<Item = String>,

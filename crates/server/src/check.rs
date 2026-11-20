@@ -20,7 +20,11 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
             let (key, password) = config
                 .password_of(&user.name)
                 .with_context(|| format!("{} has no password to sign in with", user.name))?;
-            crate::check_password(&password.resolve().context(key.clone())?, &key)?;
+            if let Some(warning) =
+                crate::check_password(&password.resolve().context(key.clone())?, &key)?
+            {
+                writeln!(out, "{warning}")?;
+            }
         }
     }
     let checks = approval_checks(config).await?;

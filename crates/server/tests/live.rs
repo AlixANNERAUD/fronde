@@ -53,6 +53,7 @@ async fn sign_in(addr: SocketAddr) -> String {
         .build()
         .unwrap()
         .post(format!("http://{addr}/auth/sign-in"))
+        .header("origin", format!("http://{addr}"))
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(format!("password={PASSWORD}"))
         .send()

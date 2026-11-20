@@ -134,14 +134,16 @@ backup of the whole home directory, as holding the secrets themselves.
 
 ## Secrets in memory
 
-Fronde holds the secrets it resolves (the `/mcp` bearer token, the web chat password, upstream MCP
+Fronde holds the secrets it resolves (the `/mcp` bearer token, upstream MCP
 tokens and component credentials, stored ones included once opened) as `secrecy::SecretString`
 values. They print as redacted with
 `Debug` and their memory is zeroed when they are dropped. The plain value is read only at a few
 places in the code, each listed in a test (`crates/server/tests/secrets.rs`): the checks of the
-token's length and of the password, the constant-time compare of `/mcp` tokens and sign-in
-passwords (on SHA-256 digests, so the length does not leak either), the component gate, the ACP
-header and the upstream MCP client.
+token's length and of the password, the constant-time compare of `/mcp` tokens (on SHA-256
+digests, so the length does not leak either), the sign-in passwords' digests and session
+bindings, made once at start (the chat's passwords are then dropped: only their digests are
+kept), the derivation of the session binding key from `server.token`, the component gate, the
+ACP header and the upstream MCP client.
 
 A component's `Authorization` header is built by the gate for each request, marked sensitive (its
 `Debug` prints `Sensitive`) and dropped with the request; between requests only the
@@ -306,23 +308,38 @@ encrypted: see above, and below.
   character; a name is never what makes a caller one of Fronde's agents, only its token is. `/mcp` skips the `Host` check against DNS
   rebinding: a page that rebinds a name to Fronde still cannot send a token.
 - **The chat** needs a person's name and their own password: one person's password never opens
-  another's name. A wrong one is answered after a second, and five in a row for one name lock
-  sign-in under that name for a minute, whoever tries; the others still sign in. A name that is
+  another's name. A wrong one is answered after a second, and five for one name, each within 15
+  minutes of the one before, lock sign-in under that name for a minute, whoever tries; the others
+  still sign in. A name that is
   no one's gets the same answer after the same second, its typed password compared with a random
   stand-in made at each start, and is counted and locked out like anyone's, so neither the
-  answer, its timing nor the lockout tells which names exist. Passwords are compared as SHA-256
-  digests in constant time, so neither their content nor their length leaks through timing.
+  answer, its timing nor the lockout tells which names exist. Each password is read once at
+  start and kept as its SHA-256 digest only; a typed one is compared digest to digest in
+  constant time, so neither its content nor its length leaks through timing.
   The typed name is never logged (a password may be typed there by mistake) and is wiped with the
-  password; the throttle keeps names by their SHA-256 only. Signing in issues a new session id,
-  so an id planted before sign-in is worthless after it.
+  password; the throttle keeps names by their HMAC-SHA256 under a key made at each start only.
+  The throttle remembers at most 4096 names and forgets none before its 15 minutes: typing
+  made-up names cannot push a name's mistakes out to start its count again. Once it is full, a
+  name not in it is refused whatever its password, so that a full table never answers a guess
+  without counting it; a flood of made-up names can keep new sign-ins out for 15 minutes, never
+  let a guess through. The forms take posts from Fronde's own pages only (`Origin`): another site
+  can neither sign your browser in as someone else, nor lock your name out from its visitors'
+  browsers, nor sign you out. Signing in issues a new session id, so an id planted before sign-in
+  is worthless after it.
 
 ## The browser
 
 The session cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` behind https. A session names
 the person who signed in, and is the only thing a page, its socket or a form is read as: never
-a field the page sends. A session whose person is no longer configured is refused at its next
-request and deleted at the next start, so a person later configured under that name (or the
-new `[data] user`, should it change) never inherits it; sessions from before names were signed
+a field the page sends. It also carries a binding of that name and the person's password, an
+HMAC-SHA256 under a key derived from `server.token`: a session is someone's only while its
+binding is the one their current password makes. Changing a person's password is thus how the
+owner signs them out of every browser, and changing `server.token` signs everyone out. The key
+lives where `server.token` does, outside `fronde.db`, so a copy of the database gives no way to
+test guesses of a password offline. A session whose person is no longer configured, or whose
+binding no longer matches, is refused at its next request and deleted at the next start, so a
+person later configured under that name with a password of their own (or the new
+`[data] user`, should it change) never inherits it; sessions from before names were signed
 out once, at the upgrade. Sessions live in `fronde.db`, so a restart signs no one out. Their ids are stored hashed (SHA-256): a copy of that
 file, a backup for instance, does not let anyone take over a signed-in browser. Fronde never logs
 a session id. Signing out deletes the session at once. A session is refused as soon as it expires,

@@ -21,6 +21,7 @@ fronde-protocol = { path = "../protocol" }
 fronde-requests = { path = "../requests" }
 fronde-wasm = { path = "../wasm" }
 getrandom.workspace = true
+hmac.workspace = true
 iana-time-zone.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true

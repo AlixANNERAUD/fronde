@@ -19,8 +19,8 @@ another site cannot know.
 | `GET /threads` | The thread list, full screen (on a wide screen it also sits beside the chat). Without a session, a redirect to `/sign-in`. |
 | `GET /new` | An empty chat whose first message starts a thread. Without a session, a redirect to `/sign-in`. |
 | `GET /sign-in` | The sign-in page. |
-| `POST /auth/sign-in` | Form fields `name` and `password`. The person named `name` (spaces around it ignored, compared exactly) and their own password: a new session for them and a redirect to `/`. With a single person (the legacy form), `name` may be empty or left out. Anything else, a name that is no one's included: a redirect to `/sign-in?error=1`, after one second, the same answer either way. |
-| `POST /auth/sign-out` | Ends the session, then redirects to `/sign-in`. |
+| `POST /auth/sign-in` | Form fields `name` and `password`. The person named `name` (spaces around it ignored, compared exactly) and their own password: a new session for them and a redirect to `/`. With a single person configured (the legacy form, or `[users]` listing one), `name` may be empty or left out. Anything else, a name that is no one's included: a redirect to `/sign-in?error=1`, after one second, the same answer either way. Only from Fronde's own pages: an `Origin` header naming another host than `Host`, or none, gets `403` before anything is checked or counted. |
+| `POST /auth/sign-out` | Ends the session, then redirects to `/sign-in`. `403`, the session kept, unless `Origin` names the same host as `Host`. |
 | `GET /ws` | The chat's WebSocket, described below. |
 | `GET /assets/…` | The interface's files, cached for a year: their names change with their content. |
 | Other paths | Files of the built interface, else `404`. |
@@ -31,24 +31,31 @@ compressed with Brotli or gzip when the browser accepts it.
 
 ### Sign-in throttle
 
-After 5 wrong passwords in a row for one name, sign-in under that name is refused for 60
-seconds, for every client at once, with a redirect to `/sign-in?error=2`; the other names still
-sign in. A name that is no one's is counted the same way, so neither the answer, its delay nor
-the lockout tells whether a name is someone's. Names are counted by their SHA-256, for at most
-4096 names at once: past that, the one whose last mistake is the oldest is forgotten, a name
-locked out last.
+After 5 wrong passwords for one name, each within 15 minutes of the one before, sign-in under
+that name is refused for 60 seconds, for every client at once, with a redirect to
+`/sign-in?error=2`; the other names still sign in. A name's mistakes are forgotten 15 minutes
+after its last one, and a right password starts its count again. A name that is no one's is
+counted the same way, so neither the answer, its delay nor the lockout tells whether a name is
+someone's. Names are counted by their HMAC-SHA256 under a key made at each start, never as typed,
+for at most 4096 names at once. A name is never forgotten before its 15 minutes to make room:
+while 4096 names have recent mistakes, a name not among them is answered `/sign-in?error=2`,
+its password right or not, until some are forgotten. Typing made-up names can thus keep new
+names out for a while, never let anyone guess more.
 
 ### Sessions
 
 The session cookie is `fronde_session`: `HttpOnly`, `SameSite=Lax`, and `Secure` when
-`secure_cookie = true`. A session names the person who signed in, and every page, socket and
-form takes the user from it alone. A session ends after 30 days without a signed-in request; each
+`secure_cookie = true`. A session names the person who signed in and carries a binding of that
+name and their password (an HMAC-SHA256 under a key derived from `server.token`, which
+`fronde.db` does not hold), and every page, socket and form takes the user from it alone, while
+that binding matches the person's current password. A session ends after 30 days without a signed-in request; each
 request renews it. Sessions are kept in `fronde.db`, so they survive a restart. Signing out
 deletes the session; an expired one is refused at once and its row deleted within the hour.
 
 A session whose person is no longer configured (removed from `[users]`, renamed, or `[data] user`
-changed in the legacy form) is refused at once, and deleted at the next start, so a person later
-configured under that name never gets it. Sessions from before names, which held no name, are
+changed in the legacy form), whose person's password changed, or written while `server.token` was
+another, is refused at once, and deleted at the next start. A person configured under a name
+someone had, with a password of their own, never gets that someone's sessions. Sessions from before names, which held no name, are
 deleted at the first start of this version: everyone signs in once again after the upgrade.
 
 ### Security headers
@@ -76,7 +83,8 @@ that knows nothing of threads talks to the main thread as before, and never gets
 message. A thread id is only a selector: each one is checked against the signed-in user, and a
 thread that does not exist is refused exactly like one the user may not see. An admin sees every
 thread; a member sees only the threads that are hers, and the main thread is the owner's. A
-`hello` that names a thread the user may not see is refused with `thread_refused`, then, as for
+`hello` that names a thread the user may not see is refused with `thread_refused`, and the socket
+streams no thread until the next `hello`; then, as for
 any `hello` naming a thread, the thread list follows: a member's `/` names the main thread, so
 her page shows « Conversation introuvable. » with her own threads to open, or *Nouvelle
 conversation* (a conversation of her own at `/` is **planned**).

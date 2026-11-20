@@ -51,7 +51,7 @@ Required.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `listen` | address | `"127.0.0.1:8484"` | Address and port to listen on. Use `"0.0.0.0:8484"` in a container. |
-| `token` | secret | required | Bearer token for `/mcp`. At least 32 characters. Fronde's own agent uses it too. |
+| `token` | secret | required | Bearer token for `/mcp`. At least 32 characters. Fronde's own agent uses it too. The chat's sessions are bound with a key derived from it: changing it signs everyone out of the chat. |
 
 ## `[data]`
 
@@ -279,7 +279,7 @@ only the hub: `/health` and `/mcp`.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `password` | secret | required without `[users]` | The legacy form of the owner's password (see [`[users.<name>]`](#usersname)): `[data] user` signs in with it. Must not be empty. Refused with `[users]`, saying to move it to `[users.<name>] password`. |
+| `password` | secret | required without `[users]` | The legacy form of the owner's password (see [`[users.<name>]`](#usersname)): `[data] user` signs in with it. Must not be empty; `fronde check` warns when it is shorter than 12 characters. Refused with `[users]`, saying to move it to `[users.<name>] password`. |
 | `secure_cookie` | boolean | `false` | Mark the session cookie `Secure`. Set it to `true` when the page is served over https. |
 
 With `[users]`, `[web]` may be left empty (`[web]` alone) to serve the chat.
@@ -292,12 +292,15 @@ sees everyone's; see [Sign in to the chat](../how-to/sign-in-to-the-chat.md)). U
 integrations and every other service are the owner's, not every admin's (see
 [Security model](../explanation/security.md#threads)). Once someone is no longer listed, Fronde
 gives their threads to `removed:<name>` at start, read-only for good, and deletes their web
-sessions: a person later listed under the same name starts with none of them.
+sessions. A session is bound to its person's name and password: changing someone's password
+signs them out everywhere at the next start, and so does giving the name to someone else with
+another password. Threads follow the name, though: to give a name to someone new, start Fronde
+once without it first, so that the threads of the person who had it are put aside.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `admin` | boolean | `false` | Whether they see and manage everything. The owner must be one. |
-| `password` | secret | required | Their password, `{ file = "…" }` or `{ env = "…" }`, never stored. Must not be empty. Signing in with OIDC instead is **planned**. |
+| `password` | secret | required | Their password, `{ file = "…" }` or `{ env = "…" }`, never stored. Must not be empty; `fronde check` warns when it is shorter than 12 characters. Changing it signs the person out. Signing in with OIDC instead is **planned**. |
 
 A name is 1 to 64 characters, with no hidden character (a zero-width space, a direction mark, a
 control character), no space at either end, and none of `/`, `\`, `:` or `..`; quote it when it

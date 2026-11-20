@@ -2,11 +2,11 @@
 //! and the page's messages passed to Fronde. Every thread a page names is checked against its
 //! user: a thread id is only a selector, never an identity.
 
-use crate::web::{Web, renew, signed_in_as};
+use crate::web::{Web, renew, same_origin, signed_in_as};
 use anyhow::bail;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fronde_agent::assistant::Assistant;
 use fronde_agent::threads::{Refusal, ThreadRow, Threads};
@@ -32,7 +32,7 @@ pub async fn upgrade(
     }
     // The socket is the session's user's, and nobody else's, for as long as it lives: nothing the
     // page sends names a user.
-    let Some(user) = signed_in_as(&session, &web.users).await else {
+    let Some(user) = signed_in_as(&session, &web).await else {
         return upgrade.on_upgrade(|mut socket| async move {
             let close = CloseFrame {
                 code: CLOSE_SIGNED_OUT,
@@ -50,16 +50,6 @@ pub async fn upgrade(
 /// The largest message a page may send: a message to Fronde or a card's answer is far smaller,
 /// and anything bigger only costs the server memory. The socket closes on a bigger one.
 const MAX_MESSAGE: usize = 64 * 1024;
-
-/// True when `Origin` names the host the request was sent to.
-fn same_origin(headers: &HeaderMap) -> bool {
-    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    let origin_host = header(header::ORIGIN).and_then(|o| o.split_once("://").map(|(_, h)| h));
-    match (origin_host, header(header::HOST)) {
-        (Some(origin), Some(host)) => origin.eq_ignore_ascii_case(host),
-        _ => false,
-    }
-}
 
 /// Streams a thread's log once the page said hello, and passes the page's messages to Fronde.
 async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User) {
@@ -261,6 +251,10 @@ impl Talk<'_> {
         let assistant = match self.assistant(id).await {
             Ok((_, assistant)) => assistant,
             Err(error) => {
+                // The page now shows the thread it named: the one streamed until now must not
+                // reach it any more.
+                self.current = None;
+                self.live = None;
                 refuse(socket, Some(id), None, &error).await?;
                 // The list still comes, so that the page offers the threads that are the user's:
                 // a member's `/` names the main thread, the owner's, until each person has a

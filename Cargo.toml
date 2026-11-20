@@ -37,6 +37,8 @@ http-body = "1"
 getrandom = "0.4"
 http-body-util = "0.1"
 # The component gate's HTTP client (crates/wasm/src/dial.rs): the crates wasmtime-wasi-http uses.
+# Keyed digests of the web sign-in (crates/server/src/web.rs): session bindings, throttle keys.
+hmac = "0.13"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 iana-time-zone = "0.1"

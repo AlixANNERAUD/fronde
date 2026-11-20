@@ -10,6 +10,9 @@ use tower_sessions_sqlx_store::sqlx::{self, SqlitePool};
 
 /// The session's key naming the user it is signed in as.
 pub const USER: &str = "user";
+/// The session's key holding the binding of that user's name and password
+/// (`web::session_binding`): the session is theirs only while it matches.
+pub const BINDING: &str = "binding";
 
 /// Sessions in the table `tower_sessions`, each row keyed by the hash of its id
 /// ([`stored_id`]). A cookie's id is random and 128 bits long, so a plain hash is enough: there
@@ -38,11 +41,15 @@ impl Sessions {
         Self(SqliteStore::new(pool.clone()), pool)
     }
 
-    /// Deletes every session that is not signed in as someone `is_user` names: those from before
-    /// names (which held `signed_in` alone), those of a person no longer configured and those that
-    /// do not read. Run at start, so that a person configured later under a name someone had
-    /// never gets that person's sessions. Returns how many it deleted.
-    pub async fn keep_signed_in(&self, is_user: impl Fn(&str) -> bool) -> anyhow::Result<usize> {
+    /// Deletes every session but those whose name and binding `signed_in` accepts: those from
+    /// before names (which held `signed_in` alone), those of a person no longer configured or
+    /// whose password changed, and those that do not read. Run at start, so that a person
+    /// configured under a name someone had, with a password of their own, never gets that
+    /// person's sessions. Returns how many it deleted.
+    pub async fn keep_signed_in(
+        &self,
+        signed_in: impl Fn(&str, &str) -> bool,
+    ) -> anyhow::Result<usize> {
         // The store's own table, not an entity: its rows are read through the store.
         let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM tower_sessions")
             .fetch_all(&self.1)
@@ -59,11 +66,13 @@ impl Sessions {
             };
             // The rows are keyed by the hashed id already: the inner store reads them as they are.
             let keep = match self.0.load(&id).await {
-                Ok(Some(record)) => record
-                    .data
-                    .get(USER)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(&is_user),
+                Ok(Some(record)) => {
+                    let text = |key| record.data.get(key).and_then(serde_json::Value::as_str);
+                    match (text(USER), text(BINDING)) {
+                        (Some(name), Some(binding)) => signed_in(name, binding),
+                        _ => false,
+                    }
+                }
                 // Expired: the purge deletes it too.
                 Ok(None) | Err(session_store::Error::Decode(_)) => false,
                 Err(error) => return Err(error.into()),
@@ -211,31 +220,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, sessions) = sessions(dir.path()).await;
         let mut kept = Vec::new();
-        for (n, user) in [Some("alix"), Some("marie"), None, Some("removed:paul")]
-            .into_iter()
-            .enumerate()
+        let signed_in = |name: &str, binding: &str| name == "alix" && binding == "of-alix";
+        for (n, (user, binding)) in [
+            (Some("alix"), Some("of-alix")),
+            (Some("marie"), Some("of-marie")),
+            (None, None),
+            (Some("removed:paul"), Some("of-paul")),
+            // An older password's, or none.
+            (Some("alix"), Some("of-alix-before")),
+            (Some("alix"), None),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut record = record(n as i128 + 1);
             if let Some(user) = user {
                 record.data = [(USER.to_owned(), serde_json::Value::from(user))].into();
             }
+            if let Some(binding) = binding {
+                record
+                    .data
+                    .insert(BINDING.to_owned(), serde_json::Value::from(binding));
+            }
             sessions.create(&mut record).await.unwrap();
-            if user == Some("alix") {
+            if user.zip(binding).is_some_and(|(u, b)| signed_in(u, b)) {
                 kept.push(stored_id(&record.id).to_string());
             }
         }
-        let deleted = sessions
-            .keep_signed_in(|name| name == "alix")
-            .await
-            .unwrap();
-        assert_eq!(deleted, 3);
+        let deleted = sessions.keep_signed_in(signed_in).await.unwrap();
+        assert_eq!(deleted, 5);
         assert_eq!(stored_ids(&db).await, kept);
-        assert_eq!(
-            sessions
-                .keep_signed_in(|name| name == "alix")
-                .await
-                .unwrap(),
-            0
-        );
+        assert_eq!(sessions.keep_signed_in(signed_in).await.unwrap(), 0);
     }
 }

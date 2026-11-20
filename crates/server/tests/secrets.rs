@@ -153,10 +153,13 @@ const ALLOWED: &[(&str, usize)] = &[
     ("crates/db/src/secrets.rs", 1),
     // The upstream MCP token handed to rmcp's transport.
     ("crates/hub/src/upstream.rs", 1),
-    // `check_token`'s length, `check_password`'s emptiness, `same_secret`'s digest, which
-    // compares the `/mcp` token and the web password in constant time, and `refuse_equal`'s
-    // digests, which tell two people's credentials holding one value apart, never shown.
+    // `check_token`'s length, `check_password`'s length, `same_secret`'s digest, which
+    // compares the `/mcp` token in constant time, and `refuse_equal`'s digests, which tell two
+    // people's credentials holding one value apart, never shown.
     ("crates/server/src/lib.rs", 5),
+    // The web sign-in: each password's digest and session binding, made once at start (the
+    // password is then dropped), and the binding key derived from `server.token`.
+    ("crates/server/src/web.rs", 2),
     // The gate: the Basic and Bearer headers built for each request, and the Bearer token's
     // bytes checked once when the grants are made.
     ("crates/wasm/src/egress.rs", 3),

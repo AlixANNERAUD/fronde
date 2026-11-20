@@ -10,6 +10,7 @@ pub mod service;
 pub mod sessions;
 pub mod thread_control;
 mod web;
+pub use web::session_binding;
 mod ws;
 pub use ws::usage_message;
 
@@ -118,7 +119,7 @@ pub fn check_token(token: &SecretString) -> anyhow::Result<()> {
 }
 
 /// Compares digests, so neither the content nor the length of the secret leaks through timing.
-/// The `/mcp` token and the web password are both checked here.
+/// The `/mcp` token is checked here; the web passwords are kept as digests (`web::Passwords`).
 pub(crate) fn same_secret(given: &[u8], expected: &SecretString) -> bool {
     let given = Sha256::digest(given);
     let expected = Sha256::digest(expected.expose_secret().as_bytes());
@@ -303,12 +304,23 @@ pub async fn healthcheck(address: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A sign-in password is not empty; `key` names it in the configuration.
-pub fn check_password(password: &SecretString, key: &str) -> anyhow::Result<()> {
-    if password.expose_secret().is_empty() {
+/// Sign-in passwords shorter than this are warned about.
+const SHORT_PASSWORD: usize = 12;
+
+/// A sign-in password is not empty; `key` names it in the configuration. One shorter than
+/// [`SHORT_PASSWORD`] characters gets a warning line, not a refusal: a configuration that loaded
+/// before keeps loading.
+pub fn check_password(password: &SecretString, key: &str) -> anyhow::Result<Option<String>> {
+    let length = password.expose_secret().chars().count();
+    if length == 0 {
         bail!("{key} must not be empty");
     }
-    Ok(())
+    Ok((length < SHORT_PASSWORD).then(|| {
+        format!(
+            "{key}: warning: shorter than {SHORT_PASSWORD} characters; a longer passphrase \
+             resists guessing better"
+        )
+    }))
 }
 
 fn system_prompt(user: &str) -> String {
@@ -1053,10 +1065,12 @@ pub async fn start_with(
                     .password_of(&person.name)
                     .with_context(|| format!("{} has no password to sign in with", person.name))?;
                 let password = password.resolve().context(key.clone())?;
-                check_password(&password, &key)?;
+                if let Some(warning) = check_password(&password, &key)? {
+                    tracing::warn!("{warning}");
+                }
                 by_name.insert(person.name.clone(), password);
             }
-            Some((web::Passwords::new(by_name)?, web.secure_cookie))
+            Some((web::Passwords::new(by_name, &token)?, web.secure_cookie))
         }
         None => None,
     };
@@ -1121,16 +1135,22 @@ pub async fn start_with(
             fronde_db::path(&data_dir).display()
         )
     })?;
-    // Everyone signs in as a configured person: a session from before names, or of a person no
-    // longer configured, is deleted, so that nobody later configured under that name gets it.
+    // Everyone signs in as a configured person with their current password: a session from
+    // before names, of a person no longer configured or of an older password, is deleted, so
+    // that nobody later configured under that name with a password of their own gets it.
+    // Without `[web]` no binding can be checked, and no session is of use: all go.
     let signed_out = sessions
-        .keep_signed_in(|name| users.get(name).is_some())
+        .keep_signed_in(|name, binding| {
+            password.as_ref().is_some_and(|(passwords, _)| {
+                users.get(name).is_some() && passwords.binds(name, binding)
+            })
+        })
         .await
         .context("cannot read the web sessions")?;
     if signed_out > 0 {
         tracing::info!(
-            "{signed_out} web session(s) signed out: from before names, or of someone no longer \
-             in [users]; they sign in again"
+            "{signed_out} web session(s) signed out: from before names, of someone no longer \
+             in [users], or of a password or server.token changed since; they sign in again"
         );
     }
     // Secrets given in a card "for this conversation": in memory only.
@@ -1268,7 +1288,7 @@ pub async fn start_with(
                 requests,
                 users,
                 passwords: password,
-                throttle: Default::default(),
+                throttle: std::sync::Mutex::new(web::Throttle::new()?),
             },
             sessions,
             secure_cookie,

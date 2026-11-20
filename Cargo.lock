@@ -2448,6 +2448,7 @@ dependencies = [
  "fronde-wasm",
  "futures",
  "getrandom 0.4.3",
+ "hmac",
  "iana-time-zone",
  "proc-macro2",
  "quote",

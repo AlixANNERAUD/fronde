@@ -93,8 +93,8 @@ home, and what it left there would run with your rights.
 ## 6. Sign in and chat
 
 Open <http://127.0.0.1:8484>. You land on the sign-in page (*Connexion*). Type your name under
-*Prénom*, the user name `fronde init` wrote as `[data] user` (alone on your Fronde, you may also
-leave it empty), the password `fronde init` printed under *Mot de passe*, and press *Se
+*Prénom*, the user name `fronde init` wrote as `[data] user` (while you are the only person
+configured, you may also leave it empty), the password `fronde init` printed under *Mot de passe*, and press *Se
 connecter*.
 
 Write a first message, for example *Retiens que je préfère le thé au café*, and send it. The

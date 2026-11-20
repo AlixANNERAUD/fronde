@@ -8,7 +8,8 @@ use fronde_protocol::{
 };
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{
-    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, LOCATION, ORIGIN,
+    SET_COOKIE,
 };
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -127,6 +128,7 @@ async fn post_password(addr: SocketAddr, password: &str) -> reqwest::Response {
         WAIT,
         client()
             .post(format!("http://{addr}/auth/sign-in"))
+            .header(ORIGIN, format!("http://{addr}"))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body)
             .send(),
@@ -189,6 +191,7 @@ async fn post_sign_in(addr: SocketAddr, name: &str, password: &str) -> reqwest::
         WAIT,
         client()
             .post(format!("http://{addr}/auth/sign-in"))
+            .header(ORIGIN, format!("http://{addr}"))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body)
             .send(),
@@ -378,6 +381,7 @@ async fn sign_in_sets_session_and_wrong_password_refused() {
         WAIT,
         client()
             .post(format!("http://{addr}/auth/sign-out"))
+            .header(ORIGIN, format!("http://{addr}"))
             .header(COOKIE, cookie)
             .send(),
     )
@@ -1148,7 +1152,16 @@ async fn session_rows(dir: &Path) -> i64 {
 /// Writes a session signed in as Alix that expires at `expiry_date` straight into the database,
 /// and returns its cookie.
 async fn plant_session(dir: &Path, id: i128, expiry_date: OffsetDateTime) -> String {
-    plant_session_holding(dir, id, expiry_date, "user", "Alix".into()).await
+    plant_session_with(
+        dir,
+        id,
+        expiry_date,
+        [
+            ("user", "Alix".into()),
+            ("binding", binding_of("Alix", PASSWORD).into()),
+        ],
+    )
+    .await
 }
 
 /// Writes a session holding `key = value` alone, that expires at `expiry_date`, straight into the
@@ -1177,6 +1190,7 @@ async fn sign_out(addr: SocketAddr, cookie: &str) -> reqwest::Response {
         WAIT,
         client()
             .post(format!("http://{addr}/auth/sign-out"))
+            .header(ORIGIN, format!("http://{addr}"))
             .header(COOKIE, cookie)
             .send(),
     )
@@ -2479,14 +2493,15 @@ async fn archived_thread_refuses_send() {
 }
 
 /// A thread that does not exist is refused like one the user may not see, whatever the
-/// message; the page's stream does not change.
+/// message; a refused hello stops the stream ([`a_refused_hello_stops_the_previous_stream`]),
+/// and the next hello starts it again.
 #[tokio::test]
 async fn unknown_thread_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, _) = start(dir.path()).await;
     let cookie = sign_in(addr).await;
     let mut socket = open_chat(addr, &cookie).await;
-    hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    let (log_id, newest, _) = hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
     let unknown = ThreadId(99);
     for message in [
         ClientMsg::Hello {
@@ -2516,7 +2531,7 @@ async fn unknown_thread_is_refused() {
             (Some(unknown), None, NOT_FOUND.into())
         );
     }
-    // Still streaming the main thread.
+    // The main thread still takes a message, and a hello for it streams it again.
     say(
         &mut socket,
         ClientMsg::Send {
@@ -2525,6 +2540,7 @@ async fn unknown_thread_is_refused() {
         },
     )
     .await;
+    hello_thread(&mut socket, ThreadId::MAIN, newest, Some(&log_id)).await;
     assert_eq!(
         next_entry(&mut socket).await.event,
         Event::User {
@@ -3579,4 +3595,263 @@ async fn no_card_keeps_an_account_token() {
         };
         assert!(text.text.contains("account's sign-in"), "{}", text.text);
     }
+}
+
+/// Posts `body` to the sign-in form, with `origin` as the `Origin` header when given.
+async fn post_sign_in_from(
+    addr: SocketAddr,
+    origin: Option<&str>,
+    body: String,
+) -> reqwest::Response {
+    let mut request = client()
+        .post(format!("http://{addr}/auth/sign-in"))
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(body);
+    if let Some(origin) = origin {
+        request = request.header(ORIGIN, origin);
+    }
+    timeout(WAIT, request.send()).await.unwrap().unwrap()
+}
+
+/// The sign-in and sign-out forms take posts from Fronde's own pages only: another site can
+/// neither sign a browser in as someone else (login CSRF), nor lock a name out by posting wrong
+/// passwords from its visitors' browsers, nor sign them out.
+#[tokio::test]
+async fn sign_in_forms_refuse_other_origins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let right = form_body(&[("name", "Alix"), ("password", PASSWORD)]);
+    for origin in [Some("http://evil.example"), Some("null"), None] {
+        let refused = post_sign_in_from(addr, origin, right.clone()).await;
+        assert_eq!(refused.status(), 403, "{origin:?}");
+        assert!(refused.headers().get(SET_COOKIE).is_none(), "{origin:?}");
+    }
+    // Wrong passwords posted from elsewhere are not counted.
+    let wrong = form_body(&[("name", "Alix"), ("password", "nope")]);
+    for _ in 0..6 {
+        let refused = post_sign_in_from(addr, Some("http://evil.example"), wrong.clone()).await;
+        assert_eq!(refused.status(), 403);
+    }
+    let cookie = sign_in_as(addr, "Alix", PASSWORD).await;
+
+    let out = timeout(
+        WAIT,
+        client()
+            .post(format!("http://{addr}/auth/sign-out"))
+            .header(ORIGIN, "http://evil.example")
+            .header(COOKIE, &cookie)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(out.status(), 403);
+    assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 200);
+}
+
+/// [`people`], with marie's password file holding `password` when Fronde starts.
+fn people_with_marie_password(dir: &Path, password: &str) -> fronde_hub::config::Config {
+    let config = people(dir, true);
+    fronde_hub::private::write(dir.join("marie.password"), password).unwrap();
+    config
+}
+
+/// Changing a person's password signs out every session they had: the owner's one way to
+/// revoke a browser left signed in.
+#[tokio::test]
+async fn a_password_change_signs_the_person_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let (addr, server) = run(people(path, true), path).await;
+    let marie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let alix = sign_in_as(addr, "Alix", PASSWORD).await;
+    assert!(opens(addr, &marie).await);
+    stop(server).await;
+
+    let (addr, _server) = run(
+        people_with_marie_password(path, "a new password of marie"),
+        path,
+    )
+    .await;
+    assert!(!opens(addr, &marie).await);
+    assert!(opens(addr, &alix).await);
+    assert_eq!(
+        session_rows(path).await,
+        1,
+        "marie's old session is deleted at start"
+    );
+    sign_in_as(addr, "marie", "a new password of marie").await;
+}
+
+/// A name given to someone else in one restart (`[users.marie]` now another person, with a
+/// password of her own) gets none of the first marie's sessions.
+#[tokio::test]
+async fn a_name_given_to_someone_else_gets_no_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let (addr, server) = run(people(path, true), path).await;
+    let first = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    stop(server).await;
+
+    let (addr, _server) = run(
+        people_with_marie_password(path, "the other marie's password"),
+        path,
+    )
+    .await;
+    assert!(!opens(addr, &first).await);
+    let second = sign_in_as(addr, "marie", "the other marie's password").await;
+    assert!(opens(addr, &second).await);
+}
+
+/// A session written while the server runs is read as no one's unless it names a configured
+/// person and carries the binding of that person's password: the session alone is checked at
+/// each request, not only at start.
+#[tokio::test]
+async fn a_session_planted_while_running_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(path), connector, &site(path)).await;
+    let later = OffsetDateTime::now_utc() + time::Duration::days(1);
+    let paul = plant_session_with(
+        path,
+        11,
+        later,
+        [
+            ("user", "paul".into()),
+            ("binding", binding_of("paul", "password-of-paul").into()),
+        ],
+    )
+    .await;
+    let forged = plant_session_with(
+        path,
+        12,
+        later,
+        [("user", "marie".into()), ("binding", "0".repeat(64).into())],
+    )
+    .await;
+    let unbound = plant_session_with(path, 13, later, [("user", "marie".into())]).await;
+    for cookie in [&paul, &forged, &unbound] {
+        assert!(!opens(addr, cookie).await, "{cookie}");
+    }
+}
+
+/// Writes a session holding `data`, that expires at `expiry_date`, straight into the database,
+/// and returns its cookie.
+/// The binding a session signed in as `name` with `password` carries, under [`TOKEN`].
+fn binding_of(name: &str, password: &str) -> String {
+    fronde::session_binding(&TOKEN.to_owned().into(), name, &password.to_owned().into())
+}
+
+async fn plant_session_with<const N: usize>(
+    dir: &Path,
+    id: i128,
+    expiry_date: OffsetDateTime,
+    data: [(&str, serde_json::Value); N],
+) -> String {
+    let db = database(dir).await;
+    let store = session_store(&db);
+    store.migrate().await.unwrap();
+    let record = Record {
+        id: Id(id),
+        data: data.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+        expiry_date,
+    };
+    store.save(&record).await.unwrap();
+    format!("fronde_session={}", Id(id))
+}
+
+/// A refused `hello` leaves the socket streaming nothing: the page now shows the thread it named,
+/// so the entries of the thread it streamed before must not reach it.
+#[tokio::test]
+async fn a_refused_hello_stops_the_previous_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in(addr).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    let unknown = ThreadId(99);
+    say(
+        &mut socket,
+        ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: Some(unknown),
+        },
+    )
+    .await;
+    assert_eq!(
+        next_thread_refusal(&mut socket).await,
+        (Some(unknown), None, NOT_FOUND.into())
+    );
+    // Another page runs a turn on the main thread.
+    let mut other = open_chat(addr, &cookie).await;
+    hello_thread(&mut other, ThreadId::MAIN, 0, None).await;
+    say(
+        &mut other,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    until_turn_ended(&mut other).await;
+    // The refused page gets the answer to its next message, and none of that turn's entries.
+    say(
+        &mut socket,
+        ClientMsg::Cancel {
+            thread: Some(unknown),
+        },
+    )
+    .await;
+    loop {
+        match next_message(&mut socket).await {
+            ServerMsg::ThreadRefused { thread, .. } => {
+                assert_eq!(thread, Some(unknown));
+                break;
+            }
+            ServerMsg::Threads { .. } => {}
+            other => panic!("the refused page still streams the main thread: {other:?}"),
+        }
+    }
+}
+
+/// `fronde check` warns about a sign-in password shorter than 12 characters, and still passes:
+/// a configuration that loaded before keeps loading.
+#[test]
+fn check_warns_about_a_short_password() {
+    let dir = tempfile::tempdir().unwrap();
+    fronde_hub::private::write(dir.path().join("token"), TOKEN).unwrap();
+    fronde_hub::private::write(dir.path().join("password"), "short").unwrap();
+    let path = dir.path().join("fronde.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\ntoken = {{ file = {:?} }}\n[data]\ndir = {:?}\ntimezone = \"Europe/Paris\"\n[web]\npassword = {{ file = {:?} }}\n",
+            dir.path().join("token").display().to_string(),
+            dir.path().join("data").display().to_string(),
+            dir.path().join("password").display().to_string()
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+        .args(["check", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("web.password: warning: shorter than 12 characters"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("short\n") && !stdout.contains("\"short\""),
+        "{stdout}"
+    );
 }
