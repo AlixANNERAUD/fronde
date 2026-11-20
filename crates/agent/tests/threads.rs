@@ -4061,10 +4061,14 @@ async fn open_people(dir: &Path, users: &[&str], owner: &str) -> Arc<Threads> {
         .unwrap()
 }
 
-/// The directories beside `home` its owner's earlier homes were moved to.
-fn homes_aside(home: &Path, earlier: &str) -> Vec<std::path::PathBuf> {
-    let prefix = format!("home.previous-{earlier}-");
-    std::fs::read_dir(home.parent().unwrap())
+/// The directories beside `dir` (a thread's home or working directory) its owner's earlier ones
+/// were moved to.
+fn homes_aside(dir: &Path, earlier: &str) -> Vec<std::path::PathBuf> {
+    let prefix = format!(
+        "{}.previous-{earlier}-",
+        dir.file_name().unwrap().to_str().unwrap()
+    );
+    std::fs::read_dir(dir.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
@@ -4105,6 +4109,14 @@ async fn the_main_tree_follows_the_owner_at_each_start() {
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::write(home.join(".claude/transcript.jsonl"), "of me").unwrap();
     }
+    let works = [
+        fronde_agent::threads::thread_dirs(dir.path(), ThreadId::MAIN).work,
+        fronde_agent::threads::thread_dirs(dir.path(), child).work,
+    ];
+    for work in &works {
+        std::fs::create_dir_all(work).unwrap();
+        std::fs::write(work.join("notes.md"), "of me").unwrap();
+    }
 
     let threads = open_people(dir.path(), &["alix"], "alix").await;
     for id in [ThreadId::MAIN, child] {
@@ -4130,8 +4142,20 @@ async fn the_main_tree_follows_the_owner_at_each_start() {
         );
         assert!(!home.join(".claude").exists(), "{}", home.display());
     }
-    // The main thread's home is there again, empty, as the server makes it.
+    // So are their working directories, the files their agents made.
+    for work in &works {
+        let aside = homes_aside(work, "me");
+        assert_eq!(aside.len(), 1, "{}: {aside:?}", work.display());
+        assert_eq!(
+            std::fs::read_to_string(aside[0].join("notes.md")).unwrap(),
+            "of me"
+        );
+        assert!(!work.join("notes.md").exists(), "{}", work.display());
+    }
+    // The main thread's home and working directory are there again, empty, as the server
+    // makes them.
     assert!(homes[0].join("tmp").is_dir());
+    assert!(works[0].is_dir());
 
     // A sub-agent left another person's under the owner's main thread follows it as well.
     give(dir.path(), child, "marie").await;
@@ -4364,4 +4388,175 @@ async fn the_token_is_read_again_at_each_start() {
         *read.lock().unwrap(),
         ["first-token-of-marie", "second-token-of-marie"]
     );
+}
+
+/// When the main tree changes owner, the cards its threads asked of the earlier owner are
+/// cancelled, their end shown: the earlier owner, still a member, can never answer one into
+/// the new owner's agent.
+#[tokio::test]
+async fn a_moved_tree_cancels_the_earlier_owners_cards() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["me"], "me").await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    // A question of the main thread's agent, whose answer would reach it late.
+    let waiter = requests
+        .ask(Ask {
+            caller: Caller::Thread(ThreadId::MAIN),
+            turn: Some(1),
+            for_user: "me".into(),
+            ..ask(TOPIC)
+        })
+        .await
+        .unwrap();
+    let id = waiter.id();
+    drop((waiter, requests));
+    drop(threads);
+
+    let threads = open_people(dir.path(), &["alix", "me"], "alix").await;
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let requests = Requests::open(db, threads.clone()).await.unwrap();
+    threads.set_requests(&requests).await;
+    let me = User {
+        name: "me".into(),
+        admin: false,
+    };
+    assert_eq!(
+        requests.answer(id, perso(), &me).await,
+        Err(fronde_requests::Refusal::Closed)
+    );
+    assert!(requests.answer(id, perso(), &alix()).await.is_err());
+    let shown = events(&threads.main());
+    assert!(
+        shown.iter().any(|event| matches!(
+            event,
+            Event::RequestClosed { id: closed, outcome: Outcome::Cancelled, .. } if *closed == id
+        )),
+        "{shown:?}"
+    );
+}
+
+/// `reassign` never gives a tree holding another person's thread: refused whole, nothing
+/// given, that person's thread keeping its owner, session and directories.
+#[tokio::test]
+async fn reassign_refuses_a_tree_with_another_persons_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["alix", "alice"], "alix").await;
+    let hers = threads
+        .create("alice", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    let under = threads
+        .create("alice", StartedBy::Thread(hers), Some(hers), "Mesurer")
+        .await
+        .unwrap()
+        .id;
+    drop(threads);
+    give(dir.path(), under, "carol").await;
+    set_session(dir.path(), under, "session-of-carol").await;
+    let home = fronde_agent::threads::thread_dirs(dir.path(), under).home;
+    std::fs::create_dir_all(&home).unwrap();
+    // Alice leaves, and comes back.
+    drop(open_people(dir.path(), &["alix"], "alix").await);
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let error = fronde_agent::threads::reassign(&db, dir.path(), "removed:alice", "alice")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(&format!("thread {under}")) && error.contains("removed:carol's"),
+        "{error}"
+    );
+    let row = |id: ThreadId| {
+        let db = db.clone();
+        async move {
+            fronde_entity::threads::Entity::find_by_id(id.0)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    assert_eq!(row(hers).await.owner, "removed:alice");
+    assert_eq!(row(under).await.owner, "removed:carol");
+    assert_eq!(
+        row(under).await.session_id.as_deref(),
+        Some("session-of-carol")
+    );
+    assert!(home.is_dir());
+}
+
+/// Archiving a thread stops and retires only what under it is its owner's, and archiving a
+/// thread tells only a parent of the same person: a thread of another person left under it
+/// (as an earlier version may have left it) is neither stopped nor tells anyone.
+#[tokio::test]
+async fn an_archive_never_reaches_another_persons_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Notify::new());
+    let (connector, _) = fake_connector(FakeScript {
+        updates: vec![text_chunk("Je regarde.")],
+        pause: Some((1, gate.clone())),
+        ..FakeScript::default()
+    });
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let mut accounts = Accounts::default();
+    for name in ["alix", "marie"] {
+        accounts.insert(
+            name,
+            "claude",
+            Binding {
+                account: name.into(),
+                token: None,
+            },
+        );
+    }
+    let people = People {
+        users: [
+            alix(),
+            User {
+                name: "marie".into(),
+                admin: false,
+            },
+        ]
+        .into_iter()
+        .collect(),
+        owner: "alix".into(),
+        prompt: None,
+        accounts,
+    };
+    let threads = Threads::open_for(db, dir.path(), spec(), connector, people, Budget::default())
+        .await
+        .unwrap();
+    let his = threads
+        .create("alix", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    let stray = threads
+        .create("alix", StartedBy::Thread(his), Some(his), "L'autre")
+        .await
+        .unwrap()
+        .id;
+    give(dir.path(), stray, "marie").await;
+    let theirs = threads.assistant(stray).await.unwrap().unwrap();
+    theirs.send("Cherche".into()).await;
+    timeout(WAIT, async {
+        while theirs.status() != ThreadStatus::Running {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("her turn never ran");
+    threads.set_archived(his, true).await.unwrap();
+    assert_eq!(
+        theirs.status(),
+        ThreadStatus::Running,
+        "her turn was stopped"
+    );
+    threads.set_archived(stray, true).await.unwrap();
+    let parent = threads.assistant(his).await.unwrap().unwrap();
+    assert_eq!(children_ended(&events(&parent)), 0, "{:?}", events(&parent));
+    gate.notify_waiters();
 }

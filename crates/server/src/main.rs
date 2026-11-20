@@ -168,6 +168,7 @@ fn warn_if_agent_missing(config: &fronde_hub::config::Config) {
 }
 
 async fn check(path: &std::path::Path) -> anyhow::Result<()> {
+    fronde::refuse_this_testing_build()?;
     let config = fronde_hub::config::load(path)?;
     fronde_hub::private::prepare_data_dir(&config.data.dir)?;
     warn_if_agent_missing(&config);
@@ -270,6 +271,7 @@ async fn healthcheck(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 async fn serve(path: &std::path::Path) -> anyhow::Result<()> {
+    fronde::refuse_this_testing_build()?;
     fronde::hardening::harden()?;
     let config = fronde_hub::config::load(path)?;
     let (addr, server) = fronde::start(config).await?;

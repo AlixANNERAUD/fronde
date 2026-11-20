@@ -38,6 +38,12 @@ dump, ptrace or `/proc/<pid>/mem` read by another process of the same user can r
 (see [Security model](../explanation/security.md#core-dumps-and-other-processes)). Set
 `FRONDE_ALLOW_CORE_DUMPS=1` to skip this when debugging a crash.
 
+A `fronde` binary built with the test hooks of its crates (their `testing` feature, which a
+workspace build with its tests, `--all-targets`, turns on) refuses to start, and so does
+`fronde check`, naming the crates: those hooks let a tool call skip its gate and fake the
+keychain. Build it alone, `cargo build --release --package fronde`, as `mise run build` does.
+Cargo's own test runs, which set `CARGO_MANIFEST_DIR`, are let through.
+
 `fronde __confine` is internal: it is how `serve` starts its agent (see
 [Security model](../explanation/security.md#the-agents-environment)). It is not meant to be run by
 hand.
@@ -107,7 +113,11 @@ form)`, `… token from Fronde's environment, CLAUDE_CODE_OAUTH_TOKEN, read (leg
 token: the agent starts unsigned (legacy form)`. A token that does not read, or holds spaces or
 line breaks, fails the check, and so does the owner's stored token not stored yet; another
 person's not stored yet is a warning, `warning: stored secret claude_marie not stored yet: store
-it with fronde secret set …`. It also refuses a grant over Fronde's data or configuration
+it with fronde secret set …`. After the accounts, it says what the data directory keeps of
+earlier owners, `kept: 2 agent director(y/ies) set aside from earlier owners (*.previous-*,
+threads/<id>.old-*); 1 thread(s) of people no longer configured (removed:<name>), with their
+agents' directories: each holds an earlier person's agent files; remove what you no longer need`
+(see [Data directory](data-directory.md)). It also refuses a grant over Fronde's data or configuration
 (see [Where the agent runs](../explanation/security.md#where-the-agent-runs)); it creates the
 agent's `agent/` and `home/` in the data directory for that. It also checks that `[data] dir` can
 be created and written:
@@ -189,9 +199,11 @@ they get their threads back once listed again. `--to` must be a user of the conf
 main thread is never given: it is always `[data] user`'s.
 
 Given back to the same person (`--from removed:marie --to marie`), each thread keeps its agent's
-conversation and home. Given to anyone else, each thread's agent starts a new conversation, and
-its home (`threads/<id>/home`) is moved to `home.previous-<name>-<time>` beside it, so that the
-new owner's agent never reads the earlier one's.
+conversation, home and working directory. Given to anyone else, each thread's agent starts a new
+conversation, and its home and working directory (`threads/<id>/home`, `threads/<id>/work`) are
+moved to `home.previous-<name>-<time>` and `work.previous-<name>-<time>` beside them, so that the
+new owner's agent never reads the earlier one's. A conversation holding a thread of someone else
+(which an earlier version may have left) is refused, and nothing is given.
 
 Like `secret rotate-key`, it refuses to run while Fronde runs on the same data directory, naming
 the process that holds it.

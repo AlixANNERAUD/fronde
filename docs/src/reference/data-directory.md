@@ -22,6 +22,7 @@ and, separately, a key file.
 | `threads/<id>/work/` | Thread `<id>`'s agent's working directory, for every thread but the main one. Created private (0700) when that thread's agent first starts. |
 | `threads/<id>/home/` | Thread `<id>`'s agent's home, with its `tmp/`: its own Claude settings and transcripts, never another thread's. It starts empty, so the agent signs in with `[agent] oauth_token` only. |
 | `threads/<id>.old-<time>/` | A thread directory a new thread found already there (from a database restored from a backup, or made anew), moved aside so that the new thread starts clean. Fronde never reads it: keep it or delete it. |
+| `home.previous-<name>-<time>/`, `agent.previous-<name>-<time>/`, `threads/<id>/home.previous-<name>-<time>/`, `threads/<id>/work.previous-<name>-<time>/` | A thread's agent home and working directory when the thread was given to someone else (`[data] user` changed, or `fronde threads reassign`), set aside so that the new owner's agent never reads `<name>`'s Claude state, transcripts or files. Fronde never reads them: they hold an earlier person's agent state, so delete them once you no longer need them. The directories of a removed person's threads (`removed:<name>`) are kept too, until those threads are given back. `fronde check` counts both (`kept:`). |
 
 Earlier versions kept the memory's search index in `index.sqlite`: Fronde deletes it at start.
 

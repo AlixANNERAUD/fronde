@@ -1341,14 +1341,14 @@ impl Threads {
         _starting: &tokio::sync::MutexGuard<'_, ()>,
     ) -> anyhow::Result<bool> {
         let mut tree = vec![(root, super::topic_of(root))];
-        // An archive stops everything under the thread; an agent's cancel stops only what is
-        // its owner's.
-        let under = if retire {
-            self.descendants(root).await?
-        } else {
-            self.own_descendants(root).await?
-        };
-        tree.extend(under.into_iter().map(|row| (row.id, row.topic)));
+        // Only what is the thread's owner's: neither an archive nor an agent's cancel stops
+        // another person's thread.
+        tree.extend(
+            self.own_descendants(root)
+                .await?
+                .into_iter()
+                .map(|row| (row.id, row.topic)),
+        );
         let mut stopped = false;
         // `descendants` goes level by level: reversed, the deepest come first.
         for (thread, topic) in tree.into_iter().rev() {

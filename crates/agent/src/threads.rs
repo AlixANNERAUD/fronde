@@ -687,7 +687,7 @@ impl Threads {
         } = people;
         let owner = owner.as_str();
         legacy::import(&db, data_dir, TOPIC, LEGACY_SESSION).await?;
-        ensure_main(&db, data_dir, owner, spec.provider.id)
+        let cancelled = ensure_main(&db, data_dir, owner, spec.provider.id)
             .await
             .context("cannot make the main thread in the database")?;
         bury_removed(&db, &users)
@@ -771,6 +771,12 @@ impl Threads {
         });
         // Set before any thread but the main one opens: a turn's end may wake its parent.
         let _ = registry.set(Arc::downgrade(&threads));
+        // The cards `ensure_main` cancelled show their end in their threads.
+        for (topic, id) in cancelled {
+            if let Err(error) = threads.close(&topic, id, &Outcome::Cancelled, None).await {
+                tracing::warn!("cannot show the end of request {id} in {topic}: {error:#}");
+            }
+        }
         let parents = threads.parents().await?;
         for row in threads.list(false).await? {
             if row.id == ThreadId::MAIN {
@@ -1354,6 +1360,14 @@ impl Threads {
                 return;
             }
         };
+        // Told only to a thread of the same person, as `child_ended` wakes one.
+        if self.owner_of(parent).name != row.owner {
+            tracing::warn!(
+                "thread {id}, {}'s, is archived: thread {parent} is another person's, not told",
+                row.owner
+            );
+            return;
+        }
         let (title, _) = fronde_protocol::text::readable(&row.title, fronde_protocol::MAX_TITLE);
         assistant
             .tell(Event::ChildEnded {
@@ -1499,23 +1513,37 @@ pub async fn reassign(
         .into_tuple()
         .all(&transaction)
         .await?;
-    // The same person back (`removed:marie` to `marie`) keeps their sessions and homes.
-    let same_person = from.strip_prefix(REMOVED).unwrap_or(from) == to;
-    let now = Utc::now();
-    let mut update = threads::Entity::update_many()
-        .col_expr(threads::Column::Owner, Expr::value(to.to_owned()))
-        .col_expr(threads::Column::UpdatedAt, Expr::value(now));
-    if !same_person {
-        for (id, owner, _) in &given {
-            move_home_aside(data_dir, ThreadId(*id), owner, now)?;
-        }
-        update = update.col_expr(
-            threads::Column::SessionId,
-            Expr::value(Option::<String>::None),
+    // A tree is one person's: one holding another's thread (left by an earlier version, or a
+    // hand edit) is not given whole, nor in part.
+    if let Some((id, owner, _)) = given.iter().find(|(_, owner, _)| owner != from) {
+        bail!(
+            "thread {id}, under a conversation of {from}, is {owner}'s: nothing was given; give \
+             {owner}'s threads first, or archive that thread"
         );
     }
-    update
-        .filter(threads::Column::Id.is_in(given.iter().map(|(id, ..)| *id)))
+    let now = Utc::now();
+    // Each thread given back to the same person (`removed:marie` to `marie`) keeps its session
+    // and directories; given to anyone else, it forgets them.
+    let (kept, fresh): (Vec<_>, Vec<_>) = given
+        .iter()
+        .partition(|(_, owner, _)| owner.strip_prefix(REMOVED).unwrap_or(owner) == to);
+    for (id, owner, _) in &fresh {
+        move_dirs_aside(data_dir, ThreadId(*id), owner, now)?;
+    }
+    threads::Entity::update_many()
+        .col_expr(threads::Column::Owner, Expr::value(to.to_owned()))
+        .col_expr(threads::Column::UpdatedAt, Expr::value(now))
+        .filter(threads::Column::Id.is_in(kept.iter().map(|(id, ..)| *id)))
+        .exec(&transaction)
+        .await?;
+    threads::Entity::update_many()
+        .col_expr(threads::Column::Owner, Expr::value(to.to_owned()))
+        .col_expr(
+            threads::Column::SessionId,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(threads::Column::UpdatedAt, Expr::value(now))
+        .filter(threads::Column::Id.is_in(fresh.iter().map(|(id, ..)| *id)))
         .exec(&transaction)
         .await?;
     fronde_entity::requests::Entity::update_many()
@@ -1532,6 +1560,15 @@ pub async fn reassign(
         .await?;
     transaction.commit().await?;
     Ok(given.len())
+}
+
+/// How many threads belong to people no longer configured (`removed:<name>`), for `fronde
+/// check`.
+pub async fn buried_count(db: &DatabaseConnection) -> anyhow::Result<u64> {
+    Ok(threads::Entity::find()
+        .filter(threads::Column::Owner.starts_with(REMOVED))
+        .count(db)
+        .await?)
 }
 
 /// Gives the threads (and the pending cards) of every owner who is not in `users` to
@@ -1577,14 +1614,14 @@ async fn bury_removed(db: &DatabaseConnection, users: &Users) -> anyhow::Result<
 /// the key-value table to the row, in one transaction: the row is then the only place it is
 /// kept. The main thread is `owner`'s, `[data] user`, and so is every thread under it, at every
 /// start: a row of that tree made for anyone else is given to `owner`, its agent session
-/// forgotten and its home moved aside ([`move_home_aside`]), so that the new owner's agent
+/// forgotten and its home moved aside ([`move_dirs_aside`]), so that the new owner's agent
 /// never resumes the earlier owner's conversation nor reads their agent's files.
 async fn ensure_main(
     db: &DatabaseConnection,
     data_dir: &Path,
     owner: &str,
     provider: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, RequestId)>> {
     let transaction = fronde_db::begin_write(db).await?;
     if streams::Entity::find_by_id(TOPIC)
         .one(&transaction)
@@ -1644,21 +1681,23 @@ async fn ensure_main(
         level.retain(|id| !tree.contains(id));
         tree.extend(&level);
     }
-    let given: Vec<(i64, String)> = threads::Entity::find()
+    let given: Vec<(i64, String, String)> = threads::Entity::find()
         .select_only()
         .column(threads::Column::Id)
         .column(threads::Column::Owner)
+        .column(threads::Column::Topic)
         .filter(threads::Column::Id.is_in(tree))
         .filter(threads::Column::Owner.ne(owner))
         .into_tuple()
         .all(&transaction)
         .await?;
+    let mut cancelled = Vec::new();
     if !given.is_empty() {
         let now = Utc::now();
         // Moved before the rows change: a home that cannot be moved stops the start, the rows
         // left as they were.
-        for (id, earlier) in &given {
-            move_home_aside(data_dir, ThreadId(*id), earlier, now)?;
+        for (id, earlier, _) in &given {
+            move_dirs_aside(data_dir, ThreadId(*id), earlier, now)?;
             tracing::warn!(
                 "thread {id} was {earlier}'s: it is now {owner}'s, [data] user's, as the main \
                  thread and everything under it are; its agent starts a new conversation"
@@ -1671,28 +1710,59 @@ async fn ensure_main(
                 Expr::value(Option::<String>::None),
             )
             .col_expr(threads::Column::UpdatedAt, Expr::value(now))
-            .filter(threads::Column::Id.is_in(given.iter().map(|(id, _)| *id)))
+            .filter(threads::Column::Id.is_in(given.iter().map(|(id, ..)| *id)))
             .exec(&transaction)
             .await?;
+        // Their cards were asked of the earlier owner, by a session now forgotten: cancelled,
+        // so that the earlier owner can never answer into the new owner's agent.
+        let topics = given.iter().map(|(.., topic)| topic.clone());
+        let pending: Vec<(i64, String)> = fronde_entity::requests::Entity::find()
+            .select_only()
+            .column(fronde_entity::requests::Column::Id)
+            .column(fronde_entity::requests::Column::Topic)
+            .filter(fronde_entity::requests::Column::Status.eq(fronde_requests::PENDING))
+            .filter(fronde_entity::requests::Column::Topic.is_in(topics))
+            .into_tuple()
+            .all(&transaction)
+            .await?;
+        if !pending.is_empty() {
+            fronde_entity::requests::Entity::update_many()
+                .col_expr(
+                    fronde_entity::requests::Column::Status,
+                    Expr::value(fronde_requests::CANCELLED),
+                )
+                .col_expr(
+                    fronde_entity::requests::Column::ResolvedAt,
+                    Expr::value(now),
+                )
+                .filter(
+                    fronde_entity::requests::Column::Id.is_in(pending.iter().map(|(id, _)| *id)),
+                )
+                .exec(&transaction)
+                .await?;
+        }
+        for (id, topic) in pending {
+            cancelled.push((
+                topic,
+                RequestId::try_from(id).context("negative request id")?,
+            ));
+        }
     }
     transaction.commit().await?;
-    Ok(())
+    Ok(cancelled)
 }
 
-/// Moves thread `id`'s home, which its agent's sign-in state and transcripts are in, to
-/// `home.previous-<earlier>-<UTC time>` beside it, when the thread changes owner from `earlier`:
-/// no agent of the new owner reads it. The main thread's home is made again, empty, as the
-/// server made it; another thread's is made when its agent first starts.
-fn move_home_aside(
+/// Moves thread `id`'s directories, its home (its agent's sign-in state and transcripts) and
+/// its working directory (the files its agent made), to `<name>.previous-<earlier>-<UTC time>`
+/// beside each, when the thread changes owner from `earlier`: no agent of the new owner reads
+/// them. The main thread's are made again, empty, as the server made them; another thread's
+/// are made when its agent first starts.
+fn move_dirs_aside(
     data_dir: &Path,
     id: ThreadId,
     earlier: &str,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let home = thread_dirs(data_dir, id).home;
-    if home.symlink_metadata().is_err() {
-        return Ok(());
-    }
     // A name of a user never holds a path separator; a buried owner's holds `:`.
     let earlier: String = earlier
         .chars()
@@ -1704,22 +1774,33 @@ fn move_home_aside(
             }
         })
         .collect();
-    let aside = home.with_file_name(format!(
-        "home.previous-{earlier}-{}",
-        now.format("%Y%m%dT%H%M%S%.6fZ")
-    ));
-    std::fs::rename(&home, &aside).with_context(|| {
-        format!(
-            "cannot move {} aside for thread {id}'s new owner",
-            home.display()
-        )
-    })?;
-    tracing::warn!(
-        "thread {id}'s agent home was {earlier}'s: moved to {}",
-        aside.display()
-    );
+    let ThreadDirs { work, home } = thread_dirs(data_dir, id);
+    for dir in [&home, &work] {
+        if dir.symlink_metadata().is_err() {
+            continue;
+        }
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("a thread's directory has a name")?;
+        let aside = dir.with_file_name(format!(
+            "{name}.previous-{earlier}-{}",
+            now.format("%Y%m%dT%H%M%S%.6fZ")
+        ));
+        std::fs::rename(dir, &aside).with_context(|| {
+            format!(
+                "cannot move {} aside for thread {id}'s new owner",
+                dir.display()
+            )
+        })?;
+        tracing::warn!(
+            "thread {id}'s agent directory {} was {earlier}'s: moved to {}",
+            dir.display(),
+            aside.display()
+        );
+    }
     if id == ThreadId::MAIN {
-        for dir in [&home, &home.join("tmp")] {
+        for dir in [&work, &home, &home.join("tmp")] {
             fronde_fs::create_dir_all(dir).with_context(|| {
                 format!("cannot create the agent's directory {}", dir.display())
             })?;

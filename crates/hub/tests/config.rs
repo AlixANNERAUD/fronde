@@ -2335,6 +2335,29 @@ fn upstream_servers_get_no_sign_in_variable() {
             "{name}: {e}"
         );
     }
+    // Wherever the assignment sits in an argument.
+    for (arg, name) in [
+        ("--env=CLAUDE_CODE_OAUTH_TOKEN=x", "CLAUDE_CODE_OAUTH_TOKEN"),
+        ("-eCLAUDE_CODE_OAUTH_TOKEN=x", "CLAUDE_CODE_OAUTH_TOKEN"),
+        (
+            "export ANTHROPIC_API_KEY=x; shop-server",
+            "ANTHROPIC_API_KEY",
+        ),
+        (
+            "A=1 ANTHROPIC_BASE_URL=https://x shop",
+            "ANTHROPIC_BASE_URL",
+        ),
+    ] {
+        let e = refused(&format!(
+            "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"shop\"\n\
+             command = [\"sh\", \"-c\", {}]\n",
+            toml::Value::String(arg.to_owned())
+        ));
+        assert!(
+            e.contains(&format!("source \"shop\": command sets {name}")),
+            "{arg}: {e}"
+        );
+    }
     // Its own token, and its own variables, stay allowed.
     load_str(&format!(
         "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"shop\"\nurl = \"https://x/mcp\"\n\

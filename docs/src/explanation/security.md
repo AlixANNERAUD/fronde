@@ -475,11 +475,16 @@ thread's first message, with its own directories, its own sandbox and its own hu
   back to anyone else's; `fronde threads reassign`, run while Fronde is stopped, gives such
   threads back. The main thread is always `[data] user`'s, and so is every thread under it,
   checked at every start: when `[data] user` changes, each thread of that tree given to the new
-  owner forgets its agent session and has its home moved aside (`home.previous-<name>-<time>`),
-  so that the new owner's agent neither resumes the earlier owner's conversation nor reads their
-  agent's files. A thread is made under another only for that thread's owner, and no
-  `threads_*` call, nor a sub-agent's result, crosses from one person's threads to another's:
-  another person's thread is answered as one that does not exist. Each person signs in as themselves: their page lists, opens and
+  owner forgets its agent session, has the cards it asked of the earlier owner cancelled, and
+  has its home and working directory moved aside (`home.previous-<name>-<time>`,
+  `work.previous-<name>-<time>`, `agent.previous-<name>-<time>` for the main thread's), so that
+  the new owner's agent neither resumes the earlier owner's conversation nor reads the files
+  their agent kept or made, and the earlier owner cannot answer into the new owner's agent. The
+  directories set aside, and those of a removed person's threads, stay in the data directory
+  with that person's agent state until you delete them: `fronde check` counts them (`kept:`). A
+  thread is made under another only for that thread's owner, and no `threads_*` call, archive,
+  nor a sub-agent's result, crosses from one person's threads to another's: another person's
+  thread is answered as one that does not exist. Each person signs in as themselves: their page lists, opens and
   writes to their own threads only, answers their own cards only, and gets the usage readings of
   their own account only, never anyone else's; an admin's page sees every thread and every
   account's readings.

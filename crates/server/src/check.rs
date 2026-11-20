@@ -115,6 +115,11 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
         for account in config.accounts() {
             writeln!(out, "{}", account_line(config, &account, &checks.secrets)?)?;
         }
+        writeln!(
+            out,
+            "kept: {}",
+            kept_line(earlier_dirs(&config.data.dir), buried_threads(config).await)
+        )?;
     }
     if let Some(python) = &config.python {
         let host = fronde_wasm::ComponentHost::new()?;
@@ -293,6 +298,71 @@ async fn usage_check_lines(config: &Config) -> Vec<String> {
 /// missing database, or a missing approvals or secrets table (a database an older Fronde left,
 /// which serving would migrate to an empty table), means no stored approval or secret. The master
 /// key is checked as serving checks it.
+/// What the data directory keeps of people who no longer use it: `dirs` agent directories set
+/// aside when their thread changed owner or its id was taken again, and `buried` threads of
+/// people no longer configured (`None` when the database cannot tell).
+pub fn kept_line(dirs: usize, buried: Option<u64>) -> String {
+    let buried = match buried {
+        Some(count) => format!(
+            "{count} thread(s) of people no longer configured (removed:<name>), with their \
+             agents' directories"
+        ),
+        None => "the threads of people no longer configured cannot be counted".to_owned(),
+    };
+    format!(
+        "{dirs} agent director(y/ies) set aside from earlier owners (*.previous-*, \
+         threads/<id>.old-*); {buried}: each holds an earlier person's agent files; remove what \
+         you no longer need"
+    )
+}
+
+/// How many agent directories the data directory keeps set aside: `home.previous-*` and
+/// `agent.previous-*` (the main thread's), `threads/<id>.old-*`, and each thread's
+/// `home.previous-*` and `work.previous-*`.
+pub fn earlier_dirs(data: &std::path::Path) -> usize {
+    let aside = |dir: &std::path::Path, prefixes: &[&str]| {
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    prefixes.iter().any(|prefix| name.starts_with(prefix))
+                })
+                .count()
+        })
+    };
+    let threads = data.join("threads");
+    let mut count = aside(data, &["home.previous-", "agent.previous-"]);
+    if let Ok(entries) = std::fs::read_dir(&threads) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(".old-") {
+                count += 1;
+            } else {
+                count += aside(&entry.path(), &["home.previous-", "work.previous-"]);
+            }
+        }
+    }
+    count
+}
+
+/// How many threads belong to people no longer configured, read from the database as the
+/// other checks read it, leaving no file behind (`fronde_db::read_only`); `Some(0)` without a
+/// database, `None` when it does not tell.
+async fn buried_threads(config: &Config) -> Option<u64> {
+    let file = fronde_db::path(&config.data.dir);
+    if !file.try_exists().ok()? {
+        return Some(0);
+    }
+    fronde_db::read_only(&config.data.dir, async |db| {
+        fronde_agent::threads::buried_count(db).await
+    })
+    .await
+    .ok()
+}
+
 async fn approval_checks(config: &Config) -> anyhow::Result<fronde_wasm::Checks> {
     let mut checks = fronde_wasm::Checks::of(config);
     let file = fronde_db::path(&config.data.dir);

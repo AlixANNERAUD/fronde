@@ -2,6 +2,10 @@
 //! creates it private, sets it up and applies the migrations of `fronde-migration`; the tables
 //! are the entities of `fronde-entity`.
 
+/// Whether this build has the `testing` feature, whose test hooks a served Fronde must not
+/// have: `fronde serve` refuses to start with it.
+pub const TESTING: bool = cfg!(feature = "testing");
+
 pub mod approvals;
 pub mod ephemeral;
 pub mod kv;

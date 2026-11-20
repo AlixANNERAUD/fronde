@@ -1942,6 +1942,16 @@ async fn threads_reassign_from_the_command_line() {
     assert!(shown.contains("Stop it first"), "{shown}");
     server.abort();
     let _ = server.await;
+    // `fronde check` counts what is kept of people gone.
+    let (code, shown) = check_with(&path, &people(true), None);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(
+            "\nkept: 0 agent director(y/ies) set aside from earlier owners (*.previous-*, \
+             threads/<id>.old-*); 1 thread(s) of people no longer configured"
+        ),
+        "{shown}"
+    );
     let (code, shown) = reassign("zoe");
     assert_eq!(code, Some(1), "{shown}");
     assert!(
@@ -1956,4 +1966,27 @@ async fn threads_reassign_from_the_command_line() {
         "{shown}"
     );
     assert_eq!(owner().await, "paul");
+}
+
+/// The agent directories set aside from earlier owners are counted, wherever they are kept.
+#[test]
+fn check_counts_the_directories_set_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    for kept in [
+        "home.previous-me-20261120T000000.000000Z",
+        "agent.previous-me-20261120T000000.000000Z",
+        "threads/3.old-20261120T000000.000000Z",
+        "threads/4/home.previous-paul-20261120T000000.000000Z",
+        "threads/4/work.previous-paul-20261120T000000.000000Z",
+        // Not set aside: the threads' own and the main thread's.
+        "threads/4/home",
+        "threads/4/work",
+        "home",
+        "agent",
+    ] {
+        std::fs::create_dir_all(data.join(kept)).unwrap();
+    }
+    assert_eq!(fronde::check::earlier_dirs(data), 5);
+    assert_eq!(fronde::check::earlier_dirs(&data.join("nothing")), 0);
 }

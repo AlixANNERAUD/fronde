@@ -475,6 +475,34 @@ pub fn signs_in(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The sign-in variable `arg` assigns, `NAME=` anywhere in it (`env NAME=…`, `--env=NAME=…`,
+/// `-eNAME=…`, `sh -c 'export NAME=…'`), with its provider. A guard against a mistake in the
+/// configuration, not a boundary: a command can always build a name Fronde does not see.
+fn sets_sign_in(arg: &str) -> Option<(String, &'static str)> {
+    for provider in PROVIDERS {
+        for name in sign_in_vars(provider) {
+            if arg
+                .match_indices(name)
+                .any(|(at, _)| arg[at + name.len()..].starts_with('='))
+            {
+                return Some(((*name).to_owned(), provider));
+            }
+        }
+        for prefix in sign_in_prefixes(provider) {
+            for (at, _) in arg.match_indices(prefix) {
+                let rest = &arg[at + prefix.len()..];
+                let tail = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if rest[tail..].starts_with('=') {
+                    return Some((format!("{prefix}{}", &rest[..tail]), provider));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// `[secrets]`: where the master key that seals stored secrets is kept.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1965,9 +1993,7 @@ fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
                     );
                 }
                 for arg in m.command.iter().flatten() {
-                    if let Some((variable, _)) = arg.split_once('=')
-                        && let Some(provider) = signs_in(variable)
-                    {
+                    if let Some((variable, provider)) = sets_sign_in(arg) {
                         bail!(
                             "source {name:?}: command sets {variable}, which signs an agent in \
                              to {provider}: a server never gets an account's sign-in; remove it \

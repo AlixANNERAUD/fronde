@@ -481,7 +481,7 @@ async fn connect(
 /// the home, the language, the temporary directory, and how this machine reaches the network
 /// (its proxy, and the certificate authorities it trusts besides the system's). Nothing else,
 /// so that no secret's variable, sign-in variable or session's bus reaches it.
-const STDIO_KEEP_ENV: [&str; 14] = [
+const STDIO_KEEP_ENV: [&str; 16] = [
     "PATH",
     "HOME",
     "LANG",
@@ -492,6 +492,8 @@ const STDIO_KEEP_ENV: [&str; 14] = [
     "http_proxy",
     "https_proxy",
     "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
@@ -815,6 +817,7 @@ mod tests {
         let fronde: std::collections::HashMap<&str, &str> = [
             ("HTTPS_PROXY", "http://proxy.lan:3128"),
             ("no_proxy", "localhost,.lan"),
+            ("ALL_PROXY", "socks5://proxy.lan:1080"),
             ("SSL_CERT_FILE", "/etc/ssl/ours.pem"),
             ("NODE_EXTRA_CA_CERTS", "/etc/ssl/extra.pem"),
             ("REQUESTS_CA_BUNDLE", "/etc/ssl/bundle.pem"),
@@ -838,6 +841,7 @@ mod tests {
         for kept in [
             "HTTPS_PROXY=http://proxy.lan:3128",
             "no_proxy=localhost,.lan",
+            "ALL_PROXY=socks5://proxy.lan:1080",
             "SSL_CERT_FILE=/etc/ssl/ours.pem",
             "NODE_EXTRA_CA_CERTS=/etc/ssl/extra.pem",
             "REQUESTS_CA_BUNDLE=/etc/ssl/bundle.pem",

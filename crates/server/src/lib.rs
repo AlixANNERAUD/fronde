@@ -1033,6 +1033,42 @@ async fn open_claude_token(
     sealed.open(&key)
 }
 
+/// The crates of this build compiled with their `testing` feature: a fake keychain, a tool call
+/// without the gate (`Registry::call`), an unconfined agent. A workspace build with its tests
+/// (`--all-targets`) turns them on in the binary too.
+pub fn testing_crates() -> Vec<&'static str> {
+    [
+        ("fronde-hub", fronde_hub::TESTING),
+        ("fronde-db", fronde_db::TESTING),
+        ("fronde-agent", fronde_agent::TESTING),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect()
+}
+
+/// Refuses a build with test hooks (`crates`, from [`testing_crates`]) outside Cargo, which runs
+/// the tests (`under_cargo`: `CARGO_MANIFEST_DIR` is set).
+pub fn refuse_testing_build(crates: &[&str], under_cargo: bool) -> anyhow::Result<()> {
+    if crates.is_empty() || under_cargo {
+        return Ok(());
+    }
+    bail!(
+        "this fronde binary was built with test hooks ({}), which let a tool skip its gate and \
+         fake the keychain: build it alone, `cargo build --release --package fronde` (or `mise \
+         run build`)",
+        crates.join(", ")
+    )
+}
+
+/// [`refuse_testing_build`] for this build and process.
+pub fn refuse_this_testing_build() -> anyhow::Result<()> {
+    refuse_testing_build(
+        &testing_crates(),
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+    )
+}
+
 /// What the agent's sandbox covers on this kernel, for the start log and `fronde check`: the
 /// line, and whether the agent can start at all.
 pub fn sandbox_line(confine: &Confine, hub_port: u16) -> (String, bool) {
@@ -1329,6 +1365,25 @@ pub async fn start_with(
 
 #[cfg(test)]
 mod tests {
+    /// A build with test hooks serves nothing outside Cargo's tests, naming the crates; one
+    /// without serves anywhere.
+    #[test]
+    fn a_build_with_test_hooks_refuses_to_serve() {
+        let error = super::refuse_testing_build(&["fronde-hub", "fronde-db"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("built with test hooks (fronde-hub, fronde-db)")
+                && error.contains("cargo build --release --package fronde"),
+            "{error}"
+        );
+        super::refuse_testing_build(&["fronde-hub"], true).unwrap();
+        super::refuse_testing_build(&[], false).unwrap();
+        // The tests' own build has them, and Cargo runs it.
+        assert!(super::testing_crates().contains(&"fronde-hub"));
+        super::refuse_this_testing_build().unwrap();
+    }
+
     #[test]
     fn a_sign_in_token_must_be_one_line() {
         assert!(super::one_line("sk-ant-oat01-abc".to_string().into()).is_ok());

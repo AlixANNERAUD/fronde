@@ -1,5 +1,9 @@
 //! Hub: tools, memory, tool sources and the MCP server.
 
+/// Whether this build has the `testing` feature, whose test hooks a served Fronde must not
+/// have: `fronde serve` refuses to start with it.
+pub const TESTING: bool = cfg!(feature = "testing");
+
 pub mod config;
 pub mod guide;
 pub mod integrations;

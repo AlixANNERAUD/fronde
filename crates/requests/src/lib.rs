@@ -45,11 +45,13 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use zeroize::Zeroize as _;
 
-const PENDING: &str = "pending";
+/// The status of a request's row that waits for an answer.
+pub const PENDING: &str = "pending";
 const ANSWERED: &str = "answered";
 const DECLINED: &str = "declined";
 const EXPIRED: &str = "expired";
-const CANCELLED: &str = "cancelled";
+/// The status of a request's row that was cancelled.
+pub const CANCELLED: &str = "cancelled";
 /// The kind of a question card's row (`user_ask`), whose answer outlives the call that asked.
 const FORM: &str = "form";
 /// The kind of a secret card's row, whose answer is where the secret was kept.
