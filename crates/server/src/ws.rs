@@ -61,6 +61,7 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User, mut ended: watch
     let mut talk = Talk {
         web: &web,
         user: &user,
+        home: None,
         current: None,
         live: None,
         last_sent: 0,
@@ -144,12 +145,15 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User, mut ended: watch
 struct Talk<'a> {
     web: &'a Web,
     user: &'a User,
+    /// The user's home conversation, once asked for: see [`Threads::home`].
+    home: Option<ThreadId>,
     /// The thread streamed, once the page said hello.
     current: Option<Arc<Assistant>>,
     live: Option<broadcast::Receiver<Entry>>,
     last_sent: u64,
-    /// The thread list's changes, once a hello named a thread: a page that names none knows
-    /// nothing of threads, and gets the main thread's log only, as before threads.
+    /// The thread list's changes, once a hello named a thread or asked for the list: a page that
+    /// does neither knows nothing of threads, and gets its user's home's log only, as before
+    /// threads.
     list: Option<watch::Receiver<u64>>,
     /// The thread list last sent.
     shown: Option<Vec<ThreadSummary>>,
@@ -186,9 +190,13 @@ impl Talk<'_> {
                 last_seq,
                 log_id,
                 thread,
-            } => self.hello(socket, last_seq, log_id, thread).await,
+                list,
+            } => self.hello(socket, last_seq, log_id, thread, list).await,
             ClientMsg::Send { text, thread } => {
-                let id = thread.unwrap_or(ThreadId::MAIN);
+                let id = match self.thread_or_home(thread).await {
+                    Ok(id) => id,
+                    Err(error) => return refuse(socket, thread, None, &error).await,
+                };
                 match self.writable(id).await {
                     Ok(assistant) => {
                         assistant.send(text).await;
@@ -198,7 +206,10 @@ impl Talk<'_> {
                 }
             }
             ClientMsg::Cancel { thread } => {
-                let id = thread.unwrap_or(ThreadId::MAIN);
+                let id = match self.thread_or_home(thread).await {
+                    Ok(id) => id,
+                    Err(error) => return refuse(socket, thread, None, &error).await,
+                };
                 match self.assistant(id).await {
                     Ok((_, assistant)) => {
                         assistant.cancel().await;
@@ -236,9 +247,7 @@ impl Talk<'_> {
             ClientMsg::Archive { thread, archived } => {
                 let done = async {
                     self.web.threads.visible(thread, self.user).await?;
-                    if thread == ThreadId::MAIN {
-                        bail!(Refusal::Main);
-                    }
+                    // A home, thread 1 or anyone's, is refused there.
                     self.web.threads.set_archived(thread, archived).await
                 };
                 match done.await {
@@ -249,34 +258,44 @@ impl Talk<'_> {
         }
     }
 
-    /// Streams thread `thread` (the main one when none): the entries after `last_seq`, then the
-    /// live ones; and, when the page named a thread, the thread list.
+    /// Streams thread `thread` (the user's home when none): the entries after `last_seq`, then
+    /// the live ones; and, when the page named a thread or asked for the `list`, the thread list.
+    /// The user's meter follows, refused or not.
     async fn hello(
         &mut self,
         socket: &mut WebSocket,
         last_seq: u64,
         log_id: Option<String>,
         thread: Option<ThreadId>,
+        list: bool,
     ) -> Result<(), ()> {
-        let id = thread.unwrap_or(ThreadId::MAIN);
-        let assistant = match self.assistant(id).await {
-            Ok((_, assistant)) => assistant,
+        let list = list || thread.is_some();
+        let mut named = thread;
+        let opened = async {
+            let id = self.thread_or_home(thread).await?;
+            named = Some(id);
+            let (_, assistant) = self.assistant(id).await?;
+            // Made now if it was not yet: the hello tells the page which it is.
+            let home = self.thread_or_home(None).await?;
+            anyhow::Ok((assistant, home))
+        };
+        let (assistant, home) = match opened.await {
+            Ok(opened) => opened,
             Err(error) => {
                 // The page now shows the thread it named: the one streamed until now must not
                 // reach it any more.
                 self.current = None;
                 self.live = None;
-                refuse(socket, Some(id), None, &error).await?;
-                // The list still comes, so that the page offers the threads that are the user's:
-                // a member's `/` names the main thread, the owner's, until each person has a
-                // conversation of their own there.
-                if thread.is_some() {
+                refuse(socket, named, None, &error).await?;
+                // The list still comes, so that the page offers the threads that are the user's,
+                // and so does the meter.
+                if list {
                     if self.list.is_none() {
                         self.list = Some(self.web.threads.changes());
                     }
                     self.send_list(socket).await?;
                 }
-                return Ok(());
+                return self.start_usage(socket).await;
             }
         };
         // Subscribed first, so nothing falls between the replay and the stream.
@@ -297,10 +316,12 @@ impl Talk<'_> {
             user: Some(self.user.name.clone()),
             admin: self.user.admin,
             thread,
+            // Absent for the owner, as before homes: thread 1.
+            home: (home != ThreadId::MAIN).then_some(home),
         };
         self.current = Some(assistant);
         send(socket, &hello).await?;
-        if thread.is_some() {
+        if list {
             if self.list.is_none() {
                 self.list = Some(self.web.threads.changes());
             }
@@ -309,12 +330,30 @@ impl Talk<'_> {
             self.send_list(socket).await?;
         }
         self.replay(socket).await?;
-        // After the log: the meter, again at each hello, and on each new reading from then on.
+        // After the log: the meter.
+        self.start_usage(socket).await
+    }
+
+    /// Sends the meter, again at each hello, and on each new reading from then on.
+    async fn start_usage(&mut self, socket: &mut WebSocket) -> Result<(), ()> {
         if self.usage.is_none() {
             self.usage = self.web.threads.usage_changes();
         }
         self.usage_sent = None;
         self.send_usage(socket).await
+    }
+
+    /// `thread`, or the user's home conversation when it is none: made now if it was not yet.
+    async fn thread_or_home(&mut self, thread: Option<ThreadId>) -> anyhow::Result<ThreadId> {
+        if let Some(thread) = thread {
+            return Ok(thread);
+        }
+        if let Some(home) = self.home {
+            return Ok(home);
+        }
+        let home = self.web.threads.home(self.user).await?;
+        self.home = Some(home);
+        Ok(home)
     }
 
     /// Sends the meter's usage, if the page's user gets one and it changed since last sent.

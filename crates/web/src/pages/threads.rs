@@ -1,4 +1,5 @@
-//! The pages of signed-in users: `/` (the main thread), `/t/<id>` (any thread), `/threads` (the
+//! The pages of signed-in users: `/` (the user's home conversation: thread 1 for the owner, a
+//! thread of their own for anyone else), `/t/<id>` (any thread), `/threads` (the
 //! thread list, the whole screen on a phone) and `/new` (a chat whose first message makes a
 //! thread). From `md` up the list sits beside the chat once there is more than one thread.
 //!
@@ -34,8 +35,8 @@ struct Session {
 #[component]
 pub fn Shell() -> Element {
     let route = use_route::<Route>();
-    // Streams the thread the address names from the first hello.
-    let threads = use_signal(|| Threads::new(route.thread().unwrap_or(ThreadId::MAIN)));
+    // Streams the thread the address names from the first hello; any other address, the home.
+    let threads = use_signal(|| route.thread().map_or_else(Threads::at_home, Threads::new));
     let status = use_signal(|| Status::Connecting);
     let kept = use_signal(Kept::default);
     let navigator = navigator();
@@ -57,7 +58,7 @@ pub fn Shell() -> Element {
 #[component]
 pub fn ChatPage() -> Element {
     rsx! {
-        Screen { view: View::Thread(ThreadId::MAIN) }
+        Screen { view: View::Home }
     }
 }
 
@@ -85,6 +86,8 @@ pub fn NewThreadPage() -> Element {
 /// What a page shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
+    /// The user's home conversation, `/`.
+    Home,
     Thread(ThreadId),
     List,
     New,
@@ -97,8 +100,10 @@ fn Screen(view: View) -> Element {
     let navigator = navigator();
     let on_send = move |outgoing: Outgoing| session.socket.send(outgoing);
     use_effect(use_reactive!(|view| {
-        if let View::Thread(id) = view {
-            show(session.threads, id, on_send);
+        match view {
+            View::Thread(id) => show(session.threads, id, on_send),
+            View::Home => show_home(session.threads, on_send),
+            View::List | View::New => {}
         }
     }));
     rsx! {
@@ -129,6 +134,19 @@ pub fn show(mut threads: Signal<Threads>, id: ThreadId, on_send: impl Fn(Outgoin
     });
 }
 
+/// Shows the user's home conversation: unless the page already does, its hello.
+pub fn show_home(mut threads: Signal<Threads>, on_send: impl Fn(Outgoing)) {
+    if threads.peek().shows_home() {
+        return;
+    }
+    let hello = threads.write().open_home();
+    on_send(Outgoing {
+        message: hello,
+        sent: None,
+        dropped: None,
+    });
+}
+
 /// The page as drawn from the threads: no socket and no router, so it renders anywhere.
 #[component]
 pub fn Workspace(
@@ -145,9 +163,20 @@ pub fn Workspace(
     let archived = model.archived_rows();
     let refusal = model.refusal().map(|refusal| refusal.reason.clone());
     let shown = model.current();
+    // `/` is the home, whichever thread the server says it is: thread 1 until it says.
+    let at_home = view == View::Home || (model.home_known() && view == View::Thread(model.home()));
+    let view = match view {
+        View::Home => View::Thread(model.home()),
+        view => view,
+    };
     let current = match view {
         View::Thread(id) => Some(id),
-        View::List | View::New => None,
+        View::Home | View::List | View::New => None,
+    };
+    let back = if model.shows_home() {
+        Place::Home
+    } else {
+        Place::Thread(shown)
     };
     let sidebar = rows.len() + archived.len() > 1;
     // The shown thread's open cards from its chat, the others' from the list.
@@ -167,7 +196,7 @@ pub fn Workspace(
                 header { class: "shrink-0 border-b pt-[env(safe-area-inset-top)]",
                     div { class: "mx-auto flex h-12 w-full max-w-3xl items-center gap-1 px-4",
                         PlaceLink {
-                            place: Place::Thread(shown),
+                            place: back,
                             on_go,
                             class: ICON_LINK,
                             aria_label: "Retour à la conversation",
@@ -196,7 +225,7 @@ pub fn Workspace(
                 div { class: "mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col", {list} }
             }
         },
-        View::Thread(_) | View::New => {
+        View::Home | View::Thread(_) | View::New => {
             let (key, chat, target, summary) = match view {
                 View::Thread(id) => (
                     id.to_string(),
@@ -204,10 +233,16 @@ pub fn Workspace(
                         .chat_of(id)
                         .cloned()
                         .unwrap_or_else(|| Chat::for_thread(id)),
-                    Target::of(id),
+                    // The home's messages name no thread, as a page without threads sent them:
+                    // the server's home for this user, even before the page knows which it is.
+                    if at_home {
+                        Target::Home(id)
+                    } else {
+                        Target::Thread(id)
+                    },
                     model.summary(id).cloned(),
                 ),
-                View::List | View::New => (
+                View::Home | View::List | View::New => (
                     "new".to_owned(),
                     Chat::default(),
                     Target::New(threads),
@@ -223,6 +258,7 @@ pub fn Workspace(
                     on_send,
                     target,
                     summary,
+                    home: at_home,
                     kept: Some(kept),
                     on_go: Some(on_go),
                     sidebar,
@@ -280,11 +316,14 @@ mod tests {
                 kept,
                 on_send: deliver,
                 on_go: move |place: Place| {
-                    if let Place::Thread(id) = place {
-                        show(threads, id, deliver);
+                    match place {
+                        Place::Thread(id) => show(threads, id, deliver),
+                        Place::Home => show_home(threads, deliver),
+                        Place::List | Place::New => {}
                     }
                     view.set(
                         match place {
+                            Place::Home => View::Home,
                             Place::Thread(id) => View::Thread(id),
                             Place::List => View::List,
                             Place::New => View::New,
@@ -344,6 +383,7 @@ mod tests {
             user: Some("alix".into()),
             admin: true,
             thread: Some(ThreadId(thread)),
+            home: None,
         }
     }
 
@@ -517,6 +557,7 @@ mod tests {
                 last_seq: 0,
                 log_id: None,
                 thread: Some(ThreadId(9)),
+                list: true,
             })
         );
     }
@@ -532,6 +573,7 @@ mod tests {
                 last_seq: 0,
                 log_id: None,
                 thread: Some(ThreadId(2)),
+                list: true,
             }]
         );
         receive(&mut page, hello(2, "deux", 1));
@@ -550,6 +592,7 @@ mod tests {
                 last_seq: 2,
                 log_id: Some("main".into()),
                 thread: Some(ThreadId::MAIN),
+                list: true,
             }
         );
         assert!(page.html().contains("Salut"), "{}", page.html());
@@ -797,6 +840,111 @@ mod tests {
         let page = dioxus_ssr::render(&dom);
         assert!(page.contains(r#"href="/t/3""#), "{page}");
         assert!(page.contains("Sous-agent terminé :"), "{page}");
+    }
+
+    /// A member's page: `/` is her home, thread 7, whose row links to `/` and offers no
+    /// archiving; her other thread links to `/t/<id>` and may be archived. Messages from `/` name
+    /// no thread (the server's home for her), from another thread name it.
+    #[test]
+    fn slash_links_to_home() {
+        let mut threads = Threads::at_home();
+        threads.apply(&ServerMsg::Hello {
+            log_id: "h".into(),
+            last_seq: 0,
+            user: Some("marie".into()),
+            admin: false,
+            thread: None,
+            home: Some(ThreadId(7)),
+        });
+        threads.apply(&ServerMsg::Threads {
+            threads: vec![summary(7, "Fronde", "09:00"), summary(9, "Garage", "10:00")],
+        });
+        let mut page = live(threads, View::Home);
+        let html = page.html();
+        let home = row(&html, 7);
+        assert!(home.contains(r#"href="/""#), "{home}");
+        assert!(home.contains(r#"aria-current="page""#), "{home}");
+        assert!(row(&html, 9).contains(r#"href="/t/9""#), "{html}");
+        page.click("tl-7-menu");
+        let html = page.html();
+        assert!(html.contains(r#"id="tl-7-rename""#), "{html}");
+        assert!(!html.contains(r#"id="tl-7-archive""#), "{html}");
+        page.click("tl-7-menu");
+        page.click("th-7-menu");
+        let html = page.html();
+        assert!(html.contains(r#"id="th-7-rename""#), "{html}");
+        assert!(!html.contains(r#"id="th-7-archive""#), "{html}");
+        page.click("th-7-menu");
+        page.click("tl-9-menu");
+        assert!(
+            page.html().contains(r#"id="tl-9-archive""#),
+            "{}",
+            page.html()
+        );
+        page.click("tl-9-menu");
+
+        page.type_text("message", "Bonjour");
+        page.key("message", Key::Enter, Code::Enter);
+        assert_eq!(
+            sent(),
+            [ClientMsg::Send {
+                text: "Bonjour".into(),
+                thread: None,
+            }]
+        );
+        page.click("tl-9");
+        page.type_text("message", "Garage");
+        page.key("message", Key::Enter, Code::Enter);
+        assert_eq!(
+            sent()[2],
+            ClientMsg::Send {
+                text: "Garage".into(),
+                thread: Some(ThreadId(9)),
+            }
+        );
+        // Back home, by the list: `/`, her home named now that the page knows it.
+        page.click("tl-7");
+        assert_eq!(
+            sent()[3],
+            ClientMsg::Hello {
+                last_seq: 0,
+                log_id: Some("h".into()),
+                thread: Some(ThreadId(7)),
+                list: true,
+            }
+        );
+        assert!(row(&page.html(), 7).contains(r#"aria-current="page""#));
+    }
+
+    /// An admin who is not the owner reads thread 1 at `/t/1`, named in what the page sends:
+    /// a message without a thread would go to her own home.
+    #[test]
+    fn thread_one_is_named_when_it_is_not_home() {
+        let mut threads = Threads::new(ThreadId::MAIN);
+        threads.apply(&ServerMsg::Hello {
+            log_id: "main".into(),
+            last_seq: 0,
+            user: Some("paul".into()),
+            admin: true,
+            thread: Some(ThreadId::MAIN),
+            home: Some(ThreadId(4)),
+        });
+        threads.apply(&ServerMsg::Threads {
+            threads: vec![summary(1, "Fronde", "09:00"), summary(4, "Fronde", "10:00")],
+        });
+        let mut page = live(threads, View::Thread(ThreadId::MAIN));
+        let html = page.html();
+        assert!(row(&html, 1).contains(r#"href="/t/1""#), "{html}");
+        assert!(row(&html, 4).contains(r#"href="/""#), "{html}");
+        page.type_text("message", "Bonjour");
+        page.key("message", Key::Enter, Code::Enter);
+        assert_eq!(
+            sent(),
+            [ClientMsg::Send {
+                text: "Bonjour".into(),
+                thread: Some(ThreadId::MAIN),
+            }]
+        );
     }
 
     #[test]

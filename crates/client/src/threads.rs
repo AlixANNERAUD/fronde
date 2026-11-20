@@ -17,6 +17,8 @@ pub struct ListRow {
     pub depth: u32,
     /// It has cards waiting for an answer: « attend ta réponse ».
     pub waiting: bool,
+    /// It is the user's home conversation, the page's `/`: never archived.
+    pub home: bool,
 }
 
 /// A thread message the server refused, for the page to say why.
@@ -44,6 +46,10 @@ pub struct Threads {
     /// The latest usage the page's user may see: their own accounts', and for an admin every
     /// other's; none before a reading.
     usage: Option<Usage>,
+    /// The user's home conversation, the page's `/`, as the server's hello said; `None` before
+    /// the first hello. While the page shows the home before knowing which thread it is, its
+    /// chat is kept under thread 1 and names no thread ([`Threads::at_home`]).
+    home: Option<ThreadId>,
 }
 
 impl Default for Threads {
@@ -63,7 +69,27 @@ impl Threads {
             creating: None,
             refusal: None,
             usage: None,
+            home: None,
         }
+    }
+
+    /// Showing the user's home conversation first, before the server said which thread it is:
+    /// the hello names no thread and asks for the list; the server's answer names the home.
+    pub fn at_home() -> Self {
+        let mut threads = Self::new(ThreadId::MAIN);
+        threads.chats.insert(ThreadId::MAIN, Chat::default());
+        threads
+    }
+
+    /// The user's home conversation, the page's `/`: thread 1 until the server's hello says
+    /// otherwise (the owner's always is).
+    pub fn home(&self) -> ThreadId {
+        self.home.unwrap_or(ThreadId::MAIN)
+    }
+
+    /// Whether the page shows the home before knowing which thread it is.
+    fn home_unknown(&self) -> bool {
+        self.home.is_none() && self.current == ThreadId::MAIN && self.chat().thread().is_none()
     }
 
     /// The usage the meter shows: the page's user's own accounts' (one per provider, Claude's
@@ -182,6 +208,7 @@ impl Threads {
                 summary: thread.clone(),
                 depth,
                 waiting: thread.open_requests > 0,
+                home: Some(thread.id) == self.home,
             });
             stack.extend(
                 children(Some(thread.id))
@@ -201,7 +228,34 @@ impl Threads {
             last_seq: chat.last_seq(),
             log_id: chat.log_id().map(str::to_owned),
             thread: Some(id),
+            list: true,
         }
+    }
+
+    /// Shows the user's home conversation, `/`: [`Threads::open`] once the server said which
+    /// thread it is; before, a hello that names none, as [`Threads::at_home`].
+    pub fn open_home(&mut self) -> ClientMsg {
+        if let Some(home) = self.home {
+            return self.open(home);
+        }
+        self.current = ThreadId::MAIN;
+        let chat = self.chats.entry(ThreadId::MAIN).or_default();
+        ClientMsg::Hello {
+            last_seq: chat.last_seq(),
+            log_id: chat.log_id().map(str::to_owned),
+            thread: chat.thread(),
+            list: true,
+        }
+    }
+
+    /// Whether the page shows the user's home conversation.
+    pub fn shows_home(&self) -> bool {
+        self.home_unknown() || Some(self.current) == self.home
+    }
+
+    /// Whether the server said which thread the user's home is.
+    pub fn home_known(&self) -> bool {
+        self.home.is_some()
     }
 
     /// A message to the thread shown.
@@ -235,7 +289,8 @@ impl Threads {
         })
     }
 
-    /// Archives thread `id`, or brings it back; `None` for the main thread, which never is.
+    /// Archives thread `id`, or brings it back; `None` for the main thread, which never is (nor
+    /// is any home: see [`ListRow::home`]).
     pub fn archive(id: ThreadId, archived: bool) -> Option<ClientMsg> {
         (id != ThreadId::MAIN).then_some(ClientMsg::Archive {
             thread: id,
@@ -247,8 +302,27 @@ impl Threads {
     /// hello of a thread just made.
     pub fn apply(&mut self, msg: &ServerMsg) -> Option<ClientMsg> {
         match msg {
-            ServerMsg::Hello { thread, .. } => {
-                let id = thread.unwrap_or(ThreadId::MAIN);
+            ServerMsg::Hello { thread, home, .. } => {
+                let home = home.unwrap_or(ThreadId::MAIN);
+                // The home shown before the server named it: its chat, still empty (entries
+                // follow the hello), is now that thread's.
+                if self.home.is_none()
+                    && self
+                        .chats
+                        .get(&ThreadId::MAIN)
+                        .is_some_and(|chat| chat.thread().is_none())
+                {
+                    self.chats.remove(&ThreadId::MAIN);
+                    if self.current == ThreadId::MAIN {
+                        self.current = home;
+                    }
+                    let current = self.current;
+                    self.chats
+                        .entry(current)
+                        .or_insert_with(|| Chat::for_thread(current));
+                }
+                self.home = Some(home);
+                let id = thread.unwrap_or(home);
                 self.streamed = Some(id);
                 self.chats
                     .entry(id)
@@ -330,6 +404,7 @@ mod tests {
             user: Some("alix".into()),
             admin: true,
             thread: Some(ThreadId(thread)),
+            home: None,
         }
     }
 
@@ -403,6 +478,7 @@ mod tests {
                 last_seq: 0,
                 log_id: None,
                 thread: Some(ThreadId::MAIN),
+                list: true,
             }
         );
         threads.apply(&hello(1, "main", 1));
@@ -415,6 +491,7 @@ mod tests {
                 last_seq: 0,
                 log_id: None,
                 thread: Some(ThreadId(2)),
+                list: true,
             }
         );
         // An entry of the main thread still on its way goes to the main thread's chat.
@@ -439,6 +516,7 @@ mod tests {
                 last_seq: 2,
                 log_id: Some("main".into()),
                 thread: Some(ThreadId::MAIN),
+                list: true,
             }
         );
         assert_eq!(
@@ -495,6 +573,7 @@ mod tests {
                 last_seq: 0,
                 log_id: None,
                 thread: Some(ThreadId(4)),
+                list: true,
             })
         );
         assert_eq!(threads.current(), ThreadId(4));
@@ -540,6 +619,99 @@ mod tests {
                 archived: true,
             })
         );
+    }
+
+    /// A page at `/` shows its user's home before the server says which thread it is: its hello
+    /// names none and asks for the list. The server's hello names the home (a member's), and the
+    /// page shows it from then on under its id: named in later hellos, the row marked home and
+    /// never offered for archiving. The owner's hello names none: thread 1.
+    #[test]
+    fn hello_sets_home() {
+        let mut threads = Threads::at_home();
+        let mut connection = Connection::default();
+        assert!(!threads.home_known());
+        assert!(threads.shows_home());
+        assert_eq!(
+            connection.on_open(threads.chat()),
+            ClientMsg::Hello {
+                last_seq: 0,
+                log_id: None,
+                thread: None,
+                list: true,
+            }
+        );
+        threads.apply(&ServerMsg::Hello {
+            log_id: "h".into(),
+            last_seq: 1,
+            user: Some("marie".into()),
+            admin: false,
+            thread: None,
+            home: Some(ThreadId(7)),
+        });
+        threads.apply(&user(1, "Salut"));
+        assert_eq!(threads.home(), ThreadId(7));
+        assert!(threads.home_known());
+        assert_eq!(threads.current(), ThreadId(7));
+        assert!(threads.shows_home());
+        assert_eq!(threads.chat().last_seq(), 1);
+        assert_eq!(threads.chat().thread(), Some(ThreadId(7)));
+        assert!(threads.chat_of(ThreadId::MAIN).is_none());
+        assert_eq!(
+            connection.on_open(threads.chat()),
+            ClientMsg::Hello {
+                last_seq: 1,
+                log_id: Some("h".into()),
+                thread: Some(ThreadId(7)),
+                list: true,
+            }
+        );
+        // Elsewhere, then back to `/`: her home, by its id.
+        threads.open(ThreadId(9));
+        assert!(!threads.shows_home());
+        assert_eq!(
+            threads.open_home(),
+            ClientMsg::Hello {
+                last_seq: 1,
+                log_id: Some("h".into()),
+                thread: Some(ThreadId(7)),
+                list: true,
+            }
+        );
+        assert_eq!(
+            threads.send("Encore".into()),
+            ClientMsg::Send {
+                text: "Encore".into(),
+                thread: Some(ThreadId(7)),
+            }
+        );
+        threads.apply(&ServerMsg::Threads {
+            threads: vec![summary(7, None, "09:00"), summary(9, None, "10:00")],
+        });
+        let homes: Vec<(i64, bool)> = threads
+            .rows()
+            .iter()
+            .map(|row| (row.summary.id.0, row.home))
+            .collect();
+        assert_eq!(homes, [(9, false), (7, true)]);
+
+        // The owner's: thread 1.
+        let mut threads = Threads::at_home();
+        threads.apply(&ServerMsg::Hello {
+            log_id: "main".into(),
+            last_seq: 0,
+            user: Some("alix".into()),
+            admin: true,
+            thread: None,
+            home: None,
+        });
+        assert_eq!(threads.home(), ThreadId::MAIN);
+        assert_eq!(threads.current(), ThreadId::MAIN);
+        assert_eq!(threads.chat().thread(), Some(ThreadId::MAIN));
+        // A page that opened elsewhere first learns its home all the same.
+        let mut threads = Threads::new(ThreadId(9));
+        threads.apply(&hello(9, "neuf", 0));
+        assert_eq!(threads.home(), ThreadId::MAIN);
+        assert_eq!(threads.current(), ThreadId(9));
     }
 
     /// The page keeps the latest usage the server sent, for the meter; none before.

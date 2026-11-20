@@ -42,10 +42,10 @@ for a minute (*Trop d'essais, réessaie dans une minute.*); everyone else still 
 
 4. Give them the address, their name as written in the section, and their password.
 
-They see only their own conversations. Until each person has a conversation of their own at `/`
-(**planned**), the main conversation is the owner's: a member landing there reads *Conversation
-introuvable.* and starts one with *Nouvelle conversation*, or opens hers from the list. Their
-agent needs a subscription of their own, `[accounts.<name>]`; without one, it does not start.
+They see only their own conversations. Each person lands at `/` on a conversation of their own,
+made the first time they open it and never archived; the owner's is the main conversation. Their
+usage meter shows there from the start. Their agent needs a subscription of their own,
+`[accounts.<name>]`; without one, it does not start.
 
 ## Sign someone out everywhere
 

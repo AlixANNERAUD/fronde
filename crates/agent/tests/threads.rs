@@ -4560,3 +4560,112 @@ async fn an_archive_never_reaches_another_persons_thread() {
     assert_eq!(children_ended(&events(&parent)), 0, "{:?}", events(&parent));
     gate.notify_waiters();
 }
+
+/// The owner's home conversation is thread 1, the main thread: asking for it makes nothing.
+#[tokio::test]
+async fn owner_home_is_thread_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["alix", "marie"], "alix").await;
+    let alix = threads.user_of("alix");
+    assert_eq!(threads.home(&alix).await.unwrap(), ThreadId::MAIN);
+    assert_eq!(threads.home(&alix).await.unwrap(), ThreadId::MAIN);
+    assert_eq!(threads.list(true).await.unwrap().len(), 1);
+}
+
+/// Another person's home is a root thread of theirs, made the first time it is asked for, once
+/// even when two pages ask at once, and the same after a restart. It is hers alone: listed for
+/// her and for an admin, refused to anyone else as any thread not theirs. A home given to
+/// someone else (`fronde threads reassign`) is no longer hers: she gets a new one, and the one
+/// given is an ordinary thread of its new owner, archived like any.
+#[tokio::test]
+async fn member_home_is_made_once_and_hers() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["alix", "marie", "paul"], "alix").await;
+    let marie = threads.user_of("marie");
+    let paul = threads.user_of("paul");
+    let changes = threads.changes();
+    let (first, second) = tokio::join!(threads.home(&marie), threads.home(&marie));
+    let home = first.unwrap();
+    assert_eq!(second.unwrap(), home);
+    assert_ne!(home, ThreadId::MAIN);
+    assert!(changes.has_changed().unwrap(), "the list was not told");
+    let row = threads.get(home).await.unwrap().unwrap();
+    assert_eq!(row.owner, "marie");
+    assert_eq!(row.parent, None);
+    assert_eq!(row.started_by, StartedBy::User);
+    assert_eq!(row.archived_at, None);
+    // Only thread 1 and her home exist.
+    assert_eq!(threads.list(true).await.unwrap().len(), 2);
+    let listed: Vec<ThreadId> = threads
+        .summaries(&marie)
+        .await
+        .unwrap()
+        .iter()
+        .map(|thread| thread.id)
+        .collect();
+    assert_eq!(listed, [home]);
+    assert_eq!(
+        threads
+            .visible(home, &paul)
+            .await
+            .unwrap_err()
+            .downcast::<Refusal>()
+            .unwrap(),
+        Refusal::NotFound
+    );
+    let alix = threads.user_of("alix");
+    assert_eq!(threads.visible(home, &alix).await.unwrap().id, home);
+    // Paul's is his own.
+    let his = threads.home(&paul).await.unwrap();
+    assert!(his != home && his != ThreadId::MAIN);
+    drop(threads);
+
+    let threads = open_people(dir.path(), &["alix", "marie", "paul"], "alix").await;
+    assert_eq!(threads.home(&marie).await.unwrap(), home);
+    assert_eq!(threads.list(true).await.unwrap().len(), 3);
+    drop(threads);
+
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    fronde_agent::threads::reassign(&db, dir.path(), "marie", "paul")
+        .await
+        .unwrap();
+    drop(db);
+    let threads = open_people(dir.path(), &["alix", "marie", "paul"], "alix").await;
+    let new = threads.home(&marie).await.unwrap();
+    assert!(new != home && new != his && new != ThreadId::MAIN);
+    assert_eq!(threads.get(new).await.unwrap().unwrap().owner, "marie");
+    assert_eq!(threads.home(&paul).await.unwrap(), his);
+    threads.set_archived(home, true).await.unwrap();
+}
+
+/// A home is never archived: thread 1, the owner's, nor another person's, whoever asks; their
+/// other threads are, as before.
+#[tokio::test]
+async fn home_cannot_be_archived() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["alix", "marie"], "alix").await;
+    let marie = threads.user_of("marie");
+    let home = threads.home(&marie).await.unwrap();
+    let other = threads
+        .create("marie", StartedBy::User, None, "Garage")
+        .await
+        .unwrap()
+        .id;
+    for id in [ThreadId::MAIN, home] {
+        let error = threads.set_archived(id, true).await.unwrap_err();
+        assert_eq!(error.downcast::<Refusal>().unwrap(), Refusal::Main);
+        assert_eq!(threads.get(id).await.unwrap().unwrap().archived_at, None);
+    }
+    threads.set_archived(other, true).await.unwrap();
+    assert!(
+        threads
+            .get(other)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some()
+    );
+    // Asked for again, the home is the same thread.
+    assert_eq!(threads.home(&marie).await.unwrap(), home);
+}

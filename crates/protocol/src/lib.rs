@@ -230,8 +230,11 @@ pub const CLOSE_SIGNED_OUT: u16 = 4401;
 
 /// What the chat page sends over the WebSocket.
 ///
-/// `thread` fields are optional: none means the main thread, so that a page that knows nothing of
-/// threads talks to the main thread as before. Every thread id is checked against the page's user:
+/// `thread` fields are optional: none means the page's user's home conversation (the main thread,
+/// thread 1, for the owner; a thread of their own for anyone else: see [`ServerMsg::Hello`]'s
+/// `home`), so that a page that knows nothing of threads talks to the main thread as before, and
+/// a page that does not know its user's home yet reaches it. Every thread id is checked against
+/// the page's user:
 /// an unknown thread and one the user may not see are refused alike ([`ServerMsg::ThreadRefused`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -239,13 +242,17 @@ pub enum ClientMsg {
     /// Start streaming `thread`: the entries after `last_seq`, then the live ones. A page that
     /// names another log than the server's (`log_id` of its last [`ServerMsg::Hello`]) gets the
     /// whole log. A new hello on the same socket switches the thread it streams. A page that
-    /// names a thread also gets the thread list ([`ServerMsg::Threads`]), now and on each change.
+    /// names a thread, or sets `list`, also gets the thread list ([`ServerMsg::Threads`]), now
+    /// and on each change: `list` is how a page showing its user's home before it knows which
+    /// thread that is (`thread` none) asks for it.
     Hello {
         last_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         log_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread: Option<ThreadId>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        list: bool,
     },
     /// A message to `thread`'s agent.
     Send {
@@ -267,8 +274,8 @@ pub enum ClientMsg {
     Create { client_id: String, text: String },
     /// Renames `thread`: at most [`MAX_TITLE`] characters, none of them hidden.
     Rename { thread: ThreadId, title: String },
-    /// Archives `thread`, or brings it back. An archived thread is read-only; the main thread is
-    /// never archived.
+    /// Archives `thread`, or brings it back. An archived thread is read-only; a home
+    /// conversation (thread 1, or another person's own) is never archived.
     Archive { thread: ThreadId, archived: bool },
 }
 
@@ -366,7 +373,8 @@ pub enum ServerMsg {
     /// `last_seq` is the newest entry at that moment. `user`: whom the page is signed in as, so
     /// a closed card can say who answered when it was someone else. `admin`: that user may keep
     /// a secret for good, so its card offers it. `thread`: the thread streamed, when the page
-    /// named one; the entries that follow are its.
+    /// named one; the entries that follow are its, the home's when it named none. `home`: that
+    /// user's home conversation, the page's `/`; absent, thread 1 (the owner's).
     Hello {
         log_id: String,
         last_seq: u64,
@@ -376,6 +384,8 @@ pub enum ServerMsg {
         admin: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread: Option<ThreadId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<ThreadId>,
     },
     Entry(Entry),
     /// The answer to the request `id` was refused, for this page only: the request did not
@@ -449,6 +459,7 @@ mod tests {
                     last_seq: 3,
                     log_id: None,
                     thread: None,
+                    list: false,
                 },
             ),
             (
@@ -612,6 +623,7 @@ mod tests {
             user: None,
             admin: false,
             thread: None,
+            home: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(json, r#"{"type":"hello","log_id":"0f3c","last_seq":12}"#);
@@ -622,6 +634,7 @@ mod tests {
             user: Some("alix".into()),
             admin: true,
             thread: None,
+            home: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
@@ -634,9 +647,43 @@ mod tests {
             last_seq: 12,
             log_id: Some("0f3c".into()),
             thread: None,
+            list: false,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(json, r#"{"type":"hello","last_seq":12,"log_id":"0f3c"}"#);
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), hello);
+    }
+
+    /// A member's hello names her home; the owner's says nothing of it, read as thread 1, as
+    /// before homes. A page showing its user's home without knowing which asks for the list.
+    #[test]
+    fn hello_names_the_home() {
+        let hello = ServerMsg::Hello {
+            log_id: "0f3c".into(),
+            last_seq: 0,
+            user: Some("marie".into()),
+            admin: false,
+            thread: None,
+            home: Some(ThreadId(7)),
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"hello","log_id":"0f3c","last_seq":0,"user":"marie","home":7}"#
+        );
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), hello);
+        let owner: ServerMsg =
+            serde_json::from_str(r#"{"type":"hello","log_id":"0f3c","last_seq":0}"#).unwrap();
+        assert!(matches!(owner, ServerMsg::Hello { home: None, .. }));
+
+        let hello = ClientMsg::Hello {
+            last_seq: 0,
+            log_id: None,
+            thread: None,
+            list: true,
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(json, r#"{"type":"hello","last_seq":0,"list":true}"#);
         assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), hello);
     }
 
@@ -672,6 +719,7 @@ mod tests {
                     last_seq: 3,
                     log_id: Some("0f3c".into()),
                     thread: Some(ThreadId(2)),
+                    list: false,
                 },
             ),
             (
@@ -723,6 +771,7 @@ mod tests {
             user: Some("alix".into()),
             admin: true,
             thread: Some(ThreadId(2)),
+            home: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(

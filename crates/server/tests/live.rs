@@ -75,6 +75,7 @@ async fn open_chat(addr: SocketAddr, cookie: &str) -> Socket {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;

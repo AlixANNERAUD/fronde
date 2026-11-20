@@ -39,12 +39,15 @@ pub enum Route {
 }
 
 impl Route {
-    /// The thread the address shows, if it shows one.
+    /// The thread the address names, if it names one: `/` shows the user's home, whichever
+    /// thread the server says it is.
     pub fn thread(&self) -> Option<ThreadId> {
         match self {
-            Self::ChatPage {} => Some(ThreadId::MAIN),
             Self::ThreadPage { id } => Some(ThreadId(*id)),
-            Self::ThreadsPage {} | Self::NewThreadPage {} | Self::SignInPage { .. } => None,
+            Self::ChatPage {}
+            | Self::ThreadsPage {}
+            | Self::NewThreadPage {}
+            | Self::SignInPage { .. } => None,
         }
     }
 }
@@ -52,7 +55,7 @@ impl Route {
 impl From<Place> for Route {
     fn from(place: Place) -> Self {
         match place {
-            Place::Thread(ThreadId::MAIN) => Self::ChatPage {},
+            Place::Home => Self::ChatPage {},
             Place::Thread(ThreadId(id)) => Self::ThreadPage { id },
             Place::List => Self::ThreadsPage {},
             Place::New => Self::NewThreadPage {},

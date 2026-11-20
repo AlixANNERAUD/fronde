@@ -57,6 +57,8 @@ impl Connection {
             last_seq: chat.last_seq(),
             log_id: chat.log_id().map(str::to_owned),
             thread: chat.thread(),
+            // This page knows threads: it gets the list, even when it names none (its home).
+            list: true,
         }
     }
 
@@ -118,6 +120,7 @@ mod tests {
                 last_seq: 0,
                 log_id: None,
                 thread: None,
+                list: true,
             }
         );
         chat.apply(&ServerMsg::Hello {
@@ -126,6 +129,7 @@ mod tests {
             user: None,
             admin: false,
             thread: None,
+            home: None,
         });
         assert_eq!(connection.state(), State::Open);
         assert_eq!(
@@ -134,6 +138,7 @@ mod tests {
                 last_seq: 0,
                 log_id: Some("a".into()),
                 thread: None,
+                list: true,
             }
         );
     }

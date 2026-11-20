@@ -196,7 +196,9 @@ transaction, with the cards they ask of `--from`; it prints `gave <n> thread(s) 
 <to>, sub-agents included`. `--from` is a person's name, or `removed:<name>` for the threads of
 someone no longer listed in `[users]` (see [Configuration](configuration.md#usersname)): this is how
 they get their threads back once listed again. `--to` must be a user of the configuration. The
-main thread is never given: it is always `[data] user`'s.
+main thread is never given: it is always `[data] user`'s. A home conversation of `--from` is given
+like any other thread, and is then an ordinary thread of `--to`: `--from` gets a new home the next
+time they open `/`.
 
 Given back to the same person (`--from removed:marie --to marie`), each thread keeps its agent's
 conversation, home and working directory. Given to anyone else, each thread's agent starts a new

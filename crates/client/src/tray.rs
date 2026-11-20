@@ -226,6 +226,7 @@ mod tests {
                 user: Some("alix".into()),
                 admin: true,
                 thread: Some(ThreadId(2)),
+                home: None,
             },
             entry(1, request(7, question("Quel   agenda ?"))),
             entry(2, request(8, secret)),

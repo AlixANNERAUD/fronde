@@ -21,6 +21,8 @@ use crate::{
 /// Where a link of the interface goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
+    /// The user's home conversation, `/`, whichever thread it is.
+    Home,
     Thread(ThreadId),
     /// The thread list, the whole screen on a phone.
     List,
@@ -31,7 +33,7 @@ pub enum Place {
 impl Place {
     pub fn href(self) -> String {
         match self {
-            Self::Thread(ThreadId::MAIN) => "/".into(),
+            Self::Home => "/".into(),
             Self::Thread(id) => format!("/t/{id}"),
             Self::List => "/threads".into(),
             Self::New => "/new".into(),
@@ -249,7 +251,7 @@ fn ThreadRow(
                 }
             } else {
                 PlaceLink {
-                    place: Place::Thread(id),
+                    place: if row.home { Place::Home } else { Place::Thread(id) },
                     on_go,
                     id: link_id(id),
                     current,
@@ -288,6 +290,7 @@ fn ThreadRow(
                     id,
                     title: summary.title.clone(),
                     archived: summary.archived,
+                    home: row.home,
                     open,
                     on_rename: move |()| renaming.set(true),
                     on_send,
@@ -298,13 +301,14 @@ fn ThreadRow(
 }
 
 /// A thread's actions behind a button: rename it, archive it or bring it back (never the main
-/// thread). Escape closes it and gives the focus back to its button.
+/// thread, nor the user's `home`). Escape closes it and gives the focus back to its button.
 #[component]
 pub fn ThreadMenu(
     prefix: String,
     id: ThreadId,
     title: String,
     archived: bool,
+    #[props(default)] home: bool,
     open: bool,
     on_rename: EventHandler<()>,
     on_send: EventHandler<Outgoing>,
@@ -312,7 +316,7 @@ pub fn ThreadMenu(
     let mut shown = use_signal(|| false);
     let toggle = format!("{prefix}-menu");
     let actions = format!("{prefix}-actions");
-    let archive = Threads::archive(id, !archived);
+    let archive = Threads::archive(id, !archived).filter(|_| !home);
     rsx! {
         div {
             class: "relative shrink-0",
@@ -500,9 +504,12 @@ mod tests {
         assert_eq!(activity(at("2025-12-31T10:00:00Z"), now, 0), "31/12/2025");
     }
 
+    /// `/` is the user's home, whichever thread it is; any thread by its id, thread 1 included
+    /// (for an admin other than the owner it is not their home).
     #[test]
     fn places_have_their_addresses() {
-        assert_eq!(Place::Thread(ThreadId::MAIN).href(), "/");
+        assert_eq!(Place::Home.href(), "/");
+        assert_eq!(Place::Thread(ThreadId::MAIN).href(), "/t/1");
         assert_eq!(Place::Thread(ThreadId(7)).href(), "/t/7");
         assert_eq!(Place::List.href(), "/threads");
         assert_eq!(Place::New.href(), "/new");

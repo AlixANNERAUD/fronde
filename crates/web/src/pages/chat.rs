@@ -29,31 +29,29 @@ use crate::{
 };
 
 /// Whom the composer writes to.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Target {
-    /// The main thread, unnamed, as a page without threads writes to it.
-    #[default]
-    Main,
+    /// The user's home conversation, unnamed in what is sent, as a page without threads writes
+    /// to the main thread: the server sends it to the user's home. The thread it is (thread 1
+    /// until the page knows) keys its draft.
+    Home(ThreadId),
     Thread(ThreadId),
     /// The thread the first message makes, through the page's threads.
     New(Signal<Threads>),
 }
 
-impl Target {
-    /// Thread `id`'s; the main thread's stays unnamed.
-    pub fn of(id: ThreadId) -> Self {
-        if id == ThreadId::MAIN {
-            Self::Main
-        } else {
-            Self::Thread(id)
-        }
+impl Default for Target {
+    /// The page of before threads: the main thread, the owner's home.
+    fn default() -> Self {
+        Self::Home(ThreadId::MAIN)
     }
+}
 
+impl Target {
     /// Whose draft and scroll the chat keeps: `None` for a thread not made yet.
     fn kept(self) -> Option<ThreadId> {
         match self {
-            Self::Main => Some(ThreadId::MAIN),
-            Self::Thread(id) => Some(id),
+            Self::Home(id) | Self::Thread(id) => Some(id),
             Self::New(_) => None,
         }
     }
@@ -62,7 +60,7 @@ impl Target {
     fn thread(self) -> Option<ThreadId> {
         match self {
             Self::Thread(id) => Some(id),
-            Self::Main | Self::New(_) => None,
+            Self::Home(_) | Self::New(_) => None,
         }
     }
 }
@@ -90,6 +88,9 @@ pub fn ChatView(
     /// The thread as the list has it: its title and menu in the header; read-only if archived.
     #[props(default)]
     summary: Option<ThreadSummary>,
+    /// It is the user's home conversation: never archived.
+    #[props(default)]
+    home: bool,
     #[props(default)] kept: Option<Signal<Kept>>,
     /// Links to the thread list and to a new thread.
     #[props(default)]
@@ -145,6 +146,7 @@ pub fn ChatView(
                     id: summary.id,
                     title: summary.title.clone(),
                     archived,
+                    home,
                     open,
                     on_rename: move |()| renaming.set(true),
                     on_send,

@@ -2,8 +2,9 @@
 
 A **thread** is one conversation: its own stream of messages, its own agent session, and its own
 agent process with its own directories, sandbox and hub token (see
-[How Fronde works](architecture.md#threads) and [Security model](security.md#threads)). The chat
-is the main thread; you start others from the chat.
+[How Fronde works](architecture.md#threads) and [Security model](security.md#threads)). Each
+person's chat at `/` is their home conversation: the main thread for the owner, a thread of their
+own for anyone else. You start others from the chat.
 
 A thread's agent can also start threads of its own for a task: **sub-agents**. Fronde's agent
 hands a long or separate piece of work to a sub-agent, and goes on with the conversation, or waits

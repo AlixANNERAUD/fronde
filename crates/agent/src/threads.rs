@@ -1,6 +1,7 @@
 //! Threads: Fronde's conversations, each a row of the `threads` table over a stream of its own,
 //! with its own agent session. Thread 1 is the main thread, the chat from before threads, over
-//! the stream `conversation`; the others use `thread:<id>`.
+//! the stream `conversation`; the others use `thread:<id>`. Thread 1 is the owner's home
+//! conversation; anyone else's home is a root thread of theirs ([`Threads::home`]).
 //!
 //! [`Threads`] is the registry: it makes sure thread 1 exists, opens each thread's [`Assistant`]
 //! when it is first needed, and shows every request in the stream of the thread it was asked in.
@@ -468,7 +469,7 @@ pub enum Refusal {
     NotFound,
     /// The thread is archived: read-only.
     Archived,
-    /// The main thread is never archived.
+    /// A home conversation (thread 1, the owner's, or another person's own) is never archived.
     Main,
     /// The page's `client_id` names another user's thread.
     Taken,
@@ -1077,6 +1078,72 @@ impl Threads {
         Ok((row, true))
     }
 
+    /// `user`'s home conversation: where their `/` leads, and where a message of theirs that
+    /// names no thread goes. The owner's (`[data] user`) is thread 1, the main thread. Anyone
+    /// else's is a root thread of theirs, made the first time it is asked for, its id kept in
+    /// the key-value table ([`home_key`]); made under the write lock [`Threads::create_for`]
+    /// takes, so that two pages asking at once get one. A home given to someone else since
+    /// (`fronde threads reassign`) is no longer theirs: they get a new one. A home is never
+    /// archived ([`Threads::set_archived`]). Refused for a name that is no configured user.
+    pub async fn home(&self, user: &User) -> anyhow::Result<ThreadId> {
+        if user.name == self.owner {
+            return Ok(ThreadId::MAIN);
+        }
+        if self.users.get(&user.name).is_none() {
+            bail!(
+                "{} is not a user of this Fronde: they have no home conversation",
+                user.name
+            );
+        }
+        // Once made, a home is only read: no write lock for that.
+        if let Some(home) = stored_home(&self.db, &user.name).await? {
+            return Ok(home);
+        }
+        let transaction = fronde_db::begin_write(&self.db).await?;
+        // Another page may have made it while this one waited for the lock.
+        if let Some(home) = stored_home(&transaction, &user.name).await? {
+            return Ok(home);
+        }
+        let row = self
+            .insert(
+                &transaction,
+                &user.name,
+                StartedBy::User,
+                None,
+                MAIN_TITLE,
+                None,
+            )
+            .await?;
+        let (scope, key) = home_key(&user.name);
+        fronde_db::kv::set(
+            &transaction,
+            &scope,
+            key,
+            row.id.0.to_string().into_bytes(),
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.changes.notify();
+        Ok(row.id)
+    }
+
+    /// Whether thread `id` is someone's home conversation: thread 1, or the home of the person
+    /// it belongs to (see [`Threads::home`]).
+    pub async fn is_home(&self, id: ThreadId) -> anyhow::Result<bool> {
+        if id == ThreadId::MAIN {
+            return Ok(true);
+        }
+        let Some(row) = self.get(id).await? else {
+            return Ok(false);
+        };
+        // The owner's only home is thread 1.
+        if row.owner == self.owner {
+            return Ok(false);
+        }
+        Ok(stored_home(&self.db, &row.owner).await? == Some(id))
+    }
+
     /// Inserts a thread's stream and row within `transaction`, which holds the write lock.
     async fn insert(
         &self,
@@ -1268,14 +1335,15 @@ impl Threads {
     /// waiting for it stopped, but stays, not archived, with what it wrote; nothing under an
     /// archived thread is woken, starts or drives a sub-agent. The secrets given in their cards
     /// "for this conversation" are forgotten. None of the turns stopped so wakes a parent; a
-    /// sub-agent archived itself is noted in its parent's stream, which it does not wake. The
-    /// main thread is never archived.
+    /// sub-agent archived itself is noted in its parent's stream, which it does not wake. A home
+    /// conversation, the main thread or another person's ([`Threads::home`]), is never
+    /// archived: [`Refusal::Main`].
     ///
     /// Under the lock sub-agents start and are sent messages under: an archive and a start or
     /// a send never interleave.
     pub async fn set_archived(&self, id: ThreadId, archived: bool) -> anyhow::Result<()> {
-        if id == ThreadId::MAIN {
-            bail!("the main thread cannot be archived");
+        if self.is_home(id).await? {
+            bail!(Refusal::Main);
         }
         let starting = self.children.starting.lock().await;
         let was = self
@@ -1807,6 +1875,32 @@ fn move_dirs_aside(
         }
     }
     Ok(())
+}
+
+/// Where the id of `name`'s home conversation is kept: the key-value table's scope
+/// `user/<name>`, key `home`. Never the owner's, whose home is thread 1.
+pub fn home_key(name: &str) -> (String, &'static str) {
+    (format!("user/{name}"), "home")
+}
+
+/// The home conversation stored for `name`, while it is still theirs: a root thread they own,
+/// not archived. `None` when none was made, or the one made was given to someone else since.
+async fn stored_home<C: ConnectionTrait>(db: &C, name: &str) -> anyhow::Result<Option<ThreadId>> {
+    let (scope, key) = home_key(name);
+    let Some(value) = fronde_db::kv::get(db, &scope, key).await? else {
+        return Ok(None);
+    };
+    let Some(id) = std::str::from_utf8(&value)
+        .ok()
+        .and_then(|id| id.parse::<i64>().ok())
+    else {
+        tracing::warn!("the home conversation stored for {name} is not a thread id: ignored");
+        return Ok(None);
+    };
+    let row = threads::Entity::find_by_id(id).one(db).await?;
+    Ok(row
+        .filter(|row| row.owner == name && row.parent_id.is_none() && row.archived_at.is_none())
+        .map(|row| ThreadId(row.id)))
 }
 
 /// Thread `id`'s model, `None` for the agent's default.

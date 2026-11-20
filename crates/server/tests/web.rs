@@ -304,6 +304,7 @@ async fn hello(socket: &mut Socket, last_seq: u64, log_id: Option<&str>) -> (Str
             last_seq,
             log_id,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -517,6 +518,7 @@ async fn ws_send_runs_a_turn() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -616,6 +618,7 @@ async fn ws_hello_replays_then_streams() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -639,6 +642,7 @@ async fn ws_hello_replays_then_streams() {
             last_seq: 2,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -683,6 +687,7 @@ async fn hub_url_follows_the_listen_address() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -1018,6 +1023,7 @@ async fn reconnect_in_the_middle_of_an_answer_gets_the_rest_once() {
             last_seq: seen.seq,
             log_id: Some(log_id),
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -1070,6 +1076,7 @@ async fn hello_after_a_log_reset_replays_everything() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -1089,6 +1096,7 @@ async fn hello_after_a_log_reset_replays_everything() {
             last_seq: 100,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -1119,6 +1127,7 @@ async fn relative_data_dir_gives_an_absolute_agent_cwd() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -1443,6 +1452,7 @@ async fn oversized_message_closes_the_socket() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -1971,6 +1981,7 @@ async fn hello_thread(
             last_seq,
             log_id: log_id.map(str::to_owned),
             thread: Some(thread),
+            list: false,
         },
     )
     .await;
@@ -2514,6 +2525,7 @@ async fn unknown_thread_is_refused() {
             last_seq: 0,
             log_id: None,
             thread: Some(unknown),
+            list: false,
         },
         ClientMsg::Send {
             text: "Salut".into(),
@@ -3019,6 +3031,8 @@ struct TwoPages {
     marie: Socket,
     alix_thread: ThreadId,
     marie_thread: ThreadId,
+    /// Her home conversation, made by her first hello that was not refused.
+    marie_home: ThreadId,
     /// Everything marie's socket got.
     seen: Vec<ServerMsg>,
     _dir: tempfile::TempDir,
@@ -3050,6 +3064,7 @@ async fn two_pages() -> TwoPages {
             last_seq: 0,
             log_id: None,
             thread: Some(ThreadId::MAIN),
+            list: false,
         },
     )
     .await;
@@ -3094,6 +3109,7 @@ async fn two_pages() -> TwoPages {
             last_seq: 0,
             log_id: None,
             thread: Some(marie_thread),
+            list: false,
         },
     )
     .await;
@@ -3105,6 +3121,7 @@ async fn two_pages() -> TwoPages {
         user,
         admin,
         thread,
+        home,
         ..
     } = hello
     else {
@@ -3114,12 +3131,15 @@ async fn two_pages() -> TwoPages {
         (user.as_deref(), admin, thread),
         (Some("marie"), false, Some(marie_thread))
     );
+    let marie_home = home.expect("her hello names her home");
+    assert!(marie_home != ThreadId::MAIN && marie_home != marie_thread);
     TwoPages {
         addr,
         alix,
         marie,
         alix_thread,
         marie_thread,
+        marie_home,
         seen,
         _dir: dir,
     }
@@ -3137,6 +3157,7 @@ async fn member_session_is_the_member() {
         marie,
         alix_thread,
         marie_thread,
+        marie_home,
         seen,
         ..
     } = &mut pages;
@@ -3176,6 +3197,7 @@ async fn member_session_is_the_member() {
                 last_seq: 0,
                 log_id: None,
                 thread: Some(id),
+                list: false,
             },
             ClientMsg::Send {
                 text: "from-marie".into(),
@@ -3206,7 +3228,7 @@ async fn member_session_is_the_member() {
             );
         }
     }
-    // A send without a thread is the main thread's, refused alike.
+    // A send without a thread is her home's, never thread 1's: checked below, in his log.
     say(
         marie,
         ClientMsg::Send {
@@ -3214,10 +3236,6 @@ async fn member_session_is_the_member() {
             thread: None,
         },
     )
-    .await;
-    gather(marie, seen, |m| {
-        matches!(m, ServerMsg::ThreadRefused { .. })
-    })
     .await;
     say(
         marie,
@@ -3250,7 +3268,9 @@ async fn member_session_is_the_member() {
                 _ => {}
             },
             ServerMsg::Threads { threads } => assert!(
-                threads.iter().all(|thread| thread.id == *marie_thread),
+                threads
+                    .iter()
+                    .all(|thread| thread.id == *marie_thread || thread.id == *marie_home),
                 "{threads:?}"
             ),
             // Her own account's, at most: never the owner's or anyone else's.
@@ -3268,11 +3288,29 @@ async fn member_session_is_the_member() {
             | ServerMsg::Created { .. } => {}
         }
     }
-    // Nothing of his changed.
+    // Nothing of his changed, and his thread 1 holds no message of hers.
     let (_, _, threads) = hello_thread(alix, ThreadId::MAIN, 0, None).await;
     let his = listed(&threads, *alix_thread).unwrap();
     assert!(!his.archived);
     assert_ne!(his.title, "Pris");
+    for message in until_quiet(alix).await {
+        if let ServerMsg::Entry(entry) = message
+            && let Event::User { text, .. } = entry.event
+        {
+            assert_ne!(text, "from-marie", "thread 1 got her message");
+        }
+    }
+    // Her home did.
+    let (_, _, _) = hello_thread(alix, *marie_home, 0, None).await;
+    let entries = until_turn_ended(alix).await;
+    assert!(
+        entries.iter().any(|entry| entry.event
+            == Event::User {
+                text: "from-marie".into(),
+                by: None,
+            }),
+        "{entries:?}"
+    );
 }
 
 /// The answer to [`ask_in_background`]'s question: `label`.
@@ -3449,6 +3487,7 @@ async fn opens(addr: SocketAddr, cookie: &str) -> bool {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -3513,6 +3552,7 @@ async fn a_renamed_owners_session_never_acts_as_the_new_owner() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
     )
     .await;
@@ -3537,6 +3577,7 @@ async fn single_user_signs_in_without_a_name() {
                 last_seq: 0,
                 log_id: None,
                 thread: None,
+                list: false,
             },
         )
         .await;
@@ -3816,6 +3857,7 @@ async fn a_refused_hello_stops_the_previous_stream() {
             last_seq: 0,
             log_id: None,
             thread: Some(unknown),
+            list: false,
         },
     )
     .await;
@@ -3956,4 +3998,181 @@ async fn a_flood_of_made_up_names_never_keeps_a_person_out() {
         sign_in_as(addr, "marie", MARIE_PASSWORD).await;
         sign_in_as(addr, "Alix", PASSWORD).await;
     }
+}
+
+/// The hello a page showing its user's home sends before it knows which thread that is.
+fn home_hello() -> ClientMsg {
+    ClientMsg::Hello {
+        last_seq: 0,
+        log_id: None,
+        thread: None,
+        list: true,
+    }
+}
+
+fn ids(threads: &[ThreadSummary]) -> Vec<ThreadId> {
+    threads.iter().map(|thread| thread.id).collect()
+}
+
+/// A member's `/` is her home, never thread 1: a hello that names no thread streams a thread of
+/// her own, made then, once even for two pages at once, named in the server's hello; her list
+/// and her meter come with it. A message or a stop without a thread goes there, and nothing of it
+/// reaches the owner's thread 1. Her home is never archived, by her nor by an admin.
+#[tokio::test]
+async fn member_slash_never_shows_thread_one() {
+    let dir = tempfile::tempdir().unwrap();
+    store_reading(&dir.path().join("data"), "marie", 0.3).await;
+    store_reading(&dir.path().join("data"), "alix", 0.9).await;
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let alix_cookie = sign_in_as(addr, "Alix", PASSWORD).await;
+    let mut alix = open_chat(addr, &alix_cookie).await;
+    hello_thread(&mut alix, ThreadId::MAIN, 0, None).await;
+    until_quiet(&mut alix).await;
+
+    let cookie = sign_in_as(addr, "marie", MARIE_PASSWORD).await;
+    let mut phone = open_chat(addr, &cookie).await;
+    let mut laptop = open_chat(addr, &cookie).await;
+    say(&mut phone, home_hello()).await;
+    say(&mut laptop, home_hello()).await;
+    let mut homes = Vec::new();
+    for socket in [&mut phone, &mut laptop] {
+        let seen = until_quiet(socket).await;
+        let Some(ServerMsg::Hello {
+            user,
+            admin,
+            thread,
+            home,
+            ..
+        }) = seen.first()
+        else {
+            panic!("expected the server's hello first: {seen:?}");
+        };
+        assert_eq!(
+            (user.as_deref(), *admin, *thread),
+            (Some("marie"), false, None)
+        );
+        let home = home.expect("her hello names her home");
+        assert_ne!(home, ThreadId::MAIN);
+        let lists: Vec<_> = seen
+            .iter()
+            .filter_map(|message| match message {
+                ServerMsg::Threads { threads } => Some(ids(threads)),
+                _ => None,
+            })
+            .collect();
+        assert!(!lists.is_empty(), "no list: {seen:?}");
+        assert!(lists.iter().all(|list| *list == [home]), "{seen:?}");
+        // Her meter, at once: her own account's.
+        assert_eq!(
+            usages(&seen),
+            [(vec!["marie".to_owned()], Vec::new())],
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|m| matches!(m, ServerMsg::Entry(_))),
+            "{seen:?}"
+        );
+        homes.push(home);
+    }
+    assert_eq!(homes[0], homes[1], "two homes were made");
+    let home = homes[0];
+
+    say(
+        &mut phone,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    let events = events_of(until_turn_ended(&mut phone).await);
+    assert_eq!(
+        events[0],
+        Event::User {
+            text: "Salut".into(),
+            by: None,
+        }
+    );
+    // The other page shows her home too.
+    let events = events_of(until_turn_ended(&mut laptop).await);
+    assert_eq!(
+        events[0],
+        Event::User {
+            text: "Salut".into(),
+            by: None,
+        }
+    );
+    say(&mut phone, ClientMsg::Cancel { thread: None }).await;
+    let quiet = until_quiet(&mut phone).await;
+    assert!(
+        !quiet
+            .iter()
+            .any(|m| matches!(m, ServerMsg::ThreadRefused { .. })),
+        "{quiet:?}"
+    );
+    // Thread 1 got nothing of hers.
+    let quiet = until_quiet(&mut alix).await;
+    assert!(
+        !quiet.iter().any(|m| matches!(m, ServerMsg::Entry(_))),
+        "{quiet:?}"
+    );
+
+    for socket in [&mut phone, &mut alix] {
+        say(
+            socket,
+            ClientMsg::Archive {
+                thread: home,
+                archived: true,
+            },
+        )
+        .await;
+        let (thread, _, reason) = next_thread_refusal(socket).await;
+        assert_eq!(thread, Some(home));
+        assert_eq!(reason, "La conversation principale ne s'archive pas.");
+    }
+    // Named, it is the same thread.
+    let (_, newest, threads) = hello_thread(&mut laptop, home, 0, None).await;
+    assert!(newest > 0);
+    assert_eq!(ids(&threads), [home]);
+    assert!(!listed(&threads, home).unwrap().archived);
+}
+
+/// The owner's `/` is thread 1, as before homes: the hello that names no thread says nothing
+/// of a home, and makes no thread.
+#[tokio::test]
+async fn owner_slash_is_thread_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector();
+    let addr = start_with(two_people(dir.path()), connector, &site(dir.path())).await;
+    let cookie = sign_in_as(addr, "Alix", PASSWORD).await;
+    let mut socket = open_chat(addr, &cookie).await;
+    say(&mut socket, home_hello()).await;
+    let seen = until_quiet(&mut socket).await;
+    let Some(ServerMsg::Hello {
+        user, thread, home, ..
+    }) = seen.first()
+    else {
+        panic!("expected the server's hello first: {seen:?}");
+    };
+    assert_eq!(
+        (user.as_deref(), *thread, *home),
+        (Some("Alix"), None, None)
+    );
+    let Some(ServerMsg::Threads { threads }) = seen.get(1) else {
+        panic!("expected the list: {seen:?}");
+    };
+    assert_eq!(ids(threads), [ThreadId::MAIN]);
+    say(
+        &mut socket,
+        ClientMsg::Send {
+            text: "Salut".into(),
+            thread: None,
+        },
+    )
+    .await;
+    until_turn_ended(&mut socket).await;
+    let (_, newest, threads) = hello_thread(&mut socket, ThreadId::MAIN, 0, None).await;
+    assert!(newest > 0);
+    assert_eq!(ids(&threads), [ThreadId::MAIN]);
 }

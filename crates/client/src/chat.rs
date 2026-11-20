@@ -178,6 +178,7 @@ impl Chat {
                 user,
                 admin,
                 thread: _,
+                home: _,
             } => {
                 // Another log, or one shorter than what the page shows (deleted and started
                 // again): what the page shows is gone, the server replays the whole new log.
@@ -530,6 +531,7 @@ mod tests {
             user: None,
             admin: false,
             thread: None,
+            home: None,
         }
     }
 
@@ -984,6 +986,7 @@ mod tests {
             user: Some("alix".into()),
             admin: true,
             thread: None,
+            home: None,
         });
         assert!(chat.admin());
         let card = Card::Secret {
@@ -1115,6 +1118,7 @@ mod tests {
             user: Some("alix".into()),
             admin: true,
             thread: None,
+            home: None,
         });
         assert!(chat.admin());
         apply_all(

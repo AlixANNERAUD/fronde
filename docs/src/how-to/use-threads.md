@@ -1,7 +1,9 @@
 # Use several conversations
 
 Fronde keeps several conversations, called threads, each with its own agent, history and files.
-The chat you land on at `/` is the main thread; it is always there and is never archived.
+The chat you land on at `/` is your home conversation; it is always there and is never archived.
+For the owner (`[data] user`) it is the main thread, thread 1. Anyone else gets a conversation of
+their own there, made the first time they open `/`, which only they (and an admin) see.
 
 ## Open the list
 
@@ -47,7 +49,8 @@ Each row and each chat's title have an actions button (three dots):
 - *Archiver* moves the thread to *Archivées*, folded at the bottom of the list. Its agent stops,
   the secrets you gave in its cards for this conversation are forgotten, and it can be read but
   not written to. The sub-agents it started stop their work too; they stay in the list with what
-  they wrote. *Désarchiver* brings the thread back, not the work its sub-agents stopped.
+  they wrote. *Désarchiver* brings the thread back, not the work its sub-agents stopped. Your home
+  conversation, at `/`, has no *Archiver*: it is never archived.
 
 When Fronde refuses an action, the reason shows above the chat, with a button to close it.
 

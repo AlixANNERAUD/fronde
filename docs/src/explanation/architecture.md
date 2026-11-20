@@ -109,7 +109,10 @@ database, with its own agent session, whose id the row keeps. The chat is the ma
 thread 1, over the topic `conversation`, the stream it had before threads existed. Fronde opens a
 thread's conversation the first time it is needed, and at start any thread a stop left in the
 middle of a turn, to close that turn. A request is shown in the stream of the thread it was asked
-in. An archived thread refuses messages; the main thread is never archived.
+in. An archived thread refuses messages. Each person has a **home conversation**, their `/`:
+the main thread for the owner, a root thread of their own for anyone else, made the first time
+it is needed, its id kept in the key-value table (`user/<name>`, `home`). A home is never
+archived.
 
 Each thread has its own agent process, started on the thread's first message, in its own
 directories (`agent/` and `home/` for the main thread, `threads/<id>/work/` and
@@ -120,8 +123,9 @@ stops another. A thread's agent can start threads of its own for a task, sub-age
 
 The chat's WebSocket carries every thread (see
 [the chat WebSocket](../reference/endpoints.md#the-chat-websocket)). A socket streams one thread
-at a time and switches with a new `hello`; the page that names a thread also gets the thread
-list, pushed again whenever a thread is made, renamed or archived, a turn starts, waits or ends,
+at a time and switches with a new `hello` (one that names no thread streams the user's home,
+and every server `hello` names that home); a page that names a thread, or asks for the list,
+also gets the thread list, pushed again whenever a thread is made, renamed or archived, a turn starts, waits or ends,
 or a card opens or closes in it. Each thread's status is computed live: waiting for an agent,
 running, or how its last turn ended, read from the thread's stream for a thread not open yet.
 Every thread id a page sends is checked against the signed-in user, never trusted as an

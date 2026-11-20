@@ -447,6 +447,7 @@ async fn assistant_token_never_appears() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
         ClientMsg::Send {
             text: "Salut".into(),
@@ -795,6 +796,7 @@ async fn secret_answer_never_appears() {
             last_seq: 0,
             log_id: None,
             thread: None,
+            list: false,
         },
         ClientMsg::Send {
             text: "Salut".into(),
