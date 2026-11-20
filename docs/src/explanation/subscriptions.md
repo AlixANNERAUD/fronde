@@ -134,6 +134,38 @@ every other account's, by name (see
 `fronde check` and the start log print one `usage:` line per account (see
 [Command line](../reference/command-line.md)).
 
+### One subscription, several people
+
+An account may list other people in `users`, and a person may use several accounts of one
+provider: their own Claude and a family one, say (see
+[`[accounts.<name>]`](../reference/configuration.md#accountsname)). Each person has one default
+account per provider, named by `default_for` when they may use more than one, so that who pays
+for a conversation is always written in the file, never guessed. Running a person's threads on an
+account someone else owns, and picking another account for one conversation, are **planned**:
+for now each person's threads run on an account they own.
+
+What the people of one account share is what the subscription itself counts:
+
+- its **usage windows**: everyone's turns on it spend the same 5-hour and weekly windows;
+- its **reserve**: `[threads] reserve` keeps a share of those windows for its owner, the
+  subscriber, and everyone's background work on it stops at that line;
+- its **daily counts** of sub-agents and their turns, all its users together.
+
+What they never share:
+
+- **conversations**: a thread is its owner's, whatever accounts two people have in common, and
+  only they and an admin see it;
+- **homes and working directories**: each thread keeps its own, and its sandbox writes only
+  those;
+- **sessions**: no transcript and no `~/.claude` state goes from one person's thread to another's;
+- **credentials**: the token reaches each agent through its environment only, and Fronde writes no
+  credential file. Two accounts never read one token either: sharing goes through `users`.
+
+The terms of a personal subscription probably do not allow sharing it with other people: a
+Claude Pro or Max plan is meant for one person. Check your provider's terms before you list
+anyone in `users`; Fronde makes sharing possible and keeps it visible, it does not make it
+allowed.
+
 ## Why MCP for the tools
 
 Fronde's tools are not wired into one agent: the hub serves them over MCP, the protocol every

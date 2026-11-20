@@ -86,7 +86,7 @@ admin = true
 password = { file = "/run/secrets/fronde_password" }
 
 # The Claude subscription the agents sign in with, one section per account, owned by one person
-# of [users]. Its token is the one `claude setup-token` prints, run in the owner's own home: a
+# of [users], its subscriber. Its token is the one `claude setup-token` prints, run in the owner's own home: a
 # secret like the others, { file = "…" }, { env = "…" } or { stored = "…" } (stored for
 # https://api.anthropic.com). Never run `claude` with HOME set to the agent's home. Without
 # [accounts], [agent] oauth_token (or CLAUDE_CODE_OAUTH_TOKEN in Fronde's environment) is read
@@ -95,6 +95,15 @@ password = { file = "/run/secrets/fronde_password" }
 provider = "claude"
 owner = "alix"
 oauth_token = { env = "CLAUDE_CODE_OAUTH_TOKEN" }
+# Others may use it too: users lists them. A person who may use two accounts of one provider
+# (their own and a family one) is named in the default_for of one of them, their default:
+#   [accounts.famille]
+#   provider = "claude"
+#   owner = "alix"
+#   users = ["marie", "paul"]
+#   default_for = ["marie", "paul"]
+#   oauth_token = { stored = "claude_famille" }
+# Sharing a personal subscription is probably outside its terms: check them first.
 
 # Optional: the agent Fronde runs (ACP over stdio), started on the first message. It keeps only a
 # few variables of Fronde's environment, never the variables it signs in with: its account's

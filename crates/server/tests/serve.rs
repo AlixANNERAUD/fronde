@@ -1572,7 +1572,80 @@ async fn check_reports_each_account() {
     assert!(!shown.contains(ALIX), "{shown}");
 }
 
-/// `fronde check` lists who signs in, whether an admin, and each one's account; a member's
+/// `fronde check` lists, for each person, the accounts they may use per provider and their
+/// default, and, for each account, the other people who may use it. No password or token is
+/// printed.
+#[tokio::test]
+async fn check_lists_who_uses_each_account() {
+    const ALIX: &str = "token-of-alix";
+    const FAMILLE: &str = "token-of-famille";
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    let legacy = std::fs::read_to_string(&path).unwrap();
+    let people = ["alix", "marie", "paul", "lea"];
+    for name in people {
+        fronde_hub::private::write(
+            dir.path().join(format!("{name}.password")),
+            format!("password-of-{name}"),
+        )
+        .unwrap();
+    }
+    let mut text = legacy
+        .replace("[data]\n", "[data]\nuser = \"alix\"\n")
+        .replace("password = { file = \"password\" }\n", "");
+    for name in people {
+        let admin = if name == "alix" { "admin = true\n" } else { "" };
+        text.push_str(&format!(
+            "[users.{name}]\n{admin}password = {{ file = \"{name}.password\" }}\n"
+        ));
+    }
+    text.push_str(
+        "[accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\ndefault_for = [\"alix\"]\n\
+         oauth_token = { stored = \"claude_alix\" }\n\
+         [accounts.famille]\nprovider = \"claude\"\nowner = \"alix\"\n\
+         users = [\"marie\", \"paul\"]\ndefault_for = [\"marie\", \"paul\"]\n\
+         oauth_token = { stored = \"claude_famille\" }\n\
+         [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+         oauth_token = { stored = \"claude_marie\" }\n",
+    );
+    let key = dir.path().join("master.key");
+    for (name, value) in [("claude_alix", ALIX), ("claude_famille", FAMILLE)] {
+        store_secret(&data, &key, name, "https://api.anthropic.com", value).await;
+    }
+    let (code, shown) = check_with(&path, &text, None);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains(
+            "\nusers: alix (admin; claude: alix (default), famille), lea (no account: no agent), \
+             marie (claude: famille (default), marie), paul (claude: famille (default))\n"
+        ),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(
+            "\naccount famille (claude, owner alix, also used by marie, paul): stored secret \
+             claude_famille opens, for https://api.anthropic.com\n"
+        ),
+        "{shown}"
+    );
+    // An account nobody shares says nothing more.
+    assert!(
+        shown.contains(
+            "\naccount alix (claude, owner alix): stored secret claude_alix opens, for \
+             https://api.anthropic.com\n"
+        ),
+        "{shown}"
+    );
+    for secret in [ALIX, FAMILLE] {
+        assert!(!shown.contains(secret), "{secret}: {shown}");
+    }
+    for name in people {
+        let password = format!("password-of-{name}");
+        assert!(!shown.contains(&password), "{password}: {shown}");
+    }
+}
+
+/// `fronde check` lists who signs in, whether an admin, and each one's accounts; a member's
 /// stored token not stored yet is a warning, not a failure. No password or token is printed.
 #[tokio::test]
 async fn check_lists_users_and_their_accounts() {
@@ -1585,7 +1658,7 @@ async fn check_lists_users_and_their_accounts() {
     let (code, shown) = check_with(&path, &legacy, None);
     assert_eq!(code, Some(0), "{shown}");
     assert!(
-        shown.contains("\nusers: me (admin, account claude)\n"),
+        shown.contains("\nusers: me (admin; claude: claude (default))\n"),
         "{shown}"
     );
 
@@ -1640,7 +1713,8 @@ async fn check_lists_users_and_their_accounts() {
     assert_eq!(code, Some(0), "{shown}");
     assert!(
         shown.contains(
-            "\nusers: alix (admin, account alix), marie (account marie), paul (no account)\n"
+            "\nusers: alix (admin; claude: alix (default)), marie (claude: marie (default)), \
+             paul (no account: no agent)\n"
         ),
         "{shown}"
     );

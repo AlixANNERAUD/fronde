@@ -170,6 +170,8 @@ impl Config {
                     name: name.clone(),
                     provider: account.provider.clone(),
                     owner: account.owner.clone(),
+                    users: account.users.clone(),
+                    default_for: account.default_for.clone(),
                     token: account.oauth_token.clone(),
                     form: AccountForm::Declared,
                 })
@@ -189,9 +191,36 @@ impl Config {
             name: LEGACY_ACCOUNT.to_owned(),
             provider: "claude".to_owned(),
             owner: self.data.user.clone(),
+            users: Vec::new(),
+            default_for: Vec::new(),
             token,
             form,
         }]
+    }
+
+    /// Whether `user` may run threads on the account named `account`: they own it or its
+    /// `users` lists them.
+    pub fn may_use(&self, user: &str, account: &str) -> bool {
+        self.accounts()
+            .iter()
+            .any(|found| found.name == account && found.usable_by(user))
+    }
+
+    /// `user`'s default account on `provider`: the one whose `default_for` names them, else the
+    /// only one of that provider they may use, else none (the load rules leave no other case).
+    pub fn default_account(&self, user: &str, provider: &str) -> Option<Account> {
+        let mut usable: Vec<Account> = self
+            .accounts()
+            .into_iter()
+            .filter(|account| account.provider == provider && account.usable_by(user))
+            .collect();
+        if let Some(named) = usable
+            .iter()
+            .position(|account| account.default_for.iter().any(|name| name == user))
+        {
+            return Some(usable.swap_remove(named));
+        }
+        (usable.len() == 1).then(|| usable.remove(0))
     }
 
     /// With `[accounts]`, refuses a sign-in variable in Fronde's environment that no account
@@ -340,14 +369,21 @@ fn look(name: &str) -> String {
         .collect()
 }
 
-/// `[accounts.<name>]`: a subscription of one provider, whose owner's agents sign in with it.
+/// `[accounts.<name>]`: a subscription of one provider, its owner's, which the people it lists
+/// may use too.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     /// One of [`PROVIDERS`].
     pub provider: String,
-    /// The user whose threads run on it.
+    /// The subscriber: whose subscription it is, whose `[threads] reserve` applies on it.
     pub owner: String,
+    /// The other people who may run threads on it.
+    #[serde(default)]
+    pub users: Vec<String>,
+    /// The people whose default account it is on its provider.
+    #[serde(default)]
+    pub default_for: Vec<String>,
     /// The token `claude setup-token` printed; a stored one is stored for [`CLAUDE_ORIGIN`].
     /// Required: an `Option` only so that its absence is refused with how to fix it.
     pub oauth_token: Option<Secret>,
@@ -364,12 +400,23 @@ pub const INHERITED_SIGN_IN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 pub struct Account {
     pub name: String,
     pub provider: String,
-    /// The user it belongs to.
+    /// The subscriber, the user it belongs to.
     pub owner: String,
+    /// The other people who may use it; none for the legacy form.
+    pub users: Vec<String>,
+    /// The people whose default account it is on its provider; none for the legacy form.
+    pub default_for: Vec<String>,
     /// Where its token comes from; `None` only for the legacy form without a token.
     pub token: Option<Secret>,
     /// Which part of the file it was read from.
     pub form: AccountForm,
+}
+
+impl Account {
+    /// Whether `user` may run threads on it: they own it or `users` lists them.
+    pub fn usable_by(&self, user: &str) -> bool {
+        self.owner == user || self.users.iter().any(|name| name == user)
+    }
 }
 
 /// Where an [`Account`] was read from.
@@ -1594,8 +1641,6 @@ fn check_accounts(config: &Config) -> anyhow::Result<()> {
         );
     }
     let users = config.user_names();
-    // (owner, provider) -> account.
-    let mut owned: BTreeMap<(&str, &str), &str> = BTreeMap::new();
     for (name, account) in &config.accounts {
         if !is_valid_name(name) {
             bail!("[accounts.{name:?}]: an account's name must match ^[a-z][a-z0-9_]{{0,63}}$");
@@ -1628,12 +1673,86 @@ fn check_accounts(config: &Config) -> anyhow::Result<()> {
                 config.data.user
             );
         }
-        if let Some(other) = owned.insert((owner, &account.provider), name) {
-            bail!(
-                "[accounts.{other}] and [accounts.{name}] both belong to {owner} on {}: a person \
-                 has one account per provider; remove one",
-                account.provider
-            );
+        for (i, user) in account.users.iter().enumerate() {
+            if !users.contains(user) {
+                bail!(
+                    "[accounts.{name}] users names {user:?}, who is not a user; name one of: {}",
+                    users.join(", ")
+                );
+            }
+            if user == owner {
+                bail!(
+                    "[accounts.{name}] users names {user:?}, its owner, who may always use it: \
+                     remove them from users"
+                );
+            }
+            if account.users[..i].contains(user) {
+                bail!("[accounts.{name}] users names {user:?} twice: remove one");
+            }
+        }
+        for (i, user) in account.default_for.iter().enumerate() {
+            if user != owner && !account.users.contains(user) {
+                bail!(
+                    "[accounts.{name}] default_for names {user:?}, who may not use it: add them \
+                     to its users, or remove them from default_for"
+                );
+            }
+            if account.default_for[..i].contains(user) {
+                bail!("[accounts.{name}] default_for names {user:?} twice: remove one");
+            }
+        }
+    }
+    check_defaults(config, &users)
+}
+
+/// Each person has at most one default account per provider, and one exactly when they may use
+/// several: Fronde never picks who pays, and adding someone to an account never changes their
+/// default silently.
+fn check_defaults(config: &Config, users: &[String]) -> anyhow::Result<()> {
+    let providers: std::collections::BTreeSet<&str> = config
+        .accounts
+        .values()
+        .map(|account| account.provider.as_str())
+        .collect();
+    for user in users {
+        for &provider in &providers {
+            let usable: Vec<&str> = config
+                .accounts
+                .iter()
+                .filter(|(_, account)| {
+                    account.provider == provider
+                        && (account.owner == *user || account.users.contains(user))
+                })
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let defaults: Vec<&str> = usable
+                .iter()
+                .copied()
+                .filter(|name| config.accounts[*name].default_for.contains(user))
+                .collect();
+            if let [first, second, ..] = defaults[..] {
+                bail!(
+                    "[accounts.{first}] default_for and [accounts.{second}] default_for both name \
+                     {user:?} on {provider}: a person has one default account per provider; \
+                     remove them from one"
+                );
+            }
+            if usable.len() > 1 && defaults.is_empty() {
+                let listed: Vec<String> = usable
+                    .iter()
+                    .map(|name| format!("[accounts.{name}]"))
+                    .collect();
+                let listed = match listed.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        format!("{} and {last}", rest.join(", "))
+                    }
+                    _ => listed.join(""),
+                };
+                bail!(
+                    "{user:?} may use {listed} on {provider}, and none is named their default: \
+                     add default_for = [{user:?}] to the one their threads run on by default"
+                );
+            }
         }
     }
     Ok(())

@@ -1174,6 +1174,16 @@ pub async fn start_with(
             // agents of every person whose account changed.
             let mut bindings = fronde_agent::threads::Accounts::default();
             for account in config.accounts() {
+                // Each person's threads still run on an account they own: of two they own on
+                // one provider, their default when it is one of them, else the first.
+                let default = config
+                    .default_account(&account.owner, &account.provider)
+                    .map(|default| default.name);
+                if bindings.of(&account.owner, &account.provider).is_some()
+                    && default.as_deref() != Some(account.name.as_str())
+                {
+                    continue;
+                }
                 let token = account.token.map(|token| {
                     account_token(account.name.clone(), token, db.clone(), backends.clone())
                 });
@@ -1186,7 +1196,12 @@ pub async fn start_with(
                     },
                 );
             }
-            let accounts = bindings.names();
+            // Every account's, bound or not: a reading is never dropped for want of a binding.
+            let accounts: Vec<String> = config
+                .accounts()
+                .into_iter()
+                .map(|account| account.name)
+                .collect();
             let main = thread_dirs(&data_dir, ThreadId::MAIN);
             for dir in [&main.work, &main.home] {
                 fronde_hub::private::create_dir_all(dir).with_context(|| {

@@ -130,8 +130,8 @@ pub async fn check(config: &Config, out: &mut impl Write) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Who signs in, whether an admin, and the accounts each owns: `alix (admin, account alix),
-/// paul (no account)`.
+/// Who signs in, whether an admin, and the accounts each may use per provider, their default
+/// marked: `alix (admin; claude: alix (default), famille), lea (no account: no agent)`.
 fn users_line(config: &Config) -> String {
     let accounts = config.accounts();
     config
@@ -142,22 +142,38 @@ fn users_line(config: &Config) -> String {
             if user.admin {
                 parts.push("admin".to_owned());
             }
-            let owned: Vec<String> = accounts
+            let providers: std::collections::BTreeSet<&str> = accounts
                 .iter()
-                .filter(|account| account.owner == user.name)
-                .map(|account| format!("account {}", account.name))
+                .filter(|account| account.usable_by(&user.name))
+                .map(|account| account.provider.as_str())
                 .collect();
-            if owned.is_empty() {
-                parts.push("no account".to_owned());
+            if providers.is_empty() {
+                parts.push("no account: no agent".to_owned());
             }
-            parts.extend(owned);
-            format!("{} ({})", user.name, parts.join(", "))
+            for provider in providers {
+                let default = config
+                    .default_account(&user.name, provider)
+                    .map(|account| account.name);
+                let usable: Vec<String> = accounts
+                    .iter()
+                    .filter(|account| account.provider == provider && account.usable_by(&user.name))
+                    .map(|account| {
+                        if default.as_ref() == Some(&account.name) {
+                            format!("{} (default)", account.name)
+                        } else {
+                            account.name.clone()
+                        }
+                    })
+                    .collect();
+                parts.push(format!("{provider}: {}", usable.join(", ")));
+            }
+            format!("{} ({})", user.name, parts.join("; "))
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// One account's line: its provider and owner, where its token comes from and whether it reads,
+/// One account's line: its provider, owner and other users, where its token comes from and whether it reads,
 /// never its value. A stored token is opened as an upstream server's is, for Claude's API. A
 /// token that does not read fails the check, but for a stored one not stored yet of an account
 /// that is not the owner's: a warning, since its owner's agents are not started yet.
@@ -168,8 +184,13 @@ fn account_line(
 ) -> anyhow::Result<String> {
     use fronde_hub::config::{AccountForm, CLAUDE_ORIGIN};
     let name = &account.name;
+    let also = if account.users.is_empty() {
+        String::new()
+    } else {
+        format!(", also used by {}", account.users.join(", "))
+    };
     let head = format!(
-        "account {name} ({}, owner {})",
+        "account {name} ({}, owner {}{also})",
         account.provider, account.owner
     );
     let place = || format!("account {name}: oauth_token");

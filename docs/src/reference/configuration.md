@@ -340,27 +340,46 @@ user, `[data] user`, an admin, signing in with `[web] password`.
 ## `[accounts.<name>]`
 
 Optional. The provider subscriptions the agents sign in with, one section per account. An
-account belongs to one person, its `owner`, and is where that is written, once: the threads of
-its owner run on it: every agent Fronde starts for a thread of theirs (their threads, their
-sub-agents, the turns a sub-agent's result wakes) signs in with this account's token, read again
-at each start, and with no one else's. A person without an account on a provider gets no agent
+account's `owner` is its subscriber: the person whose subscription it is, whose `[threads]
+reserve` applies on it. Every agent Fronde starts for a thread of theirs (their threads, their
+sub-agents, the turns a sub-agent's result wakes) signs in with an account's token, read again at
+each start, and with no one else's. A person without an account on a provider gets no agent
 there: the thread says « Aucun abonnement Claude n'est relié à ton compte : demande à
 l'administrateur. », and nothing falls back to the owner's account. Which account is a person's
 is read from the file at start, never stored with the threads: a change applies at each agent's
 next start after a restart.
 
+One account may be used by several people, and one person may use several accounts of one
+provider (their own Claude and a family one): a person **may use** an account they own or that
+lists them in `users`. Their **default account** on a provider is the one whose `default_for`
+names them, or else the only account of that provider they may use. Running each person's threads
+on their default account, which may be someone else's, and choosing another one per conversation
+are **planned**: until then `users` and `default_for` are read, checked and listed by
+`fronde check`, and each person's threads run on an account they own, their default when they own
+it. Sharing an account shares its usage windows, its reserve and its daily counts, never a
+conversation, a home, a session or a credential (see
+[One subscription, several people](../explanation/subscriptions.md#one-subscription-several-people)).
+
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `provider` | string | required | The provider the subscription is for: `"claude"`, the only one configured. Codex and Gemini/Antigravity are refused as planned. |
-| `owner` | string | required | The person it belongs to: one of [`[users]`](#usersname), or `[data] user` without them. |
-| `oauth_token` | secret | required | The token `claude setup-token` prints, run in the owner's own home and signed in with the owner's own Claude account: `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`), `{ file = "…" }` or `{ env = "…" }`. Fronde reads it at each start of the owner's agents and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through their environment only. |
+| `owner` | string | required | The subscriber: one of [`[users]`](#usersname), or `[data] user` without them. |
+| `users` | list of strings | `[]` | The other people who may run threads on it, each one of [`[users]`](#usersname). |
+| `default_for` | list of strings | `[]` | The people whose default account it is on its provider, each its owner or one of its `users`. |
+| `oauth_token` | secret | required | The token `claude setup-token` prints, run in the owner's own home and signed in with the owner's own Claude account: `{ stored = "…" }` (stored with `fronde secret set <name> --origin https://api.anthropic.com`), `{ file = "…" }` or `{ env = "…" }`. Fronde reads it at each start of an agent that runs on the account and gives it as `CLAUDE_CODE_OAUTH_TOKEN`, through their environment only. |
 
 The name matches `^[a-z][a-z0-9_]{0,63}$`. Fronde refuses, naming the keys:
 
-- an `owner` who is not a user, or two accounts of one owner on one provider: a person has one
-  account per provider;
+- an `owner` who is not a user;
+- a `users` entry who is not a user, is the owner, or comes twice;
+- a `default_for` entry who may not use the account, or comes twice;
+- a person named in the `default_for` of two accounts of one provider;
+- a person who may use two or more accounts of one provider and is named in none of their
+  `default_for`: the refusal names the accounts and says to add them to one `default_for`, so that
+  adding someone to an account never changes their default silently;
 - two accounts reading one token, or an account reading another credential's secret (see
-  [`[users.<name>]`](#usersname)), since one token would then sign both in;
+  [`[users.<name>]`](#usersname)), since one token would then sign both in: sharing goes
+  through `users`, never through a shared token;
 - `[accounts.claude]`, the legacy form's name, owned by anyone but `[data] user`;
 - an account without `oauth_token`;
 - `[agent] oauth_token` with `[accounts]`: move the token to the owner's account.
@@ -369,11 +388,28 @@ The name matches `^[a-z][a-z0-9_]{0,63}$`. Fronde refuses, naming the keys:
 [data]
 user = "alix"
 
+# [users.alix], an admin, [users.marie] and [users.paul], as above.
+
 [accounts.alix]
 provider = "claude"
 owner = "alix"
+default_for = ["alix"]                 # alix may use alix and famille: name her default
 oauth_token = { stored = "claude_alix" }
+
+[accounts.famille]
+provider = "claude"
+owner = "alix"
+users = ["marie", "paul"]              # who else may run threads on it
+default_for = ["marie", "paul"]
+oauth_token = { stored = "claude_famille" }
+
+[accounts.marie]
+provider = "claude"
+owner = "marie"
+oauth_token = { stored = "claude_marie" }
 ```
+
+Without `users`, an account is its owner's alone, as before sharing existed.
 
 ### The legacy form
 
@@ -382,7 +418,7 @@ named `claude`, on Claude, owned by `[data] user`, whose token is `[agent] oauth
 it, `CLAUDE_CODE_OAUTH_TOKEN` when Fronde's own environment holds it (the
 [Docker](../how-to/run-in-docker.md) set-up), which Fronde reads and gives the agent as an account's
 token, with a warning at start saying to name it; without either, the agent starts unsigned and
-uses the sign-in kept in its home.
+uses the sign-in kept in its home. It is its owner's alone: no `users`, no `default_for`.
 
 With `[accounts]`, `fronde check` and `fronde serve` refuse to start while Fronde's environment
 holds a variable an agent signs in with (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,

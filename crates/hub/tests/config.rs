@@ -1412,16 +1412,40 @@ fn owner_must_be_a_user() {
     );
 }
 
+/// One person may own two accounts of one provider, once the file names which one is their
+/// default; without it, the default rule refuses the file rather than pick one.
 #[test]
-fn one_account_per_owner_and_provider() {
-    let e = refused(&format!(
-        "{MIN}user = \"alix\"\n\
-         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ file = \"a\" }}\n\
-         [accounts.alix_pro]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = {{ file = \"b\" }}\n"
-    ));
+fn one_person_may_own_two_accounts() {
+    let two = |alix: &str, alix_pro: &str| {
+        format!(
+            "{MIN}user = \"alix\"\n\
+             [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n{alix}oauth_token = {{ file = \"a\" }}\n\
+             [accounts.alix_pro]\nprovider = \"claude\"\nowner = \"alix\"\n{alix_pro}oauth_token = {{ file = \"b\" }}\n"
+        )
+    };
+    let c = load_str(&two("", "default_for = [\"alix\"]\n")).unwrap();
+    let owners: Vec<(String, String)> = c
+        .accounts()
+        .into_iter()
+        .map(|account| (account.name, account.owner))
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            ("alix".to_owned(), "alix".to_owned()),
+            ("alix_pro".to_owned(), "alix".to_owned())
+        ]
+    );
+    assert!(c.may_use("alix", "alix") && c.may_use("alix", "alix_pro"));
+    assert_eq!(
+        c.default_account("alix", "claude")
+            .map(|account| account.name),
+        Some("alix_pro".to_owned())
+    );
+    let e = refused(&two("", ""));
     assert!(
-        e.contains("[accounts.alix] and [accounts.alix_pro] both belong to alix on claude")
-            && e.contains("one account per provider"),
+        e.contains("[accounts.alix] and [accounts.alix_pro]")
+            && e.contains("default_for = [\"alix\"]"),
         "{e}"
     );
 }
@@ -1967,4 +1991,286 @@ fn user_names_fold_fully() {
         ));
         assert!(e.contains("look alike"), "{a:?} {b:?}: {e}");
     }
+}
+
+/// Three people: Alix, the owner and an admin, Marie and Paul.
+const FAMILY: &str = "[users.alix]\nadmin = true\npassword = { file = \"alix.password\" }\n\
+                      [users.marie]\npassword = { file = \"marie.password\" }\n\
+                      [users.paul]\npassword = { file = \"paul.password\" }\n";
+
+/// `[accounts.<name>]` on Claude, owned by `owner`, with `rest` (its `users` and `default_for`)
+/// and its own stored token, `claude_<name>`.
+fn account(name: &str, owner: &str, rest: &str) -> String {
+    format!(
+        "[accounts.{name}]\nprovider = \"claude\"\nowner = \"{owner}\"\n{rest}\
+         oauth_token = {{ stored = \"claude_{name}\" }}\n"
+    )
+}
+
+/// The design's family: Alix uses her own account and the family one (hers by default), Marie
+/// the family one (by default) and her own, Paul the family one only.
+fn family() -> String {
+    owned_by_alix(&format!(
+        "{FAMILY}{}{}{}",
+        account("alix", "alix", "default_for = [\"alix\"]\n"),
+        account(
+            "famille",
+            "alix",
+            "users = [\"marie\", \"paul\"]\ndefault_for = [\"marie\", \"paul\"]\n"
+        ),
+        account("marie", "marie", ""),
+    ))
+}
+
+/// An account's `users` and `default_for` both default to empty.
+#[test]
+fn account_users_parse() {
+    let c = load_str(&family()).unwrap();
+    let accounts = c.accounts();
+    let seen: Vec<(&str, &[String], &[String])> = accounts
+        .iter()
+        .map(|account| {
+            (
+                account.name.as_str(),
+                account.users.as_slice(),
+                account.default_for.as_slice(),
+            )
+        })
+        .collect();
+    let names = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        seen,
+        [
+            ("alix", &[][..], &names(&["alix"])[..]),
+            (
+                "famille",
+                &names(&["marie", "paul"])[..],
+                &names(&["marie", "paul"])[..]
+            ),
+            ("marie", &[][..], &[][..]),
+        ]
+    );
+    // Who may use which: the owner and those listed, no one else.
+    for (user, account, may) in [
+        ("alix", "alix", true),
+        ("alix", "famille", true),
+        ("alix", "marie", false),
+        ("marie", "famille", true),
+        ("marie", "marie", true),
+        ("marie", "alix", false),
+        ("paul", "famille", true),
+        ("paul", "alix", false),
+        ("paul", "marie", false),
+        ("paul", "nobody", false),
+        ("lea", "famille", false),
+    ] {
+        assert_eq!(c.may_use(user, account), may, "{user} on {account}");
+    }
+    let default = |user: &str| {
+        c.default_account(user, "claude")
+            .map(|account| account.name)
+    };
+    assert_eq!(default("alix").as_deref(), Some("alix"));
+    assert_eq!(default("marie").as_deref(), Some("famille"));
+    assert_eq!(default("paul").as_deref(), Some("famille"));
+    assert_eq!(default("lea"), None);
+    assert_eq!(c.default_account("alix", "codex").map(|a| a.name), None);
+}
+
+/// `users` names people of `[users]`, and nobody else.
+#[test]
+fn account_users_must_be_users() {
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}",
+        account("famille", "alix", "users = [\"marie\", \"lea\"]\n")
+    )));
+    assert!(
+        e.contains("[accounts.famille] users names \"lea\", who is not a user")
+            && e.contains("alix, marie, paul"),
+        "{e}"
+    );
+}
+
+/// The owner may always use their account, so `users` never names them, nor anyone twice.
+#[test]
+fn account_users_refuse_the_owner_and_duplicates() {
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}",
+        account("famille", "alix", "users = [\"alix\", \"marie\"]\n")
+    )));
+    assert!(
+        e.contains("[accounts.famille] users names \"alix\", its owner"),
+        "{e}"
+    );
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}",
+        account(
+            "famille",
+            "alix",
+            "users = [\"marie\", \"paul\", \"marie\"]\n"
+        )
+    )));
+    assert!(
+        e.contains("[accounts.famille] users names \"marie\" twice"),
+        "{e}"
+    );
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}",
+        account(
+            "famille",
+            "alix",
+            "users = [\"marie\"]\ndefault_for = [\"marie\", \"marie\"]\n"
+        )
+    )));
+    assert!(
+        e.contains("[accounts.famille] default_for names \"marie\" twice"),
+        "{e}"
+    );
+}
+
+/// An account is nobody's default unless they may use it.
+#[test]
+fn default_for_must_be_able_to_use() {
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}",
+        account(
+            "famille",
+            "alix",
+            "users = [\"marie\"]\ndefault_for = [\"marie\", \"paul\"]\n"
+        )
+    )));
+    assert!(
+        e.contains("[accounts.famille] default_for names \"paul\", who may not use it")
+            && e.contains("users"),
+        "{e}"
+    );
+    // Not even someone who is no user at all.
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}",
+        account("famille", "alix", "default_for = [\"lea\"]\n")
+    )));
+    assert!(
+        e.contains("[accounts.famille] default_for names \"lea\", who may not use it"),
+        "{e}"
+    );
+}
+
+/// A person has at most one default account per provider.
+#[test]
+fn one_default_per_person_and_provider() {
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}{}",
+        account(
+            "famille",
+            "alix",
+            "users = [\"marie\"]\ndefault_for = [\"marie\"]\n"
+        ),
+        account("marie", "marie", "default_for = [\"marie\"]\n"),
+    )));
+    assert!(
+        e.contains(
+            "[accounts.famille] default_for and [accounts.marie] default_for both name \"marie\" \
+             on claude"
+        ),
+        "{e}"
+    );
+}
+
+/// Two accounts one person may use on one provider, and neither names them in `default_for`:
+/// refused, naming both and the key, so that adding someone to an account never changes their
+/// default silently.
+#[test]
+fn two_usable_accounts_need_a_default() {
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}{}",
+        account("famille", "alix", "users = [\"marie\"]\n"),
+        account("marie", "marie", ""),
+    )));
+    assert!(
+        e.contains("\"marie\" may use [accounts.famille] and [accounts.marie] on claude")
+            && e.contains("default_for = [\"marie\"]"),
+        "{e}"
+    );
+    // Alix owns one and is listed nowhere else: she uses one, hers, and needs no default.
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}{}{}",
+        account("alix", "alix", ""),
+        account(
+            "famille",
+            "alix",
+            "users = [\"marie\"]\ndefault_for = [\"marie\"]\n"
+        ),
+        account("marie", "marie", ""),
+    )));
+    assert!(
+        e.contains("\"alix\" may use [accounts.alix] and [accounts.famille] on claude"),
+        "{e}"
+    );
+}
+
+/// With one account a person may use on a provider, it is their default without naming it.
+#[test]
+fn default_is_the_only_usable_account() {
+    let c = load_str(&owned_by_alix(&format!(
+        "{FAMILY}{}{}",
+        account("famille", "alix", "users = [\"marie\"]\n"),
+        account("paul", "paul", ""),
+    )))
+    .unwrap();
+    let default = |user: &str| {
+        c.default_account(user, "claude")
+            .map(|account| account.name)
+    };
+    assert_eq!(default("alix").as_deref(), Some("famille"));
+    assert_eq!(default("marie").as_deref(), Some("famille"));
+    assert_eq!(default("paul").as_deref(), Some("paul"));
+    // An account of no one else's is nobody's default but its owner's.
+    assert!(!c.may_use("marie", "paul"));
+}
+
+/// The legacy form's one account is its owner's alone, and their default.
+#[test]
+fn legacy_account_has_no_other_users() {
+    let c = load_str(&format!(
+        "{MIN}user = \"alix\"\n[agent]\noauth_token = {{ stored = \"claude\" }}\n"
+    ))
+    .unwrap();
+    let accounts = c.accounts();
+    assert_eq!(accounts.len(), 1);
+    assert!(accounts[0].users.is_empty() && accounts[0].default_for.is_empty());
+    assert!(c.may_use("alix", "claude"));
+    assert!(!c.may_use("marie", "claude"));
+    assert_eq!(
+        c.default_account("alix", "claude")
+            .map(|account| account.name),
+        Some("claude".to_owned())
+    );
+    assert_eq!(c.default_account("marie", "claude").map(|a| a.name), None);
+}
+
+/// Sharing goes through `users`, never through one token: two accounts still cannot read one
+/// secret, whoever may use them.
+#[test]
+fn shared_account_still_names_its_own_secret() {
+    let e = refused(&owned_by_alix(&format!(
+        "{FAMILY}{}{}",
+        account(
+            "famille",
+            "alix",
+            "users = [\"marie\"]\ndefault_for = [\"marie\"]\n"
+        ),
+        account("marie", "marie", "").replace("claude_marie", "claude_famille"),
+    )));
+    assert!(
+        e.contains(
+            "[accounts.famille] oauth_token and [accounts.marie] oauth_token both read their \
+             secret from the stored secret claude_famille"
+        ),
+        "{e}"
+    );
 }

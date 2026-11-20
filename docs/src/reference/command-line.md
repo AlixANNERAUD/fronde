@@ -89,13 +89,16 @@ until 16:40 (5-hour window past the reserve's line, 70%)` past `[threads] reserv
 marie: no reading yet; background work bounded by the daily counts` before that account's first
 turn, or `usage: cannot read (the usage of marie: …)` when its stored reading does not read, and
 the check goes on (see [Usage and quotas](../explanation/subscriptions.md#usage-and-quotas)); the
-start log prints the same lines; then who signs in, `users: alix (admin, account alix), marie (account marie), paul
-(no account)` (see [`[users.<name>]`](configuration.md#usersname); for the legacy form,
-`users: alix (admin, account claude)`); then one line per [account](configuration.md#accountsname), never with its
+start log prints the same lines; then who signs in, and the accounts each may use per provider, their default
+marked, `users: alix (admin; claude: alix (default), famille), marie (claude: famille (default), marie), paul
+(claude: famille (default)), lea (no account: no agent)` (see [`[users.<name>]`](configuration.md#usersname); for
+the legacy form, `users: alix (admin; claude: claude (default))`); then one line per
+[account](configuration.md#accountsname), naming the other people who may use it, never with its
 token (it first refuses, with `[accounts]`, a sign-in variable in its environment that no account
 names, and two people's credentials holding the same value, naming the keys):
 `account alix (claude, owner alix): stored secret claude_alix opens, for
-https://api.anthropic.com` (opened as the agent's start opens it, from the database read-only),
+https://api.anthropic.com` or `account famille (claude, owner alix, also used by marie, paul): stored
+secret claude_famille opens, for https://api.anthropic.com` (opened as the agent's start opens it, from the database read-only),
 `account alix (claude, owner alix): token from the file /run/secrets/claude, read` or `… from the
 environment variable CLAUDE_TOKEN, read`; for the [legacy form](configuration.md#the-legacy-form),
 `account claude (claude, owner alix): token from the file …, read ([agent] oauth_token, legacy
