@@ -22,10 +22,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tower_http::services::ServeDir;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::cookie::time;
+use tower_sessions::session::Id;
 use tower_sessions::{Expiry, Session, SessionManagerLayer};
 
 /// How long a session survives without a signed-in request; each one renews it ([`renew`]).
@@ -56,6 +58,33 @@ pub struct Web {
     pub throttle: Mutex<Throttle>,
     /// Served behind https: the session cookie is `Secure`, and only https pages are Fronde's.
     pub secure_cookie: bool,
+    /// The open sockets of each session, to close them when it signs out.
+    pub sockets: Sockets,
+}
+
+/// A signal per session id, held by that session's sockets: ending the session drops it, which
+/// wakes them all. No socket polls the database.
+#[derive(Default)]
+pub struct Sockets(Mutex<HashMap<Id, watch::Sender<()>>>);
+
+impl Sockets {
+    /// Resolves when `id` ends: its sockets await it beside their messages.
+    pub fn watch(&self, id: Id) -> watch::Receiver<()> {
+        let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // A session whose sockets all closed leaves nothing behind.
+        open.retain(|_, signal| signal.receiver_count() > 0);
+        open.entry(id)
+            .or_insert_with(|| watch::channel(()).0)
+            .subscribe()
+    }
+
+    /// Closes every socket of `id`.
+    fn end(&self, id: &Id) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
 }
 
 impl Web {
@@ -505,9 +534,13 @@ async fn sign_out(State(web): State<Arc<Web>>, session: Session, headers: Header
     if !same_origin(&headers, web.secure_cookie) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let id = session.id();
     if let Err(error) = session.flush().await {
         tracing::error!("cannot sign out: {error}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Some(id) = id {
+        web.sockets.end(&id);
     }
     Redirect::to("/sign-in").into_response()
 }

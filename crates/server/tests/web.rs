@@ -3,8 +3,8 @@ use fronde_agent::acp::{AgentClient, AgentSpec};
 use fronde_agent::assistant::Connector;
 use fronde_agent::fake::{FakeScript, fake_agent, text_chunk};
 use fronde_protocol::{
-    ClientMsg, Entry, Event, Response, ServerMsg, ThreadId, ThreadStatus, ThreadSummary,
-    TurnOutcome,
+    CLOSE_SIGNED_OUT, ClientMsg, Entry, Event, Response, ServerMsg, ThreadId, ThreadStatus,
+    ThreadSummary, TurnOutcome,
 };
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{
@@ -3653,6 +3653,39 @@ async fn sign_in_forms_refuse_other_origins() {
     .unwrap();
     assert_eq!(out.status(), 403);
     assert_eq!(get(addr, "/", Some(&cookie)).await.status(), 200);
+}
+
+/// Signing out in one tab closes the session's other sockets at once, and only that session's.
+#[tokio::test]
+async fn signing_out_closes_the_sessions_other_sockets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _) = start(dir.path()).await;
+    let cookie = sign_in_as(addr, "Alix", PASSWORD).await;
+    let elsewhere = sign_in_as(addr, "Alix", PASSWORD).await;
+    let mut other_tab = open_chat(addr, &cookie).await;
+    let mut third_tab = open_chat(addr, &cookie).await;
+    let mut other_session = open_chat(addr, &elsewhere).await;
+    for socket in [&mut other_tab, &mut third_tab, &mut other_session] {
+        hello(socket, 0, None).await;
+    }
+
+    let out = timeout(
+        WAIT,
+        client()
+            .post(format!("http://{addr}/auth/sign-out"))
+            .header(ORIGIN, format!("http://{addr}"))
+            .header(COOKIE, &cookie)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(out.status(), 303);
+
+    assert_eq!(close_code(&mut other_tab).await, CLOSE_SIGNED_OUT);
+    assert_eq!(close_code(&mut third_tab).await, CLOSE_SIGNED_OUT);
+    let quiet = timeout(Duration::from_millis(500), other_session.next()).await;
+    assert!(quiet.is_err(), "another session's socket was closed");
 }
 
 /// [`people`], with marie's password file holding `password` when Fronde starts.

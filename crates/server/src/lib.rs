@@ -1344,6 +1344,7 @@ pub async fn start_with(
                 passwords: password,
                 throttle: std::sync::Mutex::new(web::Throttle::new()?),
                 secure_cookie,
+                sockets: Default::default(),
             },
             sessions,
             site_root,

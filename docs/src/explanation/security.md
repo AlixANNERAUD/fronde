@@ -352,7 +352,7 @@ person later configured under that name with a password of their own (or the new
 `[data] user`, should it change) never inherits it; sessions from before names were signed
 out once, at the upgrade. Sessions live in `fronde.db`, so a restart signs no one out. Their ids are stored hashed (SHA-256): a copy of that
 file, a backup for instance, does not let anyone take over a signed-in browser. Fronde never logs
-a session id. Signing out deletes the session at once. A session is refused as soon as it expires,
+a session id. Signing out deletes the session at once. Its other open sockets, in other tabs, are closed with it (close code 4401), without a database read per message. A session is refused as soon as it expires,
 after 30 days without use, and its row is deleted within the hour. Only a successful sign-in
 stores a session: a cookie a client made up is never saved.
 

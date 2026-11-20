@@ -72,7 +72,8 @@ The pages, assets and forms carry:
 `GET /ws` upgrades only when the `Origin` header names the same host as `Host`, over https while
 `secure_cookie = true`, else `403`.
 Without a session, it upgrades and closes at once with code `4401`, which the page reads as
-"sign in again": a refused upgrade would look like a network failure.
+"sign in again": a refused upgrade would look like a network failure. The same code closes every
+socket of a session when it signs out (`POST /auth/sign-out`) in any tab.
 
 Messages are JSON objects tagged by `type`. A page's message is at most 64 KiB; a bigger one
 closes the socket.

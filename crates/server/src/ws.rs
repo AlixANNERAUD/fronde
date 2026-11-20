@@ -41,10 +41,15 @@ pub async fn upgrade(
             let _ = socket.send(Message::Close(Some(close))).await;
         });
     };
+    let Some(id) = session.id() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // Watched before the next await: a sign-out from now on closes this socket.
+    let ended = web.sockets.watch(id);
     renew(&session);
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| chat(socket, web, user))
+        .on_upgrade(move |socket| chat(socket, web, user, ended))
 }
 
 /// The largest message a page may send: a message to Fronde or a card's answer is far smaller,
@@ -52,7 +57,7 @@ pub async fn upgrade(
 const MAX_MESSAGE: usize = 64 * 1024;
 
 /// Streams a thread's log once the page said hello, and passes the page's messages to Fronde.
-async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User) {
+async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User, mut ended: watch::Receiver<()>) {
     let mut talk = Talk {
         web: &web,
         user: &user,
@@ -66,6 +71,12 @@ async fn chat(mut socket: WebSocket, web: Arc<Web>, user: User) {
     };
     loop {
         tokio::select! {
+            // The sender is dropped when the session signs out.
+            _ = ended.changed() => {
+                let close = CloseFrame { code: CLOSE_SIGNED_OUT, reason: "".into() };
+                let _ = socket.send(Message::Close(Some(close))).await;
+                return;
+            }
             message = socket.recv() => {
                 let text = match message {
                     Some(Ok(Message::Text(text))) => text,
