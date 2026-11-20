@@ -340,6 +340,17 @@ impl Threads {
         let Some(assistant) = self.assistant(parent).await? else {
             return Ok(());
         };
+        // A result goes only to a thread of the same person, as read when the parent opened:
+        // never into another's.
+        let owner = self.owner_of(parent);
+        if owner.name != row.owner {
+            tracing::warn!(
+                "the sub-agent {child}, {}'s, ended: thread {parent} is {}'s, not woken",
+                row.owner,
+                owner.name
+            );
+            return Ok(());
+        }
         let (summary, truncated) = visible(answer, MAX_ANSWER);
         let (title, _) = visible(&row.title, MAX_TITLE);
         let woke = assistant

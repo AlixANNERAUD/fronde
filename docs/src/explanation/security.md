@@ -162,8 +162,9 @@ Some plain copies remain:
   `server.token`: it is made when the process starts, never written anywhere, and dies with the
   process (see [Threads](#threads)).
 - A `{ env = "…" }` value stays in Fronde's environment. The agent never gets it (see
-  [The agent's environment](#the-agents-environment)), but an upstream MCP server started from a
-  `command` inherits Fronde's whole environment.
+  [The agent's environment](#the-agents-environment)), nor does an upstream MCP server started
+  from a `command`, whose environment is cleared but for what finds programs, the locale, the
+  temporary directory, the proxy and the certificate authorities.
 - A sign-in form's body, and each `/mcp` request's `Authorization` header, are read into buffers
   that are freed but not zeroed. The parsed password is zeroed after the compare.
 - A master key read from the keychain passes through libraries Fronde does not control, which
@@ -471,8 +472,14 @@ thread's first message, with its own directories, its own sandbox and its own hu
   never in a user's name, and says so in its log; a person later configured under the same name
   starts with none of them. The page refuses a message to such a thread, nothing starts or drives
   a sub-agent of it, and its agent's sign-in fails before any process starts, without falling
-  back to anyone else's. The main thread is always `[data] user`'s, and its sub-agents go with
-  it when `[data] user` changes. Each person signs in as themselves: their page lists, opens and
+  back to anyone else's; `fronde threads reassign`, run while Fronde is stopped, gives such
+  threads back. The main thread is always `[data] user`'s, and so is every thread under it,
+  checked at every start: when `[data] user` changes, each thread of that tree given to the new
+  owner forgets its agent session and has its home moved aside (`home.previous-<name>-<time>`),
+  so that the new owner's agent neither resumes the earlier owner's conversation nor reads their
+  agent's files. A thread is made under another only for that thread's owner, and no
+  `threads_*` call, nor a sub-agent's result, crosses from one person's threads to another's:
+  another person's thread is answered as one that does not exist. Each person signs in as themselves: their page lists, opens and
   writes to their own threads only, answers their own cards only, and gets the usage readings of
   their own account only, never anyone else's; an admin's page sees every thread and every
   account's readings.
@@ -501,8 +508,9 @@ thread's first message, with its own directories, its own sandbox and its own hu
   secret for the conversation only, never in the store, and tells nothing of the names stored.
   A card only an admin answers (an integration's setup) is refused to a member's thread as well,
   before it is shown. `[agent] read` is the owner's to grant: only the owner's agents get it.
-  An unconfined agent (`[agent] sandbox = false`) is refused once someone who is not an admin is
-  configured. Of the agent slots, the one kept is for the owner's own threads only.
+  An unconfined agent (`[agent] sandbox = false`) is refused once a second person is configured,
+  an admin too, or a second account: unconfined, one person's agent could read the other's
+  threads, home and account token as Fronde's own files. Of the agent slots, the one kept is for the owner's own threads only.
 - **Unknown askers.** A request whose stored asker this version does not know (neither a thread,
   an outside client nor a server, nor the `assistant` of rows from before threads) is never read
   as a thread's: Fronde cancels it at start, and it can never be answered or own a secret.
@@ -662,7 +670,8 @@ rencontré une erreur*, and the log says why and how to fix it. Debian 12's kern
 so there the agent needs a newer kernel, such as the one from `bookworm-backports`, or
 `[agent] sandbox = false`.
 `[agent] sandbox = false` runs the agent unconfined, with the explicit environment only, and
-Fronde logs a warning at every start. There is no silent fallback.
+Fronde logs a warning at every start. There is no silent fallback. Only one person with one
+account may choose it: with a second user or account, Fronde refuses to load the configuration.
 
 What the sandbox does not cover:
 

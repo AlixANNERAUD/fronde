@@ -389,7 +389,10 @@ impl Registry {
             .map(|(d, _)| d.clone())
     }
 
-    /// Calls the tool `name` without saying who calls: a tool that needs to know refuses.
+    /// Calls the tool `name` without saying who calls, as the owner would: a tool that needs
+    /// to know refuses. For tests only: every call Fronde serves goes through
+    /// [`Registry::call_as`] and its gate.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn call(&self, name: &str, args: Value) -> ToolOutput {
         match self.handler(name) {
             Ok(h) => h.call(args).await,
@@ -408,6 +411,7 @@ impl Registry {
         }
     }
 
+    #[cfg(any(test, feature = "testing"))]
     fn handler(&self, name: &str) -> Result<Arc<dyn ToolHandler>, ToolOutput> {
         self.entry(name).map(|(_, h)| h)
     }
@@ -446,7 +450,7 @@ struct UseArgs {
 struct UseTool(std::sync::Weak<Registry>);
 
 impl UseTool {
-    async fn forward(&self, context: Option<&CallContext>, args: Value) -> ToolOutput {
+    async fn forward(&self, context: &CallContext, args: Value) -> ToolOutput {
         let a = match parse::<UseArgs>(args) {
             Ok(a) => a,
             Err(error) => return error,
@@ -459,21 +463,22 @@ impl UseTool {
                 "use_tool cannot call itself; pass the name of the tool you need",
             );
         }
-        match context {
-            Some(context) => r.call_as(context, &a.name, a.arguments).await,
-            None => r.call(&a.name, a.arguments).await,
-        }
+        r.call_as(context, &a.name, a.arguments).await
     }
 }
 
 #[async_trait]
 impl ToolHandler for UseTool {
-    async fn call(&self, args: Value) -> ToolOutput {
-        self.forward(None, args).await
+    /// Without knowing who calls, it cannot know what they may use: refused, as every tool that
+    /// needs to know refuses.
+    async fn call(&self, _args: Value) -> ToolOutput {
+        ToolOutput::error(
+            "this tool needs to know who calls it; call it through Fronde's MCP server",
+        )
     }
 
     async fn call_as(&self, context: &CallContext, args: Value) -> ToolOutput {
-        self.forward(Some(context), args).await
+        self.forward(context, args).await
     }
 }
 

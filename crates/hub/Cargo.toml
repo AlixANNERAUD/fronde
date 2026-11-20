@@ -8,7 +8,8 @@ version.workspace = true
 
 [features]
 # Test hooks: a fake keychain and a credentials directory in `SecretsConfig`, the inherited
-# sign-in variable in `Config`; only dev-dependencies turn it on.
+# sign-in variable in `Config`, `Registry::call` without the gate; only dev-dependencies turn it
+# on.
 testing = []
 
 [dependencies]

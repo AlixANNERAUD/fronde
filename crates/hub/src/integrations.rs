@@ -400,7 +400,6 @@ fn from_prefill(reaches: &[Reach], prefill: &BTreeMap<String, String>) -> bool {
 fn setup_card(
     integration: &Integration,
     prefill: &BTreeMap<String, String>,
-    family: Option<&str>,
     replaces: &[Planned],
 ) -> Result<Card, String> {
     let mut notes = Notes::default();
@@ -532,11 +531,6 @@ fn setup_card(
         });
     }
     message.push_str("\nFronde l'ajoutera à fronde.toml, puis la démarrera.");
-    if let Some(user) = family {
-        message.push_str(&format!(
-            "\nDemandé par l'agent de {user}. Demande envoyée à l'administrateur : seul un administrateur ajoute une intégration."
-        ));
-    }
     if message.chars().count() > MAX_MESSAGE {
         return Err("its description is too long for a card".into());
     }
@@ -672,13 +666,12 @@ async fn request_setup(setup: &Setup, context: CallContext, args: SetupArgs) -> 
         Ok(prefill) => prefill,
         Err(message) => return ToolOutput::error(message),
     };
-    let family = (context.user != setup.admin).then_some(context.user.as_str());
     let shown = Destinations::of(integration, &prefill);
     let replaces: Vec<Planned> = match plan(setup, integration, &shown).await {
         Ok(planned) => planned.into_iter().filter(|p| p.replaces).collect(),
         Err(Failed(message)) => return ToolOutput::error(message),
     };
-    let card = match setup_card(integration, &prefill, family, &replaces) {
+    let card = match setup_card(integration, &prefill, &replaces) {
         Ok(card) => card,
         Err(error) => {
             tracing::error!(
@@ -1377,7 +1370,7 @@ mod tests {
         )]);
         let Card::Form {
             message, fields, ..
-        } = setup_card(&integration(), &prefill, None, &[]).unwrap()
+        } = setup_card(&integration(), &prefill, &[]).unwrap()
         else {
             panic!("a form");
         };
@@ -1397,16 +1390,14 @@ mod tests {
             f,
             Field::Secret { description: Some(d), .. } if d.contains("https://cloud.example")
         )));
-        let Card::Form { message, .. } =
-            setup_card(&integration(), &BTreeMap::new(), Some("lea"), &[]).unwrap()
+        let Card::Form { message, .. } = setup_card(&integration(), &BTreeMap::new(), &[]).unwrap()
         else {
             panic!("a form");
         };
         assert!(message.contains("l'origine de events_url"), "{message}");
-        assert!(
-            message.contains("Demande envoyée à l'administrateur"),
-            "{message}"
-        );
+        // Only the owner's own agents ask (`request_setup`): a card never says it came from
+        // someone else's.
+        assert!(!message.contains("Demandé par"), "{message}");
     }
 
     #[test]

@@ -249,8 +249,43 @@ mod tests {
         assert!(none.next.unwrap().contains("Rephrase"));
     }
 
+    /// The owner, `[data] user`, calling from outside.
+    fn owner() -> crate::tools::CallContext {
+        crate::tools::CallContext {
+            caller: fronde_requests::Caller::Mcp("claude-code".into()),
+            user: "alix".into(),
+            admin: true,
+            owner: true,
+            topic: "conversation".into(),
+            turn: None,
+            cancelled: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     #[tokio::test]
     async fn use_tool_calls_deferred() {
+        let r = registry_with_echo();
+        let out = r
+            .call_as(
+                &owner(),
+                "use_tool",
+                json!({"name": "mcphub_echo", "arguments": {"x": 1}}),
+            )
+            .await;
+        assert_eq!(out.value, json!({"x": 1}));
+        let missing = r
+            .call_as(
+                &owner(),
+                "use_tool",
+                json!({"name": "nope", "arguments": {}}),
+            )
+            .await;
+        assert!(missing.is_error);
+    }
+
+    /// `use_tool` forwards only through the gate: without knowing who calls, it calls nothing.
+    #[tokio::test]
+    async fn use_tool_needs_to_know_who_calls() {
         let r = registry_with_echo();
         let out = r
             .call(
@@ -258,11 +293,12 @@ mod tests {
                 json!({"name": "mcphub_echo", "arguments": {"x": 1}}),
             )
             .await;
-        assert_eq!(out.value, json!({"x": 1}));
-        let missing = r
-            .call("use_tool", json!({"name": "nope", "arguments": {}}))
-            .await;
-        assert!(missing.is_error);
+        assert!(out.is_error);
+        assert!(
+            out.to_text().contains("needs to know who calls"),
+            "{}",
+            out.to_text()
+        );
     }
 
     #[test]

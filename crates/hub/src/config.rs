@@ -1393,6 +1393,28 @@ fn parse(text: &str, base: &Path, name: &str) -> anyhow::Result<Config> {
             table_key(member.0)
         );
     }
+    // An admin is a person too: an unconfined agent of one reads the other's threads, home and
+    // token as Fronde's own files.
+    if !config.agent.sandbox {
+        let mut people = config.users.keys();
+        if let (Some(one), Some(other)) = (people.next(), people.next()) {
+            bail!(
+                "[agent] sandbox = false with [users.{}] and [users.{}]: an unconfined agent of \
+                 one could read the other's conversations, files and account token; keep the \
+                 sandbox on, or remove the line",
+                table_key(one),
+                table_key(other)
+            );
+        }
+        let mut accounts = config.accounts.keys();
+        if let (Some(one), Some(other)) = (accounts.next(), accounts.next()) {
+            bail!(
+                "[agent] sandbox = false with [accounts.{one}] and [accounts.{other}]: an \
+                 unconfined agent signed in with one could read the other's token; keep the \
+                 sandbox on, or remove the line"
+            );
+        }
+    }
     // Read once, here: `Config::accounts` stays pure, and `serve` and `check` refuse what
     // `check_inherited` finds.
     config.inherited = PROVIDERS
@@ -1930,6 +1952,28 @@ fn check_sources(sources: &[SourceConfig]) -> anyhow::Result<()> {
                 }
                 if m.url.is_some() == m.command.is_some() {
                     bail!("source {name:?}: set exactly one of url or command");
+                }
+                // An account's token goes to its agents only: never to a server, as its token
+                // or in its command's environment.
+                if let Some(Secret::Env { env }) = &m.token
+                    && let Some(provider) = signs_in(env)
+                {
+                    bail!(
+                        "source {name:?}: token = {{ env = \"{env}\" }} names a variable that \
+                         signs an agent in to {provider}: a server never gets an account's token; \
+                         give the server a token of its own"
+                    );
+                }
+                for arg in m.command.iter().flatten() {
+                    if let Some((variable, _)) = arg.split_once('=')
+                        && let Some(provider) = signs_in(variable)
+                    {
+                        bail!(
+                            "source {name:?}: command sets {variable}, which signs an agent in \
+                             to {provider}: a server never gets an account's sign-in; remove it \
+                             from the command"
+                        );
+                    }
                 }
             }
             SourceConfig::Component(c) => check_component(c)?,

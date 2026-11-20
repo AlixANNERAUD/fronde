@@ -3918,11 +3918,30 @@ async fn no_account_starts_no_agent() {
             .iter()
             .any(|(thread, ..)| *thread == his)
     );
+    // The connector, which starts the process, was never even called.
+    assert!(
+        !bench
+            .specs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|spec| spec.thread == his),
+        "the connector was called"
+    );
     assert_eq!(bench.threads.account("paul", "claude"), None);
     // Again at the next message: still nothing, and still nobody else's.
     bench.assistant(his).await.send("Encore".into()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(bench.tokens_of(his).is_empty(), "an agent started");
+    assert!(
+        !bench
+            .specs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|spec| spec.thread == his),
+        "the connector was called"
+    );
 }
 
 /// Every start reads its owner's account, and only that: the owner's main and other thread, a
@@ -4175,6 +4194,77 @@ async fn another_admin_gets_no_owner_data() {
                 .is_some_and(|error| error.starts_with("unknown tool")),
             "{tool}: {refused}"
         );
+    }
+    bench.gate.notify_waiters();
+}
+
+/// Gives thread `id` to `owner` in the bench's database, behind the threads' back: a tree with
+/// two people's threads, which an earlier version may have left.
+async fn give(bench: &Bench, id: ThreadId, owner: &str) {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+    let db = fronde_db::open(&bench.data).await.unwrap();
+    fronde_entity::threads::Entity::update_many()
+        .col_expr(
+            fronde_entity::threads::Column::Owner,
+            Expr::value(owner.to_owned()),
+        )
+        .filter(fronde_entity::threads::Column::Id.eq(id.0))
+        .exec(&db)
+        .await
+        .unwrap();
+}
+
+/// The threads `client`'s `threads_list` shows.
+async fn listed(client: &Client) -> Vec<i64> {
+    let listed = call(client, "threads_list", json!({"arguments": {}})).await;
+    listed["result"]["children"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{listed}"))
+        .iter()
+        .map(|child| child["thread"].as_i64().unwrap())
+        .collect()
+}
+
+/// No `threads_*` call crosses from one person's threads to another's, even under a thread of
+/// the caller's: the owner's agent never reads, drives, lists or stops a member's thread, nor
+/// hers the owner's. Each is as if there were no such thread.
+#[tokio::test]
+async fn threads_tools_never_cross_owners() {
+    let bench = held_bench().await;
+    let his = bench.new_thread().await;
+    let hers = bench.new_thread_for("marie").await;
+    let mut strays = Vec::new();
+    for (parent, owner, other) in [(his, "alix", "marie"), (hers, "marie", "alix")] {
+        let own = bench
+            .threads
+            .create(owner, StartedBy::Thread(parent), Some(parent), "Le sien")
+            .await
+            .unwrap()
+            .id;
+        let stray = bench
+            .threads
+            .create(owner, StartedBy::Thread(parent), Some(parent), "L'autre")
+            .await
+            .unwrap()
+            .id;
+        give(&bench, stray, other).await;
+        strays.push((parent, own, stray));
+    }
+    for (parent, own, stray) in strays {
+        let client = bench
+            .client(&bench.start(parent).await, "claude-code", &[])
+            .await;
+        for refused in refusals(&client, stray.0).await {
+            assert_eq!(refused, no_such_thread(), "thread {stray} from {parent}");
+        }
+        assert_eq!(listed(&client).await, [own.0], "from {parent}");
+        let read = call(
+            &client,
+            "threads_read",
+            json!({"arguments": {"thread": own.0}}),
+        )
+        .await;
+        assert!(read.get("result").is_some(), "{read}");
     }
     bench.gate.notify_waiters();
 }

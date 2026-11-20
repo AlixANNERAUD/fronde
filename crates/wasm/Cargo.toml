@@ -45,6 +45,10 @@ sha2.workspace = true
 
 [dev-dependencies]
 fronde-wasm = { path = ".", features = ["testing"] }
+# `Registry::call`, which calls a tool without the gate, exists for tests only.
+fronde-hub = { path = "../hub", features = ["testing"] }
+fronde-requests = { path = "../requests" }
+tokio-util.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true

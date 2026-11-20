@@ -1970,11 +1970,41 @@ fn no_unconfined_agent_for_members() {
         e.contains("[agent] sandbox = false with [users.marie], who is not an admin"),
         "{e}"
     );
-    // With admins only, the owner may still choose it.
+    // Alone, the owner may still choose it.
+    load_str(&owned_by_alix(
+        "[agent]\nsandbox = false\n[users.alix]\nadmin = true\npassword = { file = \"alix.password\" }\n",
+    ))
+    .unwrap();
+    load_str(&format!("{MIN}[agent]\nsandbox = false\n")).unwrap();
+}
+
+/// A second person, an admin too, or a second account is someone whose files and token an
+/// unconfined agent of the other could read: refused, the key named.
+#[test]
+fn no_unconfined_agent_for_a_second_person_or_account() {
     let admins = USERS.replace("[users.marie]\n", "[users.marie]\nadmin = true\n");
-    load_str(&owned_by_alix(&format!(
+    let e = refused(&owned_by_alix(&format!(
         "[agent]\nsandbox = false\n{admins}"
-    )))
+    )));
+    assert!(
+        e.contains("[agent] sandbox = false")
+            && e.contains("[users.alix] and [users.marie]")
+            && e.contains("keep the sandbox on"),
+        "{e}"
+    );
+    let accounts = "[accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\n\
+                    oauth_token = { file = \"alix.token\" }\n\
+                    [accounts.marie]\nprovider = \"claude\"\nowner = \"marie\"\n\
+                    oauth_token = { file = \"marie.token\" }\n";
+    let e = refused(&owned_by_alix(&format!(
+        "[agent]\nsandbox = false\n{admins}{accounts}"
+    )));
+    assert!(e.contains("[agent] sandbox = false"), "{e}");
+    // One person with one account keeps the choice.
+    load_str(&owned_by_alix(
+        "[agent]\nsandbox = false\n[users.alix]\nadmin = true\npassword = { file = \"alix.password\" }\n\
+         [accounts.alix]\nprovider = \"claude\"\nowner = \"alix\"\noauth_token = { file = \"alix.token\" }\n",
+    ))
     .unwrap();
 }
 
@@ -2273,4 +2303,43 @@ fn shared_account_still_names_its_own_secret() {
         ),
         "{e}"
     );
+}
+
+/// No upstream server is handed a sign-in variable: not as its token, nor set by its command
+/// (`env CLAUDE_CODE_OAUTH_TOKEN=… server`). The same names `[agent] env` refuses.
+#[test]
+fn upstream_servers_get_no_sign_in_variable() {
+    for name in [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_USE_BEDROCK",
+    ] {
+        let e = refused(&format!(
+            "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"shop\"\nurl = \"https://x/mcp\"\n\
+             token = {{ env = \"{name}\" }}\n"
+        ));
+        assert!(
+            e.contains(&format!("source \"shop\": token = {{ env = \"{name}\" }}"))
+                && e.contains("signs an agent in"),
+            "{name}: {e}"
+        );
+        let e = refused(&format!(
+            "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"shop\"\n\
+             command = [\"env\", \"{name}=x\", \"shop-server\"]\n"
+        ));
+        assert!(
+            e.contains(&format!("source \"shop\": command sets {name}"))
+                && e.contains("signs an agent in"),
+            "{name}: {e}"
+        );
+    }
+    // Its own token, and its own variables, stay allowed.
+    load_str(&format!(
+        "{MIN}\n[[sources]]\nkind = \"mcp\"\nname = \"shop\"\nurl = \"https://x/mcp\"\n\
+         token = {{ env = \"SHOP_TOKEN\" }}\n[[sources]]\nkind = \"mcp\"\nname = \"notes\"\n\
+         command = [\"env\", \"NOTES_DIR=/srv/notes\", \"notes-server\"]\n"
+    ))
+    .unwrap();
 }

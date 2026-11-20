@@ -9,6 +9,7 @@ pub mod secret;
 pub mod service;
 pub mod sessions;
 pub mod thread_control;
+pub mod threads_cmd;
 mod web;
 pub use web::session_binding;
 mod ws;
@@ -1037,7 +1038,9 @@ async fn open_claude_token(
 pub fn sandbox_line(confine: &Confine, hub_port: u16) -> (String, bool) {
     let Some(sandbox) = &confine.policy.sandbox else {
         return (
-            "off ([agent] sandbox = false): the agent runs unconfined".to_owned(),
+            "off ([agent] sandbox = false): the agent runs unconfined, which only one person \
+             with one account may choose"
+                .to_owned(),
             true,
         );
     };

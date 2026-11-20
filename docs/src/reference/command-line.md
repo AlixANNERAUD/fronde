@@ -71,7 +71,8 @@ updating it. With
 this kernel, such as `agent sandbox: Landlock ABI 6 (files, TCP ports 443 53 8484, device ioctls,
 signals and abstract sockets); seccomp: no Unix sockets but connected pairs, only IPv4, IPv6 and netlink route
 sockets, no io_uring`, followed by `the agent cannot start` on a kernel without Landlock or
-seccomp, then what caps its resources: `agent limits: 2 GiB memory, 2 CPUs, 512 tasks, in a
+seccomp (`agent sandbox: off ([agent] sandbox = false): the agent runs unconfined, which only one
+person with one account may choose` when it is off), then what caps its resources: `agent limits: 2 GiB memory, 2 CPUs, 512 tasks, in a
 systemd scope under fronde-agents.slice` once the systemd user manager made a scope like the
 agent's (it starts one that runs `true`), or `agent limits: none (…)` with the reason, then how
 many agents run at once and their memory together: `agents: at most 3 at once (one kept for your
@@ -173,6 +174,27 @@ then, `fronde check` and `fronde secret set` say that a rotation was interrupted
 
 A component's credential names a stored secret with `{ stored = "<name>" }` (see
 [Configuration](configuration.md#kind--component)).
+
+## `fronde threads`
+
+```text
+fronde threads reassign --from <name|removed:name> --to <user> --config <file>
+```
+
+Gives every conversation of `--from`, with the sub-agents under each, to `--to`, in one
+transaction, with the cards they ask of `--from`; it prints `gave <n> thread(s) of <from> to
+<to>, sub-agents included`. `--from` is a person's name, or `removed:<name>` for the threads of
+someone no longer listed in `[users]` (see [Configuration](configuration.md#usersname)): this is how
+they get their threads back once listed again. `--to` must be a user of the configuration. The
+main thread is never given: it is always `[data] user`'s.
+
+Given back to the same person (`--from removed:marie --to marie`), each thread keeps its agent's
+conversation and home. Given to anyone else, each thread's agent starts a new conversation, and
+its home (`threads/<id>/home`) is moved to `home.previous-<name>-<time>` beside it, so that the
+new owner's agent never reads the earlier one's.
+
+Like `secret rotate-key`, it refuses to run while Fronde runs on the same data directory, naming
+the process that holds it.
 
 ## `fronde healthcheck`
 

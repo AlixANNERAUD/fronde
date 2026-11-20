@@ -4008,3 +4008,360 @@ async fn a_recycled_name_gets_no_old_threads() {
     // The owner still sees it.
     assert!(threads.visible(his, &alix()).await.is_ok());
 }
+
+/// Gives thread `id` to `owner` in the database of `dir`, behind the threads' back: the state an
+/// earlier version, or a hand edit, may have left.
+async fn give(dir: &Path, id: ThreadId, owner: &str) {
+    use sea_orm::{ColumnTrait, QueryFilter, sea_query::Expr};
+    let db = fronde_db::open(dir).await.unwrap();
+    fronde_entity::threads::Entity::update_many()
+        .col_expr(
+            fronde_entity::threads::Column::Owner,
+            Expr::value(owner.to_owned()),
+        )
+        .filter(fronde_entity::threads::Column::Id.eq(id.0))
+        .exec(&db)
+        .await
+        .unwrap();
+}
+
+/// Sets thread `id`'s stored agent session in the database of `dir`.
+async fn set_session(dir: &Path, id: ThreadId, session: &str) {
+    use sea_orm::{ColumnTrait, QueryFilter, sea_query::Expr};
+    let db = fronde_db::open(dir).await.unwrap();
+    fronde_entity::threads::Entity::update_many()
+        .col_expr(
+            fronde_entity::threads::Column::SessionId,
+            Expr::value(session.to_owned()),
+        )
+        .filter(fronde_entity::threads::Column::Id.eq(id.0))
+        .exec(&db)
+        .await
+        .unwrap();
+}
+
+/// Threads of `dir` for `users`, `owner` the main thread's, without accounts.
+async fn open_people(dir: &Path, users: &[&str], owner: &str) -> Arc<Threads> {
+    let (connector, _) = fake_connector(FakeScript::default());
+    let db = fronde_db::open(dir).await.unwrap();
+    let people = People {
+        users: users
+            .iter()
+            .map(|name| User {
+                name: (*name).into(),
+                admin: *name == owner,
+            })
+            .collect(),
+        owner: owner.into(),
+        prompt: None,
+        accounts: Accounts::default(),
+    };
+    Threads::open_for(db, dir, spec(), connector, people, Budget::default())
+        .await
+        .unwrap()
+}
+
+/// The directories beside `home` its owner's earlier homes were moved to.
+fn homes_aside(home: &Path, earlier: &str) -> Vec<std::path::PathBuf> {
+    let prefix = format!("home.previous-{earlier}-");
+    std::fs::read_dir(home.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect()
+}
+
+/// When `[data] user` changes, the whole main tree follows it, sub-agents included; each thread
+/// given forgets its agent session and its home is moved aside, so that the new owner's agent
+/// neither resumes the earlier owner's conversation nor reads their agent's files. A sub-agent
+/// left with another owner under a main thread already the owner's follows it too, at every
+/// start.
+#[tokio::test]
+async fn the_main_tree_follows_the_owner_at_each_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["me"], "me").await;
+    let child = threads
+        .create(
+            "me",
+            StartedBy::Thread(ThreadId::MAIN),
+            Some(ThreadId::MAIN),
+            "Mesurer",
+        )
+        .await
+        .unwrap()
+        .id;
+    drop(threads);
+    set_session(dir.path(), ThreadId::MAIN, "session-of-me").await;
+    set_session(dir.path(), child, "child-session-of-me").await;
+    let homes = [
+        fronde_agent::threads::thread_dirs(dir.path(), ThreadId::MAIN).home,
+        fronde_agent::threads::thread_dirs(dir.path(), child).home,
+    ];
+    for home in &homes {
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/transcript.jsonl"), "of me").unwrap();
+    }
+
+    let threads = open_people(dir.path(), &["alix"], "alix").await;
+    for id in [ThreadId::MAIN, child] {
+        let row = threads.get(id).await.unwrap().unwrap();
+        assert_eq!(row.owner, "alix", "thread {id}");
+    }
+    drop(threads);
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    for id in [ThreadId::MAIN, child] {
+        let row = fronde_entity::threads::Entity::find_by_id(id.0)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.session_id, None, "thread {id} kept its session");
+    }
+    for home in &homes {
+        let aside = homes_aside(home, "me");
+        assert_eq!(aside.len(), 1, "{}: {aside:?}", home.display());
+        assert_eq!(
+            std::fs::read_to_string(aside[0].join(".claude/transcript.jsonl")).unwrap(),
+            "of me"
+        );
+        assert!(!home.join(".claude").exists(), "{}", home.display());
+    }
+    // The main thread's home is there again, empty, as the server makes it.
+    assert!(homes[0].join("tmp").is_dir());
+
+    // A sub-agent left another person's under the owner's main thread follows it as well.
+    give(dir.path(), child, "marie").await;
+    let threads = open_people(dir.path(), &["alix", "marie"], "alix").await;
+    assert_eq!(threads.get(child).await.unwrap().unwrap().owner, "alix");
+    assert_eq!(homes_aside(&homes[1], "marie").len(), 0, "no home to move");
+}
+
+/// A thread is made under a parent only for the parent's owner: a sub-agent is its root's
+/// owner's, whoever asks.
+#[tokio::test]
+async fn a_thread_under_another_persons_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["alix", "marie"], "alix").await;
+    let error = threads
+        .create(
+            "marie",
+            StartedBy::Thread(ThreadId::MAIN),
+            Some(ThreadId::MAIN),
+            "Mesurer",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is alix's"), "{error}");
+}
+
+/// A sub-agent's result goes to its parent only when both are one person's: a sub-agent left
+/// another person's (as an earlier version may have left it) never wakes the parent.
+#[tokio::test]
+async fn a_result_never_wakes_another_persons_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let (connector, _) = fake_connector(FakeScript {
+        updates: vec![text_chunk("Trois vols.")],
+        ..FakeScript::default()
+    });
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let mut accounts = Accounts::default();
+    for name in ["alix", "marie"] {
+        accounts.insert(
+            name,
+            "claude",
+            Binding {
+                account: name.into(),
+                token: None,
+            },
+        );
+    }
+    let people = People {
+        users: [
+            alix(),
+            User {
+                name: "marie".into(),
+                admin: false,
+            },
+        ]
+        .into_iter()
+        .collect(),
+        owner: "alix".into(),
+        prompt: None,
+        accounts,
+    };
+    let threads = Threads::open_for(db, dir.path(), spec(), connector, people, Budget::default())
+        .await
+        .unwrap();
+    let child = threads
+        .create(
+            "alix",
+            StartedBy::Thread(ThreadId::MAIN),
+            Some(ThreadId::MAIN),
+            "Mesurer",
+        )
+        .await
+        .unwrap()
+        .id;
+    give(dir.path(), child, "marie").await;
+    let assistant = threads.assistant(child).await.unwrap().unwrap();
+    assistant.send("Cherche des vols".into()).await;
+    wait_for_turns(&assistant, 1).await;
+    until_done(&assistant).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(children_ended(&events(&threads.main())), 0);
+}
+
+/// `reassign` gives a removed person's conversations back, sub-agents included, with their
+/// cards; to the same person, their sessions and homes stay. Given to someone else, each forgets
+/// its session and its home is moved aside. The main thread is never given.
+#[tokio::test]
+async fn reassign_gives_threads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let threads = open_people(dir.path(), &["alix", "paul"], "alix").await;
+    let his = threads
+        .create("paul", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    let under = threads
+        .create("paul", StartedBy::Thread(his), Some(his), "Mesurer")
+        .await
+        .unwrap()
+        .id;
+    drop(threads);
+    set_session(dir.path(), his, "session-of-paul").await;
+    let home = fronde_agent::threads::thread_dirs(dir.path(), his).home;
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    // Paul leaves: his threads are buried.
+    drop(open_people(dir.path(), &["alix"], "alix").await);
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    for refused in [
+        fronde_agent::threads::reassign(&db, dir.path(), "paul", "paul").await,
+        fronde_agent::threads::reassign(&db, dir.path(), "paul", "removed:paul").await,
+        fronde_agent::threads::reassign(&db, dir.path(), "alix", "paul").await,
+        fronde_agent::threads::reassign(&db, dir.path(), "zoe", "paul").await,
+    ] {
+        refused.unwrap_err();
+    }
+    assert_eq!(
+        fronde_agent::threads::reassign(&db, dir.path(), "removed:paul", "paul")
+            .await
+            .unwrap(),
+        2
+    );
+    let row = |id: ThreadId| {
+        let db = db.clone();
+        async move {
+            fronde_entity::threads::Entity::find_by_id(id.0)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    for id in [his, under] {
+        assert_eq!(row(id).await.owner, "paul", "thread {id}");
+    }
+    assert_eq!(
+        row(his).await.session_id.as_deref(),
+        Some("session-of-paul")
+    );
+    assert!(home.join(".claude").is_dir());
+    assert_eq!(row(ThreadId::MAIN).await.owner, "alix");
+    let threads = open_people(dir.path(), &["alix", "paul"], "alix").await;
+    let paul = User {
+        name: "paul".into(),
+        admin: false,
+    };
+    assert!(threads.visible(his, &paul).await.is_ok());
+    drop(threads);
+
+    // To someone else: a new conversation, in a new home.
+    assert_eq!(
+        fronde_agent::threads::reassign(&db, dir.path(), "paul", "marie")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(row(his).await.owner, "marie");
+    assert_eq!(row(under).await.owner, "marie");
+    assert_eq!(row(his).await.session_id, None);
+    assert_eq!(homes_aside(&home, "paul").len(), 1);
+    assert!(!home.exists());
+}
+
+/// The account's token is read again at each start of an agent: a token rotated between two
+/// starts signs the second in, the first never read again.
+#[tokio::test]
+async fn the_token_is_read_again_at_each_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let current: Arc<Mutex<&'static str>> = Arc::new(Mutex::new("first-token-of-marie"));
+    let read: Arc<Mutex<Vec<String>>> = Arc::default();
+    let connector: Connector = Arc::new({
+        let read = read.clone();
+        move |spec: &AgentSpec, resume, events| {
+            let (spec, read) = (spec.clone(), read.clone());
+            Box::pin(async move {
+                let token = spec.oauth_token.as_ref().expect("her account's token")().await?;
+                read.lock().unwrap().push(token.expose_secret().to_owned());
+                let (transport, _handle) = fake_agent(FakeScript::default());
+                AgentClient::connect(transport, &spec, resume, events).await
+            })
+        }
+    });
+    let mut accounts = Accounts::default();
+    accounts.insert(
+        "marie",
+        "claude",
+        Binding {
+            account: "marie".into(),
+            token: Some(fronde_agent::acp::oauth_token({
+                let current = current.clone();
+                move || {
+                    let value = *current.lock().unwrap();
+                    async move { Ok(secrecy::SecretString::from(value)) }
+                }
+            })),
+        },
+    );
+    let people = People {
+        users: [
+            alix(),
+            User {
+                name: "marie".into(),
+                admin: false,
+            },
+        ]
+        .into_iter()
+        .collect(),
+        owner: "alix".into(),
+        prompt: None,
+        accounts,
+    };
+    let db = fronde_db::open(dir.path()).await.unwrap();
+    let threads = Threads::open_for(db, dir.path(), spec(), connector, people, Budget::default())
+        .await
+        .unwrap();
+    let hers = threads
+        .create("marie", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    let assistant = threads.assistant(hers).await.unwrap().unwrap();
+    assistant.send("Salut".into()).await;
+    wait_for_turns(&assistant, 1).await;
+    until_done(&assistant).await;
+    assert!(assistant.stop_agent().await, "her agent was not running");
+    *current.lock().unwrap() = "second-token-of-marie";
+    assistant.send("Encore".into()).await;
+    wait_for_turns(&assistant, 2).await;
+    assert_eq!(
+        *read.lock().unwrap(),
+        ["first-token-of-marie", "second-token-of-marie"]
+    );
+}

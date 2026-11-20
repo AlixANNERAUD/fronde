@@ -1801,3 +1801,139 @@ async fn real_scope_leftovers_are_stopped_at_the_next_start() {
     let _ = fronde::start_scope(&setup.config, std::env::var_os("PATH").as_deref()).await;
     assert_ne!(systemctl(&["is-active", &unit]), "active");
 }
+
+/// Waits until thread `assistant`'s log holds `count` ended turns, each done.
+async fn turns_done(assistant: &fronde_agent::assistant::Assistant, count: usize) {
+    use fronde_agent::log::{Event, TurnOutcome};
+    let ended = || {
+        assistant
+            .log()
+            .since(0)
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                Event::TurnEnded { outcome } => Some(outcome),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while ended().len() < count {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "thread {}: {:?}",
+            assistant.thread(),
+            assistant.log().since(0)
+        )
+    });
+    assert!(
+        ended().iter().all(|outcome| *outcome == TurnOutcome::Done),
+        "thread {}: {:?}",
+        assistant.thread(),
+        assistant.log().since(0)
+    );
+}
+
+/// Every agent started for a thread, through the real helper, gets its owner's account's token
+/// in its environment and no one else's: the owner's main thread the owner's, a member's thread
+/// and her sub-agent hers, never the owner's.
+#[tokio::test]
+async fn each_agent_environment_holds_its_owners_token_only() {
+    use fronde_agent::threads::{Accounts, Binding, Budget, ChildTask, People, StartedBy, Threads};
+    use fronde_requests::User;
+    const ALIX: &str = "token-of-alix";
+    const MARIE: &str = "token-of-marie";
+    let exe = std::env::current_exe().unwrap();
+    // The environment is the helper's to make, with the sandbox or without: off here, so that
+    // any kernel runs it.
+    let setup = setup("sandbox = false");
+    let script =
+        r#"env > "$PWD/env.txt"; "$0" --exact acp_child --nocapture | grep --line-buffered '^{'"#;
+    let spec = setup.spec(
+        &["/bin/sh", "-c", script, exe.to_str().unwrap()],
+        &[("FRONDE_ACP_CHILD", "1")],
+    );
+    let mut accounts = Accounts::default();
+    for (owner, token) in [("alix", ALIX), ("marie", MARIE)] {
+        accounts.insert(
+            owner,
+            "claude",
+            Binding {
+                account: owner.into(),
+                token: Some(fronde_agent::acp::oauth_token(move || async move {
+                    Ok(SecretString::from(token))
+                })),
+            },
+        );
+    }
+    let people = People {
+        users: [
+            User {
+                name: "alix".into(),
+                admin: true,
+            },
+            User {
+                name: "marie".into(),
+                admin: false,
+            },
+        ]
+        .into_iter()
+        .collect(),
+        owner: "alix".into(),
+        prompt: None,
+        accounts,
+    };
+    let db = fronde_db::open(&setup.data).await.unwrap();
+    let threads = Threads::open_for(
+        db,
+        &setup.data,
+        spec,
+        fronde_agent::assistant::confined_connector(setup.confine.clone()),
+        people,
+        Budget::default(),
+    )
+    .await
+    .unwrap();
+    let main = threads.main();
+    main.send("Bonjour".into()).await;
+    turns_done(&main, 1).await;
+    let hers = threads
+        .create("marie", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    let assistant = threads.assistant(hers).await.unwrap().unwrap();
+    assistant.send("Bonjour".into()).await;
+    turns_done(&assistant, 1).await;
+    let child = threads
+        .start_child(
+            hers,
+            None,
+            ChildTask {
+                task: "Cherche des vols".into(),
+                ..ChildTask::default()
+            },
+        )
+        .await
+        .unwrap()
+        .row
+        .id;
+    turns_done(&threads.assistant(child).await.unwrap().unwrap(), 1).await;
+
+    let env_of = |id: ThreadId| {
+        let file = thread_dirs(&setup.data, id).work.join("env.txt");
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        (variables(&text), text)
+    };
+    let (env, _) = env_of(ThreadId::MAIN);
+    assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], ALIX);
+    for id in [hers, child] {
+        let (env, text) = env_of(id);
+        assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], MARIE, "thread {id}");
+        assert!(!text.contains(ALIX), "thread {id}:\n{text}");
+    }
+}

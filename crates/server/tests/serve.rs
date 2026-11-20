@@ -1773,3 +1773,187 @@ async fn check_lists_users_and_their_accounts() {
     assert_eq!(code, Some(1), "{shown}");
     assert!(shown.contains("[users.marie] password"), "{shown}");
 }
+
+/// `fronde check` says when the agent runs unconfined, which only one person with one account
+/// may choose: with a second person, an admin too, it fails naming the key.
+#[test]
+fn check_says_who_may_run_an_unconfined_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = with_web(dir.path());
+    let alone = format!(
+        "{}[agent]\nsandbox = false\n",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    let (code, shown) = check_with(&path, &alone, None);
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.lines().any(|line| line
+            == "agent sandbox: off ([agent] sandbox = false): the agent runs unconfined, which \
+                only one person with one account may choose"),
+        "{shown}"
+    );
+    for name in ["alix", "lea"] {
+        fronde_hub::private::write(
+            dir.path().join(format!("{name}.password")),
+            format!("password-of-{name}"),
+        )
+        .unwrap();
+    }
+    let two = alone
+        .replace("[data]\n", "[data]\nuser = \"alix\"\n")
+        .replace("[web]\npassword = { file = \"password\" }\n", "[web]\n")
+        + "[users.alix]\nadmin = true\npassword = { file = \"alix.password\" }\n\
+           [users.lea]\nadmin = true\npassword = { file = \"lea.password\" }\n";
+    let (code, shown) = check_with(&path, &two, None);
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("[agent] sandbox = false with [users.alix] and [users.lea]"),
+        "{shown}"
+    );
+}
+
+/// `fronde threads reassign`: refused while Fronde runs and for anyone not configured; once
+/// stopped, a removed person's conversations go back to them.
+#[tokio::test]
+async fn threads_reassign_from_the_command_line() {
+    use fronde_agent::threads::{StartedBy, Threads};
+    let dir = tempfile::tempdir().unwrap();
+    let (path, data) = with_web(dir.path());
+    for name in ["alix", "paul"] {
+        fronde_hub::private::write(
+            dir.path().join(format!("{name}.password")),
+            format!("password-of-{name}"),
+        )
+        .unwrap();
+    }
+    let people = |paul: bool| {
+        let mut text = std::fs::read_to_string(dir.path().join("fronde.toml.base")).unwrap();
+        if paul {
+            text.push_str("[users.paul]\npassword = { file = \"paul.password\" }\n");
+        }
+        text
+    };
+    std::fs::write(
+        dir.path().join("fronde.toml.base"),
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("[data]\n", "[data]\nuser = \"alix\"\n")
+            .replace("[web]\npassword = { file = \"password\" }\n", "[web]\n")
+            + "[users.alix]\nadmin = true\npassword = { file = \"alix.password\" }\n",
+    )
+    .unwrap();
+    std::fs::write(&path, people(true)).unwrap();
+    // Paul's thread, made as `serve` makes it.
+    let config = fronde_hub::config::load(&path).unwrap();
+    fronde_hub::private::prepare_data_dir(&data).unwrap();
+    let dirs = fronde_agent::threads::thread_dirs(&data, fronde_agent::threads::ThreadId::MAIN);
+    let spec = fronde_agent::acp::AgentSpec {
+        thread: fronde_agent::threads::ThreadId::MAIN,
+        provider: &fronde_agent::provider::Provider::CLAUDE,
+        command: vec!["claude-agent-acp".into()],
+        env: Vec::new(),
+        cwd: dirs.work,
+        home: dirs.home,
+        hub_url: "http://127.0.0.1:1/mcp".into(),
+        hub_token: secrecy::SecretString::from(String::new()),
+        oauth_token: None,
+        system_prompt: String::new(),
+        builtin_tools: Vec::new(),
+        usage: None,
+        owners_grants: true,
+        account: None,
+    };
+    let connector: fronde_agent::assistant::Connector = std::sync::Arc::new(
+        |_: &fronde_agent::acp::AgentSpec,
+         _: Option<String>,
+         _: tokio::sync::mpsc::UnboundedSender<fronde_agent::acp::AgentEvent>| {
+            Box::pin(async {
+                Err::<fronde_agent::acp::AgentClient, _>(anyhow::anyhow!("no agent in this test"))
+            })
+        },
+    );
+    let threads = Threads::open_for(
+        fronde_db::open(&data).await.unwrap(),
+        &data,
+        spec,
+        connector,
+        fronde_agent::threads::People {
+            users: config.users(),
+            owner: "alix".into(),
+            prompt: None,
+            accounts: fronde_agent::threads::Accounts::default(),
+        },
+        fronde_agent::threads::Budget::default(),
+    )
+    .await
+    .unwrap();
+    let his = threads
+        .create("paul", StartedBy::User, None, "La sienne")
+        .await
+        .unwrap()
+        .id;
+    drop(threads);
+    // Paul leaves; `serve` buries his threads.
+    std::fs::write(&path, people(false)).unwrap();
+    let mut config = fronde_hub::config::load(&path).unwrap();
+    config.server.listen = "127.0.0.1:0".parse().unwrap();
+    let (_, server) = fronde::start(config).await.unwrap();
+    let owner = || {
+        let data = data.clone();
+        async move {
+            use sea_orm::EntityTrait;
+            let db = fronde_db::open(&data).await.unwrap();
+            fronde_entity::threads::Entity::find_by_id(his.0)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner
+        }
+    };
+    assert_eq!(owner().await, "removed:paul");
+    std::fs::write(&path, people(true)).unwrap();
+    let reassign = |to: &str| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_fronde"))
+            .env("FRONDE_KEYCHAIN", "off")
+            .args([
+                "threads",
+                "reassign",
+                "--from",
+                "removed:paul",
+                "--to",
+                to,
+                "--config",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (code, shown) = reassign("paul");
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(shown.contains("Stop it first"), "{shown}");
+    server.abort();
+    let _ = server.await;
+    let (code, shown) = reassign("zoe");
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(
+        shown.contains("--to \"zoe\" is not a user; name one of: alix, paul"),
+        "{shown}"
+    );
+    assert_eq!(owner().await, "removed:paul");
+    let (code, shown) = reassign("paul");
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains("gave 1 thread(s) of removed:paul to paul"),
+        "{shown}"
+    );
+    assert_eq!(owner().await, "paul");
+}

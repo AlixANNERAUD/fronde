@@ -530,8 +530,19 @@ async fn tools_register_in_the_hub_registry() {
         found.to_text()
     );
 
+    // As the owner, through the gate: `use_tool` calls nothing for a caller it does not know.
+    let owner = fronde_hub::tools::CallContext {
+        caller: fronde_requests::Caller::Mcp("claude-code".into()),
+        user: "alix".into(),
+        admin: true,
+        owner: true,
+        topic: "conversation".into(),
+        turn: None,
+        cancelled: tokio_util::sync::CancellationToken::new(),
+    };
     let out = registry
-        .call(
+        .call_as(
+            &owner,
             "use_tool",
             json!({"name": "echo_text", "arguments": {"text": "via hub"}}),
         )

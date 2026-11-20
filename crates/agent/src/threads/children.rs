@@ -936,12 +936,21 @@ impl Threads {
         self.children.handoff.waiting(child)
     }
 
-    /// Thread `target` if `caller` may reach it ([`may_access`]); else
-    /// [`Delegation::NoSuchThread`], as when there is no such thread.
+    /// Thread `target` if `caller` may reach it ([`may_access`]) and both are one person's;
+    /// else [`Delegation::NoSuchThread`], as when there is no such thread. An agent never
+    /// reaches another person's thread, whatever the tree says.
     async fn reachable(&self, caller: ThreadId, target: ThreadId) -> anyhow::Result<ThreadRow> {
-        let Some(row) = self.get(target).await? else {
+        let (Some(row), Some(calling)) = (self.get(target).await?, self.get(caller).await?) else {
             bail!(Delegation::NoSuchThread);
         };
+        if row.owner != calling.owner {
+            tracing::warn!(
+                "thread {caller}, {}'s, reached for thread {target}, {}'s: refused",
+                calling.owner,
+                row.owner
+            );
+            bail!(Delegation::NoSuchThread);
+        }
         let mut parents = HashMap::from([(row.id, row.parent)]);
         let mut next = row.parent;
         for _ in 0..MAX_CHAIN {
@@ -1232,7 +1241,7 @@ impl Threads {
         &self,
         caller: ThreadId,
     ) -> anyhow::Result<(Vec<(ThreadRow, ThreadSummary)>, usize)> {
-        let mut rows = self.descendants(caller).await?;
+        let mut rows = self.own_descendants(caller).await?;
         rows.sort_by_key(|row| std::cmp::Reverse(row.id));
         let more = rows.len().saturating_sub(MAX_LISTED);
         rows.truncate(MAX_LISTED);
@@ -1247,6 +1256,17 @@ impl Threads {
             listed.push((row, summary));
         }
         Ok((listed, more))
+    }
+
+    /// Every descendant of `id` that is `id`'s owner's, archived ones included: what an agent
+    /// of `id` may list or stop.
+    async fn own_descendants(&self, id: ThreadId) -> anyhow::Result<Vec<ThreadRow>> {
+        let Some(row) = self.get(id).await? else {
+            return Ok(Vec::new());
+        };
+        let mut rows = self.descendants(id).await?;
+        rows.retain(|descendant| descendant.owner == row.owner);
+        Ok(rows)
     }
 
     /// Every descendant of `id`, archived ones included.
@@ -1321,12 +1341,14 @@ impl Threads {
         _starting: &tokio::sync::MutexGuard<'_, ()>,
     ) -> anyhow::Result<bool> {
         let mut tree = vec![(root, super::topic_of(root))];
-        tree.extend(
-            self.descendants(root)
-                .await?
-                .into_iter()
-                .map(|row| (row.id, row.topic)),
-        );
+        // An archive stops everything under the thread; an agent's cancel stops only what is
+        // its owner's.
+        let under = if retire {
+            self.descendants(root).await?
+        } else {
+            self.own_descendants(root).await?
+        };
+        tree.extend(under.into_iter().map(|row| (row.id, row.topic)));
         let mut stopped = false;
         // `descendants` goes level by level: reversed, the deepest come first.
         for (thread, topic) in tree.into_iter().rev() {

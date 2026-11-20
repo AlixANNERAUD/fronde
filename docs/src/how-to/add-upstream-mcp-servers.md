@@ -47,7 +47,12 @@ command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/srv/shared"
 
 Fronde starts the command and talks MCP over its standard input and output. The command runs with
 Fronde's rights, so only run programs you trust. Its environment is cleared: it gets only `PATH`,
-`HOME` and `LANG` from Fronde's, never a secret's or a sign-in variable.
+`HOME`, `LANG`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in either
+case) and the certificate variables (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`,
+`NODE_EXTRA_CA_CERTS`) from Fronde's, when set, never a secret's or a sign-in variable. A command
+that sets an agent's sign-in variable (`env CLAUDE_CODE_OAUTH_TOKEN=… server`), or a `token`
+read from one (`{ env = "ANTHROPIC_API_KEY" }`), is refused: an account's token goes to its
+agents only.
 
 ## Names
 

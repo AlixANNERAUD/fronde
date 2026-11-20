@@ -478,16 +478,41 @@ async fn connect(
 }
 
 /// The variables a server run as a command keeps from Fronde's environment: what finds programs,
-/// the home and the language. Nothing else, so that no secret's variable, sign-in variable or
-/// session's bus reaches it.
-const STDIO_KEEP_ENV: [&str; 3] = ["PATH", "HOME", "LANG"];
+/// the home, the language, the temporary directory, and how this machine reaches the network
+/// (its proxy, and the certificate authorities it trusts besides the system's). Nothing else,
+/// so that no secret's variable, sign-in variable or session's bus reaches it.
+const STDIO_KEEP_ENV: [&str; 14] = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TMPDIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+];
 
 /// An upstream server's command, with a cleared environment but [`STDIO_KEEP_ENV`].
 fn stdio_command(program: &str, args: &[String]) -> tokio::process::Command {
+    stdio_command_from(program, args, |name| std::env::var_os(name))
+}
+
+/// [`stdio_command`], Fronde's environment read through `var`.
+fn stdio_command_from(
+    program: &str,
+    args: &[String],
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args).env_clear();
     for name in STDIO_KEEP_ENV {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = var(name) {
             cmd.env(name, value);
         }
     }
@@ -754,8 +779,9 @@ pub(crate) mod test_server {
 
 #[cfg(test)]
 mod tests {
-    /// A server run as a command gets a cleared environment: only `PATH`, `HOME` and `LANG`
-    /// from Fronde's, whatever else Fronde holds.
+    /// A server run as a command gets a cleared environment: only `PATH`, `HOME`, `LANG`,
+    /// `TMPDIR` and the proxy and certificate variables from Fronde's, whatever else Fronde
+    /// holds.
     #[tokio::test]
     async fn a_command_gets_a_cleared_environment() {
         let dir = tempfile::tempdir().unwrap();
@@ -777,6 +803,50 @@ mod tests {
                     || ["PWD", "SHLVL", "_", "OLDPWD"].contains(&name),
                 "{name} reached the server:\n{text}"
             );
+        }
+    }
+
+    /// The proxy, certificate and temporary directory variables a server needs to reach the
+    /// network as this machine does reach it; no sign-in variable or secret does.
+    #[tokio::test]
+    async fn a_command_keeps_the_proxy_and_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let fronde: std::collections::HashMap<&str, &str> = [
+            ("HTTPS_PROXY", "http://proxy.lan:3128"),
+            ("no_proxy", "localhost,.lan"),
+            ("SSL_CERT_FILE", "/etc/ssl/ours.pem"),
+            ("NODE_EXTRA_CA_CERTS", "/etc/ssl/extra.pem"),
+            ("REQUESTS_CA_BUNDLE", "/etc/ssl/bundle.pem"),
+            ("TMPDIR", "/var/tmp/fronde"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "token-of-alix"),
+            ("ANTHROPIC_API_KEY", "key-of-alix"),
+            ("FRONDE_TEST_SECRET", "secret-value"),
+        ]
+        .into_iter()
+        .collect();
+        let mut cmd = super::stdio_command_from(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                format!("env > {:?}", out.display().to_string()),
+            ],
+            |name| fronde.get(name).map(std::ffi::OsString::from),
+        );
+        assert!(cmd.status().await.unwrap().success());
+        let text = std::fs::read_to_string(&out).unwrap();
+        for kept in [
+            "HTTPS_PROXY=http://proxy.lan:3128",
+            "no_proxy=localhost,.lan",
+            "SSL_CERT_FILE=/etc/ssl/ours.pem",
+            "NODE_EXTRA_CA_CERTS=/etc/ssl/extra.pem",
+            "REQUESTS_CA_BUNDLE=/etc/ssl/bundle.pem",
+            "TMPDIR=/var/tmp/fronde",
+        ] {
+            assert!(text.lines().any(|line| line == kept), "{kept}:\n{text}");
+        }
+        for value in ["token-of-alix", "key-of-alix", "secret-value"] {
+            assert!(!text.contains(value), "{value} reached the server:\n{text}");
         }
     }
 

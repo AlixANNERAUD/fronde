@@ -51,6 +51,11 @@ enum Command {
         #[command(subcommand)]
         action: SecretCommand,
     },
+    /// Change the threads while Fronde is stopped.
+    Threads {
+        #[command(subcommand)]
+        action: ThreadsCommand,
+    },
     /// Internal: how Fronde starts its agent. Applies the policy to itself, then runs the command.
     #[command(name = "__confine", hide = true)]
     Confine {
@@ -101,6 +106,22 @@ enum SecretCommand {
     /// the old backend once the new one holds it. Fronde must be stopped.
     MoveKey {
         /// The backend to keep the key in: file, keychain or systemd (which only explains how).
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ThreadsCommand {
+    /// Give every conversation of one person, with its sub-agents, to another configured user.
+    /// Fronde must be stopped.
+    Reassign {
+        /// Whose conversations: a name, or removed:<name> for someone no longer configured.
+        #[arg(long)]
+        from: String,
+        /// The configured user who gets them.
         #[arg(long)]
         to: String,
         #[arg(long)]
@@ -341,6 +362,13 @@ async fn run(command: &Command) -> anyhow::Result<ExitCode> {
             ServiceCommand::Status => fronde::service::status(),
         },
         Command::Secret { action } => secret(action).await,
+        Command::Threads {
+            action: ThreadsCommand::Reassign { from, to, config },
+        } => {
+            let config = fronde_hub::config::load(config)?;
+            fronde::threads_cmd::reassign(&config, from, to, &mut std::io::stdout()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Confine { .. } => unreachable!("handled before the runtime starts"),
     }
 }
