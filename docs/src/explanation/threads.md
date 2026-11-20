@@ -115,7 +115,7 @@ summarise.
   results held and starts the count again (see
   [Late answers](requests.md#late-answers)). One that waits for a turn's end is written in the
   thread first, so a restart before then still gives it, once, before any wake. Archiving the
-  thread drops it for good, and the thread says so.
+  thread, or a thread above it, drops it for good, and the thread says so.
 - **Archive.** An archived thread is not woken, nor is a thread under an archived one: a result
   logs nothing in it, and the wakes waiting when it was archived end at once, without reaching
   its agent. When Fronde cannot tell whether a thread above is archived (a database error), the

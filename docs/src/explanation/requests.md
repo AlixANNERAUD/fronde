@@ -288,13 +288,13 @@ waits for a turn's end is written in the thread's stream (shown as nothing but t
 Fronde stops before it went out, the next start gives it to the agent, once, before any
 sub-agent's result, whether the stop cut the turn or came just after its end.
 
-An archived thread gets nothing: the thread says *Conversation archivée : ta réponse arrivée
-après coup ne partira pas à l'agent.*, whether you answered after the archive or the answer was
-waiting for the turn the archive stopped. An answer that was waiting is dropped at the archive
-itself, in the archived thread and in the sub-agents under it, and the drop is written in the
-stream, so neither bringing the thread back nor restarting Fronde gives it later, even when
-Fronde stopped before the stopped turn ended. If Fronde stopped before it could write the drop,
-bringing the thread back writes it.
+An archived thread gets nothing, nor does a sub-agent under an archived thread: its thread says
+*Conversation archivée : ta réponse arrivée après coup ne partira pas à l'agent.*, whether you
+answered after the archive or the answer was waiting for the turn the archive stopped. An answer
+that was waiting is dropped at the archive itself, and the drop is written in the stream, so
+neither bringing the thread back nor restarting Fronde gives it later, even when Fronde stopped
+before the stopped turn ended. If Fronde stopped before it could write the drop, bringing the
+thread back writes it, and a sub-agent under an archived thread writes it at the next start.
 
 Only these two kinds of cards get a late answer. An integration's setup card (see
 [Tools](../reference/tools.md#setting-up-an-integration)) does not: only its call acts on the

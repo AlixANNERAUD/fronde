@@ -24,7 +24,8 @@
 //!   still waiting go first, as at a turn's end. Archiving a thread drops those waiting in it and
 //!   in every thread under it at once, each stream noting [`Event::LateDropped`]: never given,
 //!   the thread brought back and restarted included. Those a stop left without that entry are
-//!   dropped when the thread opens archived, which bringing it back does first.
+//!   dropped when the thread opens archived or under an archived thread, which bringing an
+//!   archived thread back does first.
 //!
 //! So a result reaches the parent at most once: a stop between the `Woken` entry and the prompt,
 //! between a message carrying held results and its prompt, or between a sub-agent's end and its

@@ -3151,6 +3151,122 @@ async fn a_late_answer_dropped_by_an_archive_stays_dropped() {
     }
 }
 
+/// A sub-agent under an archived thread gets no late answer, and its own thread says so: not
+/// one waiting for the turn the archive stops, nor one that comes once it is idle, nor at the
+/// next start one a stop left waiting in its stream.
+#[tokio::test]
+async fn a_sub_agent_under_an_archived_thread_gets_no_late_answer() {
+    let dropped = Event::Notice {
+        text: fronde_agent::assistant::LATE_DROPPED.into(),
+    };
+    // While its turn runs, then once idle.
+    for idle in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (threads, pooled, requests) =
+            open_woken_with(dir.path(), Limits::default(), |pooled| {
+                pooled.gate(ThreadId(3))
+            })
+            .await;
+        let parent = new_thread(&threads, StartedBy::User).await;
+        let (child, _) = child_of(&threads, parent.thread(), "Mesure").await;
+        assert_eq!(child.thread(), ThreadId(3));
+        pooled.until_held(ThreadId(3)).await;
+        if idle {
+            pooled.open(ThreadId(3));
+            until_done(&child).await;
+        }
+        let id = requests
+            .ask(late_ask(ThreadId(3), "thread:3", 1))
+            .await
+            .unwrap()
+            .id();
+        if idle {
+            threads.set_archived(parent.thread(), true).await.unwrap();
+            requests.answer(id, perso(), &alix()).await.unwrap();
+        } else {
+            // Answered while its turn runs (a Stop would cancel the card): it waits for the
+            // turn's end, which the archive stops.
+            requests.answer(id, perso(), &alix()).await.unwrap();
+            wait_until(&child, "the late answer was never logged", |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::LateAnswer { .. }))
+            })
+            .await;
+            threads.set_archived(parent.thread(), true).await.unwrap();
+            assert!(
+                events(&child).contains(&Event::LateDropped { count: 1 }),
+                "{:?}",
+                events(&child)
+            );
+        }
+        wait_until(&child, "the drop was never shown", |events| {
+            events.contains(&dropped)
+        })
+        .await;
+        pooled.open(ThreadId(3));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        until_done(&child).await;
+        let shown = events(&child);
+        assert!(!shown.contains(&user(PERSO)), "idle {idle}: {shown:?}");
+        let given = prompts(&pooled, ThreadId(3));
+        assert_eq!(given.len(), 1, "idle {idle}: {given:?}");
+        assert!(!given[0].contains(PERSO), "idle {idle}: {given:?}");
+    }
+
+    // Waiting in its stream when Fronde stopped, its parent archived meanwhile.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (threads, pooled, requests) =
+            open_woken_with(dir.path(), Limits::default(), |pooled| {
+                pooled.gate(ThreadId(3))
+            })
+            .await;
+        let parent = new_thread(&threads, StartedBy::User).await;
+        let (child, _) = child_of(&threads, parent.thread(), "Mesure").await;
+        pooled.until_held(ThreadId(3)).await;
+        let id = requests
+            .ask(late_ask(ThreadId(3), "thread:3", 1))
+            .await
+            .unwrap()
+            .id();
+        requests.answer(id, perso(), &alix()).await.unwrap();
+        wait_until(&child, "the late answer was never logged", |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::LateAnswer { .. }))
+        })
+        .await;
+    }
+    {
+        use sea_orm::QueryFilter;
+        let db = fronde_db::open(dir.path()).await.unwrap();
+        fronde_entity::threads::Entity::update_many()
+            .col_expr(
+                fronde_entity::threads::Column::ArchivedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .filter(sea_orm::ColumnTrait::eq(
+                &fronde_entity::threads::Column::Id,
+                2,
+            ))
+            .exec(&db)
+            .await
+            .unwrap();
+    }
+    let (threads, pooled, _requests) = open_woken_with(dir.path(), Limits::default(), |_| {}).await;
+    let child = threads.assistant(ThreadId(3)).await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    until_done(&child).await;
+    let shown = events(&child);
+    assert!(!shown.contains(&user(PERSO)), "{shown:?}");
+    assert!(prompts(&pooled, ThreadId(3)).is_empty());
+    assert!(
+        shown.contains(&Event::LateDropped { count: 1 }) && shown.contains(&dropped),
+        "{shown:?}"
+    );
+}
+
 /// An answer that comes late to an archived thread's card goes to no agent, and the owner is
 /// told so in the thread.
 #[tokio::test]

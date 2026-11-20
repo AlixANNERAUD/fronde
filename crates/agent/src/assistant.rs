@@ -347,7 +347,7 @@ impl Assistant {
             late,
         } = wakes::replay(&assistant.log.since(0), budget);
         // The owner's late answers a stop left waiting go first, before any wake, as at a
-        // turn's end; an archived thread gets none.
+        // turn's end; a thread archived, or under an archived thread, gets none.
         let late = if !late.is_empty() && assistant.gets_no_late().await {
             assistant.drop_late(late.len()).await;
             Vec::new()
@@ -654,15 +654,16 @@ impl Assistant {
     /// waited for it (Fronde restarted, or the agent's call was cut), to the agent as a message
     /// of the owner's: at once when no turn runs, else once the running turn ends, before any
     /// sub-agent's result waiting (those are held, and go with it). The owner acting, it resets
-    /// the wake budget and carries the results held, as the owner's message does. An archived
-    /// thread gets nothing, and a notice says so.
+    /// the wake budget and carries the results held, as the owner's message does. A thread
+    /// archived, or under an archived thread, gets nothing, and a notice says so.
     pub async fn answer_late(self: &Arc<Self>, answer: LateAnswer) {
-        // Under the turn's lock, as a message is: an archive drops the answers waiting under
-        // the same lock, after marking the thread.
+        // Under the turn's lock, as a message is: an archive up the tree drops the answers
+        // waiting under the same lock, after marking the rows.
         let mut turn = self.turn.lock().await;
         if self.gets_no_late().await {
             tracing::warn!(
-                "thread {} is archived: the late answer of request {} is not given",
+                "thread {} is archived or under an archived thread: the late answer of request \
+                 {} is not given",
                 self.thread,
                 answer.request
             );
@@ -692,9 +693,21 @@ impl Assistant {
         self.begin_late(&mut turn).await;
     }
 
-    /// Whether the thread is archived: its agent gets no late answer.
+    /// Whether the thread is archived, or under an archived thread: its agent gets no late
+    /// answer. When that cannot be told, it gets none either: the answer is dropped where the
+    /// owner sees it rather than given to an agent the owner may have archived.
     async fn gets_no_late(&self) -> bool {
-        self.archived.load(Ordering::SeqCst)
+        if self.archived.load(Ordering::SeqCst) {
+            return true;
+        }
+        self.under_archived().await.unwrap_or_else(|error| {
+            tracing::error!(
+                "cannot tell whether a thread above thread {} is archived, its late answers are \
+                 not given: {error:#}",
+                self.thread
+            );
+            true
+        })
     }
 
     /// The thread, or one above it, is archived: the late answers waiting for its running turn
@@ -1055,8 +1068,9 @@ impl Assistant {
                     .await;
                 after = end.unwrap_or_else(|| self.log.last_seq());
             }
-            // The owner's late answers waiting, unless the thread is archived. An archive drops
-            // them at once; this catches one that came in between.
+            // The owner's late answers waiting, unless the thread is archived or under an
+            // archived thread. An archive drops them at once; this catches one that came in
+            // between.
             if !lock(&self.late).is_empty() {
                 if self.gets_no_late().await {
                     let dropped = std::mem::take(&mut *lock(&self.late));
